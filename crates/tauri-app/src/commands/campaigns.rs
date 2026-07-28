@@ -591,6 +591,26 @@ pub(crate) fn get_campaign(id: String) -> Result<CampaignSummaryDto, TauriComman
     Ok(dto)
 }
 
+/// 删除整局活动及其绑定会话；活跃活动被删除时同步清除活跃指针。
+#[tauri::command]
+pub(crate) fn delete_campaign(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign deletion is not available in the SQLite opt-in backend yet".to_string(),
+        ));
+    }
+
+    crate::playthrough_lifecycle::delete_campaign_playthrough_in_store(
+        get_campaign_store(),
+        state.conv_store.as_ref(),
+        state.inner().as_ref(),
+        &Id::from_str(&id),
+    )
+}
+
 #[tauri::command]
 pub(crate) fn set_active_campaign(
     id: String,

@@ -1,26 +1,46 @@
-use super::super::*;
+use std::sync::Arc;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use storyforge_domain::Id;
+use storyforge_domain::conversation::{
+    Conversation, MessageNode, MessageVariant, Provenance, Role as ConversationRole, VariantStatus,
+};
+use storyforge_domain::preset::{RegexPlacement, RegexScript};
+use storyforge_infra_regex::{
+    RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
+    apply_regex_scripts_for_target_at_depth,
+};
+
+use crate::AppState;
+use crate::error::TauriCommandError;
+use crate::sqlite_runtime;
+use crate::{
+    collect_campaign_scoped_regex_scripts, collect_scoped_regex_scripts, get_campaign_store,
+    get_global_regex_store, get_preset_store, merge_runtime_regex_scripts,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationSummaryDto {
-    pub id: String,
-    pub character_id: Option<String>,
-    pub campaign_id: Option<String>,
-    /// \u{5173}\u{8054}\u{89d2}\u{8272}\u{5361}\u{540d}\u{ff08}\u{524d}\u{7aef}\u{5217}\u{8868}\u{663e}\u{793a}\u{7528}\u{ff09}
-    pub card_name: Option<String>,
-    pub message_count: usize,
-    pub created_at: String,
-    pub updated_at: String,
+pub(crate) struct ConversationSummaryDto {
+    id: String,
+    character_id: Option<String>,
+    campaign_id: Option<String>,
+    /// 关联角色卡名（前端列表显示用）
+    card_name: Option<String>,
+    message_count: usize,
+    created_at: String,
+    updated_at: String,
 }
 
 #[tauri::command]
 pub(crate) fn list_conversations(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Vec<ConversationSummaryDto> {
-    // \u{8054}\u{67e5}\u{89d2}\u{8272}\u{5361}\u{540d}\u{3002}
-    // conversation.character_id \u{5b58}\u{7684}\u{662f} CharacterCard.id\u{ff08}\u{800c}\u{975e} domain Character \u{7684}
-    // source_character_id\u{ff09}\u{ff0c}\u{6240}\u{4ee5}\u{5fc5}\u{987b}\u{7528} campaign_store \u{7684}\u{5361}\u{7247}\u{8868}\u{6309} card.id \u{8054}\u{67e5},
-    // \u{4e0d}\u{80fd}\u{7528} tool_ctx.characters\u{ff08}\u{90a3}\u{662f}\u{6241}\u{5e73} Character,id=source_character_id\u{ff09}\u{3002}
-    // \u{515c}\u{5e95}:character_id \u{8054}\u{67e5}\u{4e0d}\u{5230}\u{65f6},\u{8d70} campaign_id \u{2192} campaign.card_id \u{2192} card.name\u{3002}
+    // 联查角色卡名。
+    // conversation.character_id 存的是 CharacterCard.id（而非 domain Character 的
+    // source_character_id），所以必须用 campaign_store 的卡片表按 card.id 联查,
+    // 不能用 tool_ctx.characters（那是扁平 Character,id=source_character_id）。
+    // 兜底:character_id 联查不到时,走 campaign_id → campaign.card_id → card.name。
     let store = get_campaign_store();
     let cards = store.list_cards();
     let card_by_id: std::collections::HashMap<&Id, &str> = cards
@@ -36,12 +56,12 @@ pub(crate) fn list_conversations(
                 .character_id
                 .as_ref()
                 .and_then(|cid| {
-                    // \u{9996}\u{9009}:\u{76f4}\u{63a5}\u{6309} character_id(=CharacterCard.id)\u{67e5}\u{5361}\u{540d}
+                    // 首选:直接按 character_id(=CharacterCard.id)查卡名
                     let cid_id = Id::from_str(cid);
                     card_by_id.get(&cid_id).map(|n| (*n).to_string())
                 })
                 .or_else(|| {
-                    // \u{515c}\u{5e95}:campaign_id \u{2192} campaign.card_id \u{2192} card.name
+                    // 兜底:campaign_id → campaign.card_id → card.name
                     c.campaign_id.as_ref().and_then(|camp_id| {
                         store.get_campaign(camp_id).and_then(|campaign| {
                             card_by_id.get(&campaign.card_id).map(|n| (*n).to_string())
@@ -61,10 +81,10 @@ pub(crate) fn list_conversations(
         .collect()
 }
 
-/// \u{5220}\u{9664}\u{6574}\u{4e2a}\u{4f1a}\u{8bdd}\u{3002}
+/// 删除整个会话。
 ///
-/// \u{4e00} Campaign \u{4e00}\u{5bf9}\u{8bdd}\u{ff1a}\u{82e5}\u{8be5}\u{4f1a}\u{8bdd}\u{7ed1}\u{5b9a}\u{4e86} Campaign\u{ff08}\u{6216}\u{67d0} Campaign \u{7684} conversation_id \u{6307}\u{5411}\u{5b83}\u{ff09}\u{ff0c}
-/// \u{5219}\u{6309} **\u{6574}\u{5c40}\u{6d3b}\u{52a8}** \u{7ea7}\u{8054}\u{5220}\u{9664}\u{ff08}\u{5b9e}\u{4f8b}/\u{77e5}\u{8bc6}/\u{4efb}\u{52a1}/\u{603b}\u{7ed3} + \u{4f1a}\u{8bdd}\u{ff09}\u{ff0c}\u{800c}\u{4e0d}\u{662f}\u{53ea}\u{6e05}\u{6d88}\u{606f}\u{6811}\u{3002}
+/// 一 Campaign 一对话：若该会话绑定了 Campaign（或某 Campaign 的 conversation_id 指向它），
+/// 则按 **整局活动** 级联删除（实例/知识/任务/总结 + 会话），而不是只清消息树。
 #[tauri::command]
 pub(crate) fn delete_conversation(
     conversation_id: String,
@@ -79,12 +99,12 @@ pub(crate) fn delete_conversation(
     let conv_id = Id::from_str(&conversation_id);
     let store = get_campaign_store();
 
-    // \u{4f18}\u{5148}\u{ff1a}\u{4f1a}\u{8bdd}\u{81ea}\u{5df1}\u{8bb0}\u{5f55}\u{7684} campaign_id
+    // 优先：会话自己记录的 campaign_id
     let campaign_id = state
         .conv_store
         .get(&conv_id)
         .and_then(|c| c.campaign_id.clone())
-        // \u{515c}\u{5e95}\u{ff1a}Campaign.conversation_id \u{53cd}\u{5411}\u{6307}\u{5411}\u{ff08}\u{60ac}\u{7a7a}/\u{534a}\u{7ed1}\u{5b9a}\u{65f6}\u{ff09}
+        // 兜底：Campaign.conversation_id 反向指向（悬空/半绑定时）
         .or_else(|| {
             store
                 .list_campaigns()
@@ -94,7 +114,7 @@ pub(crate) fn delete_conversation(
         });
 
     if let Some(campaign_id) = campaign_id {
-        return delete_campaign_playthrough_in_store(
+        return crate::playthrough_lifecycle::delete_campaign_playthrough_in_store(
             store,
             state.conv_store.as_ref(),
             state.inner().as_ref(),
@@ -102,98 +122,11 @@ pub(crate) fn delete_conversation(
         );
     }
 
-    // \u{65e0} Campaign \u{7684}\u{9057}\u{7559}/\u{5b64}\u{513f}\u{4f1a}\u{8bdd}\u{ff1a}\u{53ea}\u{5220}\u{5bf9}\u{8bdd}
+    // 无 Campaign 的遗留/孤儿会话：只删对话
     state
         .conv_store
         .delete(&conv_id)
         .map_err(|e| TauriCommandError::internal(e.to_string()))
-}
-
-/// \u{5220}\u{9664}\u{6574}\u{5c40}\u{6d3b}\u{52a8}\u{ff08}\u{4e00} Campaign \u{4e00}\u{5bf9}\u{8bdd}\u{6a21}\u{578b}\u{7684}\u{771f}\u{76f8}\u{6e90}\u{5220}\u{9664}\u{ff09}\u{3002}
-///
-/// \u{7ea7}\u{8054}\u{ff1a}instances / knowledge / tasks / round_summaries + \u{7ed1}\u{5b9a}\u{4f1a}\u{8bdd}\u{ff1b}
-/// \u{82e5}\u{5220}\u{7684}\u{662f}\u{5f53}\u{524d}\u{6d3b}\u{8dc3}\u{6d3b}\u{52a8}\u{ff0c}\u{6e05}\u{9664} active_campaign \u{6307}\u{9488}\u{3002}
-#[tauri::command]
-pub(crate) fn delete_campaign(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign deletion is not available in the SQLite opt-in backend yet".to_string(),
-        ));
-    }
-    let campaign_id = Id::from_str(&id);
-    delete_campaign_playthrough_in_store(
-        get_campaign_store(),
-        state.conv_store.as_ref(),
-        state.inner().as_ref(),
-        &campaign_id,
-    )
-}
-
-/// \u{5220}\u{9664}\u{4e00}\u{5c40} playthrough\u{ff1a}Campaign \u{672c}\u{4f53}\u{ff08}\u{542b}\u{5b9e}\u{4f8b}/\u{77e5}\u{8bc6}/\u{4efb}\u{52a1}/\u{603b}\u{7ed3}\u{ff09}+ \u{7ed1}\u{5b9a}\u{4f1a}\u{8bdd} + \u{6d3b}\u{8dc3}\u{6307}\u{9488}\u{3002}
-pub(crate) fn delete_campaign_playthrough_in_store(
-    store: &campaign_store::CampaignStore,
-    conv_store: &ConversationStore,
-    state: &AppState,
-    campaign_id: &Id,
-) -> Result<(), TauriCommandError> {
-    let campaign = store.get_campaign(campaign_id).ok_or_else(|| {
-        TauriCommandError::not_found(format!(
-            "\u{627e}\u{4e0d}\u{5230} campaign id={}",
-            campaign_id.as_str()
-        ))
-    })?;
-
-    // \u{6536}\u{96c6}\u{5e94}\u{5220}\u{9664}\u{7684}\u{4f1a}\u{8bdd} id\u{ff1a}Campaign \u{7ed1}\u{5b9a} + \u{53cd}\u{5411} campaign_id \u{5339}\u{914d}\u{ff08}\u{9632}\u{53ea}\u{7ed1}\u{4e00}\u{8fb9}\u{ff09}
-    let mut conversation_ids = std::collections::HashSet::new();
-    if let Some(cid) = campaign.conversation_id.clone() {
-        conversation_ids.insert(cid);
-    }
-    if let Some(found) = conv_store.find_by_campaign(campaign_id) {
-        conversation_ids.insert(found.id);
-    }
-
-    // \u{5148}\u{5220} Campaign\u{ff08}\u{7ea7}\u{8054} P2 \u{96c6}\u{5408}\u{ff09}\u{ff0c}\u{518d}\u{5220}\u{4f1a}\u{8bdd}\u{ff0c}\u{907f}\u{514d}\u{5199}\u{4e00}\u{534a}\u{7559}\u{4e0b}\u{6d3b}\u{52a8}
-    let deleted = store.delete_campaign(campaign_id).map_err(|e| {
-        TauriCommandError::storage(format!(
-            "\u{5220}\u{9664}\u{6d3b}\u{52a8}\u{5931}\u{8d25}: {e}"
-        ))
-    })?;
-    if !deleted {
-        return Err(TauriCommandError::not_found(format!(
-            "\u{627e}\u{4e0d}\u{5230} campaign id={}",
-            campaign_id.as_str()
-        )));
-    }
-
-    for conv_id in conversation_ids {
-        if let Err(e) = conv_store.delete(&conv_id) {
-            tracing::warn!(
-                "\u{5220}\u{9664}\u{6d3b}\u{52a8} {} \u{540e}\u{6e05}\u{7406}\u{4f1a}\u{8bdd} {} \u{5931}\u{8d25}: {e}",
-                campaign_id.as_str(),
-                conv_id.as_str()
-            );
-            return Err(TauriCommandError::storage(format!(
-                "\u{6d3b}\u{52a8}\u{5df2}\u{5220}\u{9664}\u{ff0c}\u{4f46}\u{6e05}\u{7406}\u{4f1a}\u{8bdd}\u{5931}\u{8d25}: {e}"
-            )));
-        }
-    }
-
-    // \u{6e05}\u{6d3b}\u{8dc3}\u{6307}\u{9488}
-    let mut active = state
-        .active_campaign
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if active.as_ref() == Some(campaign_id) {
-        *active = None;
-        if !sqlite_runtime::is_sqlite_active() {
-            save_active_campaign(&state.data_dir, None);
-        }
-    }
-
-    Ok(())
 }
 
 #[tauri::command]
@@ -202,9 +135,10 @@ pub(crate) fn get_conversation(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let conv_id = storyforge_domain::Id::from_str(&id);
-    let conversation = state.conv_store.get(&conv_id).ok_or_else(|| {
-        TauriCommandError::not_found(format!("\u{5bf9}\u{8bdd}\u{4e0d}\u{5b58}\u{5728}: {id}"))
-    })?;
+    let conversation = state
+        .conv_store
+        .get(&conv_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {id}")))?;
     let regex_scripts = collect_conversation_regex_scripts(&conversation, state.inner().as_ref());
     Ok(
         serde_json::to_value(conversation_display_dto(&conversation, &regex_scripts))
@@ -213,36 +147,36 @@ pub(crate) fn get_conversation(
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct ConversationDisplayDto {
-    pub(crate) id: Id,
-    pub(crate) character_id: Option<String>,
+struct ConversationDisplayDto {
+    id: Id,
+    character_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) campaign_id: Option<Id>,
-    pub(crate) nodes: Vec<MessageNodeDisplayDto>,
-    pub(crate) created_at: chrono::DateTime<Utc>,
-    pub(crate) updated_at: chrono::DateTime<Utc>,
+    campaign_id: Option<Id>,
+    nodes: Vec<MessageNodeDisplayDto>,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct MessageNodeDisplayDto {
-    pub(crate) id: Id,
-    pub(crate) parent_id: Option<Id>,
-    pub(crate) variants: Vec<MessageVariantDisplayDto>,
-    pub(crate) active_variant: usize,
+struct MessageNodeDisplayDto {
+    id: Id,
+    parent_id: Option<Id>,
+    variants: Vec<MessageVariantDisplayDto>,
+    active_variant: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct MessageVariantDisplayDto {
-    pub(crate) id: Id,
-    pub(crate) role: ConversationRole,
-    pub(crate) content: String,
-    pub(crate) display_content: String,
-    pub(crate) created_at: chrono::DateTime<Utc>,
-    pub(crate) status: VariantStatus,
-    pub(crate) provenance: Option<Provenance>,
+struct MessageVariantDisplayDto {
+    id: Id,
+    role: ConversationRole,
+    content: String,
+    display_content: String,
+    created_at: chrono::DateTime<Utc>,
+    status: VariantStatus,
+    provenance: Option<Provenance>,
 }
 
-pub(crate) fn collect_conversation_regex_scripts(
+fn collect_conversation_regex_scripts(
     conversation: &Conversation,
     state: &AppState,
 ) -> Vec<RegexScript> {
@@ -259,7 +193,7 @@ pub(crate) fn collect_conversation_regex_scripts(
     merge_runtime_regex_scripts(scoped_scripts, get_preset_store(), get_global_regex_store())
 }
 
-pub(crate) fn conversation_display_dto(
+fn conversation_display_dto(
     conversation: &Conversation,
     regex_scripts: &[RegexScript],
 ) -> ConversationDisplayDto {
@@ -282,7 +216,7 @@ pub(crate) fn conversation_display_dto(
     }
 }
 
-pub(crate) fn message_node_display_dto(
+fn message_node_display_dto(
     node: &MessageNode,
     display_scripts: &[RegexScript],
     depth: usize,
@@ -299,7 +233,7 @@ pub(crate) fn message_node_display_dto(
     }
 }
 
-pub(crate) fn message_variant_display_dto(
+fn message_variant_display_dto(
     variant: &MessageVariant,
     display_scripts: &[RegexScript],
     depth: usize,
@@ -311,8 +245,8 @@ pub(crate) fn message_variant_display_dto(
         display_content: render_variant_display_content(variant, display_scripts, depth),
         created_at: variant.created_at,
         status: variant.status.clone(),
-        // \u{666e}\u{901a}\u{4f1a}\u{8bdd}\u{8bfb}\u{53d6}\u{53ea}\u{8fd4}\u{56de}\u{91cd} roll \u{6240}\u{9700}\u{7684}\u{975e}\u{654f}\u{611f}\u{6eaf}\u{6e90}\u{3002}reasoning \u{539f}\u{6587}\u{4ec5}\u{7531}
-        // meta_explain_generation \u{663e}\u{5f0f}\u{5ba1}\u{8ba1}\u{547d}\u{4ee4}\u{6309}\u{9700}\u{8fd4}\u{56de}\u{ff0c}\u{907f}\u{514d}\u{9875}\u{9762}\u{52a0}\u{8f7d}\u{5373}\u{4e0b}\u{53d1}\u{3002}
+        // 普通会话读取只返回重 roll 所需的非敏感溯源。reasoning 原文仅由
+        // meta_explain_generation 显式审计命令按需返回，避免页面加载即下发。
         provenance: variant.provenance.clone().map(|mut provenance| {
             provenance.director_reasoning = None;
             provenance.writer_reasoning = None;
@@ -325,7 +259,7 @@ pub(crate) fn message_variant_display_dto(
     }
 }
 
-pub(crate) fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<RegexScript> {
+fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<RegexScript> {
     regex_scripts
         .iter()
         .filter(|script| script.markdown_only.unwrap_or(false))
@@ -333,7 +267,7 @@ pub(crate) fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<R
         .collect()
 }
 
-pub(crate) fn render_variant_display_content(
+fn render_variant_display_content(
     variant: &MessageVariant,
     display_scripts: &[RegexScript],
     depth: usize,
@@ -359,7 +293,188 @@ pub(crate) fn render_variant_display_content(
     });
 
     reasoning_applied.unwrap_or_else(|e| {
-        tracing::warn!("\u{5c55}\u{793a}\u{6b63}\u{5219}\u{6267}\u{884c}\u{5931}\u{8d25}\u{ff0c}\u{4f7f}\u{7528}\u{539f}\u{59cb}\u{6d88}\u{606f}\u{5185}\u{5bb9}: {e}");
+        tracing::warn!("展示正则执行失败，使用原始消息内容: {e}");
         variant.content.clone()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::preset::RegexScriptSource;
+    use storyforge_domain::preset::{ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING};
+
+    fn regex_script(id: &str, source: RegexScriptSource) -> RegexScript {
+        RegexScript {
+            id: id.to_string(),
+            script_name: id.to_string(),
+            find_regex: id.to_string(),
+            replace_string: String::new(),
+            placement: RegexPlacement::Output,
+            placement_codes: vec![ST_REGEX_PLACEMENT_AI_OUTPUT],
+            source,
+            disabled: false,
+            flags: String::new(),
+            only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
+        }
+    }
+
+    #[test]
+    fn display_dto_applies_markdown_only_output_without_mutating_content() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_message(
+            storyforge_domain::conversation::Role::User,
+            "<data_block>user</data_block>".into(),
+        );
+        conversation.append_ai_draft("<data_block>hp=5</data_block> scene".into(), None);
+
+        let mut script = regex_script("display-hp", RegexScriptSource::Preset);
+        script.find_regex = r"<data_block>hp=5</data_block>".into();
+        script.replace_string = "[HP:5]".into();
+        script.markdown_only = Some(true);
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let user_variant = &dto.nodes[0].variants[0];
+        assert_eq!(user_variant.content, "<data_block>user</data_block>");
+        assert_eq!(
+            user_variant.display_content,
+            "<data_block>user</data_block>"
+        );
+
+        let assistant_variant = &dto.nodes[1].variants[0];
+        assert_eq!(
+            assistant_variant.content,
+            "<data_block>hp=5</data_block> scene"
+        );
+        assert_eq!(assistant_variant.display_content, "[HP:5] scene");
+        assert_eq!(
+            conversation.nodes[1].variants[0].content,
+            "<data_block>hp=5</data_block> scene"
+        );
+    }
+
+    #[test]
+    fn display_dto_applies_markdown_only_reasoning_without_mutating_content() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("<think>raw chain</think> final raw".into(), None);
+
+        let mut script = regex_script("display-reasoning", RegexScriptSource::Preset);
+        script.find_regex = r"raw".into();
+        script.replace_string = "pretty".into();
+        script.placement = RegexPlacement::Reasoning;
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.markdown_only = Some(true);
+        script.flags = "g".into();
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let assistant_variant = &dto.nodes[0].variants[0];
+        assert_eq!(
+            assistant_variant.content,
+            "<think>raw chain</think> final raw"
+        );
+        assert_eq!(
+            assistant_variant.display_content,
+            "<think>pretty chain</think> final raw"
+        );
+        assert_eq!(
+            conversation.nodes[0].variants[0].content,
+            "<think>raw chain</think> final raw"
+        );
+    }
+
+    #[test]
+    fn ordinary_display_dto_strips_captured_reasoning() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft(
+            "visible".into(),
+            Some(Provenance {
+                session_id: Id::from_str("session-audit"),
+                plan: None,
+                subagent_results: vec![storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: "lin".into(),
+                    full_text: "performance".into(),
+                    character_instance_id: None,
+                    display_name: None,
+                    fallback_reason: None,
+                    reasoning_content: Some("subagent secret reasoning".into()),
+                }],
+                profile_id: None,
+                generation_mode: None,
+                seed: 1,
+                last_hint: None,
+                director_reasoning: Some("director secret reasoning".into()),
+                writer_reasoning: Some("writer secret reasoning".into()),
+                editor_reasoning: Some("editor secret reasoning".into()),
+            }),
+        );
+
+        let dto = conversation_display_dto(&conversation, &[]);
+        let displayed = dto.nodes[0].variants[0]
+            .provenance
+            .as_ref()
+            .expect("non-reasoning provenance remains available");
+        assert!(displayed.director_reasoning.is_none());
+        assert!(displayed.writer_reasoning.is_none());
+        assert!(displayed.editor_reasoning.is_none());
+        assert!(displayed.subagent_results[0].reasoning_content.is_none());
+
+        let stored = conversation.nodes[0].variants[0]
+            .provenance
+            .as_ref()
+            .expect("stored provenance remains intact for explicit audit");
+        assert_eq!(
+            stored.editor_reasoning.as_deref(),
+            Some("editor secret reasoning")
+        );
+    }
+
+    #[test]
+    fn display_dto_does_not_reapply_persisted_output_regex() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("persisted bar".into(), None);
+
+        let mut script = regex_script("persisted-output", RegexScriptSource::Preset);
+        script.find_regex = "bar".into();
+        script.replace_string = "baz".into();
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let variant = &dto.nodes[0].variants[0];
+        assert_eq!(variant.content, "persisted bar");
+        assert_eq!(variant.display_content, "persisted bar");
+    }
+
+    #[test]
+    fn display_dto_respects_display_regex_depth() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("<status>old</status>".into(), None);
+        conversation.append_message(
+            storyforge_domain::conversation::Role::User,
+            "continue".into(),
+        );
+        conversation.append_ai_draft("<status>new</status>".into(), None);
+
+        let mut script = regex_script("recent-status", RegexScriptSource::Preset);
+        script.find_regex = r"<status>(.*?)</status>".into();
+        script.replace_string = "[$1]".into();
+        script.markdown_only = Some(true);
+        script.min_depth = Some(0);
+        script.max_depth = Some(1);
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let old_variant = &dto.nodes[0].variants[0];
+        let new_variant = &dto.nodes[2].variants[0];
+        assert_eq!(old_variant.display_content, "<status>old</status>");
+        assert_eq!(new_variant.display_content, "[new]");
+    }
 }

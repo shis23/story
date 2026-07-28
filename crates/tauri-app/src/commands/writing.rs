@@ -1,16 +1,45 @@
-use super::super::*;
+use std::sync::Arc;
 
-// \u{2500}\u{2500}\u{2500} M1 \u{5199}\u{4f5c}\u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, watch};
 
-/// \u{5199}\u{4f5c}\u{6d41}\u{6c34}\u{7ebf}\u{4e8b}\u{4ef6}\u{ff08}Tauri Channel \u{7528}\u{ff09}
+use storyforge_app_agent::runtime::{PromptHook, PromptHookContext};
+use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
+use storyforge_domain::Id;
+use storyforge_domain::agent::PipelineEvent;
+use storyforge_domain::conversation::Provenance;
+use storyforge_domain::llm::ChatMessage;
+
+use crate::campaign_store;
+use crate::error::TauriCommandError;
+use crate::production_postprocess;
+use crate::sqlite_runtime;
+use crate::turn_lifecycle;
+use crate::turn_store;
+use crate::{
+    AppState, AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest,
+    PromptHookPendingGuard, PromptHookPendingMap, append_missing_campaign_scoped_regex_scripts,
+    begin_writing_operation, check_turn_barrier, clear_current_cancel_if,
+    collect_mvu_fallback_fragments_for_backend, collect_mvu_update_rules_for_backend,
+    collect_scoped_regex_scripts, fill_agent_profile_context, fill_campaign_context_async,
+    fill_far_memory_hits, fill_profile_context, fill_regex_context, get_campaign_store,
+    get_global_regex_store, get_preset_store, get_turn_store,
+    is_current_attempt_ready_for_postprocess, postprocess_variable_keys,
+    prepare_start_conversation_async, run_shared_postprocess_background, service_fail_turn,
+    update_turn_record,
+};
+
+// ─── M1 写作命令 ───────────────────────────────────────────────────────────
+
+/// 写作流水线事件（Tauri Channel 用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WritingEvent {
-    pub event_type: String,
-    pub data: serde_json::Value,
+pub(crate) struct WritingEvent {
+    pub(crate) event_type: String,
+    pub(crate) data: serde_json::Value,
 }
 
 impl WritingEvent {
-    pub fn from_pipeline_event(event: &PipelineEvent) -> Self {
+    pub(crate) fn from_pipeline_event(event: &PipelineEvent) -> Self {
         let (event_type, data) = match event {
             PipelineEvent::Started { session_id } => (
                 "started".into(),
@@ -177,10 +206,10 @@ impl WritingEvent {
     }
 }
 
-/// Tauri command: \u{542f}\u{52a8}\u{5199}\u{4f5c}\u{6d41}\u{6c34}\u{7ebf}\u{ff08}\u{901a}\u{8fc7} Channel \u{63a8}\u{9001}\u{4e8b}\u{4ef6}\u{ff09}
+/// Tauri command: 启动写作流水线（通过 Channel 推送事件）
 ///
-/// cancel sender \u{5b58}\u{8fdb} AppState.current_cancel\u{ff0c}\u{524d}\u{7aef}\u{53ef}\u{8c03} cancel_writing \u{4e2d}\u{6b62}\u{3002}
-/// \u{8fd4}\u{56de} { text, conversation_id, node_id } \u{4f9b}\u{524d}\u{7aef}\u{540e}\u{7eed}\u{91cd} roll \u{5b9a}\u{4f4d}\u{3002}
+/// cancel sender 存进 AppState.current_cancel，前端可调 cancel_writing 中止。
+/// 返回 { text, conversation_id, node_id } 供前端后续重 roll 定位。
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PromptHookReply {
     #[serde(default)]
@@ -261,7 +290,7 @@ pub(crate) fn frontend_prompt_hook(
     })
 }
 
-/// \u{9636}\u{6bb5} B\u{ff1a}\u{6709}\u{754c} 1\u{d7} Editor auto-fix \u{7684}\u{8f93}\u{5165}\u{4e0a}\u{4e0b}\u{6587}\u{ff08}\u{5408}\u{5e76}\u{53c2}\u{6570}\u{4ee5}\u{907f}\u{5f00} clippy too_many_arguments\u{ff09}\u{3002}
+/// 阶段 B：有界 1× Editor auto-fix 的输入上下文（合并参数以避开 clippy too_many_arguments）。
 pub(crate) struct QualityAutofixCtx<'a> {
     pub(crate) pipeline: &'a mut PipelineOrchestrator,
     pub(crate) draft_node_id: &'a Id,
@@ -273,10 +302,10 @@ pub(crate) struct QualityAutofixCtx<'a> {
     pub(crate) original_provenance: Option<Provenance>,
 }
 
-/// \u{9636}\u{6bb5} B\u{ff1a}\u{6709}\u{754c} 1\u{d7} Editor auto-fix\u{3002}
+/// 阶段 B：有界 1× Editor auto-fix。
 ///
-/// \u{5bf9}\u{8349}\u{7a3f}\u{8dd1} NarrativeContract QualityGate\u{ff1b}\u{82e5}\u{6709} Error \u{4e14}\u{5c1a}\u{672a} auto-fix\u{ff0c}
-/// \u{4ec5} Editor \u{91cd}\u{8dd1}\u{4e00}\u{6b21}\u{ff08}hint \u{6765}\u{81ea}\u{8b66}\u{544a}\u{6458}\u{8981}\u{ff09}\u{ff0c}\u{518d} gate\u{3002}\u{6700}\u{591a} 1 \u{6b21}\u{3002}
+/// 对草稿跑 NarrativeContract QualityGate；若有 Error 且尚未 auto-fix，
+/// 仅 Editor 重跑一次（hint 来自警告摘要），再 gate。最多 1 次。
 pub(crate) async fn quality_gate_with_optional_editor_autofix(
     final_text: String,
     ctx: QualityAutofixCtx<'_>,
@@ -315,27 +344,27 @@ pub(crate) async fn quality_gate_with_optional_editor_autofix(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RouteActorSignal {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) agenda: Option<String>,
-    pub(crate) private_facts: Vec<String>,
+struct RouteActorSignal {
+    id: String,
+    name: String,
+    agenda: Option<String>,
+    private_facts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RouteTaskSignal {
+struct RouteTaskSignal {
     related_actor_ids: Vec<String>,
     imminent: bool,
 }
 
-pub(crate) fn normalized_route_text(text: &str) -> String {
+fn normalized_route_text(text: &str) -> String {
     text.chars()
         .filter(|character| !character.is_whitespace() && !character.is_ascii_punctuation())
         .flat_map(char::to_lowercase)
         .collect()
 }
 
-pub(crate) fn private_fact_is_relevant(intent: &str, fact: &str) -> bool {
+fn private_fact_is_relevant(intent: &str, fact: &str) -> bool {
     let intent = normalized_route_text(intent);
     let fact = normalized_route_text(fact);
     if fact.is_empty() || intent.is_empty() {
@@ -346,16 +375,7 @@ pub(crate) fn private_fact_is_relevant(intent: &str, fact: &str) -> bool {
     }
     let chars = fact.chars().collect::<Vec<_>>();
     const ROUTE_STOP_FRAGMENTS: &[&str] = &[
-        "\u{5df2}\u{7ecf}",
-        "\u{77e5}\u{9053}",
-        "\u{4ed6}\u{4eec}",
-        "\u{5979}\u{4eec}",
-        "\u{81ea}\u{5df1}",
-        "\u{8fd9}\u{4e2a}",
-        "\u{90a3}\u{4e2a}",
-        "\u{56e0}\u{4e3a}",
-        "\u{6240}\u{4ee5}",
-        "\u{4f46}\u{662f}",
+        "已经", "知道", "他们", "她们", "自己", "这个", "那个", "因为", "所以", "但是",
     ];
     chars
         .windows(2)
@@ -365,7 +385,7 @@ pub(crate) fn private_fact_is_relevant(intent: &str, fact: &str) -> bool {
         })
 }
 
-pub(crate) fn generation_route_signals_from_parts(
+fn generation_route_signals_from_parts(
     intent: &str,
     actors: &[RouteActorSignal],
     tasks: &[RouteTaskSignal],
@@ -374,32 +394,23 @@ pub(crate) fn generation_route_signals_from_parts(
     use storyforge_domain::generation::GenerationRouteSignals;
 
     let large_scene_intent = [
-        "\u{5168}\u{5458}",
-        "\u{6240}\u{6709}\u{4eba}",
-        "\u{4f17}\u{4eba}",
-        "\u{7fa4}\u{50cf}",
-        "\u{5bb4}\u{4f1a}",
-        "\u{821e}\u{4f1a}",
-        "\u{4f1a}\u{8bae}",
-        "\u{96c6}\u{4f1a}",
-        "\u{6218}\u{573a}",
-        "\u{56f4}\u{653b}",
-        "\u{5ba1}\u{5224}",
-        "\u{591a}\u{4eba}",
+        "全员",
+        "所有人",
+        "众人",
+        "群像",
+        "宴会",
+        "舞会",
+        "会议",
+        "集会",
+        "战场",
+        "围攻",
+        "审判",
+        "多人",
     ]
     .iter()
     .any(|keyword| intent.contains(keyword));
     let high_tension = [
-        "\u{5bf9}\u{5cd9}",
-        "\u{8d28}\u{95ee}",
-        "\u{4e89}\u{5435}",
-        "\u{51b2}\u{7a81}",
-        "\u{5a01}\u{80c1}",
-        "\u{51b3}\u{88c2}",
-        "\u{6253}\u{6597}",
-        "\u{53ae}\u{6740}",
-        "\u{7d27}\u{5f20}",
-        "\u{903c}\u{95ee}",
+        "对峙", "质问", "争吵", "冲突", "威胁", "决裂", "打斗", "厮杀", "紧张", "逼问",
     ]
     .iter()
     .any(|keyword| intent.contains(keyword));
@@ -460,7 +471,7 @@ pub(crate) fn generation_route_signals_from_parts(
     }
 }
 
-pub(crate) fn generation_route_signals(
+fn generation_route_signals(
     intent: &str,
     ctx: &WritingContext,
     explicit_mode: Option<storyforge_domain::generation::GenerationMode>,
@@ -534,7 +545,7 @@ pub(crate) fn generation_route_signals(
     generation_route_signals_from_parts(intent, &actors, &[], explicit_mode)
 }
 
-pub(crate) fn enforce_generation_cost_confirmation(
+fn enforce_generation_cost_confirmation(
     decision: &storyforge_domain::generation::GenerationRouteDecision,
 ) -> Result<(), TauriCommandError> {
     if !decision.requires_cost_confirmation {
@@ -543,7 +554,7 @@ pub(crate) fn enforce_generation_cost_confirmation(
     let wire_mode =
         serde_json::to_string(&decision.mode).unwrap_or_else(|_| "\"sequential_crew\"".to_string());
     Err(TauriCommandError::validation(format!(
-        "\u{81ea}\u{52a8}\u{8def}\u{7531}\u{5efa}\u{8bae}\u{5347}\u{7ea7}\u{5230} {}\u{ff08}\u{9884}\u{8ba1} {}\u{ff09}\u{3002}\u{4e3a}\u{907f}\u{514d}\u{9759}\u{9ed8}\u{4ea7}\u{751f}\u{9ad8}\u{6210}\u{672c}\u{8c03}\u{7528}\u{ff0c}\u{672c}\u{8f6e}\u{5c1a}\u{672a}\u{542f}\u{52a8}\u{ff1b}\u{8bf7}\u{786e}\u{8ba4}\u{540e}\u{663e}\u{5f0f}\u{91cd}\u{8bd5} generation_mode={}\u{3002}",
+        "自动路由建议升级到 {}（预计 {}）。为避免静默产生高成本调用，本轮尚未启动；请确认后显式重试 generation_mode={}。",
         wire_mode.trim_matches('"'),
         decision.mode.estimated_call_label(),
         wire_mode.trim_matches('"'),
@@ -564,10 +575,10 @@ pub(crate) async fn start_writing(
     app.require_active_llm()?;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
 
-    // Phase A \u{5c4f}\u{969c}\u{ff1a}\u{5b58}\u{5728}\u{975e} terminal Turn \u{2192} \u{62d2}\u{7edd}\u{542f}\u{52a8}\u{ff08}\u{5728}\u{8ffd}\u{52a0} user \u{6d88}\u{606f}\u{4e4b}\u{524d}\u{ff09}
+    // Phase A 屏障：存在非 terminal Turn → 拒绝启动（在追加 user 消息之前）
     check_turn_barrier(&app)?;
 
-    // \u{524d}\u{7aef}\u{4e8b}\u{4ef6}\u{8f6c}\u{53d1}\u{4efb}\u{52a1}
+    // 前端事件转发任务
     let on_event_clone = on_event.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -576,11 +587,11 @@ pub(crate) async fn start_writing(
         }
     });
 
-    // \u{6784}\u{9020}\u{5199}\u{4f5c}\u{4e0a}\u{4e0b}\u{6587}\u{ff08}\u{4ece} tool_ctx \u{5feb}\u{7167}\u{8bfb}\u{53d6}\u{ff0c}\u{5bfc}\u{5165}\u{7684}\u{89d2}\u{8272}\u{5361}/\u{4e16}\u{754c}\u{4e66}\u{81ea}\u{52a8}\u{53ef}\u{89c1}\u{ff09}
+    // 构造写作上下文（从 tool_ctx 快照读取，导入的角色卡/世界书自动可见）
     let tool_snapshot = app.snapshot_tool_ctx();
 
-    // \u{5728}\u{5199}\u{5165}\u{5f00}\u{573a}\u{767d}/\u{7528}\u{6237}\u{610f}\u{56fe}\u{4e4b}\u{524d}\u{5b8c}\u{6210}\u{81ea}\u{52a8}\u{8def}\u{7531}\u{9884}\u{68c0}\u{3002}\u{81ea}\u{52a8}\u{5347}\u{5230}\u{6602}\u{8d35}\u{7fa4}\u{50cf}\u{6863}\u{65f6}
-    // fail closed\u{ff0c}\u{8c03}\u{7528}\u{65b9}\u{987b}\u{628a}\u{5efa}\u{8bae}\u{6a21}\u{5f0f}\u{4f5c}\u{4e3a}\u{663e}\u{5f0f} generation_mode \u{91cd}\u{8bd5}\u{3002}
+    // 在写入开场白/用户意图之前完成自动路由预检。自动升到昂贵群像档时
+    // fail closed，调用方须把建议模式作为显式 generation_mode 重试。
     let provisional_conversation_id = conversation_id
         .as_deref()
         .map(Id::from_str)
@@ -617,8 +628,8 @@ pub(crate) async fn start_writing(
         "selected writing generation mode"
     );
 
-    // \u{4e00} Campaign \u{4e00}\u{5bf9}\u{8bdd}\u{ff1a}Campaign \u{6a21}\u{5f0f}\u{4e0b}\u{7528} Campaign \u{7ed1}\u{5b9a}\u{7684} conversation_id\u{ff0c}
-    // \u{8986}\u{76d6}\u{524d}\u{7aef}\u{4f20}\u{5165}\u{7684}\u{ff08}\u{524d}\u{7aef}\u{53ef}\u{80fd}\u{5728}\u{5207}\u{6863}\u{65f6}\u{4f20}\u{9519}\u{6216}\u{4f20} null\u{ff09}
+    // 一 Campaign 一对话：Campaign 模式下用 Campaign 绑定的 conversation_id，
+    // 覆盖前端传入的（前端可能在切档时传错或传 null）
     let legacy_opening_character = tool_snapshot.characters.first().cloned();
     let start_target = prepare_start_conversation_async(
         app.clone(),
@@ -638,16 +649,16 @@ pub(crate) async fn start_writing(
         collect_scoped_regex_scripts(regex_character_id.as_deref(), &tool_snapshot.characters);
     append_missing_campaign_scoped_regex_scripts(&mut ctx, campaign_regex_scripts);
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
-    // \u{4ece}\u{6a21}\u{5757}/Profile \u{5b58}\u{50a8}\u{52a0}\u{8f7d}\u{9884}\u{8bbe}\u{914d}\u{7f6e}
+    // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
-    // \u{4ece}\u{6d3b}\u{8dc3} Agent Profile Config \u{52a0}\u{8f7d}\u{8fd0}\u{884c}\u{65f6}\u{914d}\u{7f6e}\u{8986}\u{76d6}
+    // 从活跃 Agent Profile Config 加载运行时配置覆盖
     fill_agent_profile_context(&mut ctx, &app);
-    // ContextCompiler\u{ff1a}\u{6309}\u{7528}\u{6237}\u{610f}\u{56fe}\u{81ea}\u{52a8}\u{53ec}\u{56de} ArchivedSummary \u{8fdc}\u{8bb0}\u{5fc6}
+    // ContextCompiler：按用户意图自动召回 ArchivedSummary 远记忆
     fill_far_memory_hits(&mut ctx, &app, &intent).await;
 
-    // Phase A: Campaign \u{6a21}\u{5f0f}\u{4e0b}\u{521b}\u{5efa} TurnRecord
+    // Phase A: Campaign 模式下创建 TurnRecord
     let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
-        // \u{83b7}\u{53d6}\u{5f53}\u{524d} Campaign revision \u{4f5c}\u{4e3a} base
+        // 获取当前 Campaign revision 作为 base
         let base_revision = if sqlite_runtime::is_sqlite_active() {
             sqlite_runtime::get_campaign(campaign_id)
                 .map_err(TauriCommandError::internal)?
@@ -663,7 +674,7 @@ pub(crate) async fn start_writing(
         };
         let input_node = start_target.input_node_id.unwrap_or_else(|| {
             tracing::warn!(
-                "Phase A: user \u{6d88}\u{606f}\u{8282}\u{70b9} ID \u{672a}\u{77e5}\u{ff0c}TurnRecord.input_node_id \u{7528} placeholder"
+                "Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder"
             );
             Id::from_str("unknown-input-node")
         });
@@ -679,20 +690,20 @@ pub(crate) async fn start_writing(
             get_turn_store().create_turn(record.clone())
         };
         if let Err(e) = create_turn {
-            tracing::error!("Phase A: \u{521b}\u{5efa} TurnRecord \u{5931}\u{8d25}: {e}");
+            tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
             return Err(TauriCommandError::internal(format!(
-                "\u{521b}\u{5efa} TurnRecord \u{5931}\u{8d25}: {e}"
+                "创建 TurnRecord 失败: {e}"
             )));
         }
         Some(record)
     } else {
-        None // \u{975e} Campaign \u{6a21}\u{5f0f}\u{ff0c}\u{4e0d}\u{521b}\u{5efa} TurnRecord
+        None // 非 Campaign 模式，不创建 TurnRecord
     };
 
     // Operation-owned cancel: pipeline / autofix / postprocess all clone this receiver.
     let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
-    // \u{6bcf}\u{6b21}\u{7528}\u{6700}\u{65b0} tool_ctx \u{5feb}\u{7167}\u{6784}\u{9020} orchestrator\u{ff08}\u{4fdd}\u{8bc1}\u{5bfc}\u{5165}\u{540e}\u{7acb}\u{523b}\u{751f}\u{6548}\u{ff09}
+    // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook))?;
@@ -706,20 +717,20 @@ pub(crate) async fn start_writing(
         )
         .await;
 
-    // \u{2500}\u{2500}\u{2500} P2 \u{540e}\u{5904}\u{7406}\u{6d41}\u{6c34}\u{7ebf}\u{ff08}\u{540e}\u{53f0}\u{6267}\u{884c}\u{ff0c}\u{4e0d}\u{963b}\u{65ad}\u{6210}\u{6587}\u{8fd4}\u{56de}\u{ff09}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-    // \u{6210}\u{6587}\u{ff08}DraftReady\u{ff09}\u{540e}\u{8dd1}\u{ff1a}\u{5267}\u{60c5}\u{603b}\u{7ed3} + \u{540e}\u{5904}\u{7406}\u{4e09}\u{5408}\u{4e00}\u{3002}
-    // postprocess \u{653e}\u{540e}\u{53f0} spawn\u{2014}\u{2014}draft_ready \u{540e}\u{7acb}\u{5373}\u{8fd4}\u{56de}\u{6210}\u{6587}\u{7ed9}\u{524d}\u{7aef}\u{ff0c}
-    // postprocess \u{5728}\u{540e}\u{53f0}\u{8dd1}\u{ff08}\u{77e5}\u{8bc6}/\u{53d8}\u{91cf}/\u{6458}\u{8981}\u{5199}\u{56de}\u{ff09}\u{ff0c}\u{901a}\u{8fc7} event_tx \u{63a8}\u{8fdb}\u{5ea6}\u{3002}
-    // \u{4ec5}\u{5728}\u{6709}\u{6d3b}\u{8dc3} Campaign \u{65f6}\u{6267}\u{884c}\u{ff08}\u{65e0} Campaign \u{8df3}\u{8fc7}\u{ff0c}\u{5411}\u{540e}\u{517c}\u{5bb9}\u{ff09}\u{3002}
+    // ─── P2 后处理流水线（后台执行，不阻断成文返回）──────────────────────
+    // 成文（DraftReady）后跑：剧情总结 + 后处理三合一。
+    // postprocess 放后台 spawn——draft_ready 后立即返回成文给前端，
+    // postprocess 在后台跑（知识/变量/摘要写回），通过 event_tx 推进度。
+    // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
     //
-    // auto-fix \u{53ef}\u{80fd}\u{6539}\u{5199}\u{6b63}\u{6587}\u{ff1a}\u{547d}\u{4ee4}\u{8fd4}\u{56de}\u{503c}\u{5fc5}\u{987b}\u{7528}\u{4fee}\u{590d}\u{540e}\u{7684} final_text\u{ff0c}
-    // \u{4e0d}\u{80fd}\u{518d}\u{56de}\u{9000}\u{5230} pipeline \u{539f}\u{59cb} result \u{91cc}\u{7684}\u{539f}\u{7a3f}\u{3002}
+    // auto-fix 可能改写正文：命令返回值必须用修复后的 final_text，
+    // 不能再回退到 pipeline 原始 result 里的原稿。
     let mut response_text: Option<String> = None;
     if let Ok((final_text, draft_node_id, provenance)) = &result {
-        // Phase A: \u{6210}\u{6587}\u{540e}\u{521b}\u{5efa} TurnAttempt \u{5e76}\u{66f4}\u{65b0} TurnRecord \u{2192} DraftReady\u{3002}
+        // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady。
         // SQLite opt-in: atomic preaccept UoW (conversation + attempt + outbox).
         // JSON default: pipeline already landed the draft; attach attempt separately.
-        // \u{6ce8}\u{610f}\u{ff1a}\u{672c}\u{5730} turn_record \u{5feb}\u{7167}\u{4e0d}\u{542b}\u{65b0} Attempt\u{ff0c}\u{5fc5}\u{987b}\u{6355}\u{83b7} attempt_id \u{7ed9}\u{540e}\u{7eed}\u{5199}\u{56de}\u{3002}
+        // 注意：本地 turn_record 快照不含新 Attempt，必须捕获 attempt_id 给后续写回。
         let mut landed_draft_node_id = draft_node_id.clone();
         let created_attempt_id = if let Some(ref turn) = turn_record {
             let attempt_id = Id::new();
@@ -748,12 +759,12 @@ pub(crate) async fn start_writing(
                         let _ = update_turn_record(&turn.turn_id, |record| {
                             record.status = storyforge_domain::turn::TurnStatus::Failed;
                             record.failure_reason =
-                                Some(format!("sqlite preaccept draft \u{5931}\u{8d25}: {e}"));
+                                Some(format!("sqlite preaccept draft 失败: {e}"));
                             record.touch();
                         });
                         clear_current_cancel_if(&app, &operation_id);
                         return Err(TauriCommandError::internal(format!(
-                            "sqlite preaccept draft \u{5931}\u{8d25}: {e}"
+                            "sqlite preaccept draft 失败: {e}"
                         )));
                     }
                 }
@@ -764,7 +775,7 @@ pub(crate) async fn start_writing(
                     final_text,
                     temps,
                 );
-                // A.1/P0-4\u{ff1a}Attempt \u{521b}\u{5efa}\u{5931}\u{8d25}\u{5fc5}\u{987b}\u{4f20}\u{64ad}\u{ff0c}\u{5e76}\u{8865}\u{507f}\u{8f6f}\u{5220}\u{65e0}\u{4e3b} Draft
+                // A.1/P0-4：Attempt 创建失败必须传播，并补偿软删无主 Draft
                 if let Err(e) = update_turn_record(&turn.turn_id, |record| {
                     record.attempts.push(attempt);
                     record.status = storyforge_domain::turn::TurnStatus::DraftReady;
@@ -775,21 +786,19 @@ pub(crate) async fn start_writing(
                         .soft_delete_variant(&conversation_id, draft_node_id)
                     {
                         tracing::error!(
-                            "P0-4 \u{8865}\u{507f}\u{5931}\u{8d25}: soft_delete \u{65e0}\u{4e3b} Draft {} \u{5931}\u{8d25}: {comp_e}\u{ff08}\u{539f}\u{9519}\u{8bef}: {e}\u{ff09}",
+                            "P0-4 补偿失败: soft_delete 无主 Draft {} 失败: {comp_e}（原错误: {e}）",
                             draft_node_id
                         );
                     }
-                    // Turn \u{6807} Failed\u{ff0c}\u{907f}\u{514d}\u{5c4f}\u{969c}\u{5361}\u{6b7b}\u{540e}\u{7eed}\u{5199}\u{4f5c}
+                    // Turn 标 Failed，避免屏障卡死后续写作
                     let _ = update_turn_record(&turn.turn_id, |record| {
                         record.status = storyforge_domain::turn::TurnStatus::Failed;
-                        record.failure_reason = Some(format!(
-                            "TurnAttempt \u{6301}\u{4e45}\u{5316}\u{5931}\u{8d25}: {e}"
-                        ));
+                        record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
                         record.touch();
                     });
                     clear_current_cancel_if(&app, &operation_id);
                     return Err(TauriCommandError::internal(format!(
-                        "TurnAttempt \u{6301}\u{4e45}\u{5316}\u{5931}\u{8d25}\u{ff08}\u{5df2}\u{5c1d}\u{8bd5}\u{8f6f}\u{5220}\u{65e0}\u{4e3b} Draft\u{ff09}: {e}"
+                        "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
                     )));
                 }
                 Some(attempt_id)
@@ -797,9 +806,9 @@ pub(crate) async fn start_writing(
         } else {
             None
         };
-        // A.1\u{ff1a}\u{4e34}\u{65f6} instance \u{4e0d}\u{518d}\u{5728} accept \u{524d}\u{76f4}\u{63a5}\u{5199} Campaign\u{ff1b}\u{6302}\u{5728} Attempt\u{ff0c}accept \u{65f6} Mutation \u{843d}\u{76d8}
+        // A.1：临时 instance 不再在 accept 前直接写 Campaign；挂在 Attempt，accept 时 Mutation 落盘
 
-        // \u{4ece} session.plan \u{53d6}\u{5728}\u{573a}\u{89d2}\u{8272} + \u{57fa}\u{7840}\u{53d8}\u{91cf}\u{952e}
+        // 从 session.plan 取在场角色 + 基础变量键
         let present_chars: Vec<String> = pipeline
             .session()
             .and_then(|s| s.plan.as_ref())
@@ -817,7 +826,7 @@ pub(crate) async fn start_writing(
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
         let mvu_rules = collect_mvu_update_rules_for_backend(&ctx, &present_chars);
 
-        // B3/B DraftQualityGate + \u{6709}\u{754c} 1\u{d7} Editor auto-fix
+        // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // SQLite: use the authoritative landed variant id (not the provisional pipeline id).
         let (final_text, quality_report, autofix_provenance) =
             quality_gate_with_optional_editor_autofix(
@@ -837,10 +846,10 @@ pub(crate) async fn start_writing(
             .map_err(|error| {
                 TauriCommandError::internal(format!("quality auto-fix failed closed: {error}"))
             })?;
-        // \u{8fd4}\u{56de}\u{7ed9}\u{524d}\u{7aef}\u{7684}\u{5fc5}\u{987b}\u{662f} auto-fix \u{540e}\u{7684}\u{6b63}\u{6587}
+        // 返回给前端的必须是 auto-fix 后的正文
         response_text = Some(final_text.clone());
-        // \u{8d28}\u{91cf}\u{62a5}\u{544a}\u{6302}\u{5230}\u{521a}\u{521b}\u{5efa}\u{7684} Attempt\u{ff0c}\u{4fbf}\u{4e8e} accept \u{524d}\u{590d}\u{67e5}\u{ff1b}auto-fix \u{540e}\u{540c}\u{6b65} draft_hash\u{3002}
-        // \u{5173}\u{952e}\u{540c}\u{6b65}\u{5931}\u{8d25}\u{5fc5}\u{987b}\u{4f20}\u{64ad}\u{ff1a}\u{5426}\u{5219}\u{547d}\u{4ee4}\u{8fd4}\u{56de}\u{4fee}\u{590d}\u{7a3f}\u{4f46} Attempt \u{4ecd}\u{6307}\u{539f}\u{7a3f} hash\u{ff0c}Accept \u{4f1a}\u{786c}\u{5931}\u{8d25}\u{3002}
+        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash。
+        // 关键同步失败必须传播：否则命令返回修复稿但 Attempt 仍指原稿 hash，Accept 会硬失败。
         let pp_identity = match (&turn_record, &created_attempt_id, &ctx.campaign_id) {
             (Some(turn), Some(attempt_id), Some(campaign_id)) => {
                 Some(production_postprocess::PostprocessIdentity {
@@ -869,7 +878,7 @@ pub(crate) async fn start_writing(
                 let combined = service_fail_turn(&sink, identity, e);
                 clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
-                    "auto-fix \u{540e} Attempt \u{540c}\u{6b65}\u{5931}\u{8d25}\u{ff08}draft_hash/quality_report\u{ff09}: {combined}"
+                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
             if sqlite_runtime::is_sqlite_active() {
@@ -877,7 +886,7 @@ pub(crate) async fn start_writing(
             }
         }
 
-        // postprocess \u{540e}\u{53f0}\u{8dd1}\u{ff0c}\u{4e0d}\u{963b}\u{585e} start_writing \u{8fd4}\u{56de}\u{ff1b}\u{4e1a}\u{52a1}\u{72b6}\u{6001}\u{673a}\u{8d70}\u{5171}\u{4eab}\u{670d}\u{52a1}\u{3002}
+        // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
         // Keep current_cancel alive until the background task finishes so cancel_writing
         // can still reach postprocess after the command returns.
         let pp_event_tx = event_tx.clone();
@@ -908,7 +917,7 @@ pub(crate) async fn start_writing(
         // Skip the normal clear for the success path with background postprocess.
         match result {
             Ok((orig_text, _provisional_node_id, _provenance)) => {
-                let text = prefer_autofix_response_text(response_text, orig_text);
+                let text = turn_lifecycle::prefer_autofix_response_text(response_text, orig_text);
                 // Prefer the authoritative landed variant id (SQLite UoW may replace provisional).
                 return Ok(serde_json::json!({
                     "text": text,
@@ -922,15 +931,12 @@ pub(crate) async fn start_writing(
                 if let Some(ref turn) = turn_record {
                     let _ = update_turn_record(&turn.turn_id, |record| {
                         record.status = storyforge_domain::turn::TurnStatus::Failed;
-                        record.failure_reason =
-                            Some(format!("\u{5199}\u{4f5c}\u{5931}\u{8d25}: {e}"));
+                        record.failure_reason = Some(format!("写作失败: {e}"));
                         record.touch();
                     });
                 }
                 clear_current_cancel_if(&app, &operation_id);
-                return Err(TauriCommandError::from(format!(
-                    "\u{5199}\u{4f5c}\u{5931}\u{8d25}: {e}"
-                )));
+                return Err(TauriCommandError::from(format!("写作失败: {e}")));
             }
         }
     }
@@ -940,7 +946,7 @@ pub(crate) async fn start_writing(
 
     match result {
         Ok((orig_text, node_id, _provenance)) => {
-            let text = prefer_autofix_response_text(response_text, orig_text);
+            let text = turn_lifecycle::prefer_autofix_response_text(response_text, orig_text);
             Ok(serde_json::json!({
                 "text": text,
                 "conversation_id": conversation_id.to_string(),
@@ -950,37 +956,17 @@ pub(crate) async fn start_writing(
             }))
         }
         Err(e) => {
-            // Phase A: \u{5199}\u{4f5c}\u{5931}\u{8d25} \u{2192} TurnRecord \u{6807} Failed\u{ff08}\u{65e0}\u{526f}\u{4f5c}\u{7528}\u{ff0c}\u{5b89}\u{5168}\u{5931}\u{8d25}\u{ff09}
+            // Phase A: 写作失败 → TurnRecord 标 Failed（无副作用，安全失败）
             if let Some(ref turn) = turn_record {
                 let _ = update_turn_record(&turn.turn_id, |record| {
                     record.status = storyforge_domain::turn::TurnStatus::Failed;
-                    record.failure_reason = Some(format!("\u{5199}\u{4f5c}\u{5931}\u{8d25}: {e}"));
+                    record.failure_reason = Some(format!("写作失败: {e}"));
                     record.touch();
                 });
             }
-            Err(TauriCommandError::from(format!(
-                "\u{5199}\u{4f5c}\u{5931}\u{8d25}: {e}"
-            )))
+            Err(TauriCommandError::from(format!("写作失败: {e}")))
         }
     }
-}
-
-/// \u{547d}\u{4ee4}\u{54cd}\u{5e94}\u{4f18}\u{5148}\u{4f7f}\u{7528} auto-fix \u{540e}\u{7684}\u{6b63}\u{6587}\u{ff1b}\u{65e0}\u{4fee}\u{590d}\u{65f6}\u{56de}\u{9000} pipeline \u{539f}\u{7a3f}\u{3002}
-pub(crate) fn prefer_autofix_response_text(
-    response_text: Option<String>,
-    original: String,
-) -> String {
-    turn_lifecycle::prefer_autofix_response_text(response_text, original)
-}
-
-/// auto-fix \u{540e}\u{540c}\u{6b65} Attempt\u{ff1a}quality_report + draft_hash \u{5fc5}\u{987b}\u{5bf9}\u{9f50}\u{6700}\u{7ec8}\u{6b63}\u{6587}\u{3002}
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn sync_attempt_after_autofix(
-    attempt: &mut storyforge_domain::turn::TurnAttempt,
-    final_text: &str,
-    report: storyforge_domain::turn::QualityReport,
-) {
-    turn_lifecycle::sync_attempt_after_autofix(attempt, final_text, report)
 }
 
 /// Routes Attempt/Turn persistence through the active backend (JSON or SQLite).
@@ -1018,9 +1004,7 @@ impl<'a> BackendTurnAttemptSink<'a> {
     {
         self.json_store()
             .mutate_if(turn_id, predicate, mutate)
-            .map_err(|e| {
-                format!("\u{6761}\u{4ef6}\u{66f4}\u{65b0} TurnRecord \u{5931}\u{8d25}: {e}")
-            })
+            .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
     }
 }
 
@@ -1247,7 +1231,7 @@ pub(crate) fn normalize_task_update_for_postprocess(
 ) -> Option<storyforge_domain::story_task::StoryTask> {
     if task.campaign_id != *camp_id {
         tracing::warn!(
-            "\u{8df3}\u{8fc7}\u{975e}\u{5f53}\u{524d} Campaign \u{4efb}\u{52a1} '{}' \u{7684}\u{72b6}\u{6001}\u{66f4}\u{65b0}\u{ff08}task campaign: {}, current campaign: {}\u{ff09}",
+            "跳过非当前 Campaign 任务 '{}' 的状态更新（task campaign: {}, current campaign: {}）",
             task.id,
             task.campaign_id,
             camp_id
@@ -1259,10 +1243,10 @@ pub(crate) fn normalize_task_update_for_postprocess(
     Some(task)
 }
 
-/// \u{6309}\u{540d}\u{5b57}\u{6216} Id \u{67e5} campaign \u{5185}\u{7684} CharacterInstance\u{ff08}\u{540e}\u{5904}\u{7406} Agent \u{8f93}\u{51fa}\u{7684}\u{662f}\u{89d2}\u{8272}\u{540d}\u{ff0c}\u{9700}\u{7ffb}\u{8bd1}\u{6210} instance\u{ff09}
-/// P3\u{ff1a}\u{5185}\u{90e8}\u{6309} KnowledgeSource \u{5206}\u{6d41}\u{2014}\u{2014}ToldByOther/Backstory \u{4e0d}\u{67e5}\u{5728}\u{573a}\u{76f4}\u{63a5}\u{653e}\u{884c}\u{ff0c}Witnessed/Inferred \u{624d}\u{67e5}\u{5728}\u{573a}\u{3002}
-/// P4\u{ff1a}\u{540c}\u{540d}\u{6536}\u{7d27}\u{2014}\u{2014}name_collisions \u{4f20}\u{5165} campaign \u{5185}\u{51fa}\u{73b0} \u{2265}2 \u{6b21}\u{7684} name \u{96c6}\u{5408}\u{ff0c}\u{540c}\u{540d}\u{65f6} name \u{8def}\u{5931}\u{6548}\u{3002}
-/// W6 \u{65b9}\u{5411} 1\u{ff1a}broadcast \u{975e}\u{7a7a}\u{65f6}\u{5206}\u{53d1}\u{7ed9}\u{591a}\u{4e2a} target\u{ff08}All=\u{5168}\u{4f53}, Group=\u{8eab}\u{4efd}\u{7ec4}\u{ff09}\u{ff0c}\u{8fd4}\u{56de} Vec\u{3002}
+/// 按名字或 Id 查 campaign 内的 CharacterInstance（后处理 Agent 输出的是角色名，需翻译成 instance）
+/// P3：内部按 KnowledgeSource 分流——ToldByOther/Backstory 不查在场直接放行，Witnessed/Inferred 才查在场。
+/// P4：同名收紧——name_collisions 传入 campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效。
+/// W6 方向 1：broadcast 非空时分发给多个 target（All=全体, Group=身份组），返回 Vec。
 pub fn normalize_knowledge_update_for_postprocess(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
@@ -1282,8 +1266,8 @@ pub fn normalize_knowledge_update_for_postprocess(
     )
 }
 
-/// V2 \u{53d8}\u{4f53}\u{ff1a}`extra_instances` \u{662f} attempt \u{4e0a}\u{5c1a}\u{672a}\u{843d}\u{76d8}\u{7684}\u{4e34}\u{65f6}\u{89d2}\u{8272}\u{ff0c}\u{53c2}\u{4e0e}\u{76ee}\u{6807}/\u{6765}\u{6e90}\u{89e3}\u{6790}\u{3002}
-/// accept \u{65f6} `prepare_commit_batch` \u{524d}\u{7f6e} `UpsertInstance`\u{ff0c}\u{6307}\u{5411}\u{5176} id \u{7684}\u{6761}\u{76ee}\u{843d}\u{5e93}\u{5b89}\u{5168}\u{3002}
+/// V2 变体：`extra_instances` 是 attempt 上尚未落盘的临时角色，参与目标/来源解析。
+/// accept 时 `prepare_commit_batch` 前置 `UpsertInstance`，指向其 id 的条目落库安全。
 pub fn normalize_knowledge_update_for_postprocess_with_extras(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
@@ -1296,10 +1280,7 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
     use storyforge_domain::character_knowledge::PropagationPolicy;
 
     if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
-        tracing::warn!(
-            "\u{8df3}\u{8fc7} private \u{77e5}\u{8bc6}\u{7684}\u{5e7f}\u{64ad}\u{5199}\u{5165}\u{ff1a}{}",
-            update.knowledge_text
-        );
+        tracing::warn!("跳过 private 知识的广播写入：{}", update.knowledge_text);
         return vec![];
     }
 
@@ -1309,12 +1290,12 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
         return vec![];
     }
 
-    // \u{65b9}\u{5411} 1\u{ff1a}\u{5e7f}\u{64ad}\u{5206}\u{53d1}\u{2014}\u{2014}broadcast \u{975e}\u{7a7a}\u{65f6}\u{904d}\u{5386} instances\u{ff0c}\u{6bcf}\u{4e2a}\u{751f}\u{6210}\u{4e00}\u{6761} ToldByOther
+    // 方向 1：广播分发——broadcast 非空时遍历 instances，每个生成一条 ToldByOther
     if let Some(ref broadcast) = update.broadcast {
         return dispatch_broadcast(store, camp_id, update, turn, broadcast, extra_instances);
     }
 
-    // \u{975e}\u{5e7f}\u{64ad}\u{ff1a}\u{5355}\u{89d2}\u{8272}\u{903b}\u{8f91}\u{ff08}\u{539f}\u{6709} P3/P4 \u{6d41}\u{7a0b}\u{ff09}
+    // 非广播：单角色逻辑（原有 P3/P4 流程）
     let target = match find_instance_by_name_or_id_with_extras(
         store,
         camp_id,
@@ -1324,7 +1305,7 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
         Some(inst) => inst,
         None => {
             tracing::warn!(
-                "\u{8df3}\u{8fc7}\u{65e0}\u{6cd5}\u{89e3}\u{6790}\u{5230} Campaign instance \u{7684}\u{77e5}\u{8bc6}\u{5199}\u{5165}\u{76ee}\u{6807}: {}",
+                "跳过无法解析到 Campaign instance 的知识写入目标: {}",
                 update.character_id
             );
             return vec![];
@@ -1335,16 +1316,16 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
         return vec![];
     }
 
-    // P3 \u{5206}\u{6d41}\u{ff1a}ToldByOther/Backstory \u{4e0d}\u{53d7}\u{5728}\u{573a}\u{7ea6}\u{675f}\u{ff08}\u{8de8}\u{5728}\u{573a}\u{544a}\u{77e5} + \u{5f00}\u{5c40}\u{5df2}\u{6709}\u{ff09}\u{ff0c}
-    // Witnessed/Inferred \u{624d}\u{67e5}\u{5728}\u{573a}\u{3002}
+    // P3 分流：ToldByOther/Backstory 不受在场约束（跨在场告知 + 开局已有），
+    // Witnessed/Inferred 才查在场。
     let knowledge_exempt_from_presence = matches!(
         update.source,
         storyforge_domain::character_knowledge::KnowledgeSource::ToldByOther
             | storyforge_domain::character_knowledge::KnowledgeSource::Backstory
     );
     if !knowledge_exempt_from_presence {
-        // \u{77e5}\u{8bc6}\u{8def}\u{5f84}\u{6536}\u{7d27}\u{ff1a}\u{7a7a}\u{96c6}\u{65f6} Witnessed/Inferred \u{4e5f}\u{62d2}\u{7edd}\u{ff08}\u{65e0}\u{4eba}\u{5728}\u{573a}\u{4e0d}\u{53ef}\u{80fd}\u{89c1}\u{8bc1}/\u{63a8}\u{65ad}\u{ff09}
-        // \u{6ce8}\u{610f}\u{ff1a}is_postprocess_instance_present \u{7684}\u{7a7a}\u{96c6}\u{653e}\u{884c}\u{4ecd}\u{670d}\u{52a1}\u{53d8}\u{91cf}\u{8def}\u{5f84}\u{ff0c}\u{6b64}\u{5904}\u{7ed5}\u{8fc7}\u{5b83}\u{3002}
+        // 知识路径收紧：空集时 Witnessed/Inferred 也拒绝（无人在场不可能见证/推断）
+        // 注意：is_postprocess_instance_present 的空集放行仍服务变量路径，此处绕过它。
         if present_ids.is_empty()
             || !is_postprocess_instance_present(
                 &target,
@@ -1354,7 +1335,7 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
             )
         {
             tracing::warn!(
-                "\u{8df3}\u{8fc7}\u{975e}\u{5728}\u{573a}\u{89d2}\u{8272} '{}' \u{7684}\u{77e5}\u{8bc6}\u{5199}\u{5165}\u{ff08}source={:?}\u{ff0c}present_chars \u{6821}\u{9a8c}\u{ff09}",
+                "跳过非在场角色 '{}' 的知识写入（source={:?}，present_chars 校验）",
                 target.name,
                 update.source
             );
@@ -1389,13 +1370,13 @@ pub fn normalize_knowledge_update_for_postprocess_with_extras(
     ]
 }
 
-/// \u{65b9}\u{5411} 1\u{ff1a}\u{5e7f}\u{64ad}\u{5206}\u{53d1}\u{2014}\u{2014}\u{6839}\u{636e} BroadcastTarget \u{904d}\u{5386} campaign \u{5185} instance\u{ff0c}\u{5404}\u{751f}\u{6210}\u{4e00}\u{6761} ToldByOther\u{3002}
+/// 方向 1：广播分发——根据 BroadcastTarget 遍历 campaign 内 instance，各生成一条 ToldByOther。
 ///
-/// - `All`\u{ff1a}campaign \u{5185}\u{6240}\u{6709} instance\u{ff08}\u{6392}\u{9664}\u{5e7f}\u{64ad}\u{53d1}\u{8d77}\u{8005}\u{81ea}\u{8eab}\u{ff09}
-/// - `Group(g)`\u{ff1a}definition.group == g \u{7684} instance\u{ff08}\u{901a}\u{8fc7} definition_id \u{53cd}\u{67e5} CharacterDefinition\u{ff09}
+/// - `All`：campaign 内所有 instance（排除广播发起者自身）
+/// - `Group(g)`：definition.group == g 的 instance（通过 definition_id 反查 CharacterDefinition）
 ///
-/// \u{5e7f}\u{64ad}\u{6761}\u{76ee}\u{7684} source \u{7edf}\u{4e00}\u{4e3a} `ToldByOther`\u{ff0c}source_character_id \u{8bb0}\u{5e7f}\u{64ad}\u{53d1}\u{8d77}\u{8005}\u{ff08}\u{82e5}\u{6709}\u{ff09}\u{3002}
-pub(crate) fn dispatch_broadcast(
+/// 广播条目的 source 统一为 `ToldByOther`，source_character_id 记广播发起者（若有）。
+fn dispatch_broadcast(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
     update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
@@ -1405,7 +1386,7 @@ pub(crate) fn dispatch_broadcast(
 ) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
     use storyforge_domain::character_knowledge::BroadcastTarget;
 
-    // \u{89e3}\u{6790}\u{5e7f}\u{64ad}\u{53d1}\u{8d77}\u{8005}\u{ff08}source_character_id\u{ff09}\u{7684} persisted id\u{ff0c}\u{7528}\u{4e8e}\u{6392}\u{9664}\u{81ea}\u{8eab} + \u{8bb0}\u{5f55}\u{6765}\u{6e90}
+    // 解析广播发起者（source_character_id）的 persisted id，用于排除自身 + 记录来源
     let broadcaster_inst = update.source_character_id.as_ref().and_then(|sid| {
         find_instance_by_name_or_id_with_extras(store, camp_id, sid, extra_instances)
     });
@@ -1414,7 +1395,7 @@ pub(crate) fn dispatch_broadcast(
     let source_knowledge_id =
         matching_source_knowledge_for_update(store, camp_id, update).map(|entry| entry.id);
 
-    // V2: \u{672a}\u{843d}\u{76d8}\u{4e34}\u{65f6}\u{89d2}\u{8272}\u{4e5f}\u{5728}\u{5e7f}\u{64ad}\u{53d7}\u{4f17}\u{5185}\u{ff08}\u{672c}\u{8f6e}\u{5b83}\u{4eec}\u{5df2}\u{662f} campaign \u{6210}\u{5458}\u{ff0c}accept \u{65f6}\u{843d}\u{5e93}\u{ff09}
+    // V2: 未落盘临时角色也在广播受众内（本轮它们已是 campaign 成员，accept 时落库）
     let mut all_instances = store.list_instances(camp_id);
     for temp in extra_instances {
         if temp.campaign_id == *camp_id && !all_instances.iter().any(|i| i.id == temp.id) {
@@ -1425,17 +1406,17 @@ pub(crate) fn dispatch_broadcast(
     let targets: Vec<_> = match broadcast {
         BroadcastTarget::All => all_instances
             .into_iter()
-            // \u{6392}\u{9664}\u{5e7f}\u{64ad}\u{53d1}\u{8d77}\u{8005}\u{81ea}\u{8eab}\u{ff08}\u{4e0d}\u{5e94}\u{8be5}\u{7ed9}\u{81ea}\u{5df1}\u{53d1}\u{5e7f}\u{64ad}\u{77e5}\u{8bc6}\u{ff09}
+            // 排除广播发起者自身（不应该给自己发广播知识）
             .filter(|inst| Some(&inst.id) != broadcaster_id.as_ref())
             .collect(),
         BroadcastTarget::Group(group) => all_instances
             .into_iter()
             .filter(|inst| {
-                // \u{6392}\u{9664}\u{5e7f}\u{64ad}\u{53d1}\u{8d77}\u{8005}\u{81ea}\u{8eab}
+                // 排除广播发起者自身
                 if Some(&inst.id) == broadcaster_id.as_ref() {
                     return false;
                 }
-                // \u{901a}\u{8fc7} definition_id \u{53cd}\u{67e5} definition.group
+                // 通过 definition_id 反查 definition.group
                 instance_matches_group(store, inst, group)
             })
             .collect(),
@@ -1443,7 +1424,7 @@ pub(crate) fn dispatch_broadcast(
 
     if targets.is_empty() {
         tracing::warn!(
-            "\u{5e7f}\u{64ad}\u{5206}\u{53d1}: broadcast={:?} \u{65e0}\u{5339}\u{914d} instance\u{ff08}campaign={}\u{ff09}",
+            "广播分发: broadcast={:?} 无匹配 instance（campaign={}）",
             broadcast,
             camp_id
         );
@@ -1457,7 +1438,7 @@ pub(crate) fn dispatch_broadcast(
                 campaign_id: camp_id.clone(),
                 character_id: inst.id,
                 knowledge_text: update.knowledge_text.clone(),
-                // \u{5e7f}\u{64ad}\u{7edf}\u{4e00}\u{4e3a} ToldByOther\u{ff08}\u{88ab}\u{544a}\u{77e5}/\u{516c}\u{544a}\u{ff09}
+                // 广播统一为 ToldByOther（被告知/公告）
                 source: storyforge_domain::character_knowledge::KnowledgeSource::ToldByOther,
                 source_character_id: source_character_id.clone(),
                 source_knowledge_id: source_knowledge_id.clone(),
@@ -1470,7 +1451,7 @@ pub(crate) fn dispatch_broadcast(
         .collect()
 }
 
-pub(crate) fn matching_source_knowledge_for_update(
+fn matching_source_knowledge_for_update(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
     update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
@@ -1497,7 +1478,7 @@ pub(crate) fn matching_source_knowledge_for_update(
         })
 }
 
-pub(crate) fn should_block_source_knowledge_propagation(
+fn should_block_source_knowledge_propagation(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
     update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
@@ -1539,7 +1520,7 @@ pub(crate) fn should_block_source_knowledge_propagation(
 
         if blocked {
             tracing::warn!(
-                "\u{963b}\u{6b62}\u{77e5}\u{8bc6}\u{4f20}\u{64ad}\u{ff1a}source={} policy={:?} text={}",
+                "阻止知识传播：source={} policy={:?} text={}",
                 source.name,
                 entry.propagation,
                 update.knowledge_text
@@ -1565,22 +1546,22 @@ pub(crate) fn knowledge_text_matches(restricted: &str, candidate: &str) -> bool 
     min_len >= 8 && (restricted.contains(&candidate) || candidate.contains(&restricted))
 }
 
-pub(crate) fn normalize_knowledge_text(text: &str) -> String {
+fn normalize_knowledge_text(text: &str) -> String {
     text.split_whitespace().collect::<String>().to_lowercase()
 }
 
-/// \u{5224}\u{65ad} instance \u{7684} CharacterDefinition.group \u{662f}\u{5426}\u{5339}\u{914d}\u{76ee}\u{6807}\u{7ec4}\u{540d}\u{3002}
-/// \u{901a}\u{8fc7} instance.definition_id \u{2192} \u{904d}\u{5386}\u{6240}\u{6709} card \u{7684} character_definitions \u{627e}\u{5339}\u{914d}\u{3002}
-pub(crate) fn instance_matches_group(
+/// 判断 instance 的 CharacterDefinition.group 是否匹配目标组名。
+/// 通过 instance.definition_id → 遍历所有 card 的 character_definitions 找匹配。
+fn instance_matches_group(
     store: &campaign_store::CampaignStore,
     inst: &storyforge_domain::campaign::CharacterInstance,
     target_group: &str,
 ) -> bool {
     let def_id = match &inst.definition_id {
         Some(id) => id,
-        None => return false, // \u{65e0} definition_id\u{ff08}\u{4e34}\u{65f6}\u{89d2}\u{8272}\u{ff09}\u{2192} \u{4e0d}\u{5339}\u{914d}
+        None => return false, // 无 definition_id（临时角色）→ 不匹配
     };
-    // \u{904d}\u{5386}\u{6240}\u{6709} card\u{ff0c}\u{627e} definition_id \u{5339}\u{914d}\u{7684} definition
+    // 遍历所有 card，找 definition_id 匹配的 definition
     for stored_card in store.list_cards() {
         if let Some(def) = stored_card
             .card
@@ -1602,23 +1583,23 @@ pub fn is_postprocess_instance_present(
 ) -> bool {
     if present_ids.is_empty() {
         tracing::warn!(
-            "postprocess \u{5199}\u{56de}: present_chars \u{4e3a}\u{7a7a}\u{96c6}\u{ff0c}\u{653e}\u{884c} '{}'\u{ff08}\u{5411}\u{540e}\u{517c}\u{5bb9}\u{9003}\u{751f}\u{53e3}\u{ff0c}\u{53d8}\u{91cf}\u{8def}\u{5f84}\u{4ecd}\u{4f9d}\u{8d56}\u{ff09}",
+            "postprocess 写回: present_chars 为空集，放行 '{}'（向后兼容逃生口，变量路径仍依赖）",
             inst.name
         );
         return true;
     }
-    // id \u{8def}\u{ff1a}\u{53ea}\u{8ba4} instance id\u{ff08}\u{6216} raw_id \u{672c}\u{8eab}\u{5c31}\u{662f}\u{8be5} instance id\u{ff09}\u{3002}
-    // \u{4e0d}\u{80fd}\u{628a} raw_id \u{7684}\u{4efb}\u{610f}\u{5b57}\u{7b26}\u{4e32}\u{547d}\u{4e2d} present \u{90fd}\u{5f53} id \u{8def}\u{2014}\u{2014}\u{540c}\u{540d}\u{78b0}\u{649e}\u{65f6} Agent \u{5e38}\u{7ed9}\u{89d2}\u{8272}\u{540d}\u{ff0c}
-    // \u{82e5}\u{628a} name \u{5f53}\u{6210} id \u{547d}\u{4e2d}\u{ff0c}\u{4f1a}\u{7ed5}\u{8fc7}\u{4e0b}\u{9762}\u{7684} name_collisions \u{6536}\u{7d27}\u{5e76}\u{9759}\u{9ed8}\u{5199}\u{5230}\u{7b2c}\u{4e00}\u{4e2a}\u{540c}\u{540d}\u{76ee}\u{6807}\u{3002}
+    // id 路：只认 instance id（或 raw_id 本身就是该 instance id）。
+    // 不能把 raw_id 的任意字符串命中 present 都当 id 路——同名碰撞时 Agent 常给角色名，
+    // 若把 name 当成 id 命中，会绕过下面的 name_collisions 收紧并静默写到第一个同名目标。
     if present_ids.contains(inst.id.as_str())
         || (raw_id == &inst.id && present_ids.contains(raw_id.as_str()))
     {
         return true;
     }
-    // name \u{8def}\u{515c}\u{5e95}\u{ff1a}P4 \u{540c}\u{540d}\u{6536}\u{7d27}\u{2014}\u{2014}campaign \u{5185}\u{5b58}\u{5728}\u{540c}\u{540d} instance \u{65f6} name \u{8def}\u{5931}\u{6548}\u{ff0c}\u{903c} id
+    // name 路兜底：P4 同名收紧——campaign 内存在同名 instance 时 name 路失效，逼 id
     if present_ids.contains(&inst.name) && !name_collisions.contains(&inst.name) {
         tracing::debug!(
-            "postprocess \u{5199}\u{56de}: '{}' \u{901a}\u{8fc7} name \u{5339}\u{914d}\u{5728}\u{573a}\u{ff08}\u{975e} id \u{5339}\u{914d}\u{ff09}",
+            "postprocess 写回: '{}' 通过 name 匹配在场（非 id 匹配）",
             inst.name
         );
         return true;
@@ -1634,7 +1615,7 @@ pub(crate) fn find_instance_by_name_or_id(
     find_instance_by_name_or_id_with_extras(store, camp_id, name_or_id, &[])
 }
 
-/// V2 \u{53d8}\u{4f53}\u{ff1a}\u{89e3}\u{6790}\u{57df} = \u{5df2}\u{6301}\u{4e45}\u{5316} instance + attempt \u{4e0a}\u{672a}\u{843d}\u{76d8}\u{7684}\u{4e34}\u{65f6}\u{5b9e}\u{4f8b}\u{ff08}\u{6309} id \u{53bb}\u{91cd}\u{ff09}\u{3002}
+/// V2 变体：解析域 = 已持久化 instance + attempt 上未落盘的临时实例（按 id 去重）。
 pub(crate) fn find_instance_by_name_or_id_with_extras(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
@@ -1647,19 +1628,19 @@ pub(crate) fn find_instance_by_name_or_id_with_extras(
             instances.push(extra.clone());
         }
     }
-    // \u{5148}\u{7cbe}\u{786e} id \u{5339}\u{914d}
+    // 先精确 id 匹配
     if let Some(i) = instances.iter().find(|i| i.id == *name_or_id) {
         return Some(i.clone());
     }
-    // \u{518d}\u{6309} instance.name \u{5339}\u{914d}\u{ff08}\u{540e}\u{5904}\u{7406} Agent \u{7ed9}\u{7684}\u{662f}\u{89d2}\u{8272}\u{540d}\u{ff09}
+    // 再按 instance.name 匹配（后处理 Agent 给的是角色名）
     instances
         .into_iter()
         .find(|i| i.name.as_str() == name_or_id.as_str())
 }
 
-/// Tauri command: \u{53d6}\u{6d88}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5199}\u{4f5c}\u{6d41}\u{6c34}\u{7ebf}
+/// Tauri command: 取消当前运行的写作流水线
 ///
-/// \u{89e6}\u{53d1} AppState.current_cancel \u{7684} sender\u{ff0c}\u{5bfc}\u{6f14}/\u{5b50}Agent/\u{7f16}\u{5267}\u{5168}\u{90e8}\u{4e2d}\u{6b62}\u{3002}
+/// 触发 AppState.current_cancel 的 sender，导演/子Agent/编剧全部中止。
 #[tauri::command]
 pub(crate) fn cancel_writing(
     state: tauri::State<'_, Arc<AppState>>,
@@ -1673,5 +1654,98 @@ pub(crate) fn cancel_writing(
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::generation::{
+        GenerationMode, GenerationRouteDecision, GenerationRouteReason,
+    };
+
+    #[test]
+    fn automatic_route_promotes_large_roster_to_sequential_crew() {
+        let actors = ["林秋", "陈默", "周岚", "守门人"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| RouteActorSignal {
+                id: format!("actor-{index}"),
+                name: name.into(),
+                agenda: None,
+                private_facts: vec![],
+            })
+            .collect::<Vec<_>>();
+        let signals = generation_route_signals_from_parts("所有人在审判厅对峙", &actors, &[], None);
+
+        assert_eq!(signals.principal_actor_count, 4);
+        assert!(signals.large_scene_intent);
+        assert_eq!(
+            storyforge_domain::generation::route_generation_mode(&signals).mode,
+            GenerationMode::SequentialCrew,
+        );
+    }
+
+    #[test]
+    fn automatic_route_detects_explicit_two_actor_interaction() {
+        let actors = vec![
+            RouteActorSignal {
+                id: "lin".into(),
+                name: "林秋".into(),
+                agenda: Some("隐瞒钥匙".into()),
+                private_facts: vec!["钥匙藏在钟里".into()],
+            },
+            RouteActorSignal {
+                id: "chen".into(),
+                name: "陈默".into(),
+                agenda: Some("找出钥匙".into()),
+                private_facts: vec![],
+            },
+        ];
+        let signals =
+            generation_route_signals_from_parts("陈默围绕钥匙质问林秋", &actors, &[], None);
+
+        assert_eq!(signals.principal_actor_count, 2);
+        assert!(signals.direct_interaction);
+        assert!(signals.relevant_private_knowledge_divergence);
+        assert!(signals.opposing_agendas);
+        assert_eq!(
+            storyforge_domain::generation::route_generation_mode(&signals).mode,
+            GenerationMode::Duet,
+        );
+    }
+
+    #[test]
+    fn automatic_expensive_route_requires_an_explicit_resubmission() {
+        let decision = GenerationRouteDecision {
+            mode: GenerationMode::SequentialCrew,
+            reason: GenerationRouteReason::ActorCount,
+            requires_cost_confirmation: true,
+        };
+
+        let error = enforce_generation_cost_confirmation(&decision)
+            .expect_err("automatic expensive upgrade must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("sequential_crew"));
+        assert!(message.contains("2+N"));
+        assert!(message.contains("generation_mode"));
+    }
+
+    #[test]
+    fn cheap_or_explicit_route_needs_no_extra_confirmation() {
+        for decision in [
+            GenerationRouteDecision {
+                mode: GenerationMode::Continuation,
+                reason: GenerationRouteReason::EconomyDefault,
+                requires_cost_confirmation: false,
+            },
+            GenerationRouteDecision {
+                mode: GenerationMode::SequentialCrew,
+                reason: GenerationRouteReason::ExplicitChoice,
+                requires_cost_confirmation: false,
+            },
+        ] {
+            enforce_generation_cost_confirmation(&decision).unwrap();
+        }
     }
 }

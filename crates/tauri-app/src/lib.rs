@@ -10,6 +10,7 @@ mod global_regex_store;
 pub mod meta_backend;
 mod module_store;
 mod mvu_webview_runtime;
+mod playthrough_lifecycle;
 mod preset_store;
 pub mod production_postprocess;
 mod shell_doc_protocol;
@@ -26,6 +27,8 @@ use commands::{
     diagnostics::*, import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*,
     presets::*, turns::*, variables::*, world_info::*, writing::*,
 };
+#[cfg(test)]
+use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 use production_postprocess::TurnAttemptSink;
 
 use chrono::Utc;
@@ -38,7 +41,7 @@ use storage::CharacterStore;
 use tokio::sync::{oneshot, watch};
 
 use storyforge_app_agent::ToolContext;
-use storyforge_app_agent::runtime::{PromptHook, PromptHookContext};
+use storyforge_app_agent::runtime::PromptHook;
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_meta::{
@@ -48,23 +51,17 @@ use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingCo
 use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
-use storyforge_domain::conversation::{
-    Conversation, MessageNode, MessageVariant, Provenance, Role as ConversationRole, VariantStatus,
-};
+#[cfg(test)]
+use storyforge_domain::conversation::VariantStatus;
+use storyforge_domain::conversation::{Conversation, Provenance, Role as ConversationRole};
 use storyforge_domain::llm::{
     ChatMessage, LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
-use storyforge_domain::preset::{
-    RegexPlacement, RegexScript, RegexScriptSource, merge_regex_script_sources,
-};
+use storyforge_domain::preset::{RegexScript, RegexScriptSource, merge_regex_script_sources};
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
-use storyforge_infra_regex::{
-    RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
-    apply_regex_scripts_for_target_at_depth,
-};
 use storyforge_infra_sqlite::preaccept::{
     AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest, RegenerateAttemptRequest,
 };
@@ -3631,7 +3628,10 @@ async fn regenerate(
     clear_current_cancel_if(&app, &operation_id);
 
     match result {
-        Ok((orig_text, _provenance)) => Ok(prefer_autofix_response_text(response_text, orig_text)),
+        Ok((orig_text, _provenance)) => Ok(turn_lifecycle::prefer_autofix_response_text(
+            response_text,
+            orig_text,
+        )),
         Err(e) => Err(TauriCommandError::from(format!("重 roll 失败: {e}"))),
     }
 }
@@ -4828,7 +4828,7 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let report = storyforge_domain::turn::QualityReport { warnings: vec![] };
-        sync_attempt_after_autofix(&mut attempt, fixed, report);
+        turn_lifecycle::sync_attempt_after_autofix(&mut attempt, fixed, report);
         assert_eq!(
             attempt.draft_hash,
             turn_lifecycle::compute_draft_hash(fixed),
@@ -4848,11 +4848,11 @@ mod tests {
         let original = "原稿".to_string();
         let fixed = "修复稿".to_string();
         assert_eq!(
-            prefer_autofix_response_text(Some(fixed.clone()), original.clone()),
+            turn_lifecycle::prefer_autofix_response_text(Some(fixed.clone()), original.clone()),
             fixed
         );
         assert_eq!(
-            prefer_autofix_response_text(None, original.clone()),
+            turn_lifecycle::prefer_autofix_response_text(None, original.clone()),
             original
         );
     }
@@ -5065,7 +5065,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use storyforge_domain::character::Character;
-    use storyforge_domain::preset::{ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING};
+    use storyforge_domain::preset::ST_REGEX_PLACEMENT_AI_OUTPUT;
 
     struct RecordingMockLlm {
         responses: Mutex<std::collections::VecDeque<storyforge_domain::llm::ChatResponse>>,
@@ -9522,159 +9522,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_conversation_display_dto_applies_markdown_only_output_without_mutating_content() {
-        let mut conversation = Conversation::new(Some("source-lin".into()), None);
-        conversation.append_message(
-            storyforge_domain::conversation::Role::User,
-            "<data_block>user</data_block>".into(),
-        );
-        conversation.append_ai_draft("<data_block>hp=5</data_block> scene".into(), None);
-
-        let mut script = test_regex_script("display-hp", RegexScriptSource::Preset);
-        script.find_regex = r"<data_block>hp=5</data_block>".into();
-        script.replace_string = "[HP:5]".into();
-        script.markdown_only = Some(true);
-
-        let dto = conversation_display_dto(&conversation, &[script]);
-
-        let user_variant = &dto.nodes[0].variants[0];
-        assert_eq!(user_variant.content, "<data_block>user</data_block>");
-        assert_eq!(
-            user_variant.display_content,
-            "<data_block>user</data_block>"
-        );
-
-        let assistant_variant = &dto.nodes[1].variants[0];
-        assert_eq!(
-            assistant_variant.content,
-            "<data_block>hp=5</data_block> scene"
-        );
-        assert_eq!(assistant_variant.display_content, "[HP:5] scene");
-
-        assert_eq!(
-            conversation.nodes[1].variants[0].content,
-            "<data_block>hp=5</data_block> scene"
-        );
-    }
-
-    #[test]
-    fn test_conversation_display_dto_applies_markdown_only_reasoning_without_mutating_content() {
-        let mut conversation = Conversation::new(Some("source-lin".into()), None);
-        conversation.append_ai_draft("<think>raw chain</think> final raw".into(), None);
-
-        let mut script = test_regex_script("display-reasoning", RegexScriptSource::Preset);
-        script.find_regex = r"raw".into();
-        script.replace_string = "pretty".into();
-        script.placement = RegexPlacement::Reasoning;
-        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
-        script.markdown_only = Some(true);
-        script.flags = "g".into();
-
-        let dto = conversation_display_dto(&conversation, &[script]);
-
-        let assistant_variant = &dto.nodes[0].variants[0];
-        assert_eq!(
-            assistant_variant.content,
-            "<think>raw chain</think> final raw"
-        );
-        assert_eq!(
-            assistant_variant.display_content,
-            "<think>pretty chain</think> final raw"
-        );
-        assert_eq!(
-            conversation.nodes[0].variants[0].content,
-            "<think>raw chain</think> final raw"
-        );
-    }
-
-    #[test]
-    fn ordinary_conversation_dto_strips_captured_reasoning() {
-        let mut conversation = Conversation::new(Some("source-lin".into()), None);
-        conversation.append_ai_draft(
-            "visible".into(),
-            Some(Provenance {
-                session_id: Id::from_str("session-audit"),
-                plan: None,
-                subagent_results: vec![storyforge_domain::conversation::SubagentSnapshot {
-                    character_id: "lin".into(),
-                    full_text: "performance".into(),
-                    character_instance_id: None,
-                    display_name: None,
-                    fallback_reason: None,
-                    reasoning_content: Some("subagent secret reasoning".into()),
-                }],
-                profile_id: None,
-                generation_mode: None,
-                seed: 1,
-                last_hint: None,
-                director_reasoning: Some("director secret reasoning".into()),
-                writer_reasoning: Some("writer secret reasoning".into()),
-                editor_reasoning: Some("editor secret reasoning".into()),
-            }),
-        );
-
-        let dto = conversation_display_dto(&conversation, &[]);
-        let displayed = dto.nodes[0].variants[0]
-            .provenance
-            .as_ref()
-            .expect("non-reasoning provenance remains available");
-        assert!(displayed.director_reasoning.is_none());
-        assert!(displayed.writer_reasoning.is_none());
-        assert!(displayed.editor_reasoning.is_none());
-        assert!(displayed.subagent_results[0].reasoning_content.is_none());
-
-        let stored = conversation.nodes[0].variants[0]
-            .provenance
-            .as_ref()
-            .expect("stored provenance remains intact for explicit audit");
-        assert_eq!(
-            stored.editor_reasoning.as_deref(),
-            Some("editor secret reasoning")
-        );
-    }
-
-    #[test]
-    fn test_conversation_display_dto_does_not_reapply_persisted_output_regex() {
-        let mut conversation = Conversation::new(Some("source-lin".into()), None);
-        conversation.append_ai_draft("persisted bar".into(), None);
-
-        let mut script = test_regex_script("persisted-output", RegexScriptSource::Preset);
-        script.find_regex = "bar".into();
-        script.replace_string = "baz".into();
-
-        let dto = conversation_display_dto(&conversation, &[script]);
-
-        let variant = &dto.nodes[0].variants[0];
-        assert_eq!(variant.content, "persisted bar");
-        assert_eq!(variant.display_content, "persisted bar");
-    }
-
-    #[test]
-    fn test_conversation_display_dto_respects_display_regex_depth() {
-        let mut conversation = Conversation::new(Some("source-lin".into()), None);
-        conversation.append_ai_draft("<status>old</status>".into(), None);
-        conversation.append_message(
-            storyforge_domain::conversation::Role::User,
-            "continue".into(),
-        );
-        conversation.append_ai_draft("<status>new</status>".into(), None);
-
-        let mut script = test_regex_script("recent-status", RegexScriptSource::Preset);
-        script.find_regex = r"<status>(.*?)</status>".into();
-        script.replace_string = "[$1]".into();
-        script.markdown_only = Some(true);
-        script.min_depth = Some(0);
-        script.max_depth = Some(1);
-
-        let dto = conversation_display_dto(&conversation, &[script]);
-
-        let old_variant = &dto.nodes[0].variants[0];
-        let new_variant = &dto.nodes[2].variants[0];
-        assert_eq!(old_variant.display_content, "<status>old</status>");
-        assert_eq!(new_variant.display_content, "[new]");
-    }
-
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）
     #[test]
     fn test_fork_campaign_in_store_records_source_and_clones_snapshot() {
@@ -13753,97 +13600,6 @@ mod tests {
             postprocess_present_characters(Some(&provenance)),
             vec!["林秋".to_string(), "陈警官".to_string()]
         );
-    }
-
-    #[test]
-    fn automatic_route_promotes_large_roster_to_sequential_crew() {
-        let actors = ["林秋", "陈默", "周岚", "守门人"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| RouteActorSignal {
-                id: format!("actor-{index}"),
-                name: name.into(),
-                agenda: None,
-                private_facts: vec![],
-            })
-            .collect::<Vec<_>>();
-        let signals = generation_route_signals_from_parts("所有人在审判厅对峙", &actors, &[], None);
-
-        assert_eq!(signals.principal_actor_count, 4);
-        assert!(signals.large_scene_intent);
-        assert_eq!(
-            storyforge_domain::generation::route_generation_mode(&signals).mode,
-            storyforge_domain::generation::GenerationMode::SequentialCrew,
-        );
-    }
-
-    #[test]
-    fn automatic_route_detects_explicit_two_actor_interaction() {
-        let actors = vec![
-            RouteActorSignal {
-                id: "lin".into(),
-                name: "林秋".into(),
-                agenda: Some("隐瞒钥匙".into()),
-                private_facts: vec!["钥匙藏在钟里".into()],
-            },
-            RouteActorSignal {
-                id: "chen".into(),
-                name: "陈默".into(),
-                agenda: Some("找出钥匙".into()),
-                private_facts: vec![],
-            },
-        ];
-        let signals =
-            generation_route_signals_from_parts("陈默围绕钥匙质问林秋", &actors, &[], None);
-
-        assert_eq!(signals.principal_actor_count, 2);
-        assert!(signals.direct_interaction);
-        assert!(signals.relevant_private_knowledge_divergence);
-        assert!(signals.opposing_agendas);
-        assert_eq!(
-            storyforge_domain::generation::route_generation_mode(&signals).mode,
-            storyforge_domain::generation::GenerationMode::Duet,
-        );
-    }
-
-    #[test]
-    fn automatic_expensive_route_requires_an_explicit_resubmission() {
-        use storyforge_domain::generation::{
-            GenerationMode, GenerationRouteDecision, GenerationRouteReason,
-        };
-        let decision = GenerationRouteDecision {
-            mode: GenerationMode::SequentialCrew,
-            reason: GenerationRouteReason::ActorCount,
-            requires_cost_confirmation: true,
-        };
-
-        let err = enforce_generation_cost_confirmation(&decision)
-            .expect_err("automatic expensive upgrade must fail closed");
-        let message = err.to_string();
-        assert!(message.contains("sequential_crew"));
-        assert!(message.contains("2+N"));
-        assert!(message.contains("generation_mode"));
-    }
-
-    #[test]
-    fn cheap_or_explicit_route_needs_no_extra_confirmation() {
-        use storyforge_domain::generation::{
-            GenerationMode, GenerationRouteDecision, GenerationRouteReason,
-        };
-        for decision in [
-            GenerationRouteDecision {
-                mode: GenerationMode::Continuation,
-                reason: GenerationRouteReason::EconomyDefault,
-                requires_cost_confirmation: false,
-            },
-            GenerationRouteDecision {
-                mode: GenerationMode::SequentialCrew,
-                reason: GenerationRouteReason::ExplicitChoice,
-                requires_cost_confirmation: false,
-            },
-        ] {
-            enforce_generation_cost_confirmation(&decision).unwrap();
-        }
     }
 
     /// AND-3：storage_meta 首建/升级轨迹 + 损坏容错（不 panic）。
