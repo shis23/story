@@ -17,15 +17,290 @@ use crate::error::TauriCommandError;
 use crate::sqlite_runtime;
 use crate::{
     collect_campaign_scoped_regex_scripts, collect_scoped_regex_scripts, get_campaign_store,
-    get_global_regex_store, get_preset_store, merge_runtime_regex_scripts,
+    get_conn_store, get_global_regex_store, get_preset_store, merge_runtime_regex_scripts,
 };
+use storyforge_app_conversation::ConversationStore;
 
 #[tauri::command]
 pub(crate) async fn archive_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
-    crate::archive_conversation_impl(conversation_id, state).await
+    archive_conversation_impl(conversation_id, state).await
+}
+
+pub(crate) async fn archive_conversation_impl(
+    conversation_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<usize, TauriCommandError> {
+    let conv_id = Id::from_str(&conversation_id);
+    let config = state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .ok_or("未配置嵌入 API，请先在设置中配置")?;
+    let llm = state.require_active_llm()?;
+    let vector_store = state.vector_store.clone();
+    let embedder = Arc::new(
+        storyforge_infra_llm::Embedder::new(config)
+            .map_err(|e| TauriCommandError::internal(e.to_string()))?,
+    );
+    let model = get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "deepseek-chat".into());
+    let archiver = storyforge_app_memory::MemoryArchiver::new(
+        llm,
+        embedder,
+        vector_store,
+        storyforge_app_memory::ArchiveConfig::default(),
+        model,
+    );
+
+    let count = run_archive_with_watermark(&state, &conv_id, &archiver, true)
+        .await
+        .map_err(TauriCommandError::internal)?;
+    Ok(count)
+}
+
+fn archivable_messages_from_conversation(conv: &Conversation) -> Vec<String> {
+    conv.nodes
+        .iter()
+        .filter_map(|node| {
+            let v = node.active()?;
+            if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
+                None
+            } else {
+                Some(v.content.clone())
+            }
+        })
+        .collect()
+}
+
+/// 归档快照：消息列表 + 水位 + campaign 标签。
+pub(crate) struct ArchiveSnapshot {
+    pub(crate) messages: Vec<String>,
+    pub(crate) archived_upto: usize,
+    pub(crate) campaign_id: Option<String>,
+    pub(crate) conversation_id: String,
+}
+
+pub(crate) async fn load_archive_snapshot(
+    conv_store: Arc<ConversationStore>,
+    conv_id: Id,
+) -> Result<ArchiveSnapshot, TauriCommandError> {
+    tokio::task::spawn_blocking(move || {
+        let conv = conv_store.get(&conv_id).ok_or_else(|| {
+            TauriCommandError::from(storyforge_app_conversation::ConversationError::NotFound(
+                conv_id.to_string(),
+            ))
+        })?;
+        Ok::<ArchiveSnapshot, TauriCommandError>(ArchiveSnapshot {
+            messages: archivable_messages_from_conversation(&conv),
+            archived_upto: conv.archived_upto,
+            campaign_id: conv.campaign_id.map(|id| id.to_string()),
+            conversation_id: conv.id.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("读取归档消息任务失败: {e}")))?
+}
+
+/// 水位驱动归档：只处理 `archived_upto..` 前缀，成功后推进水位。
+///
+/// `require_threshold`：true 时与 ArchiveConfig.threshold 对齐（自动归档）；
+/// 手动命令也传 true，避免短对话误触发 LLM。
+async fn run_archive_with_watermark(
+    state: &Arc<AppState>,
+    conv_id: &Id,
+    archiver: &storyforge_app_memory::MemoryArchiver,
+    require_threshold: bool,
+) -> Result<usize, String> {
+    let snap = load_archive_snapshot(state.conv_store.clone(), conv_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let total = snap.messages.len();
+    let upto = snap.archived_upto.min(total);
+    if upto >= total {
+        return Ok(0);
+    }
+    let pending = &snap.messages[upto..];
+    if require_threshold
+        && pending.len() < storyforge_app_memory::ArchiveConfig::default().threshold
+    {
+        return Ok(0);
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let meta = storyforge_app_memory::ArchiveMeta {
+        campaign_id: snap.campaign_id,
+        conversation_id: Some(snap.conversation_id),
+    };
+
+    // 水位路径已确认 pending 需要归档：跳过 maybe_archive 的二次 threshold，
+    // 直接 archive_prefix；source_range 相对 pending 切片。
+    let summaries = archiver
+        .archive_prefix(pending, Some(&meta))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if summaries.is_empty() {
+        return Ok(0);
+    }
+
+    // 取最大 end_idx + 1 作为本轮推进量（相对 pending）
+    let advanced = summaries
+        .iter()
+        .map(|s| s.source_range.1.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    if advanced == 0 {
+        return Ok(summaries.len());
+    }
+    let new_upto = upto.saturating_add(advanced).min(total);
+    let conv_store = state.conv_store.clone();
+    let conv_id_clone = conv_id.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        conv_store.advance_archived_upto(&conv_id_clone, new_upto)
+    })
+    .await
+    .map_err(|e| format!("推进归档水位任务失败: {e}"))?
+    {
+        tracing::warn!("推进归档水位失败: {e}");
+    } else {
+        tracing::info!(
+            target: "far_memory",
+            "归档水位 {} → {}（+{} 条消息，{} 条总结）",
+            upto,
+            new_upto,
+            advanced,
+            summaries.len()
+        );
+    }
+    Ok(summaries.len())
+}
+
+// ─── 自动归档辅助 ──────────────────────────────────────────────────────────
+
+/// 检查对话未归档消息是否超过阈值，超过则在后台触发归档。
+///
+/// 阈值：50 条未归档消息（与 ArchiveConfig.default().threshold 一致）。
+/// 归档失败只 warn，不影响用户操作。
+pub(crate) async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
+    let config = match state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        Some(c) => c,
+        None => {
+            tracing::debug!("未配置嵌入 API，跳过自动归档");
+            return;
+        }
+    };
+
+    // 快速水位检查：未归档不足阈值则跳过（避免无意义构造 archiver）
+    match load_archive_snapshot(state.conv_store.clone(), conv_id.clone()).await {
+        Ok(snap) => {
+            let pending = snap.messages.len().saturating_sub(snap.archived_upto);
+            if pending < storyforge_app_memory::ArchiveConfig::default().threshold {
+                return;
+            }
+            tracing::info!(
+                "自动归档触发：对话 {} 未归档 {} 条 >= 阈值 {}",
+                conv_id,
+                pending,
+                storyforge_app_memory::ArchiveConfig::default().threshold
+            );
+        }
+        Err(e) => {
+            tracing::debug!("读取自动归档消息失败，跳过: {e}");
+            return;
+        }
+    }
+
+    let llm = match state.require_active_llm() {
+        Ok(llm) => llm,
+        Err(error) => {
+            tracing::debug!("自动归档跳过：{error}");
+            return;
+        }
+    };
+    let vector_store = state.vector_store.clone();
+    let embedder = match storyforge_infra_llm::Embedder::new(config) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            tracing::warn!("构建 Embedder 失败，跳过自动归档: {e}");
+            return;
+        }
+    };
+    let model = get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "deepseek-chat".into());
+    let archiver = storyforge_app_memory::MemoryArchiver::new(
+        llm,
+        embedder,
+        vector_store,
+        storyforge_app_memory::ArchiveConfig::default(),
+        model,
+    );
+
+    match run_archive_with_watermark(state, conv_id, &archiver, true).await {
+        Ok(n) if n > 0 => {
+            tracing::info!("自动归档完成：{} 条总结", n);
+        }
+        Ok(_) => {
+            tracing::debug!("自动归档：无需归档");
+        }
+        Err(e) => {
+            tracing::warn!("自动归档失败（不影响用户操作）: {e}");
+        }
+    }
+}
+
+/// 活动 Turn 的质量门禁摘要（供前端刷新后回填 ProcessReview）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTurnQualityDto {
+    pub turn_id: String,
+    pub attempt_id: String,
+    pub status: String,
+    pub passed: bool,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Accept 前展示给用户的单条候选状态变化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnReceiptItemDto {
+    /// 对应 Prepared MutationBatch 中的稳定下标，确认时原样回传。
+    pub mutation_index: usize,
+    /// chronicle / knowledge / variable / task
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub selected_by_default: bool,
+}
+
+/// Campaign Turn 的 Accept-before 小票。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTurnReceiptDto {
+    pub turn_id: String,
+    pub attempt_id: String,
+    pub variant_id: String,
+    pub status: String,
+    pub ready: bool,
+    pub derivation_failed: bool,
+    pub can_retry: bool,
+    pub can_degraded_accept: bool,
+    pub notice: Option<String>,
+    pub items: Vec<TurnReceiptItemDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,14 +10,82 @@ pub(crate) async fn configure_embedder(
     dim: usize,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    crate::configure_embedder_impl(endpoint, api_key, model, dim, state).await
+    configure_embedder_impl(endpoint, api_key, model, dim, state).await
 }
 
 #[tauri::command]
 pub(crate) fn get_embed_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Option<serde_json::Value> {
-    crate::get_embed_config_impl(state)
+    get_embed_config_impl(state)
+}
+
+pub(crate) async fn configure_embedder_impl(
+    endpoint: String,
+    api_key: String,
+    model: String,
+    dim: usize,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let config = storyforge_infra_llm::EmbedConfig {
+        endpoint,
+        api_key,
+        model,
+        dim,
+    };
+    configure_embedder_async(state.inner().clone(), config).await
+}
+
+async fn configure_embedder_async(
+    state: Arc<AppState>,
+    config: storyforge_infra_llm::EmbedConfig,
+) -> Result<(), TauriCommandError> {
+    configure_embedder_with_secret_store_async(
+        state,
+        config,
+        Arc::new(SystemSecretStore::default()) as Arc<dyn SecretStore>,
+    )
+    .await
+}
+
+pub(crate) async fn configure_embedder_with_secret_store_async(
+    state: Arc<AppState>,
+    config: storyforge_infra_llm::EmbedConfig,
+    secret_store: Arc<dyn SecretStore>,
+) -> Result<(), TauriCommandError> {
+    let data_dir = state.data_dir.clone();
+    let config_for_write = config.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_embed_config_secret_ref(&data_dir, &config_for_write, secret_store.as_ref())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("嵌入配置持久化任务失败: {e}")))?
+    .map_err(|e| TauriCommandError::storage(format!("嵌入配置写入失败: {e}")))?;
+
+    *state
+        .embed_config
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = Some(config);
+    Ok(())
+}
+
+/// 获取当前嵌入配置（不含 key）
+pub(crate) fn get_embed_config_impl(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<serde_json::Value> {
+    state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|c| {
+            serde_json::json!({
+                "endpoint": c.endpoint,
+                "model": c.model,
+                "dim": c.dim,
+                "has_key": !c.api_key.is_empty(),
+            })
+        })
 }
 
 /// 列出内置连接模板
