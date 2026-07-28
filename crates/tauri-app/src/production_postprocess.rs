@@ -922,6 +922,15 @@ impl<'a> ProductionPostprocessService<'a> {
 
 /// JSON CampaignStore mutation builder (production default backend).
 ///
+/// 与 SQLite 路径共用同一组纯解析函数（`build_knowledge_mutations` /
+/// `build_variable_mutations` / `build_task_mutations`）；本函数只负责把 store
+/// 当前状态投影成 `CampaignRuntimeContext` 快照，再委托共享段。这样 knowledge /
+/// variable / task 的目标解析、在场/同名收紧、广播分发与传播策略只实现一次。
+///
+/// 后端差异**仅**保留在两处（均为既有有意行为，不可削弱）：
+/// - Chronicle A seq：JSON 扫描 `store.list_summaries` 取 max+1（容忍 code 间隙）。
+/// - revision 基线：从 `store.get_campaign` 实时读取（CAS 写入需要当前值）。
+///
 /// `pending_temporary_instances` 参与名字/ID 解析（V2）：accept 时
 /// `prepare_commit_batch` 会把它们的 `UpsertInstance` 前置，指向其 id 的
 /// mutation 落库安全。
@@ -934,140 +943,50 @@ pub fn build_json_mutation_batch(
 ) -> MutationBatch {
     let camp_id = &persist_ctx.campaign_id;
     let commit_id = Id::new();
-    let expected_revision = store.get_campaign(camp_id).map(|c| c.revision).unwrap_or(0);
+    let campaign = store.get_campaign(camp_id);
+    let expected_revision = campaign.as_ref().map(|c| c.revision).unwrap_or(0);
     let mut mutations: Vec<Mutation> = vec![];
 
+    // Chronicle A seq：扫描已有摘要（容忍 code 间隙/重排），runtime 快照做不到这一点。
     if let Some(summary) = &outcome.summary {
         let existing = store.list_summaries(camp_id);
         let next_seq = next_chronicle_a_seq(&existing);
-        let code = storyforge_domain::chronicle::ChronicleCode::new(
-            storyforge_domain::chronicle::ChronicleLevel::A,
-            next_seq,
-        );
-        let headline = storyforge_domain::chronicle::truncate_headline(summary, 40);
-        let lineage = store
-            .get_campaign(camp_id)
-            .and_then(|c| c.lineage_id)
+        let lineage = campaign
+            .as_ref()
+            .and_then(|c| c.lineage_id.clone())
             .unwrap_or_default();
-        mutations.push(Mutation::UpsertSummary(Box::new(
-            RoundSummary::new(
-                camp_id.clone(),
-                persist_ctx.conversation_id.clone(),
-                persist_ctx.turn,
-                summary.clone(),
-            )
-            .with_code(code.as_str())
-            .with_headline(headline)
-            .with_lineage(lineage),
-        )));
+        mutations.push(build_summary_mutation(
+            persist_ctx,
+            summary,
+            next_seq,
+            lineage,
+        ));
     }
 
     if let Some(pp) = &outcome.post_process {
+        // 把 store 当前状态投影成 runtime 快照，交给共享段（与 SQLite 路径同函数）。
+        let runtime = project_store_runtime_context(store, camp_id, campaign.as_ref());
+        let instances = merge_temporary_instances(&runtime, pending_temporary_instances);
         let present_ids: std::collections::HashSet<String> =
             present_chars.iter().cloned().collect();
-        let name_collisions: std::collections::HashSet<String> = {
-            let mut name_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for inst in store.list_instances(camp_id) {
-                *name_counts.entry(inst.name).or_insert(0) += 1;
-            }
-            // V2: 未落盘临时角色同样参与同名收紧（与持久实例撞名时 name 路必须失效）
-            for temp in pending_temporary_instances {
-                *name_counts.entry(temp.name.clone()).or_insert(0) += 1;
-            }
-            name_counts
-                .into_iter()
-                .filter(|(_, count)| *count >= 2)
-                .map(|(name, _)| name)
-                .collect()
-        };
+        let name_collisions = compute_name_collisions(&instances);
 
-        for u in &pp.knowledge_updates {
-            let entries = crate::normalize_knowledge_update_for_postprocess_with_extras(
-                store,
-                camp_id,
-                u,
-                persist_ctx.turn,
-                &present_ids,
-                &name_collisions,
-                pending_temporary_instances,
-            );
-            for entry in entries {
-                mutations.push(Mutation::UpsertKnowledge(Box::new(
-                    storyforge_domain::turn::KnowledgeMutation {
-                        entry_id: entry.id.clone(),
-                        campaign_id: entry.campaign_id.clone(),
-                        character_id: entry.character_id.clone(),
-                        knowledge_text: entry.knowledge_text.clone(),
-                        source: entry.source.clone(),
-                        source_character_id: entry.source_character_id.clone(),
-                        turn_number: entry.turn_number,
-                        event_id: entry.event_id.clone(),
-                        pinned: entry.pinned,
-                        propagation: entry.propagation.clone(),
-                    },
-                )));
-            }
-        }
-
-        for vu in &pp.variable_updates {
-            if let Some(inst_id) = &vu.instance_id {
-                if let Some(inst) = crate::find_instance_by_name_or_id_with_extras(
-                    store,
-                    camp_id,
-                    inst_id,
-                    pending_temporary_instances,
-                ) {
-                    let is_present = crate::is_postprocess_instance_present(
-                        &inst,
-                        inst_id,
-                        &present_ids,
-                        &name_collisions,
-                    );
-                    if is_present {
-                        mutations.push(Mutation::SetVariable {
-                            instance_id: Some(inst.id.clone()),
-                            key: vu.key.clone(),
-                            value: vu.value.clone(),
-                            turn: persist_ctx.turn,
-                        });
-                    }
-                }
-            } else {
-                mutations.push(Mutation::SetVariable {
-                    instance_id: None,
-                    key: vu.key.clone(),
-                    value: vu.value.clone(),
-                    turn: persist_ctx.turn,
-                });
-            }
-        }
-
-        for tu in &pp.task_updates {
-            if let Some(tid) = &tu.task_id {
-                if let Some(task) = store.get_task(tid)
-                    && let Some(task) = crate::normalize_task_update_for_postprocess(
-                        camp_id,
-                        task,
-                        tu.new_status.clone(),
-                    )
-                {
-                    mutations.push(Mutation::SetTaskStatus {
-                        task_id: task.id.clone(),
-                        status: task.status.clone(),
-                    });
-                }
-            } else if let Some(spec) = &tu.new_task {
-                let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
-                    camp_id.clone(),
-                    spec.title.clone(),
-                    spec.description.clone(),
-                    spec.triggers.clone(),
-                    persist_ctx.turn,
-                );
-                mutations.push(Mutation::UpsertNewTask(Box::new(new_task)));
-            }
-        }
+        mutations.extend(build_knowledge_mutations(
+            persist_ctx,
+            pp,
+            &present_ids,
+            &instances,
+            &name_collisions,
+            &runtime,
+        ));
+        mutations.extend(build_variable_mutations(
+            persist_ctx,
+            pp,
+            &present_ids,
+            &instances,
+            &name_collisions,
+        ));
+        mutations.extend(build_task_mutations(persist_ctx, pp, &runtime));
     }
 
     MutationBatch {
@@ -1077,6 +996,368 @@ pub fn build_json_mutation_batch(
         status: MutationBatchStatus::Prepared,
         mutations,
     }
+}
+
+/// 把 JSON `CampaignStore` 的当前状态投影成纯 domain `CampaignRuntimeContext`。
+///
+/// 供 `build_json_mutation_batch` 委托共享段使用；与 `runtime_support` 启动期组装的
+/// runtime 快照语义一致（同源 instances / knowledge / tasks / definitions）。
+fn project_store_runtime_context(
+    store: &CampaignStore,
+    camp_id: &Id,
+    campaign: Option<&storyforge_domain::campaign::Campaign>,
+) -> CampaignRuntimeContext {
+    let campaign = campaign
+        .cloned()
+        .unwrap_or_else(|| storyforge_domain::campaign::Campaign::new(Id::from_str("missing"), ""));
+    let instances = store.list_instances(camp_id);
+    let knowledge = store.list_knowledge(camp_id);
+    let tasks = store.list_tasks(camp_id);
+    // definitions_by_id：遍历所有 card 的 character_definitions（与既有
+    // `instance_matches_group` 的 store.list_cards 扫描同源）。
+    let definitions_by_id = store
+        .list_cards()
+        .into_iter()
+        .flat_map(|stored| stored.card.character_definitions)
+        .map(|def| (def.id.clone(), def))
+        .collect();
+    CampaignRuntimeContext {
+        campaign,
+        instances,
+        definitions_by_id,
+        knowledge,
+        tasks,
+        // turn：共享段统一用 persist_ctx.turn；快照字段不参与 builder 计算，置 0。
+        turn: 0,
+    }
+}
+
+// ─── 共享纯函数：postprocess mutation 解析域（JSON 与 SQLite 共用） ───────────
+//
+// 以下函数把 runtime builder 原先以闭包实现的解析/在场/同名/广播/传播规则提升为
+// 模块级纯函数。JSON 与 SQLite 两条路径都通过同一组函数构建 MutationBatch 的
+// knowledge / variable / task 段，确保字段语义一致；差异只存在于 Chronicle A seq
+// 与 revision 基线的来源（见各自 builder 的 summary/revision 段）。
+
+/// 有效实例集 = runtime 快照实例 + attempt 挂载的临时实例（按 id 去重，跨 campaign 拒绝）。
+fn merge_temporary_instances(
+    runtime: &CampaignRuntimeContext,
+    pending_temporary_instances: &[storyforge_domain::campaign::CharacterInstance],
+) -> Vec<storyforge_domain::campaign::CharacterInstance> {
+    let mut all = runtime.instances.clone();
+    for temp in pending_temporary_instances {
+        if temp.campaign_id == runtime.campaign.id && !all.iter().any(|i| i.id == temp.id) {
+            all.push(temp.clone());
+        }
+    }
+    all
+}
+
+/// campaign 内出现 ≥2 次的 name 集合（同名时 name 路失效，逼 id）。
+fn compute_name_collisions(
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+) -> std::collections::HashSet<String> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for instance in instances {
+        *counts.entry(instance.name.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, count)| (count >= 2).then_some(name))
+        .collect()
+}
+
+/// 按 id 或 name 解析 instance（id 优先）。
+fn resolve_instance_by_id_or_name(
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    value: &Id,
+) -> Option<storyforge_domain::campaign::CharacterInstance> {
+    instances
+        .iter()
+        .find(|instance| instance.id == *value || instance.name == value.as_str())
+        .cloned()
+}
+
+/// instance 是否属于指定 group（通过 definition_id 反查 definitions_by_id）。
+fn instance_matches_group(
+    runtime: &CampaignRuntimeContext,
+    instance: &storyforge_domain::campaign::CharacterInstance,
+    group: &str,
+) -> bool {
+    instance
+        .definition_id
+        .as_ref()
+        .and_then(|id| runtime.definitions_by_id.get(id))
+        .and_then(|definition| definition.group.as_deref())
+        == Some(group)
+}
+
+/// 在 runtime.knowledge 中查找 source 的匹配条目（最新 turn，相同 text 规则）。
+fn source_entry_for(
+    runtime: &CampaignRuntimeContext,
+    source_id: &Id,
+    text: &str,
+) -> Option<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    runtime
+        .knowledge
+        .iter()
+        .filter(|entry| entry.character_id == *source_id)
+        .filter(|entry| crate::knowledge_text_matches(&entry.knowledge_text, text))
+        .max_by(|left, right| {
+            left.turn_number
+                .cmp(&right.turn_number)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        })
+        .cloned()
+}
+
+/// 判断一条知识更新是否被源端传播策略阻止（Open=放行，Private=阻止，
+/// GroupRestricted=按 group/target 判定）。
+///
+/// `resolve`/`group_member`/`source_lookup` 以闭包传入，让本函数完全脱离具体数据源
+/// （JSON store 与 runtime 快照都能复用同一逻辑）。
+fn source_propagation_blocks(
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+    target: Option<&storyforge_domain::campaign::CharacterInstance>,
+    resolve: impl Fn(&Id) -> Option<storyforge_domain::campaign::CharacterInstance>,
+    group_member: impl Fn(&storyforge_domain::campaign::CharacterInstance, &str) -> bool,
+    source_lookup: impl Fn(
+        &Id,
+        &str,
+    ) -> Option<storyforge_domain::character_knowledge::PropagationPolicy>,
+) -> bool {
+    use storyforge_domain::character_knowledge::{
+        BroadcastTarget, KnowledgeSource, PropagationPolicy,
+    };
+
+    let propagating =
+        update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
+    if !propagating {
+        return false;
+    }
+    let Some(source_raw) = update.source_character_id.as_ref() else {
+        return false;
+    };
+    let Some(source) = resolve(source_raw) else {
+        return false;
+    };
+    let Some(policy) = source_lookup(&source.id, &update.knowledge_text) else {
+        return false;
+    };
+    match policy {
+        PropagationPolicy::Open => false,
+        PropagationPolicy::Private => true,
+        PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
+            (Some(BroadcastTarget::Group(target_group)), _) => target_group != &group,
+            (Some(BroadcastTarget::All), _) => true,
+            (None, Some(target_instance)) => !group_member(target_instance, &group),
+            (None, None) => true,
+        },
+    }
+}
+
+/// 构建知识段 mutation（广播分发 + 单目标 + 在场/同名/传播策略收紧）。
+///
+/// 返回的 KnowledgeMutation 序列与原 runtime builder 逐条等价；JSON 与 SQLite
+/// 共用本函数后，character_id / source / propagation 等字段不再因后端不同而分叉。
+fn build_knowledge_mutations(
+    persist_ctx: &PostprocessPersistContext,
+    postprocess: &storyforge_domain::agent::PostProcessResult,
+    present_ids: &std::collections::HashSet<String>,
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    name_collisions: &std::collections::HashSet<String>,
+    runtime: &CampaignRuntimeContext,
+) -> Vec<Mutation> {
+    use storyforge_domain::character_knowledge::{
+        BroadcastTarget, KnowledgeSource, PropagationPolicy,
+    };
+    use storyforge_domain::turn::KnowledgeMutation;
+
+    let resolve = |value: &Id| resolve_instance_by_id_or_name(instances, value);
+    let group_member = |inst: &storyforge_domain::campaign::CharacterInstance, g: &str| {
+        instance_matches_group(runtime, inst, g)
+    };
+    let source_lookup =
+        |sid: &Id, text: &str| source_entry_for(runtime, sid, text).map(|e| e.propagation);
+
+    let mut mutations = Vec::new();
+    for update in &postprocess.knowledge_updates {
+        if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
+            continue;
+        }
+        if source_propagation_blocks(update, None, resolve, group_member, source_lookup) {
+            continue;
+        }
+        let source_instance = update.source_character_id.as_ref().and_then(resolve);
+        let source_character_id = source_instance.as_ref().map(|i| i.id.clone());
+        let targets: Vec<_> = match &update.broadcast {
+            Some(BroadcastTarget::All) => instances
+                .iter()
+                .filter(|instance| Some(&instance.id) != source_character_id.as_ref())
+                .cloned()
+                .collect(),
+            Some(BroadcastTarget::Group(group)) => instances
+                .iter()
+                .filter(|instance| {
+                    Some(&instance.id) != source_character_id.as_ref()
+                        && instance_matches_group(runtime, instance, group)
+                })
+                .cloned()
+                .collect(),
+            None => resolve(&update.character_id).into_iter().collect(),
+        };
+
+        for target in targets {
+            if source_propagation_blocks(
+                update,
+                Some(&target),
+                resolve,
+                group_member,
+                source_lookup,
+            ) {
+                continue;
+            }
+            let presence_exempt = matches!(
+                update.source,
+                KnowledgeSource::ToldByOther | KnowledgeSource::Backstory
+            );
+            if update.broadcast.is_none()
+                && !presence_exempt
+                && (present_ids.is_empty()
+                    || !crate::is_postprocess_instance_present(
+                        &target,
+                        &update.character_id,
+                        present_ids,
+                        name_collisions,
+                    ))
+            {
+                continue;
+            }
+            mutations.push(Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
+                entry_id: Id::new(),
+                campaign_id: persist_ctx.campaign_id.clone(),
+                character_id: target.id,
+                knowledge_text: update.knowledge_text.clone(),
+                source: if update.broadcast.is_some() {
+                    KnowledgeSource::ToldByOther
+                } else {
+                    update.source.clone()
+                },
+                source_character_id: source_character_id.clone(),
+                turn_number: persist_ctx.turn,
+                event_id: None,
+                pinned: update.pinned,
+                propagation: update.propagation.clone(),
+            })));
+        }
+    }
+    mutations
+}
+
+/// 构建变量段 mutation（角色级按 name/id 解析 + 在场/同名收紧；全局级无约束）。
+fn build_variable_mutations(
+    persist_ctx: &PostprocessPersistContext,
+    postprocess: &storyforge_domain::agent::PostProcessResult,
+    present_ids: &std::collections::HashSet<String>,
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    name_collisions: &std::collections::HashSet<String>,
+) -> Vec<Mutation> {
+    let mut mutations = Vec::new();
+    for update in &postprocess.variable_updates {
+        if let Some(instance_raw) = &update.instance_id {
+            if let Some(instance) = resolve_instance_by_id_or_name(instances, instance_raw)
+                && crate::is_postprocess_instance_present(
+                    &instance,
+                    instance_raw,
+                    present_ids,
+                    name_collisions,
+                )
+            {
+                mutations.push(Mutation::SetVariable {
+                    instance_id: Some(instance.id),
+                    key: update.key.clone(),
+                    value: update.value.clone(),
+                    turn: persist_ctx.turn,
+                });
+            }
+        } else {
+            mutations.push(Mutation::SetVariable {
+                instance_id: None,
+                key: update.key.clone(),
+                value: update.value.clone(),
+                turn: persist_ctx.turn,
+            });
+        }
+    }
+    mutations
+}
+
+/// 构建任务段 mutation（已有任务状态更新 + 新建任务）。
+fn build_task_mutations(
+    persist_ctx: &PostprocessPersistContext,
+    postprocess: &storyforge_domain::agent::PostProcessResult,
+    runtime: &CampaignRuntimeContext,
+) -> Vec<Mutation> {
+    let mut mutations = Vec::new();
+    for update in &postprocess.task_updates {
+        if let Some(task_id) = &update.task_id {
+            if let Some(task) = runtime
+                .tasks
+                .iter()
+                .find(|task| task.id == *task_id)
+                .cloned()
+                && let Some(task) = crate::normalize_task_update_for_postprocess(
+                    &persist_ctx.campaign_id,
+                    task,
+                    update.new_status.clone(),
+                )
+            {
+                mutations.push(Mutation::SetTaskStatus {
+                    task_id: task.id,
+                    status: task.status,
+                });
+            }
+        } else if let Some(spec) = &update.new_task {
+            mutations.push(Mutation::UpsertNewTask(Box::new(
+                storyforge_domain::story_task::StoryTask::from_narrative(
+                    persist_ctx.campaign_id.clone(),
+                    spec.title.clone(),
+                    spec.description.clone(),
+                    spec.triggers.clone(),
+                    persist_ctx.turn,
+                ),
+            )));
+        }
+    }
+    mutations
+}
+
+/// 构建 Chronicle A 摘要 mutation。
+///
+/// `a_seq` 由调用方决定：JSON 路径扫描 `store.list_summaries` 取 max+1（容忍 code
+/// 间隙/重排），Runtime 路径在没有活动摘要索引时退化为 `persist_ctx.turn`。本函数
+/// 只负责按给定 seq 组装 RoundSummary，不再各自计算。
+fn build_summary_mutation(
+    persist_ctx: &PostprocessPersistContext,
+    summary: &str,
+    a_seq: u32,
+    lineage: Id,
+) -> Mutation {
+    let code = storyforge_domain::chronicle::ChronicleCode::new(
+        storyforge_domain::chronicle::ChronicleLevel::A,
+        a_seq,
+    );
+    Mutation::UpsertSummary(Box::new(
+        RoundSummary::new(
+            persist_ctx.campaign_id.clone(),
+            persist_ctx.conversation_id.clone(),
+            persist_ctx.turn,
+            summary.to_string(),
+        )
+        .with_code(code.as_str())
+        .with_headline(storyforge_domain::chronicle::truncate_headline(summary, 40))
+        .with_lineage(lineage),
+    ))
 }
 
 /// Pure runtime-based builder (no JSON store reads). Used by SQLite opt-in path.
@@ -1090,238 +1371,40 @@ pub fn build_runtime_mutation_batch(
     runtime: &CampaignRuntimeContext,
     pending_temporary_instances: &[storyforge_domain::campaign::CharacterInstance],
 ) -> MutationBatch {
-    use storyforge_domain::character_knowledge::{
-        BroadcastTarget, KnowledgeSource, PropagationPolicy,
-    };
-    use storyforge_domain::turn::KnowledgeMutation;
-
     let campaign = &runtime.campaign;
-    // 有效实例集 = 快照实例 + attempt 挂载的临时实例（按 id 去重，跨 campaign 拒绝）
-    let instances: Vec<storyforge_domain::campaign::CharacterInstance> = {
-        let mut all = runtime.instances.clone();
-        for temp in pending_temporary_instances {
-            if temp.campaign_id == campaign.id && !all.iter().any(|i| i.id == temp.id) {
-                all.push(temp.clone());
-            }
-        }
-        all
-    };
-    let mut mutations = Vec::new();
+    let instances = merge_temporary_instances(runtime, pending_temporary_instances);
     let present_ids: std::collections::HashSet<String> = present_chars.iter().cloned().collect();
-    let name_collisions: std::collections::HashSet<String> = {
-        let mut counts = std::collections::HashMap::<String, usize>::new();
-        for instance in &instances {
-            *counts.entry(instance.name.clone()).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .filter_map(|(name, count)| (count >= 2).then_some(name))
-            .collect()
-    };
-    let resolve_instance = |value: &Id| {
-        instances
-            .iter()
-            .find(|instance| instance.id == *value || instance.name == value.as_str())
-            .cloned()
-    };
-    let is_group_member = |instance: &storyforge_domain::campaign::CharacterInstance,
-                           group: &str| {
-        instance
-            .definition_id
-            .as_ref()
-            .and_then(|id| runtime.definitions_by_id.get(id))
-            .and_then(|definition| definition.group.as_deref())
-            == Some(group)
-    };
-    let source_entry_for = |source_id: &Id, text: &str| {
-        runtime
-            .knowledge
-            .iter()
-            .filter(|entry| entry.character_id == *source_id)
-            .filter(|entry| crate::knowledge_text_matches(&entry.knowledge_text, text))
-            .max_by(|left, right| {
-                left.turn_number
-                    .cmp(&right.turn_number)
-                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-            })
-            .cloned()
-    };
-    let source_policy_blocks =
-        |update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
-         target: Option<&storyforge_domain::campaign::CharacterInstance>| {
-            let propagating =
-                update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
-            if !propagating {
-                return false;
-            }
-            let Some(source_raw) = update.source_character_id.as_ref() else {
-                return false;
-            };
-            let Some(source) = resolve_instance(source_raw) else {
-                return false;
-            };
-            let Some(entry) = source_entry_for(&source.id, &update.knowledge_text) else {
-                return false;
-            };
-            match &entry.propagation {
-                PropagationPolicy::Open => false,
-                PropagationPolicy::Private => true,
-                PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
-                    (Some(BroadcastTarget::Group(target_group)), _) => target_group != group,
-                    (Some(BroadcastTarget::All), _) => true,
-                    (None, Some(target_instance)) => !is_group_member(target_instance, group),
-                    (None, None) => true,
-                },
-            }
-        };
+    let name_collisions = compute_name_collisions(&instances);
 
+    let mut mutations = Vec::new();
     if let Some(summary) = &outcome.summary {
-        // Match previous SQLite opt-in builder: use turn number as A-seq when
-        // the runtime snapshot has no live summary index to scan.
-        let code = storyforge_domain::chronicle::ChronicleCode::new(
-            storyforge_domain::chronicle::ChronicleLevel::A,
-            persist_ctx.turn,
-        );
+        // Runtime 快照不含活动摘要索引：用 turn 号作为 A-seq（与既有 SQLite 行为一致）。
         let lineage = campaign.lineage_id.clone().unwrap_or_default();
-        mutations.push(Mutation::UpsertSummary(Box::new(
-            RoundSummary::new(
-                persist_ctx.campaign_id.clone(),
-                persist_ctx.conversation_id.clone(),
-                persist_ctx.turn,
-                summary.clone(),
-            )
-            .with_code(code.as_str())
-            .with_headline(storyforge_domain::chronicle::truncate_headline(summary, 40))
-            .with_lineage(lineage),
-        )));
+        mutations.push(build_summary_mutation(
+            persist_ctx,
+            summary,
+            persist_ctx.turn,
+            lineage,
+        ));
     }
 
     if let Some(postprocess) = &outcome.post_process {
-        for update in &postprocess.knowledge_updates {
-            if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
-                continue;
-            }
-            if source_policy_blocks(update, None) {
-                continue;
-            }
-            let source_instance = update
-                .source_character_id
-                .as_ref()
-                .and_then(resolve_instance);
-            let source_character_id = source_instance.as_ref().map(|instance| instance.id.clone());
-            let targets: Vec<_> = match &update.broadcast {
-                Some(BroadcastTarget::All) => instances
-                    .iter()
-                    .filter(|instance| Some(&instance.id) != source_character_id.as_ref())
-                    .cloned()
-                    .collect(),
-                Some(BroadcastTarget::Group(group)) => instances
-                    .iter()
-                    .filter(|instance| {
-                        Some(&instance.id) != source_character_id.as_ref()
-                            && is_group_member(instance, group)
-                    })
-                    .cloned()
-                    .collect(),
-                None => resolve_instance(&update.character_id).into_iter().collect(),
-            };
-
-            for target in targets {
-                if source_policy_blocks(update, Some(&target)) {
-                    continue;
-                }
-                let presence_exempt = matches!(
-                    update.source,
-                    KnowledgeSource::ToldByOther | KnowledgeSource::Backstory
-                );
-                if update.broadcast.is_none()
-                    && !presence_exempt
-                    && (present_ids.is_empty()
-                        || !crate::is_postprocess_instance_present(
-                            &target,
-                            &update.character_id,
-                            &present_ids,
-                            &name_collisions,
-                        ))
-                {
-                    continue;
-                }
-                mutations.push(Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
-                    entry_id: Id::new(),
-                    campaign_id: persist_ctx.campaign_id.clone(),
-                    character_id: target.id,
-                    knowledge_text: update.knowledge_text.clone(),
-                    source: if update.broadcast.is_some() {
-                        KnowledgeSource::ToldByOther
-                    } else {
-                        update.source.clone()
-                    },
-                    source_character_id: source_character_id.clone(),
-                    turn_number: persist_ctx.turn,
-                    event_id: None,
-                    pinned: update.pinned,
-                    propagation: update.propagation.clone(),
-                })));
-            }
-        }
-
-        for update in &postprocess.variable_updates {
-            if let Some(instance_raw) = &update.instance_id {
-                if let Some(instance) = resolve_instance(instance_raw)
-                    && crate::is_postprocess_instance_present(
-                        &instance,
-                        instance_raw,
-                        &present_ids,
-                        &name_collisions,
-                    )
-                {
-                    mutations.push(Mutation::SetVariable {
-                        instance_id: Some(instance.id),
-                        key: update.key.clone(),
-                        value: update.value.clone(),
-                        turn: persist_ctx.turn,
-                    });
-                }
-            } else {
-                mutations.push(Mutation::SetVariable {
-                    instance_id: None,
-                    key: update.key.clone(),
-                    value: update.value.clone(),
-                    turn: persist_ctx.turn,
-                });
-            }
-        }
-
-        for update in &postprocess.task_updates {
-            if let Some(task_id) = &update.task_id {
-                if let Some(task) = runtime
-                    .tasks
-                    .iter()
-                    .find(|task| task.id == *task_id)
-                    .cloned()
-                    && let Some(task) = crate::normalize_task_update_for_postprocess(
-                        &persist_ctx.campaign_id,
-                        task,
-                        update.new_status.clone(),
-                    )
-                {
-                    mutations.push(Mutation::SetTaskStatus {
-                        task_id: task.id,
-                        status: task.status,
-                    });
-                }
-            } else if let Some(spec) = &update.new_task {
-                mutations.push(Mutation::UpsertNewTask(Box::new(
-                    storyforge_domain::story_task::StoryTask::from_narrative(
-                        persist_ctx.campaign_id.clone(),
-                        spec.title.clone(),
-                        spec.description.clone(),
-                        spec.triggers.clone(),
-                        persist_ctx.turn,
-                    ),
-                )));
-            }
-        }
+        mutations.extend(build_knowledge_mutations(
+            persist_ctx,
+            postprocess,
+            &present_ids,
+            &instances,
+            &name_collisions,
+            runtime,
+        ));
+        mutations.extend(build_variable_mutations(
+            persist_ctx,
+            postprocess,
+            &present_ids,
+            &instances,
+            &name_collisions,
+        ));
+        mutations.extend(build_task_mutations(persist_ctx, postprocess, runtime));
     }
 
     MutationBatch {
@@ -1747,6 +1830,191 @@ mod tests {
                     ..
                 }
         )));
+    }
+
+    /// 后端 builder 一致性（Batch 2.3）：给定相同的活动状态、相同 outcome 和
+    /// 相同 present_chars，JSON 与 Runtime 路径必须产生**语义相同**的 mutation 序列。
+    ///
+    /// 一致性规则（已知差异排除后）：
+    /// - `entry_id` / `commit_id` 非确定（每路独立 `Id::new()`），忽略。
+    /// - Chronicle A seq：JSON 扫 `list_summaries` 取 max+1，Runtime 用 `persist_ctx.turn`
+    ///   ——存在 summary 时记录该差异并在统一后断言相等（当前先 skip summary 断言）。
+    /// - summary / 变量 / 任务 / 知识条目：character_id / key / value / status / propagation
+    ///   必须按相同顺序一一对应。
+    ///
+    /// 这是一个**保护性契约**：它现在应当 PASS（捕捉当前两条路径的实际差异面），
+    /// 一旦 builder 统一后仍必须保持 PASS。
+    #[test]
+    fn json_and_runtime_builders_produce_equivalent_mutations() {
+        use storyforge_domain::character::CharacterCard;
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+        use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskUpdate};
+
+        // 用 JSON store 建立活动状态，再投影成等效 runtime 快照。
+        let fx = Fx::new("parity");
+        let camp_id = fx.campaign_id.clone();
+        let conv_id = fx.conversation_id.clone();
+
+        // 两个持久化 instance：Lin（有 definition，group=heroes）+ Chen（无 definition）
+        let def = storyforge_domain::character::CharacterDefinition {
+            id: Id::new(),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm".into(),
+            behavior_rules: "rule".into(),
+            base_backstory: vec![],
+            group: Some("heroes".into()),
+            role_type: storyforge_domain::character::RoleType::Protagonist,
+            variable_schema: storyforge_domain::variables::default_character_variables(),
+        };
+        let inst_lin = storyforge_domain::campaign::CharacterInstance {
+            id: Id::new(),
+            campaign_id: camp_id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let inst_chen = storyforge_domain::campaign::CharacterInstance {
+            id: Id::new(),
+            campaign_id: camp_id.clone(),
+            definition_id: None,
+            name: "Chen".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        // 建一张 card 承载 definition（JSON 路径 instance_matches_group 遍历 store.list_cards）
+        let card = CharacterCard {
+            id: Id::from_str("card-1"),
+            name: "c".into(),
+            source_character_id: Id::from_str("src-1"),
+            character_definitions: vec![def.clone()],
+            campaign_variable_schema: vec![],
+            raw_card_json: serde_json::Value::Null,
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
+            extraction_message: None,
+        };
+        fx.campaign_store.save_card(card).unwrap();
+        fx.campaign_store.add_instance(inst_lin.clone()).unwrap();
+        fx.campaign_store.add_instance(inst_chen.clone()).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: camp_id.clone(),
+            conversation_id: conv_id.clone(),
+            turn: 2,
+        };
+        // Lin 广播给 Group("heroes") 的一条知识 + Chen 的一条变量 + 一个新任务
+        let outcome = PostProcessOutcome {
+            summary: None, // summary 路径 seq 策略不同，单独不比较
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("Lin"),
+                    knowledge_text: "广播给英雄组".into(),
+                    source: KnowledgeSource::ToldByOther,
+                    source_character_id: Some(Id::from_str("Lin")),
+                    pinned: false,
+                    broadcast: Some(
+                        storyforge_domain::character_knowledge::BroadcastTarget::Group(
+                            "heroes".into(),
+                        ),
+                    ),
+                    propagation: PropagationPolicy::GroupRestricted("heroes".into()),
+                }],
+                variable_updates: vec![VariableUpdate {
+                    instance_id: Some(Id::from_str("Chen")),
+                    key: "警觉度".into(),
+                    value: serde_json::json!(5),
+                }],
+                task_updates: vec![TaskUpdate {
+                    task_id: None,
+                    new_status: TaskStatus::Pending,
+                    new_task: Some(NewTaskSpec {
+                        title: "调查集市".into(),
+                        description: "夜间行动".into(),
+                        triggers: vec![],
+                        related_characters: vec![],
+                    }),
+                }],
+                parse_succeeded: true,
+            }),
+            summary_attempted: false,
+            post_process_attempted: true,
+        };
+        let present = vec!["Lin".to_string(), "Chen".to_string()];
+
+        // JSON 路径
+        let json_batch =
+            build_json_mutation_batch(&fx.campaign_store, &persist_ctx, &outcome, &present, &[]);
+        // Runtime 快照（与 store 当前持久化状态投影一致）
+        let runtime = CampaignRuntimeContext {
+            campaign: fx.campaign_store.get_campaign(&camp_id).unwrap(),
+            instances: vec![inst_lin.clone(), inst_chen.clone()],
+            definitions_by_id: [(def.id.clone(), def.clone())].into_iter().collect(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 2,
+        };
+        let runtime_batch =
+            build_runtime_mutation_batch(&persist_ctx, &outcome, &present, &runtime, &[]);
+
+        // helper：把每条 mutation 投影成可比较的稳定签名（剔除非确定 entry_id/commit_id）
+        fn signature(m: &Mutation) -> String {
+            match m {
+                Mutation::UpsertKnowledge(k) => {
+                    format!(
+                        "K|char={}|text={}|source={:?}|prop={:?}",
+                        k.character_id, k.knowledge_text, k.source, k.propagation
+                    )
+                }
+                Mutation::SetVariable {
+                    instance_id,
+                    key,
+                    value,
+                    turn,
+                } => {
+                    format!(
+                        "V|inst={:?}|key={}|val={}|turn={}",
+                        instance_id, key, value, turn
+                    )
+                }
+                Mutation::UpsertNewTask(t) => {
+                    format!("T+|title={}|desc={:?}", t.title, t.description)
+                }
+                Mutation::SetTaskStatus { task_id, status } => {
+                    format!("T=|id={}|status={:?}", task_id, status)
+                }
+                Mutation::UpsertSummary(s) => {
+                    format!("S|turn={}|text={}", s.turn, s.content)
+                }
+                _ => format!("OTHER|{m:?}"),
+            }
+        }
+        let json_sigs: Vec<String> = json_batch.mutations.iter().map(signature).collect();
+        let runtime_sigs: Vec<String> = runtime_batch.mutations.iter().map(signature).collect();
+        assert_eq!(
+            json_sigs, runtime_sigs,
+            "JSON 与 Runtime builder mutation 签名不一致\nJSON:    {json_sigs:?}\nRuntime: {runtime_sigs:?}"
+        );
+
+        // revision 基线必须取自同一活动 campaign：JSON 经 get_campaign，Runtime 用快照字段
+        let camp_revision = fx
+            .campaign_store
+            .get_campaign(&camp_id)
+            .map(|c| c.revision)
+            .unwrap_or(0);
+        assert_eq!(json_batch.expected_revision, camp_revision);
+        assert_eq!(runtime_batch.expected_revision, camp_revision);
+        assert_eq!(json_batch.target_revision, json_batch.expected_revision + 1);
+        assert_eq!(
+            runtime_batch.target_revision,
+            runtime_batch.expected_revision + 1
+        );
     }
 
     #[tokio::test]
