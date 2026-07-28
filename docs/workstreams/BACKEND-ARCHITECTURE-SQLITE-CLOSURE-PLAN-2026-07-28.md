@@ -612,3 +612,8 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 当前 `lib.rs` 为 14,721 行；命令属性/注册数为 175/175，前端唯一 invoke 162，缺失后端命令 0。
 - 通过条件：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）和前端合同测试。
 - Gate 1 尚未整体通过：仍需 bootstrap/AppState/注册与 inline tests 的收敛；Gate 2 状态机、Gate 3 backend facade、SQLite 能力补齐与迁移切换均未开始收口。
+## 19. 2026-07-28 Conversations 子批检查点
+
+- 新增 `crates/tauri-app/src/commands/conversations.rs`，迁移会话列表、删除、活动级联删除、详情 DTO、展示正则和归档入口前的会话展示辅助。
+- 当前 `lib.rs` 为 14,360 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0。
+- 该子批通过 fmt、check、clippy、Rust lib tests（344 passed, 3 ignored）和前端命令合同测试；提交 `069b7a4`。

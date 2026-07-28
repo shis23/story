@@ -216,3 +216,9 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - `lib.rs` 当前 14,721 行；`#[tauri::command]` 175，注册 175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
 - 验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`，均通过。
 - 结论：Writing 子批 PASS；Gate 1 总体仍未收口，bootstrap/AppState/注册与 inline tests 仍在 `lib.rs`，Gate 2 状态机、Gate 3 facade、Gate 4–8 SQLite/迁移/平台验收尚未完成。
+## 17. Gate 1 Conversations 子批结果
+
+- 提交：`069b7a4 refactor(tauri): split conversation commands`。
+- 新增 `commands/conversations.rs`，根 `lib.rs` 移除会话列表/详情/删除及展示正则辅助；Campaign 级联删除保持原语义。
+- `lib.rs` 当前 14,360 行；命令属性/注册 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
+- 验证全绿：`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）、前端合同 3/3。
