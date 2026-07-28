@@ -617,29 +617,29 @@ pub(crate) fn set_active_campaign(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
-    if sqlite_runtime::is_sqlite_active() {
-        if sqlite_runtime::get_campaign(&campaign_id)
-            .map_err(TauriCommandError::internal)?
-            .is_none()
-        {
-            return Err(TauriCommandError::not_found(format!(
-                "campaign id={id} was not found"
-            )));
-        }
-    } else if get_campaign_store().get_campaign(&campaign_id).is_none() {
-        return Err(TauriCommandError::not_found(format!(
-            "找不到 campaign id={id}"
-        )));
-    }
     let json_active = !sqlite_runtime::is_sqlite_active();
-    if json_active {
-        save_active_campaign(&state.data_dir, Some(&campaign_id))
-            .map_err(TauriCommandError::storage)?;
-    }
-    *state
-        .active_campaign
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
+    set_active_campaign_in_state(
+        state.inner().as_ref(),
+        campaign_id.clone(),
+        json_active,
+        || {
+            if sqlite_runtime::is_sqlite_active() {
+                if sqlite_runtime::get_campaign(&campaign_id)
+                    .map_err(TauriCommandError::internal)?
+                    .is_none()
+                {
+                    return Err(TauriCommandError::not_found(format!(
+                        "campaign id={id} was not found"
+                    )));
+                }
+            } else if get_campaign_store().get_campaign(&campaign_id).is_none() {
+                return Err(TauriCommandError::not_found(format!(
+                    "找不到 campaign id={id}"
+                )));
+            }
+            Ok(())
+        },
+    )?;
     if json_active {
         // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书
         let store = get_campaign_store();
@@ -656,6 +656,34 @@ pub(crate) fn set_active_campaign(
             apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
         }
     }
+    Ok(())
+}
+
+/// Commit an active Campaign selection as one serialized update. The validator
+/// runs under the same lock so deletion cannot invalidate a selection between
+/// validation, pointer persistence and the in-memory commit.
+pub(crate) fn set_active_campaign_in_state<F>(
+    state: &AppState,
+    campaign_id: Id,
+    json_active: bool,
+    validate: F,
+) -> Result<(), TauriCommandError>
+where
+    F: FnOnce() -> Result<(), TauriCommandError>,
+{
+    let _update = state
+        .active_campaign_update
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    validate()?;
+    if json_active {
+        save_active_campaign(&state.data_dir, Some(&campaign_id))
+            .map_err(TauriCommandError::storage)?;
+    }
+    *state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id);
     Ok(())
 }
 

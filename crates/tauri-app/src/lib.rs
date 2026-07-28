@@ -709,6 +709,8 @@ pub struct AppState {
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
     pub active_campaign: Mutex<Option<Id>>,
+    /// Serialize active Campaign switching with deletion and pointer persistence.
+    pub(crate) active_campaign_update: Mutex<()>,
     /// 插件注册表（持久化到 data/plugins.json）
     pub plugin_registry: Arc<PluginRegistry>,
     /// 模块存储（内置 + 自定义模块 + 启用/禁用状态）
@@ -857,6 +859,7 @@ impl AppState {
             // authority record after cutover. SQLite-native preference storage
             // is intentionally deferred; selection remains in-process.
             active_campaign: Mutex::new(load_active_campaign_for_backend(&data_dir)),
+            active_campaign_update: Mutex::new(()),
             plugin_registry,
             module_store,
             profile_store,

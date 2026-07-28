@@ -66,6 +66,12 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
     conversation_ids: &HashSet<Id>,
     deleter: &D,
 ) -> Result<(), TauriCommandError> {
+    // Keep pointer read, persistence/rollback, Campaign deletion and the final
+    // in-memory commit in the same critical section as active Campaign changes.
+    let _active_update = state
+        .active_campaign_update
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let active_pointer_needs_clear = {
         let active_campaign = state
             .active_campaign
@@ -153,10 +159,12 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::commands::campaigns::set_active_campaign_in_state;
     use crate::load_active_campaign;
     use storyforge_app_conversation::{ConversationError, ConversationPersistence};
     use storyforge_domain::campaign::Campaign;
@@ -243,5 +251,194 @@ mod tests {
         assert_eq!(load_active_campaign(&state.data_dir), None);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn active_campaign_switch_and_delete_success_are_serialized() {
+        for round in 0..16 {
+            let dir = std::env::temp_dir().join(format!(
+                "storyforge-active-update-success-{round}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = Arc::new(CampaignStore::new(&dir));
+            let conv_store = Arc::new(ConversationStore::new(dir.join("conversations")));
+
+            let campaign_a = Campaign::new(
+                Id::from_str(format!("campaign-delete-{round}")),
+                "delete me",
+            );
+            let campaign_b = Campaign::new(
+                Id::from_str(format!("campaign-switch-{round}")),
+                "switch to me",
+            );
+            let conversation = conv_store
+                .create_persisted(None, Some(campaign_a.id.clone()))
+                .unwrap();
+            let mut campaign_a = campaign_a;
+            campaign_a.conversation_id = Some(conversation.id.clone());
+            store.save_campaign(campaign_a.clone()).unwrap();
+            store.save_campaign(campaign_b.clone()).unwrap();
+
+            let state = Arc::new(AppState::new_for_test());
+            *state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
+            save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let delete_store = Arc::clone(&store);
+            let delete_conv_store = Arc::clone(&conv_store);
+            let delete_state = Arc::clone(&state);
+            let delete_id = campaign_a.id.clone();
+            let delete_barrier = Arc::clone(&barrier);
+            let delete = std::thread::spawn(move || {
+                delete_barrier.wait();
+                delete_campaign_playthrough_in_store(
+                    &delete_store,
+                    &delete_conv_store,
+                    &delete_state,
+                    &delete_id,
+                )
+            });
+
+            let switch_store = Arc::clone(&store);
+            let switch_state = Arc::clone(&state);
+            let switch_id = campaign_b.id.clone();
+            let switch_barrier = Arc::clone(&barrier);
+            let switch = std::thread::spawn(move || {
+                switch_barrier.wait();
+                let id_for_validation = switch_id.clone();
+                set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                    if switch_store.get_campaign(&id_for_validation).is_some() {
+                        Ok(())
+                    } else {
+                        Err(TauriCommandError::not_found(
+                            "switch target disappeared during validation",
+                        ))
+                    }
+                })
+            });
+
+            barrier.wait();
+            assert!(delete.join().unwrap().is_ok());
+            assert!(switch.join().unwrap().is_ok());
+            assert_eq!(
+                state
+                    .active_campaign
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref(),
+                Some(&campaign_b.id)
+            );
+            assert_eq!(
+                load_active_campaign(&state.data_dir),
+                Some(campaign_b.id.clone())
+            );
+            assert!(store.get_campaign(&campaign_a.id).is_none());
+            assert!(store.get_campaign(&campaign_b.id).is_some());
+
+            std::fs::remove_dir_all(dir).ok();
+            std::fs::remove_dir_all(&state.data_dir).ok();
+        }
+    }
+
+    #[test]
+    fn active_campaign_switch_and_delete_failure_are_serialized() {
+        for round in 0..16 {
+            let dir = std::env::temp_dir().join(format!(
+                "storyforge-active-update-failure-{round}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = Arc::new(CampaignStore::new(&dir));
+            let conversations_dir = dir.join("conversations");
+            let conv_store = Arc::new(ConversationStore::new(conversations_dir.clone()));
+
+            let campaign_a = Campaign::new(
+                Id::from_str(format!("campaign-delete-fails-{round}")),
+                "delete fails",
+            );
+            let campaign_b = Campaign::new(
+                Id::from_str(format!("campaign-switch-after-failure-{round}")),
+                "switch survives",
+            );
+            let conversation = conv_store
+                .create_persisted(None, Some(campaign_a.id.clone()))
+                .unwrap();
+            let conversation_path = conversations_dir.join(format!("{}.json", conversation.id));
+            std::fs::remove_file(&conversation_path).unwrap();
+            std::fs::create_dir(&conversation_path).unwrap();
+            let sentinel = conversation_path.join("must-survive");
+            std::fs::write(&sentinel, b"sentinel").unwrap();
+
+            let mut campaign_a = campaign_a;
+            campaign_a.conversation_id = Some(conversation.id.clone());
+            store.save_campaign(campaign_a.clone()).unwrap();
+            store.save_campaign(campaign_b.clone()).unwrap();
+
+            let state = Arc::new(AppState::new_for_test());
+            *state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
+            save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let delete_store = Arc::clone(&store);
+            let delete_conv_store = Arc::clone(&conv_store);
+            let delete_state = Arc::clone(&state);
+            let delete_id = campaign_a.id.clone();
+            let delete_barrier = Arc::clone(&barrier);
+            let delete = std::thread::spawn(move || {
+                delete_barrier.wait();
+                delete_campaign_playthrough_in_store(
+                    &delete_store,
+                    &delete_conv_store,
+                    &delete_state,
+                    &delete_id,
+                )
+            });
+
+            let switch_store = Arc::clone(&store);
+            let switch_state = Arc::clone(&state);
+            let switch_id = campaign_b.id.clone();
+            let switch_barrier = Arc::clone(&barrier);
+            let switch = std::thread::spawn(move || {
+                switch_barrier.wait();
+                let id_for_validation = switch_id.clone();
+                set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                    if switch_store.get_campaign(&id_for_validation).is_some() {
+                        Ok(())
+                    } else {
+                        Err(TauriCommandError::not_found(
+                            "switch target disappeared during validation",
+                        ))
+                    }
+                })
+            });
+
+            barrier.wait();
+            assert!(delete.join().unwrap().is_err());
+            assert!(switch.join().unwrap().is_ok());
+            assert_eq!(
+                state
+                    .active_campaign
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref(),
+                Some(&campaign_b.id)
+            );
+            assert_eq!(
+                load_active_campaign(&state.data_dir),
+                Some(campaign_b.id.clone())
+            );
+            assert!(store.get_campaign(&campaign_a.id).is_some());
+            assert!(sentinel.is_file());
+
+            std::fs::remove_dir_all(dir).ok();
+            std::fs::remove_dir_all(&state.data_dir).ok();
+        }
     }
 }
