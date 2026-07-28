@@ -3053,7 +3053,7 @@ async fn start_writing(
             _ => None,
         };
         if let Some(identity) = &pp_identity {
-            let sink = BackendTurnAttemptSink;
+            let sink = BackendTurnAttemptSink::production();
             // new_json is fine for autofix: it only uses sink, not batch_source.
             let service = production_postprocess::ProductionPostprocessService::new_json(
                 get_campaign_store(),
@@ -3175,9 +3175,45 @@ fn sync_attempt_after_autofix(
 }
 
 /// Routes Attempt/Turn persistence through the active backend (JSON or SQLite).
-struct BackendTurnAttemptSink;
+struct BackendTurnAttemptSink<'a> {
+    /// Production uses the process-wide store; tests can inject an isolated store so
+    /// backend adapter coverage never writes to the user's real AppData directory.
+    json_turn_store: Option<&'a turn_store::TurnStore>,
+}
 
-impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
+impl<'a> BackendTurnAttemptSink<'a> {
+    fn production() -> Self {
+        Self {
+            json_turn_store: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_json_store(json_turn_store: &'a turn_store::TurnStore) -> Self {
+        Self {
+            json_turn_store: Some(json_turn_store),
+        }
+    }
+
+    fn json_store(&self) -> &'a turn_store::TurnStore {
+        match self.json_turn_store {
+            Some(store) => store,
+            None => get_turn_store(),
+        }
+    }
+
+    fn mutate_json_if<P, M>(&self, turn_id: &Id, predicate: P, mutate: M) -> Result<bool, String>
+    where
+        P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
+        M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
+    {
+        self.json_store()
+            .mutate_if(turn_id, predicate, mutate)
+            .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
+    }
+}
+
+impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink<'_> {
     fn load_turn(
         &self,
         turn_id: &Id,
@@ -3185,7 +3221,7 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         if sqlite_runtime::is_sqlite_active() {
             sqlite_runtime::get_turn(turn_id)
         } else {
-            Ok(get_turn_store().get_turn(turn_id))
+            Ok(self.json_store().get_turn(turn_id))
         }
     }
 
@@ -3266,60 +3302,61 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         // Capture typed validation under the same conditional durable mutation.
         let mut precondition: Option<ProductionPostprocessError> = None;
         let mut not_writable = false;
-        let applied = update_turn_record_if(
-            &identity.turn_id,
-            |record| {
-                if record.campaign_id != identity.campaign_id {
-                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
-                        field: "campaign_id",
-                        expected: identity.campaign_id.to_string(),
-                        actual: record.campaign_id.to_string(),
-                    });
-                    return false;
-                }
-                if record.conversation_id != identity.conversation_id {
-                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
-                        field: "conversation_id",
-                        expected: identity.conversation_id.to_string(),
-                        actual: record.conversation_id.to_string(),
-                    });
-                    return false;
-                }
-                if record.find_attempt(&identity.attempt_id).is_none() {
-                    precondition = Some(ProductionPostprocessError::AttemptMissing {
-                        turn_id: identity.turn_id.to_string(),
-                        attempt_id: identity.attempt_id.to_string(),
-                    });
-                    return false;
-                }
-                let writable = matches!(
-                    record.status,
-                    TurnStatus::DraftReady | TurnStatus::DerivingState
-                ) && record.find_attempt(&identity.attempt_id).is_some_and(
-                    |attempt| {
-                        matches!(
-                            attempt.status,
-                            AttemptStatus::DraftReady | AttemptStatus::DerivingState
-                        )
-                    },
-                );
-                if !writable {
-                    not_writable = true;
-                    return false;
-                }
-                true
-            },
-            |record| {
-                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
-                    turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
-                    if let Some(provenance) = provenance {
-                        att.provenance = Some(provenance);
+        let applied = self
+            .mutate_json_if(
+                &identity.turn_id,
+                |record| {
+                    if record.campaign_id != identity.campaign_id {
+                        precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                            field: "campaign_id",
+                            expected: identity.campaign_id.to_string(),
+                            actual: record.campaign_id.to_string(),
+                        });
+                        return false;
                     }
-                }
-                record.touch();
-            },
-        )
-        .map_err(ProductionPostprocessError::AutofixSync)?;
+                    if record.conversation_id != identity.conversation_id {
+                        precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                            field: "conversation_id",
+                            expected: identity.conversation_id.to_string(),
+                            actual: record.conversation_id.to_string(),
+                        });
+                        return false;
+                    }
+                    if record.find_attempt(&identity.attempt_id).is_none() {
+                        precondition = Some(ProductionPostprocessError::AttemptMissing {
+                            turn_id: identity.turn_id.to_string(),
+                            attempt_id: identity.attempt_id.to_string(),
+                        });
+                        return false;
+                    }
+                    let writable = matches!(
+                        record.status,
+                        TurnStatus::DraftReady | TurnStatus::DerivingState
+                    ) && record.find_attempt(&identity.attempt_id).is_some_and(
+                        |attempt| {
+                            matches!(
+                                attempt.status,
+                                AttemptStatus::DraftReady | AttemptStatus::DerivingState
+                            )
+                        },
+                    );
+                    if !writable {
+                        not_writable = true;
+                        return false;
+                    }
+                    true
+                },
+                |record| {
+                    if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
+                        turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
+                        if let Some(provenance) = provenance {
+                            att.provenance = Some(provenance);
+                        }
+                    }
+                    record.touch();
+                },
+            )
+            .map_err(ProductionPostprocessError::AutofixSync)?;
         if applied {
             Ok(())
         } else if let Some(err) = precondition {
@@ -3354,7 +3391,7 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
                 PostprocessApplyOutcome::SkippedLate => Ok(false),
             };
         }
-        update_turn_record_if(
+        self.mutate_json_if(
             &identity.turn_id,
             |record| {
                 record.campaign_id == identity.campaign_id
@@ -3376,7 +3413,7 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         identity: &production_postprocess::PostprocessIdentity,
         reason: String,
     ) -> Result<bool, String> {
-        update_turn_record_if(
+        self.mutate_json_if(
             &identity.turn_id,
             |record| {
                 record.campaign_id == identity.campaign_id
@@ -3440,7 +3477,7 @@ async fn run_shared_postprocess_background(
         return Ok(false);
     }
 
-    let sink = BackendTurnAttemptSink;
+    let sink = BackendTurnAttemptSink::production();
     let Some(identity) = identity else {
         // 非 Campaign 路径：保持旧行为（直接写 store）
         if let Some(outcome) = outcome {
@@ -3512,7 +3549,7 @@ async fn run_shared_postprocess_background(
 }
 
 fn service_fail_turn(
-    sink: &BackendTurnAttemptSink,
+    sink: &BackendTurnAttemptSink<'_>,
     identity: &production_postprocess::PostprocessIdentity,
     original: production_postprocess::ProductionPostprocessError,
 ) -> production_postprocess::ProductionPostprocessError {
@@ -6259,7 +6296,7 @@ async fn regenerate(
             _ => None,
         };
         if let Some(identity) = &pp_identity {
-            let sink = BackendTurnAttemptSink;
+            let sink = BackendTurnAttemptSink::production();
             let service = production_postprocess::ProductionPostprocessService::new_json(
                 get_campaign_store(),
                 &sink,
@@ -21023,7 +21060,8 @@ mod tests {
             conversation_id: conversation_id.clone(),
             turn_number: 1,
         };
-        let combined = service_fail_turn(&BackendTurnAttemptSink, &bad_identity, err);
+        let backend = BackendTurnAttemptSink::for_json_store(&turn_store);
+        let combined = service_fail_turn(&backend, &bad_identity, err);
         assert!(matches!(
             combined,
             ProductionPostprocessError::ScopeMismatch { .. }
@@ -21031,12 +21069,10 @@ mod tests {
         assert_zero_write("apply cross campaign");
 
         // start_writing / regenerate adapter path: sync_autofix via Backend sink.
-        // Install the same turn into the process JSON turn store used by BackendTurnAttemptSink.
-        // save_turn upserts so parallel tests / prior state cannot leave us without the record.
-        get_turn_store()
-            .save_turn(before.clone())
-            .expect("seed backend turn store");
-        let backend = BackendTurnAttemptSink;
+        // Use the isolated JSON store for the backend adapter path. This keeps the test hermetic
+        // even when the workspace test runner executes tests in parallel.
+        let backend = BackendTurnAttemptSink::for_json_store(&turn_store);
+        turn_store.save_turn(before.clone()).unwrap();
         // new_json only needs sink for autofix; campaign_store is unused on this path.
         let backend_service =
             ProductionPostprocessService::new_json(get_campaign_store(), &backend);
@@ -21071,7 +21107,7 @@ mod tests {
             }
         ));
         // zero-write on process turn store
-        let after_backend = get_turn_store().get_turn(&turn_id).unwrap();
+        let after_backend = turn_store.get_turn(&turn_id).unwrap();
         assert_eq!(after_backend.status, TurnStatus::DraftReady);
         assert_eq!(after_backend.failure_reason, None);
         assert_eq!(
@@ -21101,7 +21137,7 @@ mod tests {
             }
         ));
         let _ = service_fail_turn(&backend, &conv_identity, conv_err);
-        let after_conv = get_turn_store().get_turn(&turn_id).unwrap();
+        let after_conv = turn_store.get_turn(&turn_id).unwrap();
         assert_eq!(after_conv.conversation_id, conversation_id);
         assert_eq!(after_conv.failure_reason, None);
         assert_eq!(
@@ -21128,7 +21164,7 @@ mod tests {
             ProductionPostprocessError::AttemptMissing { .. }
         ));
         let _ = service_fail_turn(&backend, &miss_identity, miss_err);
-        let after_miss = get_turn_store().get_turn(&turn_id).unwrap();
+        let after_miss = turn_store.get_turn(&turn_id).unwrap();
         assert_eq!(after_miss.status, TurnStatus::DraftReady);
         assert_eq!(after_miss.failure_reason, None);
         assert_eq!(
@@ -21138,7 +21174,7 @@ mod tests {
 
         // Concurrent supersede + late Storage/BatchConstruction from old postprocess.
         let new_attempt_id = Id::new();
-        get_turn_store()
+        turn_store
             .with_turn_mut(&turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&attempt_id) {
                     att.status = AttemptStatus::Superseded;
@@ -21184,7 +21220,7 @@ mod tests {
                 ),
                 "unexpected: {combined}"
             );
-            let after = get_turn_store().get_turn(&turn_id).unwrap();
+            let after = turn_store.get_turn(&turn_id).unwrap();
             assert_eq!(after.status, TurnStatus::DraftReady);
             assert_eq!(after.failure_reason, None);
             assert_eq!(
@@ -21196,7 +21232,7 @@ mod tests {
                 AttemptStatus::Superseded
             );
         }
-        let after_super = get_turn_store().get_turn(&turn_id).unwrap();
+        let after_super = turn_store.get_turn(&turn_id).unwrap();
         assert_eq!(
             after_super.find_attempt(&attempt_id).unwrap().draft_hash,
             original_hash
@@ -21204,7 +21240,7 @@ mod tests {
         assert_eq!(after_super.conversation_id, conversation_id);
 
         // Cleanup process store entry so other tests are not polluted.
-        let _ = get_turn_store().with_turn_mut(&turn_id, |r| {
+        let _ = turn_store.with_turn_mut(&turn_id, |r| {
             r.status = TurnStatus::Failed;
             r.failure_reason = Some("test cleanup".into());
         });

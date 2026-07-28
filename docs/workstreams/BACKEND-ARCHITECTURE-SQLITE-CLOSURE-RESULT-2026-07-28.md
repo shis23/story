@@ -1,0 +1,83 @@
+# 后端架构与 SQLite 收口：Gate 0 基线结果（2026-07-28）
+
+> 状态：**PASS（Gate 0）**。本结果只覆盖事实基线和保护网，不代表巨石拆分或 SQLite 彻底迁移已经完成。
+> 代码基线：`main@2832030e3f2151b29e87d41c0ecfe26542a956cb`，含本 Gate 0 工作区变更。
+> 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
+
+## 1. Gate 0 产物
+
+- 可重复基线脚本：`scripts/architecture/backend-baseline.mjs`。
+- 前端 IPC → Tauri 注册合同测试：`frontend/tests/tauri-command-contract.test.mjs`。
+- 计划文档中的 9 个 Gate 已建立，后续阶段不得跳过 Gate 1–3 直接堆 SQLite 分支。
+
+## 2. 当前基线
+
+基线由脚本从源码实时计算，当前结果为：
+
+| 指标 | 当前值 |
+| --- | ---: |
+| workspace crate | 16 |
+| `lib.rs` 行数 | 23,781（脚本按源码换行计数） |
+| `#[tauri::command]` 属性 | 156 |
+| `generate_handler!` 注册命令（去重） | 175 |
+| `frontend/src/tauri-api.js` unique invoke | 162 |
+| 前端调用但后端未注册 | 0 |
+| `is_sqlite_active()` 引用 | 67 |
+
+当前 `lib.rs` 的注册命令中存在若干只由内部/插件/运行时使用、未被
+`tauri-api.js` 直接调用的命令；因此前端 162 与后端注册 175 不要求相等，合同要求是
+“前端调用集合必须是后端注册集合的子集”。
+
+## 3. 确定性验证
+
+### 3.1 Gate 0 合同测试
+
+命令：
+
+```powershell
+Set-Location frontend
+npm.cmd test -- tests/tauri-command-contract.test.mjs
+```
+
+结果：**PASS（3/3）**。测试固定了命令属性数、注册命令数、前端调用数、workspace
+crate 数和 SQLite 分支计数，并检查前端调用不存在后端漏注册。
+
+### 3.2 基线生成
+
+```powershell
+node scripts/architecture/backend-baseline.mjs
+```
+
+输出包含：
+
+- 后端命令清单及重复注册；
+- 前端 invoke 清单及漏注册；
+- workspace crate 数；
+- `lib.rs` 行数和 command 属性数；
+- SQLite 分支计数；
+- 当前 Meta/SQLite unsupported 代码位置。
+
+### 3.3 已执行的静态检查
+
+- `git diff --check`：通过。
+- `node --test tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
+- `cargo test -p storyforge --lib scope_validation_errors_do_not_mark_turn_failed -- --nocapture`：1 passed / 0 failed。
+- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`：在提升权限环境通过 7/7；受限沙箱运行时仅因 esbuild 读取项目根目录被拒而中止，不属于代码测试失败。
+- 为保证门禁的确定性，`BackendTurnAttemptSink` 增加临时 `TurnStore` 注入，仅测试使用；生产路径仍使用进程级后端存储。
+
+## 4. 当前能力矩阵快照
+
+Gate 0 确认以下项目必须继续处理：
+
+- JSON/SQLite Accept 业务决策仍需进一步共用状态机；
+- `is_sqlite_active()` 仍散落在 Tauri 命令层；
+- SQLite Meta typed patch / MVU schema apply 仍有 fail-closed 路径；
+- SQLite Chronicle compressor worker 仍有 JSON-only 跳过路径；
+- 默认后端仍是 JSON；
+- Native12/TextFallback/Full100 真实 SQLite 证据仍未封存为 PASS；
+- Android APK、真机和 Windows runner/签名现场证据仍是后续发布闸门。
+
+## 5. Gate 0 结论
+
+Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。下一步进入 Gate 1：
+只做低耦合命令域的机械拆分，第一批为 diagnostics、presets、connections；Gate 1 仍未开始。
