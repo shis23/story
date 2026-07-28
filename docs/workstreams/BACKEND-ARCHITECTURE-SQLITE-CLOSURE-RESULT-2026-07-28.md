@@ -187,4 +187,64 @@ Batch 2.3 消除 JSON 与 SQLite 两条 postprocess mutation 构建路径的重�
 - **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
 - **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
 
+## 8. Gate 2 Batch 2.4 检查点（typed patch preview/apply 纯函数统一）
+
+### 8.1 范围与策略
+
+Batch 2.4 消除 typed patch 的 Preview 与 Accept 两套前置条件判定逻辑。
+
+**改动前**：
+- `meta_typed::validate_typed_patch_targets`（`meta_typed.rs:379-463`）自带一套 target 存在性 + SyncInstanceVariables definition/schema 校验；
+- `app_meta::is_patch_stale`（`typed_patch.rs:139-164`）另有一套 target 存在性扫描；
+- `app_meta::apply_to_snapshot`（`typed_patch.rs:167`）的 `apply_action` 在 target 缺失时返回 `TargetMissing`（第三处存在性判定）；
+- Preview（`meta_preview_typed_patch`）只调 `is_patch_stale`，Accept 调 `is_patch_stale` + `validate_typed_patch_targets` + `apply_to_snapshot`，三者判定面不一致（Preview 通过但 Accept 失败的窗口）。
+
+**改动后**：新增 `app_meta::validate_patch_preconditions(&TypedPatch, &PreviewInput) -> Result<(), TypedPatchError>` 作为单一权威前置条件纯函数：
+- target 存在性复用私有 `action_target_missing`（`is_patch_stale` 与本函数共用，存在性扫描只此一份）；
+- `SyncInstanceVariables` 的 definition_id 匹配、definition 存在、add_keys 在 schema 内的校验归并于此；
+- `RepointInstanceDefinition` 的 `new_definition_id` 存在性校验归并于此；
+- 缺失 target 返回 `TargetMissing`，definition/schema 不匹配返回新增的 `PreconditionFailed`。
+
+`meta_typed::validate_typed_patch_targets` 改为委托该纯函数（映射 `TypedPatchError → TauriCommandError`），删除重复的存在性/前置条件循环及不再使用的 `find_instance`/`ensure_instance_exists`/`ensure_definition_exists`/`ensure_task_exists` 辅助。
+
+`meta_preview_typed_patch` 也改调 `validate_patch_preconditions`：Preview 与 Accept 现共用同一前置判定，Preview 看到的可接受性与 Accept 一致（不再出现「Preview 通过但 Accept 失败」）。
+
+### 8.2 保留的后端差异（不可削弱）
+
+- 写盘机制：`apply_typed_action`（`meta_typed.rs:509`）仍是 store-bound 写盘辅助；SQLite 活跃时 typed patch accept 仍由 `ensure_typed_patch_backend_supported` 拒绝（Gate 4 才补齐 SQLite Meta UoW）。本批次只统一**前置条件判定**，不动写盘路径。
+- `apply_to_snapshot`（纯函数预演）仍由 Accept 在写盘前调用（`meta_typed.rs:319-337`），作为 dry-run 保护；它与 `validate_patch_preconditions` 互补：前者验语义可应用，后者验 target/definition 前置。
+
+### 8.3 新增 parity/契约测试
+
+- `typed_patch_preconditions_share_one_pure_function_between_preview_and_accept`（`lib_tests_meta.rs`）：钉住三点——target 存在 + definition 匹配 + schema 含 add_key 时通过；definition_id 不匹配被纯函数拒绝；target instance 缺失被纯函数拒绝。
+- 既有 `test_meta_accept_typed_patch_preflights_all_actions_before_writing`（验证 RepointInstanceDefinition 的 `new_definition_id` 缺失在写盘前失败）继续通过，证明归并后行为不变。
+- 既有 `test_meta_accept_typed_patch_rejects_stale_definition_binding`（SyncInstanceVariables definition 不匹配）继续通过。
+
+### 8.4 验证证据
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge-app-meta`：110 passed、0 failed。
+- `cargo test -p storyforge --no-default-features`：360 passed（Batch 2.3 后 359 + 1 新契约测试）、3 ignored、0 failed。
+- `tests::meta` 全 14 项通过（含既有 stale/preflight/prune/dismiss 回归）。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过（仅 LF→CRLF 行尾提示）。
+
+### 8.5 未削弱项核对
+
+- [x] target 存在性：`is_patch_stale` 与 `validate_patch_preconditions` 共用 `action_target_missing`，只此一份。
+- [x] SyncInstanceVariables definition/schema 前置：归并进纯函数，既有错误消息（"已不再使用 definition"、"缺少变量 schema"）保留。
+- [x] RepointInstanceDefinition new_definition_id 存在性：归并进纯函数，"Definition 不存在" 错误保留。
+- [x] Preview 与 Accept 前置判定一致：两者现共用 `validate_patch_preconditions`。
+- [x] 写盘路径（`apply_typed_action`）、SQLite backend 拒绝（`ensure_typed_patch_backend_supported`）、active-turn barrier：未改动。
+- [x] 命令名/参数/DTO/事件/前端 IPC 合同：未改动（175/175 不变）。
+
+### 8.6 Gate 2 剩余（按计划 §7）
+
+- **Batch 2.5（tool loop 合并）**：`run_tool_loop`/`run_tool_loop_streaming`/`run_tool_loop_with_layout`（`app-agent/runtime.rs`）三个近似实现待合并为单一可配置执行器。
+- **Batch 2.6（writing 阶段复用）**：start_writing / regenerate 的 Director/Subagent/Editor 仍各写一遍；`EditorStarted` 双发待消除。
+- **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
+- **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
+
 

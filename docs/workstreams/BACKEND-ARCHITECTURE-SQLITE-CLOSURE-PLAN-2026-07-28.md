@@ -653,4 +653,14 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 未削弱角色解析、同名冲突、在场豁免、广播分发、传播策略、变量归属或 revision CAS；未改变任何 command/DTO/事件/前端 IPC 合同。
 - Gate 2 剩余：Batch 2.4（typed patch）、2.5（tool loop）、2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 7 节。
 
+## 24. Gate 2 Batch 2.4 检查点（typed patch preview/apply 纯函数统一，2026-07-28）
+
+- Batch 2.4：消除 typed patch Preview 与 Accept 的两套前置条件判定。新增 `app_meta::validate_patch_preconditions(&TypedPatch, &PreviewInput) -> Result<(), TypedPatchError>` 作为单一权威纯函数，承载 target 存在性（与 `is_patch_stale` 共用私有 `action_target_missing`）、SyncInstanceVariables 的 definition/schema 前置、RepointInstanceDefinition 的 new_definition_id 存在性。
+- `meta_typed::validate_typed_patch_targets` 改为委托该纯函数（`TypedPatchError → TauriCommandError`），删除重复存在性循环与 `find_instance`/`ensure_*_exists` 辅助；`meta_preview_typed_patch` 也改调同一纯函数，Preview 与 Accept 前置判定一致（消除「Preview 通过但 Accept 失败」窗口）。
+- 新增 `TypedPatchError::PreconditionFailed` 变体承载 definition/schema 不匹配；target 缺失仍走 `TargetMissing`。
+- 保留：写盘路径（`apply_typed_action`）、SQLite backend 拒绝（`ensure_typed_patch_backend_supported`）、`apply_to_snapshot` dry-run、active-turn barrier 均未改动。
+- 新增契约测试 `typed_patch_preconditions_share_one_pure_function_between_preview_and_accept`；既有 stale/preflight/prune 回归全通过。
+- 验证：`cargo fmt --all -- --check`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge-app-meta`（110 passed）、`cargo test -p storyforge --no-default-features`（360 passed、3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175、sqlite 68）均通过。
+- Gate 2 剩余：Batch 2.5（tool loop）、2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 8 节。
+
 
