@@ -1,7 +1,7 @@
-# 后端架构与 SQLite 收口：Gate 0 基线结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：Gate 1 第二批结果（2026-07-28）
 
-> 状态：**PASS（Gate 0）**。本结果只覆盖事实基线和保护网，不代表巨石拆分或 SQLite 彻底迁移已经完成。
-> 代码基线：`main@2832030e3f2151b29e87d41c0ecfe26542a956cb`，含本 Gate 0 工作区变更。
+> 状态：**PASS（Gate 1 第二批）**。本结果记录 Gate 0 保护网与 Gate 1 前两批机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
+> 代码基线：`main@c4ffd40e0f33959d3d25226d745fc8a6b5409d80`。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -17,7 +17,7 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | workspace crate | 16 |
-| `lib.rs` 行数 | 22,610（脚本按源码换行计数） |
+| `lib.rs` 行数 | 20,922（脚本按源码换行计数） |
 | `#[tauri::command]` 属性（`src/**/*.rs`） | 175 |
 | `generate_handler!` 注册命令（去重） | 175 |
 | `frontend/src/tauri-api.js` unique invoke | 162 |
@@ -77,11 +77,11 @@ Gate 0 确认以下项目必须继续处理：
 - Native12/TextFallback/Full100 真实 SQLite 证据仍未封存为 PASS；
 - Android APK、真机和 Windows runner/签名现场证据仍是后续发布闸门。
 
-## 5. Gate 0 结论
+## 5. Gate 0 / Gate 1 当前结论
 
-Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。Gate 1 第一批也已完成：
-`presets`、`connections`、`diagnostics` 已移入 `commands/`，仅保留模块导入和注册接线。
-下一批为 `import/export`、`cards`、`characters`，尚未开始。
+Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。Gate 1 前两批已完成：
+`presets`、`connections`、`diagnostics`、`import/export`、`cards`、`characters` 已移入 `commands/`，根模块仅保留导入、注册和跨域接线。
+下一批为 `plugins`、`card-shell`。
 
 ## 6. Gate 1 第一批结果
 
@@ -92,3 +92,16 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
 - `cargo test -p storyforge --lib`：344 passed / 3 ignored。
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
+
+## 7. Gate 1 第二批结果
+
+- 新增 `crates/tauri-app/src/commands/{characters,cards,import_export}.rs`。
+- 保持 Tauri command 名称、参数、返回 DTO、注册顺序和前端 IPC 合同不变。
+- `lib.rs` 从 22,610 行降至 20,922 行；本批只做机械移动与最小可见性调整。
+- `cargo fmt --all`：通过。
+- `cargo check -p storyforge --all-targets`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --lib`：344 passed / 3 ignored。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
+- 本批提交：`c4ffd40 refactor(tauri): split character card and import commands`。
