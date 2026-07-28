@@ -538,3 +538,90 @@ test('shell self-CSP blocks unauthorized remote fetch even though inline scripts
   const vios = await v.read()
   expect(vios.some((t) => String(t).includes('connect-src') || String(t).includes('unauthorized'))).toBe(true)
 })
+
+// --- Scenario 9: module execution inside an opaque sandbox -----------------
+// WebView2 rejects dynamic imports of iframe-created `blob:null/...` URLs, and
+// large data: module URLs are not reliable either. Production serves fetched
+// module source through one-shot token URLs on the restricted shell protocol.
+// The opaque sandbox performs a CORS module fetch without gaining same-origin
+// access to either the parent or sibling shells.
+test('isolated opaque sandbox imports a tokenized shell-protocol module without allow-same-origin', async ({ page }) => {
+  const shellCsp = buildShellCspContent([])
+  const moduleUrl = 'http://storyforge-shell.localhost/module/runtime-token'
+  const shellHTML = `<!doctype html><html><head><meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="${shellCsp.replace(/"/g, '&quot;')}">
+    </head><body>
+    <script>
+      import(${JSON.stringify(moduleUrl)}).then(function(mod) {
+        window.parent.postMessage({
+          type: 'module-result',
+          runtime: mod.runtime,
+          value: mod.value,
+          origin: window.origin
+        }, '*');
+      }).catch(function(err) {
+        window.parent.postMessage({ type: 'module-error', error: String(err) }, '*');
+      });
+    <\/script>
+    </body></html>`
+
+  await page.route('http://shell.local.test/module.html', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      headers: { 'Content-Security-Policy': shellCsp },
+      body: shellHTML,
+    })
+  })
+  await page.route(moduleUrl, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/javascript',
+      headers: {
+        'Access-Control-Allow-Origin': 'null',
+        'Access-Control-Allow-Credentials': 'true',
+        'Cross-Origin-Resource-Policy': 'cross-origin',
+        Vary: 'Origin',
+      },
+      body: 'export const runtime = "sandbox-protocol-module"; export const value = 42;',
+    })
+  })
+  const fixCsp = APP_CSP.replace(
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test',
+  )
+  const appHTML = `<!doctype html><html><body>
+    <iframe id="shell" sandbox="allow-scripts" src="http://shell.local.test/module.html"></iframe>
+  </body></html>`
+  await page.route('http://app.local.test/module', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      headers: { 'Content-Security-Policy': fixCsp },
+      body: appHTML,
+    })
+  })
+
+  const v = collectViolations(page)
+  await v.attach()
+  await page.addInitScript(() => {
+    window.__MODULE_RESULT__ = null
+    window.addEventListener('message', (e) => {
+      if (e.data?.type === 'module-result' || e.data?.type === 'module-error') {
+        window.__MODULE_RESULT__ = e.data
+      }
+    })
+  })
+
+  await page.goto('http://app.local.test/module')
+  await expect.poll(
+    async () => page.evaluate(() => window.__MODULE_RESULT__),
+    { timeout: 5000 },
+  ).toEqual({
+    type: 'module-result',
+    runtime: 'sandbox-protocol-module',
+    value: 42,
+    origin: 'null',
+  })
+  expect(await v.read()).toEqual([])
+})

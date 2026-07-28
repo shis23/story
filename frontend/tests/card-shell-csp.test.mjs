@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   SHELL_CACHE_ORIGINS,
+  SHELL_MODULE_ORIGINS,
   buildShellCspContent,
   buildShellCspMetaTag,
 } from '../src/utils/cardShellCsp.js'
@@ -33,6 +34,10 @@ test('pins every network-capable directive to the allowlist hosts', () => {
   }
   // 模块运行器依赖 blob:，宿主代持二进制走 data:
   assert.ok(directives['script-src'].includes('blob:'))
+  for (const origin of SHELL_MODULE_ORIGINS) {
+    assert.ok(directives['script-src'].includes(origin))
+    assert.ok(directives['connect-src'].includes(origin))
+  }
   assert.ok(directives['img-src'].includes('data:'))
   assert.deepEqual(directives['object-src'], ["'none'"])
   assert.deepEqual(directives['form-action'], ["'none'"])

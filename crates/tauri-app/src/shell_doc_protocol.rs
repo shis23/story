@@ -51,7 +51,9 @@ pub const SHELL_DOC_ORIGIN: &str = "storyforge-shell://localhost";
 /// own (identical) `<meta>` simply intersect to the same policy.
 const SHELL_DOC_CSP: &str = concat!(
     "default-src 'none'; ",
-    "script-src 'unsafe-inline' 'unsafe-eval' blob: data:; ",
+    "script-src 'unsafe-inline' 'unsafe-eval' blob: data: ",
+    "http://storyforge-shell.localhost ",
+    "storyforge-shell://localhost; ",
     "style-src 'unsafe-inline' blob: data:; ",
     "img-src data: blob: ",
     "http://storyforge-cache.localhost ",
@@ -64,7 +66,9 @@ const SHELL_DOC_CSP: &str = concat!(
     "storyforge-cache://localhost; ",
     "connect-src data: blob: ",
     "http://storyforge-cache.localhost ",
-    "storyforge-cache://localhost; ",
+    "storyforge-cache://localhost ",
+    "http://storyforge-shell.localhost ",
+    "storyforge-shell://localhost; ",
     "frame-src blob: data:; ",
     "worker-src blob:; ",
     "child-src blob:; ",
@@ -75,14 +79,26 @@ const SHELL_DOC_CSP: &str = concat!(
 const MAX_SHELL_DOCS: usize = 128;
 const MAX_SHELL_DOC_BYTES: usize = 16 * 1024 * 1024;
 
-/// In-memory token → HTML registry. Tokens are opaque 32-byte hex strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellResourceKind {
+    Document,
+    Module,
+}
+
+#[derive(Clone)]
+struct ShellResource {
+    body: Arc<String>,
+    kind: ShellResourceKind,
+}
+
+/// In-memory token → shell-resource registry. Tokens are opaque 32-byte hex strings.
 ///
 /// A successful GET consumes the entry. HEAD only probes it, while the parent
 /// can explicitly unregister a document that was replaced before navigation.
 /// Size and entry-count limits keep a compromised renderer from turning this
 /// bridge into unbounded process memory.
 struct ShellDocRegistry {
-    docs: Mutex<HashMap<String, Arc<String>>>,
+    docs: Mutex<HashMap<String, ShellResource>>,
     max_docs: usize,
     max_doc_bytes: usize,
 }
@@ -103,10 +119,10 @@ impl ShellDocRegistry {
     /// Register a shell document and return an opaque token. The same HTML
     /// registered twice yields two distinct tokens (no dedup: callers may
     /// legitimately want independent documents for identical content).
-    fn register(&self, html: String) -> Result<String, String> {
-        if html.len() > self.max_doc_bytes {
+    fn register(&self, body: String, kind: ShellResourceKind) -> Result<String, String> {
+        if body.len() > self.max_doc_bytes {
             return Err(format!(
-                "shell document exceeds {} byte limit",
+                "shell resource exceeds {} byte limit",
                 self.max_doc_bytes
             ));
         }
@@ -122,7 +138,13 @@ impl ShellDocRegistry {
         for _ in 0..8 {
             let token = random_hex_token();
             if !docs.contains_key(&token) {
-                docs.insert(token.clone(), Arc::new(html));
+                docs.insert(
+                    token.clone(),
+                    ShellResource {
+                        body: Arc::new(body),
+                        kind,
+                    },
+                );
                 return Ok(token);
             }
         }
@@ -131,23 +153,35 @@ impl ShellDocRegistry {
 
     /// Look up a document by token. Returns a cloned Arc (cheap) so the
     /// caller can build the response body without holding the lock.
-    fn get(&self, token: &str) -> Option<Arc<String>> {
+    fn get(&self, token: &str, kind: ShellResourceKind) -> Option<ShellResource> {
         self.docs
             .lock()
             .expect("shell-doc registry poisoned")
             .get(token)
+            .filter(|resource| resource.kind == kind)
             .cloned()
     }
 
-    fn take(&self, token: &str) -> Option<Arc<String>> {
-        self.docs
-            .lock()
-            .expect("shell-doc registry poisoned")
-            .remove(token)
+    fn take(&self, token: &str, kind: ShellResourceKind) -> Option<ShellResource> {
+        let mut docs = self.docs.lock().expect("shell-doc registry poisoned");
+        if docs
+            .get(token)
+            .is_some_and(|resource| resource.kind == kind)
+        {
+            docs.remove(token)
+        } else {
+            None
+        }
     }
 
     fn unregister(&self, token: &str) -> bool {
-        is_valid_token(token) && self.take(token).is_some()
+        is_valid_token(token)
+            && self
+                .docs
+                .lock()
+                .expect("shell-doc registry poisoned")
+                .remove(token)
+                .is_some()
     }
 }
 
@@ -160,7 +194,12 @@ fn get_shell_doc_registry() -> &'static ShellDocRegistry {
 /// Returns the opaque token only; the caller (frontend) builds the full URL
 /// as `<SHELL_DOC_ORIGIN>/<token>`.
 pub fn register_shell_doc(html: String) -> Result<String, String> {
-    get_shell_doc_registry().register(html)
+    get_shell_doc_registry().register(html, ShellResourceKind::Document)
+}
+
+/// Register JavaScript for one-shot module loading by an opaque-origin shell.
+pub fn register_shell_module(source: String) -> Result<String, String> {
+    get_shell_doc_registry().register(source, ShellResourceKind::Module)
 }
 
 pub fn unregister_shell_doc(token: &str) -> bool {
@@ -198,6 +237,27 @@ pub fn shell_doc_protocol_response(
 ) -> tauri::http::Response<Vec<u8>> {
     use tauri::http::{Method, Response, StatusCode, header};
 
+    let path = request.uri().path().trim_start_matches('/');
+    let (kind, token) = match path.strip_prefix("module/") {
+        Some(token) => (ShellResourceKind::Module, token),
+        None => (ShellResourceKind::Document, path),
+    };
+    if request.method() == Method::OPTIONS
+        && kind == ShellResourceKind::Module
+        && is_valid_token(token)
+        && get_shell_doc_registry().get(token, kind).is_some()
+    {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "null")
+            .header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+            .header("Cross-Origin-Resource-Policy", "cross-origin")
+            .header(header::VARY, "Origin")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Vec::new())
+            .unwrap_or_else(|_| Response::new(Vec::new()));
+    }
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -205,29 +265,46 @@ pub fn shell_doc_protocol_response(
             .unwrap_or_else(|_| Response::new(Vec::new()));
     }
 
-    let token = request.uri().path().trim_start_matches('/');
     let body = if !is_valid_token(token) {
         None
-    } else if request.method() == Method::HEAD {
-        get_shell_doc_registry().get(token)
+    } else if request.method() == Method::HEAD || kind == ShellResourceKind::Module {
+        // WebView2 can read an ES module resource more than once while
+        // resolving/importing a graph. Module leases are explicitly released
+        // by the parent bridge after import settles; documents stay one-shot.
+        get_shell_doc_registry().get(token, kind)
     } else {
-        get_shell_doc_registry().take(token)
+        get_shell_doc_registry().take(token, kind)
     };
 
     match body {
-        Some(html) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            // Authoritative shell policy; intersects with the document's own
-            // <meta> (identical) to the same result.
-            .header(header::CONTENT_SECURITY_POLICY, SHELL_DOC_CSP)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(if request.method() == Method::HEAD {
-                Vec::new()
-            } else {
-                html.as_bytes().to_vec()
-            })
-            .unwrap_or_else(|_| Response::new(Vec::new())),
+        Some(resource) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CACHE_CONTROL, "no-store");
+            response = match resource.kind {
+                ShellResourceKind::Document => response
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    // Authoritative shell policy; intersects with the document's own
+                    // <meta> (identical) to the same result.
+                    .header(header::CONTENT_SECURITY_POLICY, SHELL_DOC_CSP),
+                ShellResourceKind::Module => response
+                    .header(header::CONTENT_TYPE, "text/javascript; charset=utf-8")
+                    // Sandboxed shells intentionally have the opaque Origin `null`.
+                    // A module response must opt into CORS for import() to consume it.
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "null")
+                    .header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                    .header("Cross-Origin-Resource-Policy", "cross-origin")
+                    .header(header::VARY, "Origin"),
+            };
+            response
+                .body(if request.method() == Method::HEAD {
+                    Vec::new()
+                } else {
+                    resource.body.as_bytes().to_vec()
+                })
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -283,6 +360,97 @@ mod tests {
 
         let replay = shell_doc_protocol_response(req(Method::GET, &format!("/{token}")));
         assert_eq!(replay.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn module_get_returns_javascript_with_cors_until_explicit_release() {
+        let token = register_shell_module("export const answer = 42;".into())
+            .expect("register shell module");
+        let resp: Response<Vec<u8>> =
+            shell_doc_protocol_response(req(Method::GET, &format!("/module/{token}")));
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "null"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            resp.headers().get("Cross-Origin-Resource-Policy").unwrap(),
+            "cross-origin"
+        );
+        assert_eq!(resp.body(), b"export const answer = 42;");
+
+        let replay = shell_doc_protocol_response(req(Method::GET, &format!("/module/{token}")));
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.body(), b"export const answer = 42;");
+
+        assert!(unregister_shell_doc(&token));
+        let after_release =
+            shell_doc_protocol_response(req(Method::GET, &format!("/module/{token}")));
+        assert_eq!(after_release.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn module_options_preflight_has_cors_without_consuming_source() {
+        let token =
+            register_shell_module("export default 1;".into()).expect("register shell module");
+        let preflight =
+            shell_doc_protocol_response(req(Method::OPTIONS, &format!("/module/{token}")));
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "null"
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap(),
+            "GET, HEAD, OPTIONS"
+        );
+        assert!(preflight.body().is_empty());
+
+        let get_after_preflight =
+            shell_doc_protocol_response(req(Method::GET, &format!("/module/{token}")));
+        assert_eq!(get_after_preflight.status(), StatusCode::OK);
+        assert_eq!(get_after_preflight.body(), b"export default 1;");
+    }
+
+    #[test]
+    fn shell_csp_allows_only_the_restricted_protocol_as_a_module_origin() {
+        assert!(SHELL_DOC_CSP.contains(
+            "script-src 'unsafe-inline' 'unsafe-eval' blob: data: \
+             http://storyforge-shell.localhost storyforge-shell://localhost"
+        ));
+        assert!(SHELL_DOC_CSP.contains(
+            "connect-src data: blob: http://storyforge-cache.localhost \
+             storyforge-cache://localhost http://storyforge-shell.localhost \
+             storyforge-shell://localhost"
+        ));
+        assert!(!SHELL_DOC_CSP.contains("script-src https:"));
+        assert!(!SHELL_DOC_CSP.contains("connect-src https:"));
     }
 
     #[test]
@@ -354,18 +522,34 @@ mod tests {
     #[test]
     fn registry_rejects_oversized_documents_and_capacity_exhaustion() {
         let registry = ShellDocRegistry::with_limits(1, 4);
-        assert!(registry.register("12345".into()).is_err());
+        assert!(
+            registry
+                .register("12345".into(), ShellResourceKind::Document)
+                .is_err()
+        );
 
-        let token = registry.register("1234".into()).expect("within limit");
-        assert!(registry.register("next".into()).is_err());
+        let token = registry
+            .register("1234".into(), ShellResourceKind::Document)
+            .expect("within limit");
+        assert!(
+            registry
+                .register("next".into(), ShellResourceKind::Document)
+                .is_err()
+        );
         assert!(registry.unregister(&token));
-        assert!(registry.register("next".into()).is_ok());
+        assert!(
+            registry
+                .register("next".into(), ShellResourceKind::Document)
+                .is_ok()
+        );
     }
 
     #[test]
     fn unregister_rejects_replay_and_malformed_tokens() {
         let registry = ShellDocRegistry::with_limits(2, 64);
-        let token = registry.register("<body>x".into()).expect("register");
+        let token = registry
+            .register("<body>x".into(), ShellResourceKind::Document)
+            .expect("register");
         assert!(registry.unregister(&token));
         assert!(!registry.unregister(&token));
         assert!(!registry.unregister("../not-a-token"));

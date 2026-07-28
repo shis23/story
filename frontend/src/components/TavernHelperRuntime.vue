@@ -1,6 +1,6 @@
 <template>
   <!--
-    隐藏 TH 运行时：顺序执行 tavern_helper.scripts（远程 ES module + inline JS）。
+    隐藏 TH 运行时：顺序执行 tavern_helper.scripts（远程/内联传统脚本）。
     宿主代持网络；iframe 仅 allow-scripts，与主应用不同源。
   -->
   <div class="tavern-helper-runtime" :class="{ 'sr-only-runtime': !showStatus }">
@@ -59,19 +59,26 @@
 
 <script setup>
 /**
- * TavernHelperRuntime — Phase 6: ordered remote module + inline script execution.
+ * TavernHelperRuntime — Phase 6: ordered remote + inline classic script execution.
  * No silent success: failures surface in status line.
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { cardShellFetchUrl, getCardShellInlineJs } from '../tauri-api.js'
-import { orderedTavernHelperFromShells, collectVisibleThButtons } from '../utils/tavernHelperScripts.js'
+import {
+  orderedTavernHelperFromShells,
+  collectVisibleThButtons,
+  analyzeEsmModuleSource,
+} from '../utils/tavernHelperScripts.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
 import {
   configureShellDocInvoke,
   registerShellDoc,
+  registerShellModule,
   releaseShellDoc,
+  releaseShellModule,
 } from '../utils/shellDocUrl.js'
+import { registerShellModuleGraph } from '../utils/shellModuleGraph.js'
 
 const props = defineProps({
   /** CardShellManifest.shells */
@@ -112,6 +119,34 @@ const detailsOpen = ref(false)
 let runSeq = 0
 let bridgeHandler = null
 const blobUrls = []
+const activeModuleLeases = new Set()
+
+const TH_MODULE_GLOBAL_PREAMBLE = [
+  'const __sfG = globalThis;',
+  'const z = __sfG.z;',
+  'const Zod = __sfG.Zod || __sfG.z;',
+  'const Vue = __sfG.Vue;',
+  'const _ = __sfG._;',
+  'const $ = __sfG.$ || __sfG.jQuery;',
+  'const jQuery = __sfG.jQuery || __sfG.$;',
+  'const getvar = __sfG.getvar;',
+  'const setvar = __sfG.setvar;',
+  'const getScriptId = __sfG.getScriptId;',
+  'const eventOn = __sfG.eventOn;',
+  'const eventEmit = __sfG.eventEmit;',
+  'const triggerSlash = __sfG.triggerSlash;',
+  'const TavernHelper = __sfG.TavernHelper || __sfG.tavernHelper;',
+  'const tavernHelper = __sfG.tavernHelper || __sfG.TavernHelper;',
+  'const registerVariableSchema = __sfG.registerVariableSchema;',
+  'const getChatVariable = __sfG.getChatVariable || __sfG.getvar;',
+  'const setChatVariable = __sfG.setChatVariable || __sfG.setvar;',
+  'const SillyTavern = __sfG.SillyTavern;',
+  'const toastr = __sfG.toastr;',
+  'const tavern_events = __sfG.tavern_events;',
+  'const getLastMessageId = __sfG.getLastMessageId;',
+  'const updateVariablesWith = __sfG.updateVariablesWith;',
+  'const YAML = __sfG.YAML || __sfG.jsyaml || __sfG.jsYaml;',
+].join('\n') + '\n'
 
 const scripts = computed(() => orderedTavernHelperFromShells(props.shells))
 const visibleButtons = computed(() => collectVisibleThButtons(scripts.value))
@@ -162,14 +197,15 @@ function bootstrapSrcdoc() {
     "    });",
     "  }",
     "  window.__sfThHostFetchText = function(url){ return ask('fetch_text', { url: url }); };",
-    "  window.__sfThHostFetchModuleSource = function(url){ return ask('fetch_module_source', { url: url }); };",
+    "  window.__sfThHostPrepareRemoteScript = function(url){ return ask('prepare_remote_script', { url: url }); };",
     "  window.__sfThReport = function(payload){ return ask('report', payload); };",
-    "  window.__sfThLocalBlobs = [];",
-    "  window.__sfThModuleSourceToBlob = function(code){",
-    "    var blob = new Blob([code], { type: 'text/javascript' });",
-    "    var u = URL.createObjectURL(blob);",
-    "    window.__sfThLocalBlobs.push(u);",
-    "    return u;",
+    "  window.__sfThModuleLeases = [];",
+    "  window.__sfThModuleSourceToUrl = function(code){",
+    "    return ask('register_module', { source: code }).then(function(url){ window.__sfThModuleLeases.push(url); return url; });",
+    "  };",
+    "  window.__sfThReleaseModuleLeases = async function(){",
+    "    var urls = window.__sfThModuleLeases.splice(0);",
+    "    await Promise.all(urls.map(function(url){ return ask('release_module', { url: url }).catch(function(){}); }));",
     "  };",
     "  window.__sfThBindGlobalsPreamble = function(){",
     "    var nl = String.fromCharCode(10);",
@@ -200,8 +236,8 @@ function bootstrapSrcdoc() {
     "      'const YAML = __sfG.YAML || __sfG.jsyaml || __sfG.jsYaml;'",
     "    ].join(nl) + nl;",
     "  };",
-    "  window.__sfThModuleSourceToBlobBound = function(code){",
-    "    return window.__sfThModuleSourceToBlob(window.__sfThBindGlobalsPreamble() + code);",
+    "  window.__sfThModuleSourceToUrlBound = function(code){",
+    "    return window.__sfThModuleSourceToUrl(window.__sfThBindGlobalsPreamble() + code);",
     "  };",
     "  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };",
     "  window.setvar = function(k, v){",
@@ -211,6 +247,7 @@ function bootstrapSrcdoc() {
     "  };",
     "  window.getChatVariable = window.getvar;",
     "  window.setChatVariable = window.setvar;",
+    "  window.getVariables = window.getVariables || function(){ return Object.assign({}, V); };",
     "  window.eventOn = window.eventOn || function(){ return function(){}; };",
     "  window.eventEmit = window.eventEmit || function(){};",
     "  window.triggerSlash = window.triggerSlash || function(){ return Promise.resolve(''); };",
@@ -223,15 +260,7 @@ function bootstrapSrcdoc() {
     "    triggerSlash: window.triggerSlash,",
     "  };",
     "  window.tavernHelper = window.TavernHelper;",
-    "  window.__sfThImportSpecRe = function(){",
-    "    var bs = String.fromCharCode(92);",
-    "    var sq = String.fromCharCode(39);",
-    "    var dq = String.fromCharCode(34);",
-    "    var qcls = sq + dq;",
-    "    var pat = '(?:' + bs + 'bfrom' + bs + 's+|' + bs + 'bimport' + bs + 's*' + bs + '(?|' + bs + 'bimport' + bs + 's+)[' + qcls + ']([^' + qcls + ']+)[' + qcls + ']';",
-    "    return new RegExp(pat, 'g');",
-    "  };",
-        "  window.getScriptId = window.getScriptId || function(){ return window.__sfCurrentScriptId || 'storyforge-th'; };",
+    "  window.getScriptId = window.getScriptId || function(){ return window.__sfCurrentScriptId || 'storyforge-th'; };",
     "  window.registerVariableSchema = window.registerVariableSchema || function(){};",
     "  // Minimal ST host surface for MagVarUpdate / destined-journey scripts.",
     "  window.toastr = window.toastr || {",
@@ -329,12 +358,14 @@ function bootstrapSrcdoc() {
     "      for (var zi = 0; zi < zodUrls.length && !api; zi++) {",
     "        try {",
     "          var zodUrl = zodUrls[zi];",
-    "          // Direct host fetch + local blob import (skip graph rewrite).",
+    "          // Direct host fetch + origin-independent data import (skip graph rewrite).",
     "          var code = await window.__sfThHostFetchText(zodUrl);",
     "          if (!code || code.length < 1000) throw new Error('zod source too small: ' + (code ? code.length : 0));",
     "          if (code.indexOf('prefault') < 0) throw new Error('zod source missing prefault (not v4?)');",
-    "          var blobUrl = window.__sfThModuleSourceToBlob(code);",
-    "          var zodMod = await import(blobUrl);",
+    "          var moduleUrl = await window.__sfThModuleSourceToUrl(code);",
+    "          var zodMod;",
+    "          try { zodMod = await import(moduleUrl); }",
+    "          finally { await window.__sfThReleaseModuleLeases(); }",
     "          var cand = null;",
     "          if (zodMod && typeof zodMod.object === 'function') cand = zodMod;",
     "          else if (zodMod && zodMod.z && typeof zodMod.z.object === 'function') cand = zodMod.z;",
@@ -448,44 +479,46 @@ function bootstrapSrcdoc() {
 
     "    if (!window.$) throw new Error('jQuery global missing after preload');",
     "  };",
-"  window.__sfThImportUrl = async function(entryUrl){",
-    "    var cache = Object.create(null);",
-    "    async function load(url){",
-    "      if (cache[url]) return cache[url];",
-    "      cache[url] = (async function(){",
-    "        var code = await window.__sfThHostFetchModuleSource(url);",
-    "        var re = window.__sfThImportSpecRe();",
-    "        var specs = [];",
-    "        var m;",
-    "        while ((m = re.exec(code)) !== null) {",
-    "          var spec = m[1];",
-    "          if (!spec) continue;",
-    "          if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') {",
-    "            specs.push(spec);",
-    "          }",
-    "        }",
-    "        var map = Object.create(null);",
-    "        for (var i = 0; i < specs.length; i++) {",
-    "          var sp = specs[i];",
-    "          var abs = sp;",
-    "          if (sp.charAt(0) === '.' || sp.charAt(0) === '/') {",
-    "            try { abs = new URL(sp, url).href; } catch (e) { continue; }",
-    "          }",
-    "          try { map[sp] = await load(abs); } catch (e) { console.warn('[TH] module dep failed', abs, e); }",
-    "        }",
-    "        if (Object.keys(map).length) {",
-    "          re = window.__sfThImportSpecRe();",
-    "          code = code.replace(re, function(full, spec){",
-    "            if (!map[spec]) return full;",
-    "            return full.replace(spec, map[spec]);",
-    "          });",
-    "        }",
-    "        return window.__sfThModuleSourceToBlobBound(code);",
-    "      })();",
-    "      return cache[url];",
+    "  window.__sfThExecuteClassic = function(code){",
+    "    return new Promise(function(resolve, reject){",
+    "      var settled = false;",
+    "      function cleanup(){ window.removeEventListener('error', onError, true); }",
+    "      function finishError(error){",
+    "        if (settled) return;",
+    "        settled = true;",
+    "        cleanup();",
+    "        reject(error);",
+    "      }",
+    "      function onError(ev){",
+    "        var message = (ev && ev.message) || 'classic script execution failed';",
+    "        finishError(new Error(message));",
+    "      }",
+    "      window.addEventListener('error', onError, true);",
+    "      try {",
+    "        var script = document.createElement('script');",
+    "        script.text = code;",
+    "        document.head.appendChild(script);",
+    "        setTimeout(function(){",
+    "          if (settled) return;",
+    "          settled = true;",
+    "          cleanup();",
+    "          resolve();",
+    "        }, 0);",
+    "      } catch (e) { finishError(e); }",
+    "    });",
+    "  };",
+    "  window.__sfThRunRemoteUrl = async function(url){",
+    "    var descriptor = await window.__sfThHostPrepareRemoteScript(url);",
+    "    if (!descriptor || !descriptor.module) {",
+    "      return window.__sfThExecuteClassic((descriptor && descriptor.source) || '');",
     "    }",
-    "    var blobUrl = await load(entryUrl);",
-    "    return import(blobUrl);",
+    "    try { return await import(descriptor.url); }",
+    "    catch (importErr) {",
+    "      await Promise.all((descriptor.leases || []).map(function(moduleUrl){",
+    "        return ask('release_module', { url: moduleUrl }).catch(function(){});",
+    "      }));",
+    "      throw importErr;",
+    "    }",
     "  };",
     "  window.__sfThRunScripts = async function(items){",
     "    await window.__sfThEnsureGlobals();",
@@ -496,18 +529,9 @@ function bootstrapSrcdoc() {
     "        await window.__sfThReport({ index: i, label: item.label, state: 'running' });",
     "        window.__sfCurrentScriptId = String(item.label || ('th-' + i));",
     "        if (item.kind === 'remote_url'){",
-    "          await window.__sfThImportUrl(item.url);",
+    "          await window.__sfThRunRemoteUrl(item.url);",
     "        } else if (item.kind === 'inline_js'){",
-    "          await new Promise(function(resolve, reject){",
-    "            try {",
-    "              var s = document.createElement('script');",
-    "              s.text = item.js;",
-    "              s.onload = function(){ resolve(); };",
-    "              s.onerror = function(e){ reject(e || new Error('inline script error')); };",
-    "              document.head.appendChild(s);",
-    "              setTimeout(resolve, 0);",
-    "            } catch (e) { reject(e); }",
-    "          });",
+    "          await window.__sfThExecuteClassic(item.js);",
     "        } else {",
     "          throw new Error('unknown th kind: ' + item.kind);",
     "        }",
@@ -565,6 +589,7 @@ function bootstrapSrcdoc() {
 }
 
 function clearFrameUrl() {
+  releaseActiveModuleLeases()
   const previous = frameBlobUrl
   frameBlobUrl = null
   if (!previous) return
@@ -573,6 +598,14 @@ function clearFrameUrl() {
     return
   }
   void releaseShellDoc(previous).catch(() => {})
+}
+
+function releaseActiveModuleLeases() {
+  const urls = Array.from(activeModuleLeases)
+  activeModuleLeases.clear()
+  for (const url of urls) {
+    void releaseShellModule(url).catch(() => {})
+  }
 }
 
 async function setFrameHtml(html) {
@@ -614,14 +647,6 @@ async function hostFetchText(url) {
   return res.body_text
 }
 
-function resolveUrl(base, rel) {
-  try {
-    return new URL(rel, base).href
-  } catch {
-    return null
-  }
-}
-
 /**
  * Host-mediated ES module graph:
  * fetch → rewrite absolute/relative imports to blob: URLs → object URL.
@@ -631,51 +656,25 @@ function resolveUrl(base, rel) {
  * Parent fetches code and inlines relative deps as absolute http(s) imports so
  * the iframe can build same-origin blob URLs itself (parent blobs are opaque).
  */
-async function fetchModuleSource(entryUrl, cache = new Map(), depth = 0) {
-  if (depth > 12) throw new Error('module graph too deep: ' + entryUrl)
-  if (cache.has(entryUrl)) return cache.get(entryUrl)
-
-  cache.set(entryUrl, null)
-  let code = await hostFetchText(entryUrl)
-
-  const re =
-    /(?:\bfrom\s+|\bimport\s*\(?|\bimport\s+)['"`]([^'"`]+)['"`]/g
-  const specs = new Set()
-  let m
-  while ((m = re.exec(code)) !== null) {
-    const spec = m[1]
-    if (!spec) continue
-    if (spec.startsWith('http://') || spec.startsWith('https://') || spec.startsWith('.')) {
-      specs.add(spec)
-    }
+async function prepareTavernHelperRemoteScript(entryUrl) {
+  const normalized = new URL(entryUrl).href
+  if (!/^https?:$/.test(new URL(normalized).protocol)) {
+    throw new Error('unsupported module URL protocol')
   }
+  const source = await hostFetchText(normalized)
+  const analysis = analyzeEsmModuleSource(source)
+  if (!analysis.isModule) return { module: false, source }
 
-  // Rewrite relative imports to absolute http(s) so iframe can re-fetch via host.
-  if (specs.size) {
-    code = code.replace(re, (full, spec) => {
-      if (!(spec.startsWith('.') || spec.startsWith('/'))) return full
-      const abs = resolveUrl(entryUrl, spec)
-      if (!abs) return full
-      return full.replace(spec, abs)
-    })
-  }
-
-  // Pre-warm dependency sources (best effort) so first run fails less often.
-  for (const spec of specs) {
-    const abs =
-      spec.startsWith('http://') || spec.startsWith('https://')
-        ? spec
-        : resolveUrl(entryUrl, spec)
-    if (!abs || abs === entryUrl) continue
-    try {
-      await fetchModuleSource(abs, cache, depth + 1)
-    } catch (e) {
-      console.warn('[TH] dep source fetch failed', abs, e)
-    }
-  }
-
-  cache.set(entryUrl, code)
-  return code
+  const graph = await registerShellModuleGraph({
+    entryUrl: normalized,
+    entrySource: source,
+    preamble: TH_MODULE_GLOBAL_PREAMBLE,
+    fetchText: hostFetchText,
+    registerModule: registerShellModule,
+    releaseModule: releaseShellModule,
+  })
+  for (const url of graph.leases) activeModuleLeases.add(url)
+  return { module: true, ...graph }
 }
 
 async function onBridgeMessage(ev) {
@@ -709,15 +708,26 @@ async function onBridgeMessage(ev) {
   }
 
   try {
+    if (d.type === 'register_module') {
+      const source = d.payload?.source
+      if (typeof source !== 'string') throw new Error('module source must be a string')
+      const url = await registerShellModule(source)
+      activeModuleLeases.add(url)
+      reply(url)
+      return
+    }
+    if (d.type === 'release_module') {
+      activeModuleLeases.delete(d.payload?.url)
+      reply(await releaseShellModule(d.payload?.url))
+      return
+    }
     if (d.type === 'fetch_text') {
       const text = await hostFetchText(d.payload.url)
       reply(text)
       return
     }
-    if (d.type === 'fetch_module_blob' || d.type === 'fetch_module_source') {
-      // Return source text; iframe creates its own blob: URL.
-      const source = await fetchModuleSource(d.payload.url)
-      reply(source)
+    if (d.type === 'prepare_remote_script') {
+      reply(await prepareTavernHelperRemoteScript(d.payload.url))
       return
     }
     if (d.type === 'report') {

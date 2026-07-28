@@ -12229,6 +12229,11 @@ fn card_shell_register_doc(html: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn card_shell_register_module(source: String) -> Result<String, String> {
+    shell_doc_protocol::register_shell_module(source)
+}
+
+#[tauri::command]
 fn card_shell_unregister_doc(token: String) -> bool {
     shell_doc_protocol::unregister_shell_doc(&token)
 }
@@ -14025,6 +14030,7 @@ pub fn run() {
             get_card_shell_inline_js,
             card_shell_list_allowed_hosts,
             card_shell_register_doc,
+            card_shell_register_module,
             card_shell_unregister_doc,
             card_shell_allow_host,
             card_shell_clear_cache,

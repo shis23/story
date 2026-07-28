@@ -53,8 +53,11 @@ import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
 import {
   configureShellDocInvoke,
   registerShellDoc,
+  registerShellModule,
   releaseShellDoc,
+  releaseShellModule,
 } from '../utils/shellDocUrl.js'
+import { registerShellModuleGraph } from '../utils/shellModuleGraph.js'
 import {
   createCardShellRuntimeCompatibilityScript,
   isCardShellBridgeMessageForSession,
@@ -121,6 +124,36 @@ const emit = defineEmits(['loaded', 'error', 'message', 'var-write', 'opening-ap
 // shared helper with the same Tauri invoke this component already uses.
 configureShellDocInvoke(invoke)
 
+const CARD_SHELL_MODULE_PREAMBLE = [
+  'const __sfG = globalThis;',
+  'const Vue = __sfG.Vue;',
+  'const $ = __sfG.$ || __sfG.jQuery;',
+  'const jQuery = __sfG.jQuery || __sfG.$;',
+  'const _ = __sfG._;',
+  'const getvar = __sfG.getvar;',
+  'const setvar = __sfG.setvar;',
+  'const TavernHelper = __sfG.TavernHelper || __sfG.tavernHelper;',
+  'const tavernHelper = __sfG.tavernHelper || __sfG.TavernHelper;',
+  'const SillyTavern = __sfG.SillyTavern;',
+  'const z = __sfG.z;',
+  'const Zod = __sfG.Zod || __sfG.z;',
+  'const getVariables = __sfG.getVariables;',
+  'const setVariables = __sfG.setVariables;',
+  'const insertOrAssignVariables = __sfG.insertOrAssignVariables;',
+  'const deleteVariable = __sfG.deleteVariable;',
+  'const updateVariablesWith = __sfG.updateVariablesWith;',
+  'const getChatMessages = __sfG.getChatMessages;',
+  'const getLastMessageId = __sfG.getLastMessageId;',
+  'const getCurrentMessageId = __sfG.getCurrentMessageId;',
+  'const triggerSlash = __sfG.triggerSlash;',
+  'const eventOn = __sfG.eventOn;',
+  'const eventEmit = __sfG.eventEmit;',
+  'const substituteParams = __sfG.substituteParams;',
+  'const getScriptId = __sfG.getScriptId;',
+  'const getContext = __sfG.getContext;',
+  'const Mvu = __sfG.Mvu;',
+].join('\n') + '\n'
+
 const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
 const frameSrc = ref('about:blank')
@@ -148,6 +181,7 @@ const shellVirtualPlugin = {
 }
 /** @type {Map<string, string>} host-side store for large inline modules */
 const inlineModuleSources = new Map()
+const activeShellModuleLeases = new Set()
 let inlineModuleSeq = 0
 let bridgeSessionSeq = 0
 let activeBridgeSession = ''
@@ -201,6 +235,7 @@ function blankSrcdoc(msg) {
 }
 
 function clearFrameUrl() {
+  releaseActiveShellModuleLeases()
   const previous = frameBlobUrl
   frameBlobUrl = null
   if (!previous) return
@@ -209,6 +244,14 @@ function clearFrameUrl() {
     return
   }
   void releaseShellDoc(previous).catch(() => {})
+}
+
+function releaseActiveShellModuleLeases() {
+  const urls = Array.from(activeShellModuleLeases)
+  activeShellModuleLeases.clear()
+  for (const url of urls) {
+    void releaseShellModule(url).catch(() => {})
+  }
 }
 
 async function setFrameHtml(html) {
@@ -266,6 +309,32 @@ async function hostFetch(url) {
     }
   }
   throw new Error('empty shell body')
+}
+
+async function hostFetchTextForModule(url) {
+  const res = await hostFetch(url)
+  if (res.kind !== 'text' || res.body_text == null) {
+    throw new Error(
+      'module response is not text: ' + url + ' (' + (res.content_type || '') + ')',
+    )
+  }
+  return res.body_text
+}
+
+async function prepareInlineCardShellModule(id, entryUrl) {
+  if (!ownsCardShellInlineModule(inlineModuleSources, id)) {
+    throw new Error('inline module is not owned by this shell')
+  }
+  const graph = await registerShellModuleGraph({
+    entryUrl: entryUrl || 'https://shell.local/inline-module.js',
+    entrySource: inlineModuleSources.get(id),
+    preamble: CARD_SHELL_MODULE_PREAMBLE,
+    fetchText: hostFetchTextForModule,
+    registerModule: registerShellModule,
+    releaseModule: releaseShellModule,
+  })
+  for (const url of graph.leases) activeShellModuleLeases.add(url)
+  return graph
 }
 
 async function loadShellSelectorVariables() {
@@ -456,127 +525,35 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, op
     "  window.__sfShellAsk = ask;",
     "  window.__sfHostFetchText = function(url){ return ask('fetch_text', { url: url }); };",
     "  window.__sfHostFetchDataUrl = function(url){ return ask('fetch_data_url', { url: url }); };",
-    "  window.__sfShellLocalBlobs = [];",
-    "  window.__sfShellModuleCache = Object.create(null);",
-    "  window.__sfShellSourceToBlob = function(code){",
-    "    var blob = new Blob([code], { type: 'text/javascript' });",
-    "    var u = URL.createObjectURL(blob);",
-    "    window.__sfShellLocalBlobs.push(u);",
-    "    return u;",
+    "  window.__sfShellModuleLeases = [];",
+    "  window.__sfShellSourceToModuleUrl = function(code){",
+    "    return ask('register_module', { source: code }).then(function(url){ window.__sfShellModuleLeases.push(url); return url; });",
     "  };",
-    "  window.__sfShellImportSpecRe = function(){",
-    "    var bs = String.fromCharCode(92);",
-    "    var sq = String.fromCharCode(39);",
-    "    var dq = String.fromCharCode(34);",
-    "    var qcls = sq + dq;",
-    "    var pat = '(?:' + bs + 'bfrom' + bs + 's+|' + bs + 'bimport' + bs + 's*' + bs + '(?|' + bs + 'bimport' + bs + 's+)[' + qcls + ']([^' + qcls + ']+)[' + qcls + ']';",
-    "    return new RegExp(pat, 'g');",
-    "  };",
-    "  window.__sfShellResolveModuleBlob = async function(entryUrl){",
-    "    async function load(url){",
-    "      if (window.__sfShellModuleCache[url]) return window.__sfShellModuleCache[url];",
-    "      window.__sfShellModuleCache[url] = (async function(){",
-    "        var code = await window.__sfHostFetchText(url);",
-    "        var re = window.__sfShellImportSpecRe();",
-    "        var specs = [];",
-    "        var m;",
-    "        while ((m = re.exec(code)) !== null) {",
-    "          var spec = m[1];",
-    "          if (!spec) continue;",
-    "          if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
-    "        }",
-    "        var map = Object.create(null);",
-    "        for (var i = 0; i < specs.length; i++) {",
-    "          var sp = specs[i];",
-    "          var abs = sp;",
-    "          if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, url).href; } catch (e) { continue; } }",
-    "          map[sp] = await load(abs);",
-    "        }",
-    "        if (Object.keys(map).length) {",
-    "          re = window.__sfShellImportSpecRe();",
-    "          code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
-    "        }",
-    "        return window.__sfShellSourceToBlob(code);",
-    "      })();",
-    "      return window.__sfShellModuleCache[url];",
-    "    }",
-    "    return load(entryUrl);",
-    "  };",
-    "  window.__sfShellImportUrl = async function(entryUrl){",
-    "    var blobUrl = await window.__sfShellResolveModuleBlob(entryUrl);",
-    "    return import(blobUrl);",
+    "  window.__sfShellReleaseModuleLeases = async function(){",
+    "    var urls = window.__sfShellModuleLeases.splice(0);",
+    "    await Promise.all(urls.map(function(url){ return ask('release_module', { url: url }).catch(function(){}); }));",
     "  };",
     "  window.__sfShellRunInlineModuleFromHost = async function(id, entryUrl){",
-"    var code = await ask('fetch_inline_module', { id: id });",
-"    return window.__sfShellRunInlineModule(code, entryUrl);",
-"  };",
-"  window.__sfShellBindGlobalsPreamble = function(){",
-    "    var nl = String.fromCharCode(10);",
-    "    return [",
-    "      'const __sfG = globalThis;',",
-    "      'const Vue = __sfG.Vue;',",
-    "      'const $ = __sfG.$ || __sfG.jQuery;',",
-    "      'const jQuery = __sfG.jQuery || __sfG.$;',",
-    "      'const _ = __sfG._;',",
-    "      'const getvar = __sfG.getvar;',",
-    "      'const setvar = __sfG.setvar;',",
-    "      'const TavernHelper = __sfG.TavernHelper || __sfG.tavernHelper;',",
-    "      'const tavernHelper = __sfG.tavernHelper || __sfG.TavernHelper;',",
-    "      'const SillyTavern = __sfG.SillyTavern;',",
-    "      'const z = __sfG.z;',",
-    "      'const Zod = __sfG.Zod || __sfG.z;',",
-    "      'const getVariables = __sfG.getVariables;',",
-    "      'const setVariables = __sfG.setVariables;',",
-    "      'const insertOrAssignVariables = __sfG.insertOrAssignVariables;',",
-    "      'const deleteVariable = __sfG.deleteVariable;',",
-    "      'const updateVariablesWith = __sfG.updateVariablesWith;',",
-    "      'const getChatMessages = __sfG.getChatMessages;',",
-    "      'const getLastMessageId = __sfG.getLastMessageId;',",
-    "      'const getCurrentMessageId = __sfG.getCurrentMessageId;',",
-    "      'const triggerSlash = __sfG.triggerSlash;',",
-    "      'const eventOn = __sfG.eventOn;',",
-    "      'const eventEmit = __sfG.eventEmit;',",
-    "      'const substituteParams = __sfG.substituteParams;',",
-    "      'const getScriptId = __sfG.getScriptId;',",
-    "      'const getContext = __sfG.getContext;',",
-    "      'const Mvu = __sfG.Mvu;'",
-    "    ].join(nl) + nl;",
-    "  };",
-    "  window.__sfShellReport = function(kind, detail){",
-    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, type: 'shell_runtime', payload: { kind: kind, detail: String(detail || '') } }, '*'); } catch (e) {}",
-    "  };",
-    "  window.__sfShellRunInlineModule = async function(code, entryUrl){",
+    "    window.__sfShellReport('module_start', entryUrl || '');",
     "    try {",
-    "      window.__sfShellReport('module_start', entryUrl || '');",
-    "      var re = window.__sfShellImportSpecRe();",
-    "      var specs = [];",
-    "      var m;",
-    "      while ((m = re.exec(code)) !== null) {",
-    "        var spec = m[1];",
-    "        if (!spec) continue;",
-    "        if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
+    "      var descriptor = await ask('prepare_inline_module', { id: id, entryUrl: entryUrl });",
+    "      var mod;",
+    "      try { mod = await import(descriptor.url); }",
+    "      catch (importErr) {",
+    "        await Promise.all((descriptor.leases || []).map(function(url){",
+    "          return ask('release_module', { url: url }).catch(function(){});",
+    "        }));",
+    "        throw importErr;",
     "      }",
-    "      var map = Object.create(null);",
-    "      for (var i = 0; i < specs.length; i++) {",
-    "        var sp = specs[i];",
-    "        var abs = sp;",
-    "        if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, entryUrl || 'https://shell.local/inline.js').href; } catch (e) { throw new Error('bad relative import ' + sp); } }",
-    "        map[sp] = await window.__sfShellResolveModuleBlob(abs);",
-    "        if (!map[sp]) throw new Error('dep blob empty: ' + abs);",
-    "      }",
-    "      if (Object.keys(map).length) {",
-    "        re = window.__sfShellImportSpecRe();",
-    "        code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
-    "      }",
-    "      code = window.__sfShellBindGlobalsPreamble() + code;",
-    "      var blobUrl = window.__sfShellSourceToBlob(code);",
-    "      var mod = await import(blobUrl);",
     "      window.__sfShellReport('module_ok', entryUrl || '');",
     "      return mod;",
     "    } catch (err) {",
     "      window.__sfShellReport('module_error', (err && err.message) || err);",
     "      throw err;",
     "    }",
+    "  };",
+    "  window.__sfShellReport = function(kind, detail){",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, type: 'shell_runtime', payload: { kind: kind, detail: String(detail || '') } }, '*'); } catch (e) {}",
     "  };",
 "  function patch$(){",
     "    if (!window.jQuery || window.jQuery.__sfLoadPatched) return !!window.jQuery;",
@@ -698,9 +675,10 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, op
     "        try {",
     "          var zcode = await window.__sfHostFetchText(zodUrls[zi]);",
     "          if (!zcode || zcode.indexOf('prefault') < 0) throw new Error('not zod v4');",
-    "          var zblob = new Blob([zcode], { type: 'text/javascript' });",
-    "          var zurl = URL.createObjectURL(zblob);",
-    "          var zmod = await import(zurl);",
+    "          var zurl = await window.__sfShellSourceToModuleUrl(zcode);",
+    "          var zmod;",
+    "          try { zmod = await import(zurl); }",
+    "          finally { await window.__sfShellReleaseModuleLeases(); }",
     "          var cand = null;",
     "          if (zmod && typeof zmod.object === 'function') cand = zmod;",
     "          else if (zmod && zmod.z && typeof zmod.z.object === 'function') cand = zmod.z;",
@@ -937,6 +915,18 @@ async function onBridgeMessage(ev) {
     }
   }
   try {
+    if (type === 'register_module') {
+      if (typeof payload.source !== 'string') throw new Error('module source must be a string')
+      const url = await registerShellModule(payload.source)
+      activeShellModuleLeases.add(url)
+      reply(url)
+      return
+    }
+    if (type === 'release_module') {
+      activeShellModuleLeases.delete(payload.url)
+      reply(await releaseShellModule(payload.url))
+      return
+    }
     if (type === 'fetch_text') {
       const res = await hostFetch(payload.url)
       if (res.kind !== 'text' || res.body_text == null) {
@@ -994,12 +984,12 @@ async function onBridgeMessage(ev) {
       reply(tree)
       return
     }
-    if (type === 'fetch_inline_module') {
+    if (type === 'prepare_inline_module') {
       const id = payload.id
       // All visible shell hosts receive the same parent-window message. A
       // non-owner must not race the source owner with an error response.
       if (!ownsCardShellInlineModule(inlineModuleSources, id)) return
-      reply(inlineModuleSources.get(id))
+      reply(await prepareInlineCardShellModule(id, payload.entryUrl))
       return
     }
     emit('message', d)

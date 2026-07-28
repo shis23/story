@@ -1,9 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import {
   orderedTavernHelperFromShells,
   parseShellEntry,
   collectVisibleThButtons,
+  analyzeEsmModuleSource,
+  extractBareImportTarget,
+  fetchClassicScriptSource,
 } from '../src/utils/tavernHelperScripts.js'
 
 test('parseShellEntry handles serde externally tagged remote_url', () => {
@@ -108,4 +112,92 @@ test('deferred inline_js without body is kept', () => {
   assert.equal(ordered.length, 1)
   assert.equal(ordered[0].deferred, true)
   assert.equal(ordered[0].js, '')
+})
+
+test('extractBareImportTarget only unwraps a single side-effect import', () => {
+  assert.equal(
+    extractBareImportTarget(
+      " \ufeff import 'https://cdn.example.test/card-script.js';\r\n",
+    ),
+    'https://cdn.example.test/card-script.js',
+  )
+  assert.equal(
+    extractBareImportTarget(
+      "import thing from 'https://cdn.example.test/module.js';",
+    ),
+    null,
+  )
+  assert.equal(
+    extractBareImportTarget(
+      "import 'https://cdn.example.test/one.js';\nwindow.ready = true;",
+    ),
+    null,
+  )
+})
+
+test('fetchClassicScriptSource follows an import-only wrapper and returns classic code', async () => {
+  const calls = []
+  const source = await fetchClassicScriptSource(
+    'https://cards.example.test/wrapper.js',
+    async (url) => {
+      calls.push(url)
+      if (url.endsWith('/wrapper.js')) return "import './bundle.js'"
+      return 'window.cardScriptReady = true;'
+    },
+  )
+
+  assert.deepEqual(calls, [
+    'https://cards.example.test/wrapper.js',
+    'https://cards.example.test/bundle.js',
+  ])
+  assert.equal(source, 'window.cardScriptReady = true;')
+})
+
+test('fetchClassicScriptSource rejects wrapper cycles', async () => {
+  await assert.rejects(
+    fetchClassicScriptSource(
+      'https://cards.example.test/a.js',
+      async (url) =>
+        url.endsWith('/a.js') ? "import './b.js'" : "import './a.js'",
+    ),
+    /cycle/,
+  )
+})
+
+test('ES module scanner recognizes minified and conventional imports', async () => {
+  const source = [
+    "import{registerMvuSchema as r}from'https://cdn.example.test/mvu.js';",
+    'export{value as default}from"./value.js";',
+    "import 'https://cdn.example.test/side-effect.js';",
+    'const lazy = import("./lazy.js");',
+  ].join('')
+  const analysis = await analyzeEsmModuleSource(source)
+
+  assert.deepEqual(analysis.imports.map((item) => item.specifier), [
+    'https://cdn.example.test/mvu.js',
+    './value.js',
+    'https://cdn.example.test/side-effect.js',
+    './lazy.js',
+  ])
+  assert.equal(analysis.isModule, true)
+  assert.equal(
+    (await analyzeEsmModuleSource('window.cardScriptReady = true;')).isModule,
+    false,
+  )
+  assert.equal(
+    analyzeEsmModuleSource('const load = () => import("./lazy.js");').isModule,
+    true,
+  )
+})
+
+test('TavernHelper classifies remote card entries before execution', () => {
+  const source = fs.readFileSync(
+    new URL('../src/components/TavernHelperRuntime.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(source, /ask\('prepare_remote_script', \{ url: url \}\)/)
+  assert.match(source, /window\.__sfThRunRemoteUrl\(item\.url\)/)
+  assert.match(source, /descriptor\.module/)
+  assert.doesNotMatch(source, /window\.__sfThImportUrl\(item\.url\)/)
 })

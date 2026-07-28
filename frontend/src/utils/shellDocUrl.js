@@ -68,6 +68,25 @@ export async function registerShellDoc(html) {
   return `${SHELL_DOC_ORIGIN}/${token}`
 }
 
+/**
+ * Register JavaScript for lease-scoped loading by an opaque-origin shell.
+ *
+ * The host serves the source with a JavaScript MIME type and CORS on the
+ * restricted shell protocol, avoiding both blob:null and oversized data URLs.
+ */
+export async function registerShellModule(source) {
+  if (!_invoke) {
+    throw new Error(
+      'registerShellModule: Tauri invoke not configured (call configureShellDocInvoke)',
+    )
+  }
+  const token = await _invoke('card_shell_register_module', { source })
+  if (typeof token !== 'string' || !TOKEN_RE.test(token)) {
+    throw new Error('registerShellModule: invalid shell module token returned by host')
+  }
+  return shellModuleUrlForToken(token)
+}
+
 export function shellDocTokenFromUrl(url) {
   if (typeof url !== 'string') return null
   const prefix = `${SHELL_DOC_ORIGIN}/`
@@ -86,6 +105,21 @@ export async function releaseShellDoc(url) {
   return Boolean(await _invoke('card_shell_unregister_doc', { token }))
 }
 
+export function shellModuleTokenFromUrl(url) {
+  if (typeof url !== 'string') return null
+  const prefix = `${SHELL_DOC_ORIGIN}/module/`
+  if (!url.startsWith(prefix)) return null
+  const token = url.slice(prefix.length)
+  return TOKEN_RE.test(token) ? token : null
+}
+
+/** Release a module lease after its shell is replaced or unmounted. */
+export async function releaseShellModule(url) {
+  const token = shellModuleTokenFromUrl(url)
+  if (!_invoke || !token) return false
+  return Boolean(await _invoke('card_shell_unregister_doc', { token }))
+}
+
 /**
  * Test/fixture helper: build a URL for a pre-known token without IPC. Used by
  * the Playwright CSP-behavior tests (which mock the protocol via page.route,
@@ -96,4 +130,11 @@ export function shellDocUrlForToken(token) {
     throw new Error('shellDocUrlForToken: invalid shell document token')
   }
   return `${SHELL_DOC_ORIGIN}/${token}`
+}
+
+export function shellModuleUrlForToken(token) {
+  if (!TOKEN_RE.test(String(token || ''))) {
+    throw new Error('shellModuleUrlForToken: invalid shell module token')
+  }
+  return `${SHELL_DOC_ORIGIN}/module/${token}`
 }
