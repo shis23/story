@@ -68,6 +68,12 @@ jobs:
       - name: Install Linux Tauri / WebKit system deps
         run: |
           set -euo pipefail
+          for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            [ -f "$sources_file" ] || continue
+            sudo sed -i -E \
+              's|https?://(archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?|https://mirrors.cloud.tencent.com/ubuntu/|g' \
+              "$sources_file"
+          done
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           for attempt in 1 2 3; do
             if sudo env DEBIAN_FRONTEND=noninteractive apt-get \
@@ -141,6 +147,12 @@ jobs:
       - name: Install Linux Tauri / WebKit system deps
         run: |
           set -euo pipefail
+          for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            [ -f "$sources_file" ] || continue
+            sudo sed -i -E \
+              's|https?://(archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?|https://mirrors.cloud.tencent.com/ubuntu/|g' \
+              "$sources_file"
+          done
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           for attempt in 1 2 3; do
             if sudo env DEBIAN_FRONTEND=noninteractive apt-get \

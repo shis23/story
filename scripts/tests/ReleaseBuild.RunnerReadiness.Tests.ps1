@@ -1385,6 +1385,8 @@ Describe 'Release workflow static governance (runner readiness)' {
         ([regex]::Matches($ci, 'for attempt in 1 2 3')).Count | Should Be 2
         ([regex]::Matches($ci, 'Acquire::Retries=3')).Count | Should Be 4
         ([regex]::Matches($ci, 'retrying with cached archives')).Count | Should Be 2
+        ([regex]::Matches($ci, 'mirrors\.cloud\.tencent\.com/ubuntu')).Count | Should Be 2
+        ([regex]::Matches($ci, '/etc/apt/sources\.list\.d/ubuntu\.sources')).Count | Should Be 2
         # The PyYAML/parser-backed Windows jobs are NOT in ci-gates.yml anymore.
         $ci | Should Not Match 'PyYAML==6\.0\.2'
         $ci | Should Not Match 'Test-ReleaseWorkflowSyntax'
