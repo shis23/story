@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**进行中（Gate 1 writing/conversations 子批、删除一致性返修已完成；Gate 1 总体和 SQLite 迁移仍未收口）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> code-under-test：`main@d552344`。
+> 状态：**进行中（Gate 1 已通过；Gate 2–8 backend facade、SQLite 迁移与平台验收仍在进行）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> code-under-test：`main@bf9bff1`。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
@@ -28,7 +28,7 @@
 
 以起草基线实测：
 
-- `crates/tauri-app/src/lib.rs`：约 **16,365 行**（Gate 1 Turn 子批后的实时基线）。
+- `crates/tauri-app/src/lib.rs`：**2,455 行**（`scripts/architecture/backend-baseline.mjs` 实时基线）。
 - `#[tauri::command]`：**175 个**，由 `src/**/*.rs` 基线脚本统一统计；注册命令也是 175 个。
 - `is_sqlite_active()`：**68 处**，以 Gate 0/1 基线脚本对整个 `src/**/*.rs` 实时计算为准。
 - JSON 与 SQLite 的部分业务决策仍在命令层分别实现。
@@ -610,7 +610,7 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - Gate 1 writing 主链机械拆分已完成：新增 `crates/tauri-app/src/commands/writing.rs`，包含 start_writing、prompt hook、quality autofix、后处理归一化与 cancel_writing。
 - 当前 `lib.rs` 为 14,721 行；命令属性/注册数为 175/175，前端唯一 invoke 162，缺失后端命令 0。
 - 通过条件：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）和前端合同测试。
-- Gate 1 尚未整体通过：仍需 bootstrap/AppState/注册与 inline tests 的收敛；Gate 2 状态机、Gate 3 backend facade、SQLite 能力补齐与迁移切换均未开始收口。
+- 检查点结论（当时）：Writing 子批通过；随后已完成 bootstrap/AppState/注册边界与 inline tests 收敛，Gate 1 总体验收见第 21 节。
 ## 19. 2026-07-28 Conversations 子批检查点
 
 - 新增 `crates/tauri-app/src/commands/conversations.rs`，迁移会话列表、删除、活动级联删除、详情 DTO、展示正则和归档入口前的会话展示辅助。
@@ -625,3 +625,11 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 活跃 Campaign 切换与删除共用 `AppState.active_campaign_update` 串行锁；切换的校验、指针写盘和内存提交，以及删除的读取、清空/恢复指针和最终提交均处于同一更新临界区。
 - 新增成功、失败两类 Barrier 竞态测试，确认并发切换不会被旧 Campaign 删除路径覆盖，删除失败也不会回滚新选择。
 - 本检查点不代表 SQLite 事务、backend facade、迁移切换或 Gate 2–8 已完成。
+
+## 21. Gate 1 总体验收检查点（2026-07-28）
+
+- code-under-test：`main@bf9bff1`。
+- `lib.rs` 当前 **2,455 行**；根模块仅保留 bootstrap、`AppState` 组装、命令注册和跨域接线，具体命令实现、运行时辅助、启动恢复与根测试已拆入独立模块。
+- 合同门禁：Tauri command 属性/注册 **175/175**，前端唯一 invoke **162**，缺失后端命令 **0**；`lib.rs` 不含 `#[tauri::command]`。
+- 验证通过：`cargo fmt --all -- --check`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --no-default-features`、`node --test frontend/tests/tauri-command-contract.test.mjs`（5/5）。
+- Gate 2 状态机、Gate 3 backend facade、Gate 4–8 SQLite 能力补齐、迁移/恢复、平台证据、默认切换和发布封存仍未完成。

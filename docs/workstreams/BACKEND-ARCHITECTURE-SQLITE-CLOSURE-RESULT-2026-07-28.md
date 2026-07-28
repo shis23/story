@@ -1,7 +1,7 @@
-# 后端架构拆分与 SQLite 收口：Gate 1 子批结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：Gate 1 总体验收结果（2026-07-28）
 
-> 状态：**PASS（Gate 1 已完成子批与返修）**。本结果记录 Gate 0 保护网及已完成的命令拆分子批；Gate 1 总体、backend facade 和 SQLite 彻底迁移仍未完成。
-> code-under-test：`main@d552344`。
+> 状态：**Gate 1 PASS**。根模块已完成机械拆分、测试外置与命令合同收口；Gate 2–8（backend facade、SQLite 迁移与平台验收）仍在进行。
+> code-under-test：`main@bf9bff1`。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
@@ -18,7 +18,7 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | workspace crate | 16 |
-| `lib.rs` 行数 | 16,365（脚本按源码换行计数） |
+| `lib.rs` 行数 | 2,455（脚本按源码换行计数） |
 | `#[tauri::command]` 属性（`src/**/*.rs`） | 175 |
 | `generate_handler!` 注册命令（去重） | 175 |
 | `frontend/src/tauri-api.js` unique invoke | 162 |
@@ -234,5 +234,11 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - 世界书写入、Campaign 存在性检查和删除使用一致的 world-info → campaigns 锁顺序；新增 Barrier 并发测试验证删除后不会留下孤立世界书。
 - 活跃指针持久化失败会返回错误；启动阶段会丢弃指向不存在 Campaign 的旧指针；公开生命周期入口通过真实 `ConversationPersistence` 失败替身验证失败后重试。
 - 活跃 Campaign 切换与删除共用 `AppState.active_campaign_update` 串行锁，覆盖切换校验/指针写盘/内存提交与删除读取/清空或恢复指针/最终提交；新增成功、失败两类 Barrier 竞态测试。
-- 当前 `lib.rs` 为 14,045 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
-- 返修验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --lib --no-default-features`（351 passed, 3 ignored）、默认特性 `cargo test -p storyforge --lib`（351 passed, 3 ignored）、前端合同测试 3/3 和 `git diff --check`，均通过。
+- 当前 `lib.rs` 为 **2,455 行**；`#[tauri::command]`/注册 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
+- 返修验证：`cargo fmt --all -- --check`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --lib --no-default-features`（351 passed, 3 ignored）、默认特性 `cargo test -p storyforge --lib`（351 passed, 3 ignored）、前端合同测试 5/5 和 `git diff --check`，均通过。
+
+## 19. Gate 1 总体验收（bf9bff1）
+
+- 根模块已完成机械拆分、测试外置与命令合同收口；运行时辅助、启动恢复、重 roll DTO/校验和根测试已分别移入独立模块。
+- Gate 1 合同测试：命令属性 175、注册 175、前端 invoke 162、缺失后端命令 0；`lib.rs` 2,455 行且无 `#[tauri::command]`。
+- 未宣称完成：Gate 2 状态机、Gate 3 backend facade、SQLite 全量迁移/默认切换、Windows/Android 真机验收与发布封存。
