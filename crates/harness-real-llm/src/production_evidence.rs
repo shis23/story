@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
 use storyforge_domain::chronicle::ContextWindowParams;
+use tokio::time::Instant as TokioInstant;
 
 use crate::HarnessEnv;
 use crate::budget::BudgetedLlmClient;
@@ -506,7 +507,7 @@ pub async fn run_production_evidence_loop<W: ProductionTurnWriter>(
 }
 
 struct SuiteDeadline {
-    started: Instant,
+    started: TokioInstant,
     duration: Duration,
 }
 
@@ -618,7 +619,7 @@ pub async fn run_production_evidence_loop_with_hook<
             .saturating_mul(u64::from(remaining_calls)),
     );
     let deadline = SuiteDeadline {
-        started: Instant::now(),
+        started: TokioInstant::now(),
         duration: cfg.hard_deadline.unwrap_or(default_deadline),
     };
     deadline.check()?;
