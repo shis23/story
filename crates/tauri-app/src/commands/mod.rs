@@ -6,3 +6,4 @@ pub(crate) mod diagnostics;
 pub(crate) mod import_export;
 pub(crate) mod plugins;
 pub(crate) mod presets;
+pub(crate) mod world_info;
