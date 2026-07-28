@@ -422,6 +422,10 @@ impl CampaignStore {
 
     pub fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
         self.ensure_json_write_allowed()?;
+        // World-info reads/writes and Campaign deletion use the same outer lock.
+        // The lock is acquired before checking Campaign existence so a writer
+        // cannot pass that check and recreate a file after deletion.
+        let mut world_info = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
@@ -462,19 +466,30 @@ impl CampaignStore {
         // Persist all JSON files before mutating any in-memory cache. If a later
         // file fails, restore every file already written so deletion remains
         // retryable instead of leaving a half-deleted aggregate.
-        let original_campaigns_file = self.campaigns_path.is_file();
-        let original_instances_file = self.instances_path.is_file();
-        let original_knowledge_file = self.knowledge_path.is_file();
-        let original_tasks_file = self.tasks_path.is_file();
-        let original_summaries_file = self.summaries_path.is_file();
+        let original_campaigns_file = snapshot_path(&self.campaigns_path)?;
+        let original_instances_file = snapshot_path(&self.instances_path)?;
+        let original_knowledge_file = snapshot_path(&self.knowledge_path)?;
+        let original_tasks_file = snapshot_path(&self.tasks_path)?;
+        let original_summaries_file = snapshot_path(&self.summaries_path)?;
+        for (path, snapshot) in [
+            (&self.campaigns_path, original_campaigns_file),
+            (&self.instances_path, original_instances_file),
+            (&self.knowledge_path, original_knowledge_file),
+            (&self.tasks_path, original_tasks_file),
+            (&self.summaries_path, original_summaries_file),
+        ] {
+            ensure_regular_or_missing(path, snapshot)?;
+        }
         let world_info_path = self.world_info_path(id);
-        let original_world_info = if world_info_path.is_file() {
-            Some(
+        let original_world_info_file = snapshot_path(&world_info_path)?;
+        ensure_regular_or_missing(&world_info_path, original_world_info_file)?;
+        let original_world_info = match original_world_info_file {
+            PathSnapshot::RegularFile => Some(
                 std::fs::read_to_string(&world_info_path)
                     .map_err(|error| format!("读取本局世界书以备删除回滚失败: {error}"))?,
-            )
-        } else {
-            None
+            ),
+            PathSnapshot::Missing => None,
+            PathSnapshot::Other => unreachable!("validated above"),
         };
 
         let write_result = (|| {
@@ -483,15 +498,25 @@ impl CampaignStore {
             persist(&self.knowledge_path, &next_knowledge)?;
             persist(&self.tasks_path, &next_tasks)?;
             persist(&self.summaries_path, &next_summaries)?;
-            if world_info_path.exists() {
-                if !world_info_path.is_file() {
+            match snapshot_path(&world_info_path)? {
+                current if current == original_world_info_file => {
+                    if current == PathSnapshot::RegularFile {
+                        std::fs::remove_file(&world_info_path)
+                            .map_err(|error| format!("删除本局世界书失败: {error}"))?;
+                    }
+                }
+                PathSnapshot::Other => {
                     return Err(format!(
                         "本局世界书路径不是普通文件，拒绝删除: {}",
                         world_info_path.display()
                     ));
                 }
-                std::fs::remove_file(&world_info_path)
-                    .map_err(|error| format!("删除本局世界书失败: {error}"))?;
+                current => {
+                    return Err(format!(
+                        "本局世界书路径在删除期间发生变化 ({current:?}): {}",
+                        world_info_path.display()
+                    ));
+                }
             }
             Ok::<(), String>(())
         })();
@@ -510,16 +535,11 @@ impl CampaignStore {
             restore!(&self.knowledge_path, original_knowledge_file, &knowledge);
             restore!(&self.tasks_path, original_tasks_file, &tasks);
             restore!(&self.summaries_path, original_summaries_file, &summaries);
-            if let Some(raw) = original_world_info {
-                if let Err(rollback_error) =
-                    storyforge_infra_util::atomic_write_json_str(&world_info_path, &raw)
-                {
-                    rollback_errors.push(format!(
-                        "恢复本局世界书失败 {}: {rollback_error}",
-                        world_info_path.display()
-                    ));
-                }
-            } else if let Err(rollback_error) = remove_path_if_present(&world_info_path) {
+            if let Err(rollback_error) = restore_world_info_file(
+                &world_info_path,
+                original_world_info_file,
+                original_world_info.as_deref(),
+            ) {
                 rollback_errors.push(rollback_error);
             }
 
@@ -538,10 +558,7 @@ impl CampaignStore {
         *knowledge = next_knowledge;
         *tasks = next_tasks;
         *summaries = next_summaries;
-        self.world_info
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(id.as_str());
+        world_info.remove(id.as_str());
 
         Ok(true)
     }
@@ -575,12 +592,12 @@ impl CampaignStore {
         F: FnOnce(&mut WorldInfoBook) -> Result<T, String>,
     {
         self.ensure_json_write_allowed()?;
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         if self.get_campaign(campaign_id).is_none() {
             return Err(format!("campaign not found: {}", campaign_id.as_str()));
         }
         let _ = std::fs::create_dir_all(&self.world_info_dir);
         let path = self.world_info_path(campaign_id);
-        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         let mut book = match map.get(campaign_id.as_str()) {
             Some(book) => book.clone(),
             None => self.read_world_info_file(campaign_id)?,
@@ -611,12 +628,12 @@ impl CampaignStore {
     /// 整本替换本局世界书并落盘。
     pub fn set_world_info(&self, campaign_id: &Id, book: WorldInfoBook) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         if self.get_campaign(campaign_id).is_none() {
             return Err(format!("campaign not found: {}", campaign_id.as_str()));
         }
         let _ = std::fs::create_dir_all(&self.world_info_dir);
         let path = self.world_info_path(campaign_id);
-        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         storyforge_infra_util::atomic_write_json(&path, &book)
             .map_err(|e| format!("persist campaign world_info failed: {e}"))?;
         map.insert(campaign_id.as_str().to_string(), book);
@@ -1304,27 +1321,71 @@ pub(crate) fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<()
     })
 }
 
-fn restore_json_file<T: serde::Serialize>(
-    path: &Path,
-    existed: bool,
-    data: &[T],
-) -> Result<(), String> {
-    if existed {
-        persist(path, data)
-    } else {
-        remove_path_if_present(path)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathSnapshot {
+    Missing,
+    RegularFile,
+    Other,
+}
+
+fn snapshot_path(path: &Path) -> Result<PathSnapshot, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(PathSnapshot::RegularFile),
+        Ok(_) => Ok(PathSnapshot::Other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PathSnapshot::Missing),
+        Err(error) => Err(format!("读取路径状态失败 {}: {error}", path.display())),
     }
 }
 
-fn remove_path_if_present(path: &Path) -> Result<(), String> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-            .map_err(|error| format!("删除回滚路径失败 {}: {error}", path.display()))
-    } else if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|error| format!("删除回滚文件失败 {}: {error}", path.display()))
-    } else {
-        Ok(())
+fn ensure_regular_or_missing(path: &Path, snapshot: PathSnapshot) -> Result<(), String> {
+    if snapshot == PathSnapshot::Other {
+        return Err(format!("路径不是普通文件，拒绝删除: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn restore_json_file<T: serde::Serialize>(
+    path: &Path,
+    snapshot: PathSnapshot,
+    data: &[T],
+) -> Result<(), String> {
+    match snapshot {
+        PathSnapshot::RegularFile => persist(path, data),
+        PathSnapshot::Missing => remove_created_file_if_present(path),
+        PathSnapshot::Other => Err(format!(
+            "拒绝回滚原本为非普通文件的路径: {}",
+            path.display()
+        )),
+    }
+}
+
+fn restore_world_info_file(
+    path: &Path,
+    snapshot: PathSnapshot,
+    raw: Option<&str>,
+) -> Result<(), String> {
+    match (snapshot, raw) {
+        (PathSnapshot::RegularFile, Some(raw)) => {
+            storyforge_infra_util::atomic_write_json_str(path, raw)
+                .map_err(|error| format!("恢复本局世界书失败 {}: {error}", path.display()))
+        }
+        (PathSnapshot::Missing, None) => remove_created_file_if_present(path),
+        (PathSnapshot::Other, _) => Err(format!(
+            "拒绝回滚原本为非普通文件的路径: {}",
+            path.display()
+        )),
+        _ => Err(format!("本局世界书原始快照不一致: {}", path.display())),
+    }
+}
+
+/// Roll back only a regular file created by this operation. Never recurse into
+/// a directory or follow a symlink that appeared after the snapshot.
+fn remove_created_file_if_present(path: &Path) -> Result<(), String> {
+    match snapshot_path(path)? {
+        PathSnapshot::Missing => Ok(()),
+        PathSnapshot::RegularFile => std::fs::remove_file(path)
+            .map_err(|error| format!("删除回滚文件失败 {}: {error}", path.display())),
+        PathSnapshot::Other => Err(format!("回滚拒绝删除非普通文件路径: {}", path.display())),
     }
 }
 
@@ -1536,13 +1597,16 @@ mod tests {
         let instance = CharacterInstance::temporary(campaign_id.clone(), "Lin");
         store.add_instance(instance.clone()).unwrap();
 
-        // A directory at the target path makes the knowledge write fail after
-        // campaigns and instances have already been persisted.
+        // A pre-existing directory at the target path must be treated as an
+        // unsupported path, never as a missing file that rollback may remove.
         std::fs::create_dir(&store.knowledge_path).unwrap();
+        let sentinel = store.knowledge_path.join("must-survive.txt");
+        std::fs::write(&sentinel, b"pre-existing directory").unwrap();
         let error = store
             .delete_campaign(&campaign_id)
             .expect_err("cascade write failure should be surfaced");
-        assert!(error.contains("持久化失败"));
+        assert!(error.contains("不是普通文件"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"pre-existing directory");
         assert!(store.get_campaign(&campaign_id).is_some());
         assert_eq!(store.list_instances(&campaign_id).len(), 1);
 
@@ -1619,6 +1683,71 @@ mod tests {
         assert!(persisted.entries.iter().all(|entry| entry.disabled));
 
         drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn campaign_delete_serializes_with_world_info_write_and_leaves_no_orphan() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use storyforge_domain::world_info::{LoreRoute, WorldInfoEntry};
+
+        let dir = temp_dir();
+        let store = Arc::new(CampaignStore::new(&dir));
+        store.save_card(make_card()).unwrap();
+        let campaign = Campaign::new(Id::from_str("card-1"), "world-info-delete-race");
+        let campaign_id = campaign.id.clone();
+        store.create_campaign_with_instances(campaign).unwrap();
+
+        let write_entered = Arc::new(Barrier::new(2));
+        let release_write = Arc::new(Barrier::new(2));
+        let writer_store = Arc::clone(&store);
+        let writer_id = campaign_id.clone();
+        let writer_entered = Arc::clone(&write_entered);
+        let writer_release = Arc::clone(&release_write);
+        let writer = thread::spawn(move || {
+            writer_store
+                .mutate_world_info(&writer_id, |book| {
+                    writer_entered.wait();
+                    writer_release.wait();
+                    book.entries.push(WorldInfoEntry {
+                        st_id: None,
+                        keys: vec!["race".into()],
+                        secondary_keys: vec![],
+                        content: "must not survive deletion".into(),
+                        constant: false,
+                        selective: true,
+                        selective_logic: Default::default(),
+                        disabled: false,
+                        position: 0,
+                        depth: 2,
+                        order: 100,
+                        route: LoreRoute::Selective,
+                        extensions: serde_json::json!({}),
+                        extra: Default::default(),
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        write_entered.wait();
+        let delete_store = Arc::clone(&store);
+        let delete_id = campaign_id.clone();
+        let delete = thread::spawn(move || delete_store.delete_campaign(&delete_id));
+        release_write.wait();
+
+        writer.join().unwrap();
+        assert!(delete.join().unwrap().unwrap());
+        assert!(!store.world_info_path(&campaign_id).exists());
+        assert!(
+            store
+                .get_world_info(&campaign_id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

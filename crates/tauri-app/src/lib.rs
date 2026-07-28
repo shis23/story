@@ -579,6 +579,7 @@ fn load_active_campaign(data_dir: &Path) -> Option<Id> {
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     v.get("campaign_id")
         .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
         .map(Id::from_str)
 }
 
@@ -599,15 +600,40 @@ fn resolve_active_campaign_with_legacy_fallback(
 }
 
 fn load_active_campaign_for_backend(data_dir: &Path) -> Option<Id> {
-    resolve_active_campaign_with_legacy_fallback(None, data_dir, sqlite_runtime::is_sqlite_active())
+    let sqlite_active = sqlite_runtime::is_sqlite_active();
+    let active_id = resolve_active_campaign_with_legacy_fallback(None, data_dir, sqlite_active);
+    if sqlite_active {
+        return active_id;
+    }
+    let active_id = active_id?;
+    if campaign_exists_on_disk(data_dir, &active_id) {
+        Some(active_id)
+    } else {
+        tracing::warn!(
+            campaign_id = active_id.as_str(),
+            "启动时丢弃指向不存在 Campaign 的活跃指针"
+        );
+        None
+    }
 }
 
-fn save_active_campaign(data_dir: &Path, id: Option<&Id>) {
+fn campaign_exists_on_disk(data_dir: &Path, id: &Id) -> bool {
+    let path = data_dir.join("campaigns.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(campaigns) = serde_json::from_str::<Vec<storyforge_domain::campaign::Campaign>>(&raw)
+    else {
+        return false;
+    };
+    campaigns.iter().any(|campaign| campaign.id == *id)
+}
+
+fn save_active_campaign(data_dir: &Path, id: Option<&Id>) -> Result<(), String> {
     let path = data_dir.join("active_campaign.json");
     let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
-    if let Err(e) = storyforge_infra_util::atomic_write_json(&path, &v) {
-        tracing::error!("保存活跃 Campaign 失败: {e}");
-    }
+    storyforge_infra_util::atomic_write_json(&path, &v)
+        .map_err(|error| format!("保存活跃 Campaign 失败: {error}"))
 }
 
 // ─── AppState（M1 新增，注入到 Tauri managed state）─────────────────────────
@@ -7121,6 +7147,7 @@ mod tests {
         }];
 
         let instances_path = dir.join("instances.json");
+        let instances_sentinel = instances_path.join("pre-existing-after-baseline.txt");
         let error = import_campaign_bundle_into_store_with_after_campaign(
             &store,
             &conv_store,
@@ -7141,6 +7168,9 @@ mod tests {
                 std::fs::create_dir_all(&instances_path).map_err(|error| {
                     TauriCommandError::storage(format!("inject rollback fault: {error}"))
                 })?;
+                std::fs::write(&instances_sentinel, b"must survive").map_err(|error| {
+                    TauriCommandError::storage(format!("inject sentinel fault: {error}"))
+                })?;
                 Ok(())
             },
         )
@@ -7150,8 +7180,10 @@ mod tests {
             other => panic!("expected storage error, got {other:?}"),
         };
         assert!(
-            message.contains("导入角色实例失败") && !message.contains("回滚未完全验证"),
-            "rollback verification should preserve the original import error after compensation: {message}"
+            message.contains("回滚未完全验证")
+                && message.contains("strict disk read failed")
+                && message.contains("instances.json"),
+            "rollback verification must report the preserved non-file path: {message}"
         );
 
         // Reload store from disk — in-memory empty is not enough.
@@ -7168,6 +7200,7 @@ mod tests {
             reloaded.list_all_instances().is_empty(),
             "rollback must clear instances on disk"
         );
+        assert_eq!(std::fs::read(&instances_sentinel).unwrap(), b"must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13852,6 +13885,39 @@ mod tests {
             Some(Id::from_str("stale-json-campaign")),
             "JSON mode preserves its legacy restart behavior"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn startup_discards_active_pointer_for_missing_campaign() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-active-pointer-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("active_campaign.json"),
+            r#"{"campaign_id":"missing-campaign"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("campaigns.json"), "[]").unwrap();
+
+        assert_eq!(load_active_campaign_for_backend(&dir), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_active_campaign_reports_persistence_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-active-pointer-write-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("active_campaign.json")).unwrap();
+
+        let error = save_active_campaign(&dir, Some(&Id::from_str("campaign")))
+            .expect_err("directory collision must not be silently ignored");
+        assert!(!error.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

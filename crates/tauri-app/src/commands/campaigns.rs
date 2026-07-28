@@ -631,12 +631,16 @@ pub(crate) fn set_active_campaign(
             "找不到 campaign id={id}"
         )));
     }
+    let json_active = !sqlite_runtime::is_sqlite_active();
+    if json_active {
+        save_active_campaign(&state.data_dir, Some(&campaign_id))
+            .map_err(TauriCommandError::storage)?;
+    }
     *state
         .active_campaign
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
-    if !sqlite_runtime::is_sqlite_active() {
-        save_active_campaign(&state.data_dir, Some(&campaign_id));
+    if json_active {
         // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书
         let store = get_campaign_store();
         if let Ok(mut book) = store.get_world_info(&campaign_id) {
