@@ -25,10 +25,26 @@ pub mod turn_lifecycle;
 pub mod turn_store;
 
 use commands::{
-    campaigns::*, card_shell::*, cards::*, characters::*, connections::*, conversations::*,
-    diagnostics::*, import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*,
-    presets::*, profiles::*, turns::*, variables::*, world_info::*, writing::*,
-    writing_regenerate::*,
+    campaigns::*,
+    card_shell::*,
+    cards::*,
+    characters::*,
+    connections::*,
+    conversations::*,
+    diagnostics::*,
+    import_export::*,
+    memory::*,
+    meta::*,
+    meta_typed::*,
+    mvu::*,
+    plugins::*,
+    presets::*,
+    profiles::*,
+    turns::*,
+    variables::*,
+    world_info::*,
+    writing::*,
+    writing_regenerate::{parse_target_dto, validate_regenerate_campaign_scope},
 };
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
@@ -76,6 +92,7 @@ use tauri::Manager;
 
 use crate::error::TauriCommandError;
 use crate::mvu_webview_runtime::{MvuPendingMap, WebViewMvuRuntime, new_mvu_pending_map};
+pub use commands::writing_regenerate::{RegenerateRequestDto, RegenerateTargetDto};
 pub(crate) use startup_support::*;
 
 type PromptHookPendingMap =

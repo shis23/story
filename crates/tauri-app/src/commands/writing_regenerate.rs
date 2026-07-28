@@ -6,14 +6,14 @@ use storyforge_domain::conversation::Conversation;
 use crate::error::TauriCommandError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RegenerateTargetDto {
+pub struct RegenerateTargetDto {
     /// "director" / "editor" / "subagent:<角色名>"
     pub kind: String,
 }
 
 /// 重 roll 请求 DTO
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RegenerateRequestDto {
+pub struct RegenerateRequestDto {
     pub conversation_id: String,
     pub node_id: String,
     /// 目标列表（空 = 整体重 roll）
