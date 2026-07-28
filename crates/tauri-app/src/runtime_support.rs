@@ -101,7 +101,9 @@ pub(crate) async fn run_shared_postprocess_background(
             if let Some(reason) = result.skipped_reason.as_deref() {
                 tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
                 if reason == "cancelled" {
-                    let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                    // 取消不是失败：发 PostProcessSkipped（前端置 idle），
+                    // 不再误发 PostProcessFailed（前端会显示「后处理失败」错误态）。
+                    let _ = event_tx.send(PipelineEvent::PostProcessSkipped {
                         reason: "postprocess cancelled".into(),
                     });
                 }
