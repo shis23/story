@@ -8,6 +8,19 @@ function readUtf8(filePath) {
   return fs.readFileSync(filePath, 'utf8')
 }
 
+function listRustSources(root) {
+  const sources = []
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) visit(entryPath)
+      else if (entry.isFile() && entry.name.endsWith('.rs')) sources.push(entryPath)
+    }
+  }
+  visit(root)
+  return sources.sort()
+}
+
 export function extractRegisteredCommands(source) {
   const match = source.match(/tauri::generate_handler!\[([\s\S]*?)\]\s*\)\s*\.run/)
   if (!match) throw new Error('tauri::generate_handler! registration block not found')
@@ -50,16 +63,19 @@ export function extractSqliteReferences(source) {
 
 export function collectBaseline(repoRoot = REPO_ROOT) {
   const libPath = path.join(repoRoot, 'crates', 'tauri-app', 'src', 'lib.rs')
+  const backendSourceRoot = path.join(repoRoot, 'crates', 'tauri-app', 'src')
   const apiPath = path.join(repoRoot, 'frontend', 'src', 'tauri-api.js')
   const cargoPath = path.join(repoRoot, 'Cargo.toml')
   const libSource = readUtf8(libPath)
+  const backendSources = listRustSources(backendSourceRoot).map((filePath) => readUtf8(filePath))
+  const backendSource = backendSources.join('\n')
   const apiSource = readUtf8(apiPath)
   const cargoSource = readUtf8(cargoPath)
   const registered = extractRegisteredCommands(libSource)
   const frontend = extractFrontendInvokes(apiSource)
   const registeredSet = new Set(registered)
   const frontendSet = new Set(frontend)
-  const sqlite = extractSqliteReferences(libSource)
+  const sqlite = extractSqliteReferences(backendSource)
   const crates = [...cargoSource.matchAll(/^\s*"(crates\/[^"\r\n]+)"\s*,?\s*$/gm)].map(
     (match) => match[1],
   )
@@ -67,12 +83,12 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   return {
     generatedAt: new Date().toISOString(),
     files: {
-      backend: 'crates/tauri-app/src/lib.rs',
+      backend: 'crates/tauri-app/src/**/*.rs',
       frontendApi: 'frontend/src/tauri-api.js',
     },
     backend: {
       libLines: libSource.split(/\r?\n/).length,
-      commandAttributes: extractCommandAttributes(libSource),
+      commandAttributes: extractCommandAttributes(backendSource),
       registeredCommandCount: registeredSet.size,
       duplicateRegisteredCommands: [...new Set(registered.filter((name, index) => registered.indexOf(name) !== index))].sort(),
       registeredCommands: [...registeredSet].sort(),

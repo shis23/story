@@ -1,6 +1,6 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**Gate 0 已完成；Gate 1 待执行**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> 状态：**Gate 0 已完成；Gate 1 第一批完成，后续批次待执行**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
 > 起草基线：`main@2832030`。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
@@ -27,9 +27,9 @@
 
 以起草基线实测：
 
-- `crates/tauri-app/src/lib.rs`：约 **23,781 行**（Gate 0 注入测试存储后的实时基线）。
-- `#[tauri::command]`：约 **156 个**，仍集中在 `lib.rs`。
-- `is_sqlite_active()`：**67 处**，以 Gate 0 基线脚本实时计算为准。
+- `crates/tauri-app/src/lib.rs`：约 **22,610 行**（Gate 1 第一批拆分后的实时基线）。
+- `#[tauri::command]`：**175 个**，由 `src/**/*.rs` 基线脚本统一统计；注册命令也是 175 个。
+- `is_sqlite_active()`：**68 处**，以 Gate 0/1 基线脚本对整个 `src/**/*.rs` 实时计算为准。
 - JSON 与 SQLite 的部分业务决策仍在命令层分别实现。
 - SQLite 模式仍明确不支持部分 Meta typed patch、legacy Meta patch 与 MVU schema apply。
 - SQLite 模式会跳过 Chronicle compressor worker 的入队和启动恢复。
@@ -164,7 +164,7 @@ crates/tauri-app/src/
 
 按低耦合到高耦合执行：
 
-1. diagnostics、presets、connections；
+1. diagnostics、presets、connections（已完成，见 Gate 1 第一批提交）；
 2. import/export、cards、characters；
 3. plugins、card-shell；
 4. world-info、variables、MVU、Meta；
@@ -184,7 +184,7 @@ crates/tauri-app/src/
 
 - `lib.rs` 目标不超过约 2,500 行；若因 bootstrap 必需内容超过，RESULT 需逐项解释。
 - `lib.rs` 不再包含具体业务命令实现。
-- 156 个命令均且仅注册一次。
+- 175 个命令均且仅注册一次。
 - 前端无需修改 IPC 调用名。
 - 全量测试结果与 Gate 0 等价。
 

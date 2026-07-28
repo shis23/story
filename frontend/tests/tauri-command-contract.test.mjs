@@ -10,13 +10,13 @@ test('every frontend Tauri invoke is registered by the backend', () => {
 
 test('Gate 0 command registration baseline is stable', () => {
   assert.deepEqual(baseline.backend.duplicateRegisteredCommands, [])
-  assert.equal(baseline.backend.commandAttributes, 156)
+  assert.equal(baseline.backend.commandAttributes, 175)
   assert.equal(baseline.backend.registeredCommandCount, 175)
   assert.equal(baseline.frontend.uniqueInvokeCount, 162)
 })
 
 test('Gate 0 records the expected SQLite branch surface', () => {
   assert.equal(baseline.workspace.crateCount, 16)
-  assert.equal(baseline.sqlite.activeFlagReferences, 67)
+  assert.equal(baseline.sqlite.activeFlagReferences, 68)
   assert.ok(baseline.sqlite.unsupported.length > 0)
 })

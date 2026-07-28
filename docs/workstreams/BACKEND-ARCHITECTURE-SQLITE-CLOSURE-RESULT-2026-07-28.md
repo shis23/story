@@ -17,12 +17,12 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | workspace crate | 16 |
-| `lib.rs` 行数 | 23,781（脚本按源码换行计数） |
-| `#[tauri::command]` 属性 | 156 |
+| `lib.rs` 行数 | 22,610（脚本按源码换行计数） |
+| `#[tauri::command]` 属性（`src/**/*.rs`） | 175 |
 | `generate_handler!` 注册命令（去重） | 175 |
 | `frontend/src/tauri-api.js` unique invoke | 162 |
 | 前端调用但后端未注册 | 0 |
-| `is_sqlite_active()` 引用 | 67 |
+| `is_sqlite_active()` 引用（`src/**/*.rs`） | 68 |
 
 当前 `lib.rs` 的注册命令中存在若干只由内部/插件/运行时使用、未被
 `tauri-api.js` 直接调用的命令；因此前端 162 与后端注册 175 不要求相等，合同要求是
@@ -79,5 +79,16 @@ Gate 0 确认以下项目必须继续处理：
 
 ## 5. Gate 0 结论
 
-Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。下一步进入 Gate 1：
-只做低耦合命令域的机械拆分，第一批为 diagnostics、presets、connections；Gate 1 仍未开始。
+Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。Gate 1 第一批也已完成：
+`presets`、`connections`、`diagnostics` 已移入 `commands/`，仅保留模块导入和注册接线。
+下一批为 `import/export`、`cards`、`characters`，尚未开始。
+
+## 6. Gate 1 第一批结果
+
+- 新增 `crates/tauri-app/src/commands/{presets,connections,diagnostics}.rs` 与模块入口。
+- 保持前端 IPC 名称、Tauri 注册顺序和生成器行为不变。
+- `lib.rs` 从 23,781 行降至 22,610 行；未进行跨批业务重构。
+- `cargo check -p storyforge --all-targets`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --lib`：344 passed / 3 ignored。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
