@@ -117,3 +117,74 @@ Gate 1 PASS 不等于项目总体 PASS。以下仍属于后续 Gate：
 - Batch 2.3/2.4 触及 postprocess 与 typed patch 的数据写入路径，须先补 parity 测试再迁移，避免削弱字段一致性。
 - 真实模型证据（Gate 6）不在此阶段运行；deterministic mock-LLM 测试足够验证 Gate 2。
 
+## 7. Gate 2 Batch 2.3 检查点（postprocess mutation builder 统一）
+
+### 7.1 范围与策略
+
+Batch 2.3 消除 JSON 与 SQLite 两条 postprocess mutation 构建路径的重复实现。
+
+**改动前**：`build_json_mutation_batch`（`production_postprocess.rs:928-1080`）与 `build_runtime_mutation_batch`（`:1086-1334`）各自维护一套角色解析、同名冲突、在场豁免、广播分发、传播策略、变量归属与任务段逻辑；JSON 路径委托 `writing.rs:1581-1993` 的 store-bound 辅助，SQLite 路径用闭包内联实现等价逻辑。
+
+**改动后**：抽取 9 个共享纯函数，JSON 与 SQLite 共用同一组 knowledge / variable / task 段构建：
+
+- `merge_temporary_instances(runtime, temps)` — 快照实例 + attempt 临时实例去重合并。
+- `compute_name_collisions(instances)` — ≥2 次出现的 name 集合（同名时 name 路失效）。
+- `resolve_instance_by_id_or_name(instances, value)` — id 优先、name 兜底。
+- `instance_matches_group(runtime, instance, group)` — definition_id → definitions_by_id 反查 group。
+- `source_entry_for(runtime, source_id, text)` — runtime.knowledge 中最新匹配条目。
+- `source_propagation_blocks(update, target, resolve, group_member, source_lookup)` — Open/Private/GroupRestricted 传播策略判定（纯函数，数据源无关）。
+- `build_knowledge_mutations(...)` — 广播分发 + 单目标 + 在场/同名/传播收紧。
+- `build_variable_mutations(...)` — 角色级 name/id 解析 + 在场收紧；全局级无约束。
+- `build_task_mutations(...)` — 已有任务状态更新 + 新建任务。
+- `build_summary_mutation(persist_ctx, summary, a_seq, lineage)` — Chronicle A 摘要组装（seq 由调用方决定）。
+
+**JSON 路径**（`build_json_mutation_batch`）改为：把 `store` 当前状态投影成 `CampaignRuntimeContext`（`project_store_runtime_context`），再委托上述共享段；revision 基线与 Chronicle A seq 仍从 store 实时读取（CAS 与 code 间隙容忍需要）。
+
+**SQLite 路径**（`build_runtime_mutation_batch`）改为：直接复用共享段，闭包提升为命名函数。
+
+### 7.2 保留的有意差异（不可削弱）
+
+- **Chronicle A seq**：JSON 扫描 `store.list_summaries` 取 `max(parsed A-seq, A.turn) + 1`（容忍 code 间隙/重排）；SQLite 用 `persist_ctx.turn`（runtime 快照无活动摘要索引）。这是既有有意行为，非缺陷；统一不要求抹平。
+- **revision 基线**：JSON 从 `store.get_campaign` 实时读（CAS 写入需要当前值）；SQLite 从 `runtime.campaign.revision` 读（快照已包含）。
+- **非 Campaign 旧路径**：`persist_postprocess_outcome_to_store`（`runtime_support.rs:1944`，identity=None 的 fallback）仍用 `writing.rs` 的 store-bound 辅助；该路径不在本批次收敛范围（计划 §7.3 只收敛 ProductionPostprocessService 内部）。
+
+### 7.3 新增 parity 测试
+
+- `json_and_runtime_builders_produce_equivalent_mutations`（`production_postprocess.rs`）：用同一 JSON store 建立活动状态，分别走 JSON builder 与投影成 runtime 快照后走 SQLite builder，断言两者产生的 mutation 签名序列（剔除非确定 entry_id/commit_id）逐条相等；覆盖 Group 广播、变量更新、新建任务、revision 基线。当前 PASS，证明除 Chronicle A seq 外两条路径已字段等价。
+
+### 7.4 验证证据
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo check -p storyforge --all-targets`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --no-default-features`：359 passed（Batch 2.2 后 358 + 1 新 parity 测试）、3 ignored、0 failed。
+- `production_postprocess::tests` 全 17 项通过，含既有 `pending_temporary_instances_resolve_in_json_batch`（V2 临时角色解析回归）与 `pending_temporary_instances_resolve_in_runtime_batch`。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过（仅 LF→CRLF 行尾提示，无空白错误）。
+
+### 7.5 未削弱项核对
+
+- [x] 角色解析、同名冲突、在场豁免、广播分发、传播策略、变量归属：JSON 与 SQLite 现共用同一组纯函数，字段语义一致。
+- [x] Chronicle A seq 的 JSON 扫描 vs SQLite turn 号差异：保留，未抹平。
+- [x] revision CAS 基线：JSON 仍从 store 实时读，SQLite 从快照读；未削弱。
+- [x] V2 临时角色解析：JSON 路径投影后仍经 `merge_temporary_instances` 纳入解析域（回归测试通过）。
+- [x] 命令名/参数/DTO/事件/前端 IPC 合同：未改动（175/175 不变）。
+
+### 7.6 性能侧效（正向）
+
+- JSON 路径原先每次 group 判定都遍历 `store.list_cards()`（O(cards × defs) per broadcast target）；现改为投影时一次性构建 `definitions_by_id` 哈希表，后续 group 判定为 O(1) 查表。多目标广播场景下净优化。
+
+### 7.7 code-under-test
+
+本检查点提交后记录具体 SHA。
+
+### 7.8 Gate 2 剩余（按计划 §7）
+
+- **Batch 2.4（typed patch preview/apply 纯函数）**：Preview 读 propose 预存 diff，Accept 三处重新推导；待统一。
+- **Batch 2.5（tool loop 合并）**：三个近似 `run_tool_loop*` 待合并为单一可配置执行器。
+- **Batch 2.6（writing 阶段复用）**：start_writing / regenerate 的 Director/Subagent/Editor 仍各写一遍；`EditorStarted` 双发待消除。
+- **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
+- **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
+
+

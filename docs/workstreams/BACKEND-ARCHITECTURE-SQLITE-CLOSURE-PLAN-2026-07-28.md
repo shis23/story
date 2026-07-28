@@ -643,3 +643,14 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 未削弱 revision CAS、fail-closed、`AcceptError` 分类或 active-turn barrier；未改变任何 command 名称/参数/DTO/事件/前端 IPC 合同。
 - Gate 2 剩余：Batch 2.3（postprocess builder 统一）、2.4（typed patch preview/apply 纯函数）、2.5（tool loop 合并）、2.6（writing 阶段复用）、2.7（取消/失败/重试事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 6 节。
 
+## 23. Gate 2 Batch 2.3 检查点（postprocess mutation builder 统一，2026-07-28）
+
+- Batch 2.3：消除 `build_json_mutation_batch` 与 `build_runtime_mutation_batch` 的重复实现。抽取 9 个共享纯函数（`merge_temporary_instances`、`compute_name_collisions`、`resolve_instance_by_id_or_name`、`instance_matches_group`、`source_entry_for`、`source_propagation_blocks`、`build_knowledge_mutations`、`build_variable_mutations`、`build_task_mutations`、`build_summary_mutation`）；JSON 路径把 store 状态投影成 `CampaignRuntimeContext`（`project_store_runtime_context`）后委托共享段，SQLite 路径直接复用。
+- 保留的有意差异：Chronicle A seq（JSON 扫描 store / SQLite 用 turn 号）、revision 基线来源、非 Campaign 旧路径（`persist_postprocess_outcome_to_store` 仍用 store-bound 辅助）。
+- 新增 parity 测试 `json_and_runtime_builders_produce_equivalent_mutations`：同一 store 状态走两条 builder，断言 mutation 签名序列逐条相等（Group 广播 + 变量 + 新建任务 + revision）；当前 PASS。
+- 验证：`cargo fmt --all -- --check`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --no-default-features`（359 passed、3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175、sqlite 68）均通过。
+- 性能侧效：JSON 路径 group 判定从 per-target 遍历 `store.list_cards()` 改为一次性 `definitions_by_id` 哈希查表，多目标广播场景净优化。
+- 未削弱角色解析、同名冲突、在场豁免、广播分发、传播策略、变量归属或 revision CAS；未改变任何 command/DTO/事件/前端 IPC 合同。
+- Gate 2 剩余：Batch 2.4（typed patch）、2.5（tool loop）、2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 7 节。
+
+
