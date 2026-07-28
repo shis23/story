@@ -354,4 +354,104 @@ regenerate 的路径 B（`rerun_editor_only`）与路径 C（`rerun_subagents`�
 - **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
 - **Batch 2.8（RESULT 收口）**：待 2.7 完成后追加最终 Gate 2 结论（含 2.6 阶段抽取 PARTIAL 的诚实记录）。
 
+## 11. Gate 2 Batch 2.7 检查点（取消/失败事件发射区分）
+
+### 11.1 已完成：postprocess cancel 不再误报为 failed
+
+`run_shared_postprocess_background`（`runtime_support.rs:100-110`）在 postprocess 被取消（`skipped_reason == "cancelled"`）时，原先发 `PostProcessFailed { reason: "postprocess cancelled" }`。前端 `usePipeline.js` 的 `postprocess_failed` 处理器把 postprocess 置为 `status: 'error'`（显示「后处理失败」），对用户主动取消是误导。
+
+**修复**：取消时改发 `PostProcessSkipped { reason: "postprocess cancelled" }`（前端置 `status: 'idle'`，无错误态）。真实存储/derivation 失败仍走 `Err(e)` 分支发 `PostProcessFailed`（`runtime_support.rs:111-118`），不受影响。
+
+### 11.2 PARTIAL：SubagentCancelled 混淆真取消与 LLM 失败（受约束推迟）
+
+计划 §7.2 要求「统一取消、失败、重试和事件发射；消除双发、漏发和'失败被标成取消'」。子 Agent 结果循环（`app-pipeline/lib.rs:1062-1070` 路径 A 同 `:2318-2336`）在 `Err(e)` 时统一发 `SubagentCancelled`，无论 `e` 是 `AgentError::Cancelled`（真取消）还是 `AgentError::Llm(...)`（真失败）。
+
+**未修复理由**：`PipelineEvent` 枚举（`domain/src/agent.rs:438`）只有 `SubagentCancelled`，没有 `SubagentFailed` 变体。区分真取消与真失败需要新增事件变体（或给 `SubagentCancelled` 加 `reason` 字段），这会改变事件词汇表与前端 IPC 合同，违反硬约束「不改变现有事件名和前端 IPC 合同，除非有独立迁移计划」。故本批次只修了 postprocess cancel/failed 混淆（无需新事件），SubagentCancelled 的区分留待独立的事件词汇演进计划。
+
+**现状缓解**：全失败的子 Agent 集仍会触发 `PipelineError::InvalidState` 中止（`:1078-1085`），编排层不会因混淆而静默继续；只是单个失败子 Agent 在前端显示为「取消」而非「失败」。
+
+### 11.3 验证证据
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`：通过。
+- `cargo test -p storyforge --no-default-features`：360 passed、3 ignored、0 failed（无回归）。
+- 既有 `cancel_after_runner_discards_outcome_and_does_not_await_acceptance`（验证 `skipped_reason == "cancelled"`）继续通过。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过。
+
+### 11.4 未削弱项核对
+
+- [x] postprocess 取消发 `PostProcessSkipped`（前端 idle），不再误发 `PostProcessFailed`（前端 error）。
+- [x] 真实 postprocess 存储/derivation 失败仍发 `PostProcessFailed`。
+- [x] 事件词汇表（`PostProcessDone`/`PostProcessFailed`/`PostProcessSkipped`）未新增/改名。
+- [x] 命令名/参数/DTO/前端 IPC 合同：未改动（175/175 不变）。
+
+## 12. Gate 2 收口（Batch 2.8）
+
+### 12.1 Gate 2 总结论：PARTIAL
+
+Gate 2（业务状态机与重复编排收敛）按计划 §7 分 8 个子批执行。结论为 **PARTIAL**：核心状态机统一（Batch 2.1–2.5、2.7 的可修部分）已完成并测试；两处需独立迁移计划或真实模型回归护栏的项目诚实记为 PARTIAL/推迟。
+
+### 12.2 各批次结论
+
+| 批次 | 内容 | 结论 | 提交 |
+|---|---|---|---|
+| 2.1 | `compute_draft_hash` 提升为 domain 单一权威 | ✅ PASS | `ca048ae` |
+| 2.2 | `evaluate_accept_decision` 后端无关 Accept 决策核心 | ✅ PASS | `71e7884` |
+| 2.3 | postprocess mutation builder 统一（JSON/SQLite 共享纯函数） | ✅ PASS | `7ba5df1` |
+| 2.4 | typed patch preview/apply 前置条件纯函数统一 | ✅ PASS | `efd442f` |
+| 2.5 | 三个 tool loop 合并为单一 `run_tool_loop_core` | ✅ PASS | `6c57b1a` |
+| 2.6 | EditorStarted 双发消除 | ✅ PASS | `d57ebf5` |
+| 2.6 | Director/Subagent/Editor 阶段抽取 | ⚠️ PARTIAL（推迟） | — |
+| 2.7 | postprocess cancel 不再误报 failed | ✅ PASS | `0904379` |
+| 2.7 | SubagentCancelled 区分真取消/失败 | ⚠️ PARTIAL（需新事件变体） | — |
+| 2.8 | RESULT 收口 | ✅ 本节 | — |
+
+文档检查点提交：`a04f960`（2.1+2.2）、`beb7870`（2.3）、`08400a8`（2.4）、`4b0e395`（2.5）、`2b3b6f2`（2.6）、本节（2.7+2.8）。
+
+### 12.3 Gate 2 通过条件核对（计划 §7.5）
+
+- [x] JSON/SQLite Accept 对照测试使用同一输入得到同一领域结果和同类错误 — Batch 2.2（7 parity 测试）。
+- [ ] start/regenerate 不再复制完整阶段实现 — **PARTIAL**：EditorStarted 双发已消除（2.6），Director/Subagent/Editor 阶段抽取推迟（2.6 PARTIAL）。
+- [x] tool loop 只有一个权威实现 — Batch 2.5（`run_tool_loop_core`）。
+- [x] postprocess mutation 规则只有一个权威实现 — Batch 2.3（共享纯函数 + parity 测试）。
+- [x] typed patch preview 与 apply 使用同一纯函数 — Batch 2.4（`validate_patch_preconditions`）。
+
+### 12.4 推迟项与后续计划
+
+1. **Director/Subagent/Editor 阶段抽取**（2.6 PARTIAL）：~600 行核心写作路径，差异面（intent 来源、SequentialCrew 分支、落地语义）需参数化。建议 Gate 6（真实模型证据）后以独立子批执行（Editor→Director→Subagent），每步配 mock-LLM parity + 真实模型冒烟。
+2. **SubagentCancelled vs 失败**（2.7 PARTIAL）：需新增 `SubagentFailed` 事件变体或给 `SubagentCancelled` 加 `reason` 字段，属事件词汇演进，应有独立迁移计划（含前端适配），不混入 Gate 2。
+3. **harness-real-llm 可见性**（2.5 已知前置）：`normalize_knowledge_update_for_postprocess`/`is_postprocess_instance_present` 在 Gate 1 后变 private，`harness-real-llm`（default-features）测试报 E0603。需在 lib.rs 补 re-export 或迁移 harness 调用路径；不在确定性门禁内，建议独立 follow-up。
+
+### 12.5 Gate 2 验证证据汇总（最终态）
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`：通过。
+- `cargo clippy -p storyforge-app-agent --all-targets -- -D warnings`：通过。
+- `cargo clippy -p storyforge-app-pipeline --all-targets -- -D warnings`：通过。
+- `cargo clippy -p storyforge-app-meta --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --no-default-features`：**360 passed**（Gate 1 基线 351 + 9 新 parity/契约测试）、3 ignored、0 failed。
+- `cargo test -p storyforge-app-agent`：125 passed。
+- `cargo test -p storyforge-app-pipeline`：110 passed。
+- `cargo test -p storyforge-app-meta`：110 passed。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过。
+- 命令属性/注册 **175/175**，前端唯一 invoke **162**，缺失后端命令 **0**——IPC 合同未改。
+
+### 12.6 未削弱项最终核对
+
+- [x] revision CAS、active-turn barrier、fail-closed、`AcceptError` 分类、`quality_accept_decision`：Batch 2.1/2.2 统一后未削弱。
+- [x] postprocess 字段一致性（角色解析/同名/在场/广播/传播/变量归属/任务）：Batch 2.3 parity 测试钉住。
+- [x] typed patch target/definition/schema 前置：Batch 2.4 归并，错误消息保留。
+- [x] tool loop cancel/drift/terminal 语义：Batch 2.5 三版 parity 测试钉住。
+- [x] EditorStarted 单发、postprocess cancel 不误报 failed：Batch 2.6/2.7 修复。
+- [x] SQLite 活跃时不访问 legacy JSON authority、无双写：未涉及（本 Gate 不动存储路由）。
+- [x] 命令名/参数/DTO/事件名/前端 IPC 合同：全程未改（175/175、162 invoke、0 missing）。
+
+### 12.7 下一阶段
+
+Gate 2 PARTIAL 后进入 **Gate 3（单一 backend facade）**。Gate 3 目标：进程启动时解析一次 backend，构造显式 facade/port 集合；命令层不读全局 `is_sqlite_active()` flag（当前 68 处）。Gate 2 的推迟项（阶段抽取、SubagentCancelled）不阻塞 Gate 3 facade 抽象，可在 facade 稳定后并行补齐。
+
 

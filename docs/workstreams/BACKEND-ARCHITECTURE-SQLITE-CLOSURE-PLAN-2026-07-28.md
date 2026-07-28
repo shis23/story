@@ -681,4 +681,14 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 未削弱：`EditorStarted` 路径 B/C 单发（契约钉住）；`StateChanged{Editing}` 保留；路径 A / sequential suffix / start_writing / start_duet 单发未动；命令/DTO/事件词汇/前端 IPC 合同未改（175/175）。
 - Gate 2 剩余：Batch 2.7（事件发射）、2.8（RESULT 收口，含 2.6 阶段抽取 PARTIAL 记录）。详见 RESULT 文档第 10 节。
 
+## 27. Gate 2 Batch 2.7 + 2.8 收口检查点（2026-07-28）
+
+- Batch 2.7（已完成）：`run_shared_postprocess_background` 取消时改发 `PostProcessSkipped`（前端 idle）而非 `PostProcessFailed`（前端 error）；真实存储/derivation 失败仍发 `PostProcessFailed`。
+- Batch 2.7（PARTIAL，推迟）：`SubagentCancelled` 混淆真取消与 LLM 失败需新增事件变体（`SubagentFailed` 或 `reason` 字段），属事件词汇演进，受硬约束「不改变事件名/前端 IPC 合同」限制，留待独立迁移计划。
+- Batch 2.8（RESULT 收口）：Gate 2 总结论 **PARTIAL**。详见 RESULT 文档第 12 节。
+- Gate 2 通过条件（§7.5）：4/5 PASS（Accept parity、tool loop 单一实现、postprocess mutation 单一实现、typed patch preview/apply 同一纯函数）；1/5 PARTIAL（start/regenerate 阶段抽取，EditorStarted 双发已修但 Director/Subagent/Editor 抽取推迟）。
+- 推迟项：①Director/Subagent/Editor 阶段抽取（~600 行，建议 Gate 6 后独立子批）；②SubagentCancelled 区分（需事件词汇演进）；③harness-real-llm 可见性（Gate 1 遗留，独立 follow-up）。
+- 最终验证态：`cargo fmt/clippy/test`（360 passed）、`app-agent`（125）、`app-pipeline`（110）、`app-meta`（110）、前端合同（8/8）、baseline（175/175、sqlite 68）全绿；命令 175/175、invoke 162、缺失 0；IPC 合同全程未改。
+- Gate 2 PARTIAL 后进入 Gate 3（单一 backend facade）。
+
 
