@@ -2,6 +2,28 @@ use super::super::*;
 
 // ─── M1 对话操作命令 ──────────────────────────────────────────────────────
 
+#[tauri::command]
+pub(crate) fn get_active_turn_receipt(
+    campaign_id: String,
+    node_id: String,
+) -> Result<Option<ActiveTurnReceiptDto>, TauriCommandError> {
+    crate::get_active_turn_receipt_impl(campaign_id, node_id)
+}
+
+#[tauri::command]
+pub(crate) async fn retry_active_turn_postprocess(
+    campaign_id: String,
+    node_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ActiveTurnReceiptDto, TauriCommandError> {
+    crate::retry_active_turn_postprocess_impl(campaign_id, node_id, state).await
+}
+
+#[tauri::command]
+pub(crate) fn get_active_turn_quality(campaign_id: String) -> Option<ActiveTurnQualityDto> {
+    crate::get_active_turn_quality_impl(campaign_id)
+}
+
 /// 编辑当前变体内容
 #[tauri::command]
 pub(crate) fn edit_variant(

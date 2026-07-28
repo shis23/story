@@ -31,6 +31,18 @@ use crate::{
 
 // ─── M1 写作命令 ───────────────────────────────────────────────────────────
 
+/// Regenerate command entrypoint. The orchestration implementation remains
+/// temporarily in the root module while the final Gate 1 helper extraction is
+/// completed; the IPC command itself belongs to this domain module.
+#[tauri::command]
+pub(crate) async fn regenerate(
+    req: crate::RegenerateRequestDto,
+    state: tauri::State<'_, Arc<AppState>>,
+    on_event: tauri::ipc::Channel<WritingEvent>,
+) -> Result<String, TauriCommandError> {
+    crate::regenerate_impl(req, state, on_event).await
+}
+
 /// 写作流水线事件（Tauri Channel 用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WritingEvent {

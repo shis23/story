@@ -25,7 +25,7 @@ pub mod turn_store;
 use commands::{
     campaigns::*, card_shell::*, cards::*, characters::*, connections::*, conversations::*,
     diagnostics::*, import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*,
-    presets::*, turns::*, variables::*, world_info::*, writing::*,
+    presets::*, profiles::*, turns::*, variables::*, world_info::*, writing::*,
 };
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
@@ -1034,160 +1034,6 @@ impl AppState {
         }
         Ok(pipeline)
     }
-}
-
-// ─── 预设/模块系统命令 ─────────────────────────────────────────────────────
-
-#[tauri::command]
-fn list_modules(state: tauri::State<'_, Arc<AppState>>) -> Vec<module_store::PromptModuleDto> {
-    state
-        .module_store
-        .list_all()
-        .iter()
-        .map(|(m, enabled)| module_store::module_to_dto(m, *enabled))
-        .collect()
-}
-
-#[tauri::command]
-fn update_module(
-    id: String,
-    content: Option<String>,
-    enabled: Option<bool>,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    if state
-        .module_store
-        .update(&id, content.as_deref(), enabled)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
-    {
-        Ok(())
-    } else {
-        Err("内置模块不能修改内容".into())
-    }
-}
-
-#[tauri::command]
-fn list_profiles(state: tauri::State<'_, Arc<AppState>>) -> Vec<module_store::ProfileSummaryDto> {
-    state.profile_store.list()
-}
-
-#[tauri::command]
-fn get_active_profile(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Option<module_store::PromptProfileDto> {
-    state
-        .profile_store
-        .get_active()
-        .map(|p| module_store::profile_to_dto(&p, true))
-}
-
-#[tauri::command]
-fn save_profile(
-    profile_json: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    let profile: PromptProfile = serde_json::from_str(&profile_json)
-        .map_err(|e| TauriCommandError::validation(format!("Profile 解析失败: {e}")))?;
-    state
-        .profile_store
-        .save(profile)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
-    Ok(())
-}
-
-#[tauri::command]
-fn set_active_profile(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    state
-        .profile_store
-        .set_active(&id)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
-}
-
-// ─── Agent Profile Config 命令 ─────────────────────────────────────────────
-
-#[tauri::command]
-fn list_agent_profile_configs(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Vec<storyforge_domain::agent_profile_config::AgentProfileConfigSummaryDto> {
-    state.agent_profile_config_store.list()
-}
-
-#[tauri::command]
-fn get_agent_profile_config(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Option<storyforge_domain::agent_profile_config::AgentProfileConfig> {
-    state.agent_profile_config_store.get(&id)
-}
-
-#[tauri::command]
-fn get_active_agent_profile_config(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> storyforge_domain::agent_profile_config::AgentProfileConfig {
-    state.agent_profile_config_store.get_active()
-}
-
-#[tauri::command]
-fn save_agent_profile_config(
-    config_json: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    let mut config: storyforge_domain::agent_profile_config::AgentProfileConfig =
-        serde_json::from_str(&config_json).map_err(|e| {
-            TauriCommandError::validation(format!("Agent Profile Config 解析失败: {e}"))
-        })?;
-    config.sanitize();
-    state
-        .agent_profile_config_store
-        .save(config)
-        .map_err(TauriCommandError::from)
-}
-
-#[tauri::command]
-fn export_agent_profile_config(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<String, TauriCommandError> {
-    state
-        .agent_profile_config_store
-        .export_json(&id)
-        .map_err(TauriCommandError::from)
-}
-
-#[tauri::command]
-fn import_agent_profile_config(
-    config_json: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<storyforge_domain::agent_profile_config::AgentProfileConfig, TauriCommandError> {
-    state
-        .agent_profile_config_store
-        .import_json(&config_json)
-        .map_err(TauriCommandError::from)
-}
-
-#[tauri::command]
-fn delete_agent_profile_config(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<bool, TauriCommandError> {
-    state
-        .agent_profile_config_store
-        .delete(&id)
-        .map_err(TauriCommandError::from)
-}
-
-#[tauri::command]
-fn set_active_agent_profile_config(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), TauriCommandError> {
-    state
-        .agent_profile_config_store
-        .set_active(&id)
-        .map_err(TauriCommandError::from)
 }
 
 /// Shared production postprocess entry used by start_writing (spawned) and regenerate (awaited).
@@ -3328,8 +3174,7 @@ fn validate_regenerate_campaign_scope(
 /// Tauri command: 重 roll（整体/只重编剧/只重某子 Agent，可附 hint）
 ///
 /// 通过 Channel 推送事件，返回新 variant 的成文。
-#[tauri::command]
-async fn regenerate(
+pub(crate) async fn regenerate_impl(
     req: RegenerateRequestDto,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
@@ -3667,8 +3512,7 @@ async fn regenerate(
 
 // ─── M1 对话命令 ───────────────────────────────────────────────────────────
 
-#[tauri::command]
-async fn configure_embedder(
+pub(crate) async fn configure_embedder_impl(
     endpoint: String,
     api_key: String,
     model: String,
@@ -3718,8 +3562,9 @@ async fn configure_embedder_with_secret_store_async(
 }
 
 /// 获取当前嵌入配置（不含 key）
-#[tauri::command]
-fn get_embed_config(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json::Value> {
+pub(crate) fn get_embed_config_impl(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<serde_json::Value> {
     state
         .embed_config
         .read()
@@ -3736,8 +3581,7 @@ fn get_embed_config(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json
 }
 
 /// 手动触发对话归档（将未归档前缀压缩为远记忆摘要并入库）
-#[tauri::command]
-async fn archive_conversation(
+pub(crate) async fn archive_conversation_impl(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
@@ -4154,8 +3998,7 @@ fn active_turn_receipt_from_record(
 }
 
 /// 读取活动 Attempt 的 Accept-before 小票，不修改任何状态。
-#[tauri::command]
-fn get_active_turn_receipt(
+pub(crate) fn get_active_turn_receipt_impl(
     campaign_id: String,
     node_id: String,
 ) -> Result<Option<ActiveTurnReceiptDto>, TauriCommandError> {
@@ -4258,8 +4101,7 @@ fn postprocess_present_characters(provenance: Option<&Provenance>) -> Vec<String
 }
 
 /// 仅重跑当前草稿的 Summarizer + PostProcessor，不重写正文。
-#[tauri::command]
-async fn retry_active_turn_postprocess(
+pub(crate) async fn retry_active_turn_postprocess_impl(
     campaign_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
@@ -4441,8 +4283,7 @@ fn active_turn_quality_from_record(
 /// 读取当前 Campaign 活动 Turn 上 active Attempt 的 QualityReport。
 ///
 /// 无活动 Turn / 无质量报告 → None。不创建状态。
-#[tauri::command]
-fn get_active_turn_quality(campaign_id: String) -> Option<ActiveTurnQualityDto> {
+pub(crate) fn get_active_turn_quality_impl(campaign_id: String) -> Option<ActiveTurnQualityDto> {
     let camp = Id::from_str(&campaign_id);
     let turn = get_active_turn_for_backend(&camp).ok()??;
     active_turn_quality_from_record(&turn)

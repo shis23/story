@@ -2,6 +2,24 @@ use super::super::*;
 
 // ─── LLM 连接管理命令 ──────────────────────────────────────────────────────
 
+#[tauri::command]
+pub(crate) async fn configure_embedder(
+    endpoint: String,
+    api_key: String,
+    model: String,
+    dim: usize,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    crate::configure_embedder_impl(endpoint, api_key, model, dim, state).await
+}
+
+#[tauri::command]
+pub(crate) fn get_embed_config(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<serde_json::Value> {
+    crate::get_embed_config_impl(state)
+}
+
 /// 列出内置连接模板
 #[tauri::command]
 pub(crate) fn list_connection_templates() -> Vec<storyforge_domain::llm::ConnectionTemplate> {

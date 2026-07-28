@@ -20,6 +20,14 @@ use crate::{
     get_global_regex_store, get_preset_store, merge_runtime_regex_scripts,
 };
 
+#[tauri::command]
+pub(crate) async fn archive_conversation(
+    conversation_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<usize, TauriCommandError> {
+    crate::archive_conversation_impl(conversation_id, state).await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConversationSummaryDto {
     id: String,
