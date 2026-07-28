@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**进行中（Gate 1 writing/conversations 子批及其返修已完成；Gate 1 总体和 SQLite 迁移仍未收口）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> 当前基线：`main@cb79875`。
+> 状态：**进行中（Gate 1 writing/conversations 子批、删除一致性返修已完成；Gate 1 总体和 SQLite 迁移仍未收口）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> 当前代码基线：`main@0485d98`。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
 
@@ -167,10 +167,8 @@ crates/tauri-app/src/
 1. diagnostics、presets、connections（已完成，见 Gate 1 第一批提交）；
 2. import/export、cards、characters（已完成，见 Gate 1 第二批提交）；
 3. plugins、card-shell（已完成，见 Gate 1 第三批提交）；
-4. world-info、variables、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆、Turn、writing、conversations（已完成，拆成独立子批）；
-5. campaigns、turns；
-6. writing 与 pipeline command；
-7. inline tests 跟随被测域迁移。
+4. world-info、variables、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆、Turn、writing、conversations（Gate 1 机械拆分已完成，拆成独立子批）；
+5. inline tests 跟随被测域迁移（writing/conversations 纯测试已归位，其余按被测域继续）；
 
 每批必须：
 
@@ -617,3 +615,10 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 新增 `crates/tauri-app/src/commands/conversations.rs`，迁移会话列表、删除、活动级联删除、详情 DTO、展示正则和归档入口前的会话展示辅助。
 - 当前 `lib.rs` 为 14,360 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0。
 - 该子批通过 fmt、check、clippy、Rust lib tests（344 passed, 3 ignored）和前端命令合同测试；提交 `069b7a4`。
+
+## 20. 2026-07-28 删除一致性与测试边界返修检查点
+
+- 代码提交：`0485d98 fix(storage): make playthrough deletion retryable`。
+- Campaign 删除先清理会话；会话失败时保留 Campaign，旧版本留下的孤立会话也可重试清理；CampaignStore 级联 JSON/本局世界书写入失败时执行补偿回滚，内存和磁盘快照均保持可重试。
+- 新增会话删除失败、孤立会话重试、级联写入失败回滚测试；writing 的 prompt-hook 与任务归一化纯测试已归位，命令级 start/regenerate 集成测试仍留在根模块。
+- 本检查点不代表 SQLite 事务、backend facade、迁移切换或 Gate 2–8 已完成。
