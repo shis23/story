@@ -287,30 +287,18 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
             save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
 
-            let barrier = Arc::new(Barrier::new(3));
-            let delete_store = Arc::clone(&store);
-            let delete_conv_store = Arc::clone(&conv_store);
-            let delete_state = Arc::clone(&state);
-            let delete_id = campaign_a.id.clone();
-            let delete_barrier = Arc::clone(&barrier);
-            let delete = std::thread::spawn(move || {
-                delete_barrier.wait();
-                delete_campaign_playthrough_in_store(
-                    &delete_store,
-                    &delete_conv_store,
-                    &delete_state,
-                    &delete_id,
-                )
-            });
-
+            let switch_entered = Arc::new(Barrier::new(2));
+            let release_switch = Arc::new(Barrier::new(2));
             let switch_store = Arc::clone(&store);
             let switch_state = Arc::clone(&state);
             let switch_id = campaign_b.id.clone();
-            let switch_barrier = Arc::clone(&barrier);
+            let switch_entered_for_thread = Arc::clone(&switch_entered);
+            let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
-                switch_barrier.wait();
                 let id_for_validation = switch_id.clone();
                 set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                    switch_entered_for_thread.wait();
+                    release_switch_for_thread.wait();
                     if switch_store.get_campaign(&id_for_validation).is_some() {
                         Ok(())
                     } else {
@@ -321,7 +309,26 @@ mod tests {
                 })
             });
 
-            barrier.wait();
+            // The switch now owns the update lock and is paused inside its
+            // validation. Deletion must wait until the whole switch commits.
+            switch_entered.wait();
+            let delete_start = Arc::new(Barrier::new(2));
+            let delete_store = Arc::clone(&store);
+            let delete_conv_store = Arc::clone(&conv_store);
+            let delete_state = Arc::clone(&state);
+            let delete_id = campaign_a.id.clone();
+            let delete_start_for_thread = Arc::clone(&delete_start);
+            let delete = std::thread::spawn(move || {
+                delete_start_for_thread.wait();
+                delete_campaign_playthrough_in_store(
+                    &delete_store,
+                    &delete_conv_store,
+                    &delete_state,
+                    &delete_id,
+                )
+            });
+            delete_start.wait();
+            release_switch.wait();
             assert!(delete.join().unwrap().is_ok());
             assert!(switch.join().unwrap().is_ok());
             assert_eq!(
@@ -385,30 +392,18 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
             save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
 
-            let barrier = Arc::new(Barrier::new(3));
-            let delete_store = Arc::clone(&store);
-            let delete_conv_store = Arc::clone(&conv_store);
-            let delete_state = Arc::clone(&state);
-            let delete_id = campaign_a.id.clone();
-            let delete_barrier = Arc::clone(&barrier);
-            let delete = std::thread::spawn(move || {
-                delete_barrier.wait();
-                delete_campaign_playthrough_in_store(
-                    &delete_store,
-                    &delete_conv_store,
-                    &delete_state,
-                    &delete_id,
-                )
-            });
-
+            let switch_entered = Arc::new(Barrier::new(2));
+            let release_switch = Arc::new(Barrier::new(2));
             let switch_store = Arc::clone(&store);
             let switch_state = Arc::clone(&state);
             let switch_id = campaign_b.id.clone();
-            let switch_barrier = Arc::clone(&barrier);
+            let switch_entered_for_thread = Arc::clone(&switch_entered);
+            let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
-                switch_barrier.wait();
                 let id_for_validation = switch_id.clone();
                 set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                    switch_entered_for_thread.wait();
+                    release_switch_for_thread.wait();
                     if switch_store.get_campaign(&id_for_validation).is_some() {
                         Ok(())
                     } else {
@@ -419,7 +414,26 @@ mod tests {
                 })
             });
 
-            barrier.wait();
+            // Hold the update lock across the switch while deletion is
+            // released, then verify the failed deletion cannot restore A.
+            switch_entered.wait();
+            let delete_start = Arc::new(Barrier::new(2));
+            let delete_store = Arc::clone(&store);
+            let delete_conv_store = Arc::clone(&conv_store);
+            let delete_state = Arc::clone(&state);
+            let delete_id = campaign_a.id.clone();
+            let delete_start_for_thread = Arc::clone(&delete_start);
+            let delete = std::thread::spawn(move || {
+                delete_start_for_thread.wait();
+                delete_campaign_playthrough_in_store(
+                    &delete_store,
+                    &delete_conv_store,
+                    &delete_state,
+                    &delete_id,
+                )
+            });
+            delete_start.wait();
+            release_switch.wait();
             assert!(delete.join().unwrap().is_err());
             assert!(switch.join().unwrap().is_ok());
             assert_eq!(
