@@ -19,12 +19,10 @@ use crate::turn_coordinator::{self, CampaignMutationCoordinator, CommitError};
 use crate::turn_store::TurnStore;
 
 /// Stable draft identity used by Accept and autofix synchronization.
-pub fn compute_draft_hash(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
+///
+/// Re-exported from the domain crate so JSON and SQLite paths share one
+/// backend-agnostic authority (Gate 2).
+pub use storyforge_domain::turn::compute_draft_hash;
 
 /// Prefer autofix response text when present; otherwise keep the pipeline draft.
 pub fn prefer_autofix_response_text(response_text: Option<String>, original: String) -> String {

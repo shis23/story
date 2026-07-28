@@ -81,11 +81,10 @@ struct LedgerRow {
 }
 
 /// Stable draft identity used by the JSON production path and the SQLite adapter.
-pub fn compute_draft_hash(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hex_encode(hasher.finalize())
-}
+///
+/// Re-exported from the domain crate so JSON and SQLite paths share one
+/// backend-agnostic authority (Gate 2).
+pub use storyforge_domain::turn::compute_draft_hash;
 
 impl SqliteProductionRepository {
     pub fn bootstrap_campaign(

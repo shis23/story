@@ -533,6 +533,19 @@ pub fn quality_accept_decision(
     }
 }
 
+/// Stable draft identity: lowercase SHA-256 hex of the draft text.
+///
+/// This is the single backend-agnostic authority used by JSON and SQLite Accept
+/// paths, postprocess autofix synchronization, and pre-accept DraftReady landing.
+/// Both backends must derive `TurnAttempt.draft_hash` from this function so the
+/// Accept draft-hash guard compares identical fingerprints.
+pub fn compute_draft_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +606,28 @@ mod tests {
         );
         assert!(report.blocks_accept(false));
         assert!(!report.blocks_accept(true));
+    }
+
+    #[test]
+    fn compute_draft_hash_is_stable_lowercase_sha256_hex() {
+        let a = compute_draft_hash("hello-turn");
+        let b = compute_draft_hash("hello-turn");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(a, compute_draft_hash("hello-turn!"));
+    }
+
+    #[test]
+    fn compute_draft_hash_matches_known_sha256_vector() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            compute_draft_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
