@@ -29,6 +29,11 @@ use commands::{
     diagnostics::*, import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*,
     presets::*, profiles::*, turns::*, variables::*, world_info::*, writing::*,
 };
+// Stable crate-root surface used by deterministic/real-LLM harnesses. Keep the
+// command module private while exposing only the shared postprocess helpers.
+pub use commands::writing::{
+    is_postprocess_instance_present, normalize_knowledge_update_for_postprocess,
+};
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 use production_postprocess::TurnAttemptSink;

@@ -168,6 +168,55 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
         Err(AcceptError::CampaignScopeMismatch { .. })
     ));
 
+    // Adapter parity with the JSON accept service: scope validation belongs
+    // before the requested-conversation lookup. A nonexistent foreign id must
+    // therefore remain a typed scope error, not degrade into Storage(missing).
+    let foreign_conversation = Id::from_str("wrong-conversation");
+    let campaign_before =
+        serde_json::to_value(sqlite_runtime::get_campaign(&campaign_id).unwrap().unwrap()).unwrap();
+    let turn_before =
+        serde_json::to_value(sqlite_runtime::get_turn(&turn_id).unwrap().unwrap()).unwrap();
+    let conversation_before = serde_json::to_value(
+        sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let err =
+        sqlite_runtime::accept_by_variant(&campaign_id, &foreign_conversation, &draft_node, false)
+            .expect_err("foreign conversation must be rejected before storage lookup");
+    match err {
+        AcceptError::ConversationScopeMismatch {
+            turn_conversation,
+            requested,
+        } => {
+            assert_eq!(turn_conversation, conversation_id.to_string());
+            assert_eq!(requested, foreign_conversation.to_string());
+        }
+        other => panic!("expected ConversationScopeMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(sqlite_runtime::get_campaign(&campaign_id).unwrap().unwrap(),)
+            .unwrap(),
+        campaign_before,
+        "scope rejection must not commit campaign mutations"
+    );
+    assert_eq!(
+        serde_json::to_value(sqlite_runtime::get_turn(&turn_id).unwrap().unwrap()).unwrap(),
+        turn_before,
+        "scope rejection must not mutate the turn or attempt"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            sqlite_runtime::get_conversation(&conversation_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap(),
+        conversation_before,
+        "scope rejection must not finalize the draft variant"
+    );
+
     let outcome =
         sqlite_runtime::accept_by_variant(&campaign_id, &conversation_id, &draft_node, true)
             .expect("force accept uses the regenerated SQLite Attempt");
@@ -229,4 +278,24 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
         .unwrap()
         .expect("reopened database contains recovery result");
     assert_eq!(persisted.status, TurnStatus::Failed);
+
+    // A terminal replay is ledger-backed and must not depend on unrelated
+    // live conversation deserialization. Corrupt that payload only after all
+    // normal lifecycle checks, then verify the accepted turn still replays.
+    reopened
+        .connection()
+        .execute(
+            "UPDATE conversations SET payload_json = '{' WHERE conversation_id = ?1",
+            [conversation_id.as_str()],
+        )
+        .unwrap();
+    drop(reopened);
+    let replay_without_live_conversation =
+        sqlite_runtime::accept_by_variant(&campaign_id, &conversation_id, &draft_node, false)
+            .expect("terminal replay must reach the SQLite ledger before conversation reads");
+    assert_eq!(
+        replay_without_live_conversation.turn_status,
+        TurnStatus::Degraded
+    );
+    assert!(replay_without_live_conversation.commit_as_degraded);
 }

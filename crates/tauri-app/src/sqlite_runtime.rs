@@ -343,6 +343,32 @@ pub fn capture_audit_snapshot() -> Result<storyforge_infra_sqlite::SqliteAuditSn
     with_db_mut(|db| storyforge_infra_sqlite::capture_audit_snapshot(db).map_err(|e| e.to_string()))
 }
 
+fn reconfirm_accept_replay(
+    attempt: &storyforge_domain::turn::TurnAttempt,
+    outcome: crate::turn_lifecycle::AcceptOutcome,
+) -> Result<crate::turn_lifecycle::AcceptOutcome, crate::turn_lifecycle::AcceptError> {
+    use crate::turn_lifecycle::AcceptError;
+
+    let batch = outcome.batch.clone();
+    let terminal_status = outcome.turn_status.clone();
+    let ledger_outcome = with_db_mut(|db| {
+        let request = AcceptTurnRequest {
+            turn_id: &outcome.turn_id,
+            attempt_id: &outcome.attempt_id,
+            draft_hash: &attempt.draft_hash,
+            batch: &batch,
+            terminal_status: terminal_status.clone(),
+        };
+        SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
+    })
+    .map_err(AcceptError::Commit)?;
+    debug_assert!(matches!(
+        ledger_outcome,
+        SqliteAcceptOutcome::AlreadyCommitted
+    ));
+    Ok(outcome)
+}
+
 /// Atomic Accept through the SQLite production UoW.
 ///
 /// The pure decision (scope, derivation, quality, draft-hash, revision, batch)
@@ -356,12 +382,18 @@ pub fn accept_by_variant(
     force_accept: bool,
 ) -> Result<crate::turn_lifecycle::AcceptOutcome, crate::turn_lifecycle::AcceptError> {
     use crate::turn_lifecycle::{
-        AcceptDecision, AcceptDecisionInput, AcceptError, AcceptOutcome, evaluate_accept_decision,
+        AcceptDecision, AcceptDecisionInput, AcceptError, AcceptOutcome, ensure_accept_scope,
+        evaluate_accept_decision, evaluate_accept_replay,
     };
 
     let turn = get_turn_by_variant(variant_id)
         .map_err(AcceptError::Storage)?
         .ok_or(AcceptError::NoTurnRecord)?;
+
+    // Preserve the permanent-guard order used by the JSON adapter. In
+    // particular, a foreign requested conversation must remain a typed scope
+    // mismatch even when that id does not exist in SQLite.
+    ensure_accept_scope(campaign_id, conversation_id, &turn)?;
 
     let attempt = turn
         .attempts
@@ -370,6 +402,12 @@ pub fn accept_by_variant(
         .find(|a| a.variant_id == *variant_id)
         .cloned()
         .ok_or(AcceptError::NoAttempt)?;
+
+    // Terminal retries only need the persisted Attempt batch and SQLite
+    // ledger. Do not require live conversation/campaign reads to replay them.
+    if let Some(outcome) = evaluate_accept_replay(&turn, &attempt)? {
+        return reconfirm_accept_replay(&attempt, outcome);
+    }
 
     let conversation = get_conversation(conversation_id)
         .map_err(AcceptError::Storage)?
@@ -404,24 +442,7 @@ pub fn accept_by_variant(
             // Re-confirm durability against the SQLite mutation ledger. A retry
             // after the UoW committed must reach `accept_turn`, which validates
             // the persisted batch and returns AlreadyCommitted.
-            let batch = outcome.batch.clone();
-            let terminal_status = outcome.turn_status.clone();
-            let ledger_outcome = with_db_mut(|db| {
-                let request = AcceptTurnRequest {
-                    turn_id: &outcome.turn_id,
-                    attempt_id: &outcome.attempt_id,
-                    draft_hash: &attempt.draft_hash,
-                    batch: &batch,
-                    terminal_status: terminal_status.clone(),
-                };
-                SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
-            })
-            .map_err(AcceptError::Commit)?;
-            debug_assert!(matches!(
-                ledger_outcome,
-                SqliteAcceptOutcome::AlreadyCommitted
-            ));
-            Ok(outcome)
+            reconfirm_accept_replay(&attempt, outcome)
         }
         AcceptDecision::Commit {
             batch,

@@ -1,8 +1,8 @@
-# 后端架构拆分与 SQLite 收口：Gate 1 验收结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：执行结果（2026-07-28 起）
 
-> 状态：**Gate 1 PASS（最终边界返修已完成）**；Gate 2–8（backend facade、SQLite 迁移、平台验收和发布封存）尚未完成。
+> 状态：**Gate 1 PASS；Gate 2 PASS（verifier 返修已完成）**；Gate 3–8（backend facade、SQLite 迁移、平台验收和发布封存）尚未完成。
 >
-> code-under-test：`main@d340d99`。
+> code-under-test：`main@b6cad53` 加当前 Gate 2 verifier-repair 工作树（尚未提交）。
 >
 > document HEAD：本文件所在文档提交；不把文档提交当作被测代码。
 
@@ -454,4 +454,53 @@ Gate 2（业务状态机与重复编排收敛）按计划 §7 分 8 个子批执
 
 Gate 2 PARTIAL 后进入 **Gate 3（单一 backend facade）**。Gate 3 目标：进程启动时解析一次 backend，构造显式 facade/port 集合；命令层不读全局 `is_sqlite_active()` flag（当前 68 处）。Gate 2 的推迟项（阶段抽取、SubagentCancelled）不阻塞 Gate 3 facade 抽象，可在 facade 稳定后并行补齐。
 
+## 13. Gate 2 verifier 返修与最终验收（2026-07-29）
 
+### 13.1 返修范围与结果
+
+前次第 12 节记录的是 verifier 介入前的历史检查点；verifier 随后将目标标为 incomplete。本次按实际代码逐项复现、补测试并修复，结果如下：
+
+| 项目 | 返修结果 | 证据 |
+|---|---|---|
+| postprocess 实例解析优先级 | 精确 ID 优先，只有 ID 不存在时才按名称回退 | `instance_resolution_prefers_exact_id_over_an_earlier_name_match` |
+| SQLite Accept scope/error parity | scope 与 terminal replay 先于 live conversation/campaign 读取；错误分类与 JSON 一致且无副作用 | `sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery` 中的 scope 零副作用断言及 replay 回归 |
+| harness helper 可见性 | crate root 只 re-export 两个既有 helper | `cargo test -p harness-real-llm --no-run` |
+| Editor 阶段复用 | 标准 start、Duet 与 regenerate 的 editor 执行共用 `run_editor_stage`；落地由调用方保留 | 事件顺序、单发与 full-regenerate 回归 |
+| Director 阶段复用 | 标准 start 与 full regenerate 路径 A 共用 `run_director_stage` | 配置、历史、hint、progress、plan parse 回归 |
+| Subagent 阶段复用 | 标准/Sequential start 与 full regenerate 路径 A 共用 `run_subagent_stage` | runner 选择、临时实例、失败守卫、provenance 回归 |
+
+三段抽取均保持现有 command、DTO、事件名称和前端 IPC 合同；Duet、subagent-only reroll、Sequential suffix 等语义不同的编排没有被错误并入通用路径。每一段均经过独立代码审查并得到 APPROVE。
+
+### 13.2 Gate 2 通过条件复核（计划 §7.5）
+
+- [x] JSON/SQLite Accept 使用同一领域决策并得到同类结果/错误；本次补齐 SQLite scope/replay 调用顺序。
+- [x] start/regenerate 不再复制完整 Director、Subagent、Editor 阶段实现；三段共享 helper 均有行为契约测试。
+- [x] tool loop 只有一个权威 `run_tool_loop_core`。
+- [x] postprocess mutation 规则只有一套共享纯函数实现；本次补齐 ID 优先语义回归。
+- [x] typed patch preview/apply 使用同一 `validate_patch_preconditions` 纯函数。
+
+结论由第 12 节的历史 **PARTIAL** 更新为最终 **PASS（5/5）**。
+
+### 13.3 最终验证证据
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：通过，退出码 0；需要真实 LLM 凭证或 OS credential-store 的测试按既有约定 ignored。
+- `cargo test -p storyforge --no-default-features`：361 passed、3 ignored、0 failed。
+- `cargo test -p storyforge-app-pipeline --lib`：117 passed、0 failed。
+- `cargo test -p harness-real-llm --no-run`：通过，原 E0603 已消除。
+- `frontend/npm.cmd test`：476 passed、0 failed。
+- `frontend/npm.cmd run build`：通过；仅保留既有动态/静态 import 与大 chunk 警告。
+- `node scripts/architecture/backend-baseline.mjs`：175 个 command 属性/175 个注册，162 个前端唯一 invoke，0 missing，16 crates，`activeFlagReferences=68` 未变化。
+- `git diff --check`：通过。
+
+### 13.4 明确不在 Gate 2 内的后续项
+
+- `SubagentCancelled` 区分真取消与 LLM 失败需要事件词汇/前端 IPC 迁移，继续作为独立计划项；当前 all-failed guard 仍 fail-closed。
+- SQLite typed patch 的持久化能力补齐属于 Gate 4，不属于 Gate 2 的 preview/apply 前置条件统一。
+- 真实付费模型与 Windows/Android 现场证据分别属于后续 Gate 6/平台验收，本次不虚报。
+- 当前修复尚未提交；提交后应把本节 code-under-test 从工作树描述替换为确切 SHA。
+
+### 13.5 下一阶段
+
+进入 **Gate 3（单一 backend facade）**。Gate 3 的目标保持不变：启动时一次性解析 backend，构造显式 facade/port 集合，并逐步消除命令层对 `is_sqlite_active()` 的 68 处直接读取。

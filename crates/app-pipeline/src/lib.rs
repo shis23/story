@@ -588,6 +588,64 @@ impl WritingContext {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EditorPromptFlavor {
+    Standard,
+    Duet,
+}
+
+struct EditorStageInput<'a> {
+    plan: &'a Plan,
+    performances: &'a [storyforge_domain::agent::Performance],
+    conversation_id: &'a Id,
+    history_before_node_id: Option<&'a Id>,
+    scene_brief: &'a str,
+    hint: Option<&'a str>,
+    profile: Option<&'a storyforge_domain::prompt_module::PromptProfile>,
+    modules: &'a [storyforge_domain::prompt_module::PromptModule],
+    campaign_runtime: Option<&'a storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+    agent_profile_config: Option<&'a AgentProfileConfig>,
+    regex_scripts: &'a [RegexScript],
+    template_context: Option<&'a storyforge_domain::prompt_module::TemplateVarContext>,
+    recent_summaries: &'a [storyforge_domain::agent::RoundSummary],
+    far_memory_hits: &'a [FarMemoryHit],
+    scene_plan: Option<&'a storyforge_domain::agent::ScenePlan>,
+    prompt_flavor: EditorPromptFlavor,
+}
+
+struct EditorStageOutput {
+    final_text: String,
+    reasoning_content: Option<String>,
+}
+
+struct DirectorStageInput<'a> {
+    intent: &'a str,
+    ctx: &'a WritingContext,
+    conversation_id: &'a Id,
+    history_before_node_id: Option<&'a Id>,
+    hint: Option<&'a str>,
+    template_context: Option<&'a storyforge_domain::prompt_module::TemplateVarContext>,
+}
+
+struct DirectorStageOutput {
+    plan: Plan,
+    director_config: AgentConfig,
+    reasoning_content: Option<String>,
+}
+
+struct SubagentStageInput<'a> {
+    plan: &'a Plan,
+    director_config: &'a AgentConfig,
+    generation_mode: GenerationMode,
+    intent: &'a str,
+    ctx: &'a WritingContext,
+}
+
+struct SubagentStageOutput {
+    performances: Vec<storyforge_domain::agent::Performance>,
+    effective_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
+}
+
 /// 流水线编排器
 pub struct PipelineOrchestrator {
     runtime: Arc<AgentRuntime>,
@@ -814,376 +872,67 @@ impl PipelineOrchestrator {
         let _ = event_tx.send(PipelineEvent::Started {
             session_id: session_id.to_string(),
         });
-        self.state = PipelineState::Directing;
-        let _ = event_tx.send(PipelineEvent::StateChanged {
-            state: self.state.clone(),
-        });
-
-        // ─── 阶段 1：导演 Agent（流式）──────────────────────────────────
-        let _ = event_tx.send(PipelineEvent::DirectorStarted);
-
-        // 前置校验：没有可用角色时，导演无法分配子 Agent，提前返回友好错误
-        // （避免导演陷入"搜不到角色 → 输出空 Plan → drift recovery 死循环"）
-        // 兼容 Campaign 主线：campaign_runtime.instances 非空也可通过
-        if !has_available_characters(ctx) {
-            let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
-            let _ = event_tx.send(PipelineEvent::Error {
-                message: msg.into(),
-            });
-            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
-        }
-
-        let director_intent = match apply_director_intent_regex(&intent, &ctx.regex_scripts) {
-            Ok(text) => text,
-            Err(e) => return Err(self.abort_with(&event_tx, e)),
-        };
         let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
-
-        let director_config = make_director_config(
-            ctx.profile.as_ref(),
-            &ctx.modules,
-            &build_director_system_extra(ctx),
-            ctx.agent_profile_config.as_ref(),
-            template_context.as_ref(),
-            &self.reasoning_mode(),
-        );
-        let mut director_registry = ToolRegistry::new();
-        register_director_tools(&mut director_registry);
-        if let Some(apc) = ctx.agent_profile_config.as_ref() {
-            let wl = apc
-                .run_config_for(&AgentRole::Director)
-                .tool_whitelist
-                .as_deref();
-            filter_registry_by_whitelist(&mut director_registry, wl, "Director");
-        }
-
-        // §22 cache 友好布局：system（role_directive + 模块 + 蓝灯）+ history（对话历史）+ tail（意图/角色/任务）
-        // 对话历史作为独立消息段（而非塞进 user 文本），保证 system+history 前缀稳定、cache 命中。
-        // 超窗时 history 首条为确定性 epoch checkpoint（同 epoch 内稳定）。
-        let (history, epoch_info) = self.conv_store.recent_history_with_epoch(
-            &ctx.conversation_id,
-            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            history_before_node_id,
-        );
-        if let Some(info) = &epoch_info {
-            tracing::debug!(
-                target: "context_compiler",
-                epoch_id = %info.epoch_id,
-                start = info.start,
-                len = info.len,
-                dropped = info.dropped,
-                has_checkpoint = info.has_checkpoint,
-                "Director history epoch"
-            );
-        }
-        // M2：概览 + 纪要带进 history 前缀；近窗摘要从 tail 剔除（硬去重）
-        let chronicle_src = if ctx.chronicle_prompt_catalog.is_empty() {
-            &ctx.recent_summaries
-        } else {
-            &ctx.chronicle_prompt_catalog
-        };
-        let chronicle_part =
-            chronicle_partition_for_context(chronicle_src, ctx.context_epoch.as_ref());
-        tracing::debug!(
-            target: "context_compiler",
-            overview = chronicle_part.overview_lines.len(),
-            band = chronicle_part.band_lines.len(),
-            near_turns = ?chronicle_part.near_turns,
-            "Director chronicle history prefix"
-        );
-        let history = prepend_chronicle_history_prefix(history, &chronicle_part);
-        let history = filter_history_to_near_raw_turns(history, &chronicle_part.near_turns);
-        let director_layout = storyforge_domain::message_layout::MessageLayout::build()
-            .system(director_config.system_prompt.clone())
-            .history(history)
-            .tail(|_| build_director_tail(&director_intent, ctx));
-
-        // 流式：导演的输出 token 实时转成 DirectorProgress 事件
-        let (director_prog_tx, mut director_prog_rx) = mpsc::unbounded_channel::<String>();
-        let event_tx_clone = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(delta) = director_prog_rx.recv().await {
-                let _ = event_tx_clone.send(PipelineEvent::DirectorProgress { delta });
-            }
-        });
-
-        let director_resp = match self
-            .runtime
-            .run_tool_loop_with_layout(
-                &director_config,
-                director_layout,
-                &director_registry,
+        let director_output = self
+            .run_director_stage(
+                DirectorStageInput {
+                    intent: &intent,
+                    ctx,
+                    conversation_id: &ctx.conversation_id,
+                    history_before_node_id,
+                    hint: None,
+                    template_context: template_context.as_ref(),
+                },
+                &event_tx,
                 cancel.clone(),
-                director_prog_tx,
-                // 完成探测：导演 content 里若已含合法 Plan JSON，立即终止（避免 drift recovery 死循环）
-                Some(&|content: &str| {
-                    let fake_resp = storyforge_domain::llm::ChatResponse {
-                        content: content.to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        finish_reason: None,
-                        usage: None,
-                    };
-                    parse_plan_from_response(&fake_resp).is_ok()
-                }),
             )
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(target: "app-pipeline", "导演失败: {e}");
-                return Err(self.abort_with(&event_tx, PipelineError::Agent(e)));
-            }
-        };
+            .await?;
+        let plan = director_output.plan;
+        let director_config = director_output.director_config;
+        let director_reasoning = director_output.reasoning_content;
 
-        // 解析 Plan
-        let plan = match parse_plan_from_response(&director_resp) {
-            Ok(plan) => plan,
-            Err(e) => return Err(self.abort_with(&event_tx, e)),
-        };
-
-        let _ = event_tx.send(PipelineEvent::DirectorDone {
-            scene_brief: plan.scene_brief.clone(),
-            subagent_count: plan.subagent_tasks.len(),
-        });
-
-        info!(target: "app-pipeline", "导演完成: {} 个子任务", plan.subagent_tasks.len());
-
-        // ─── 阶段 2：子 Agent 并行 ───────────────────────────────────────
-        self.state = PipelineState::Delegating;
-        let _ = event_tx.send(PipelineEvent::StateChanged {
-            state: self.state.clone(),
-        });
-
-        // 推送子 Agent 开始事件
-        for (i, task) in plan.subagent_tasks.iter().enumerate() {
-            let _ = event_tx.send(PipelineEvent::SubagentStarted {
-                character_id: task.character_id.clone(),
-                index: i,
-                total: plan.subagent_tasks.len(),
-            });
-        }
-
-        // Phase 6：为未匹配的角色创建临时 instance（临场角色）
-        // 从 Director 的 context_package.character_brief 提取 persona 作为 override
-        let char_specs: Vec<(String, Option<String>, Option<String>)> = plan
-            .subagent_tasks
-            .iter()
-            .map(|t| {
-                let persona = if t.context_package.character_brief.is_empty() {
-                    None
-                } else {
-                    Some(t.context_package.character_brief.clone())
-                };
-                (t.character_id.clone(), persona, None)
-            })
-            .collect();
-        let effective_runtime = if let Some(cr) = &ctx.campaign_runtime {
-            let (updated, temps) = cr.with_temporaries_for(&char_specs);
-            if !temps.is_empty() {
-                info!(target: "app-pipeline", "创建 {} 个临时 instance: {:?}",
-                    temps.len(), temps.iter().map(|t| t.id.as_str()).collect::<Vec<_>>());
-            }
-            self.pending_temporary_instances = temps;
-            Some(Arc::new(updated))
-        } else {
-            ctx.campaign_runtime.clone()
-        };
-
-        let effective_runtime_for_prov = effective_runtime.clone();
-        let max_concurrent = ctx
-            .agent_profile_config
-            .as_ref()
-            .map(|c| c.effective_max_concurrent_subagents())
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
-        let summary_block = render_recent_summaries_for_injection(
-            &ctx.recent_summaries,
-            RECENT_SUMMARIES_INJECT_LIMIT,
-        );
-        let recent_texts: Vec<String> = ctx
-            .recent_summaries
-            .iter()
-            .map(|s| s.content.clone())
-            .collect();
-        let far_block = render_far_memory_for_injection_excluding(
-            &ctx.far_memory_hits,
-            FAR_MEMORY_INJECT_LIMIT,
-            &recent_texts,
-        );
-        let subagent_base = assemble_subagent_base_prompt(
-            ctx.profile.as_ref(),
-            &ctx.modules,
-            &self.reasoning_mode(),
-        );
-        let subagent_results = if generation_mode == GenerationMode::SequentialCrew {
-            sequential_crew::run_sequential_crew(
-                plan.subagent_tasks.clone(),
-                self.runtime.clone(),
-                &director_config,
-                &subagent_base,
+        let subagent_output = self
+            .run_subagent_stage(
+                SubagentStageInput {
+                    plan: &plan,
+                    director_config: &director_config,
+                    generation_mode,
+                    intent: &intent,
+                    ctx,
+                },
+                &event_tx,
                 cancel.clone(),
-                event_tx.clone(),
-                effective_runtime,
-                ctx.agent_profile_config.as_ref(),
-                summary_block.as_deref(),
-                far_block.as_deref(),
-                &intent,
             )
-            .await
-        } else {
-            spawn_subagents(
-                plan.subagent_tasks.clone(),
-                self.runtime.clone(),
-                &director_config,
-                &subagent_base,
-                cancel.clone(),
-                event_tx.clone(),
-                effective_runtime,
-                max_concurrent,
-                ctx.agent_profile_config.as_ref(),
-                summary_block.as_deref(),
-                far_block.as_deref(),
-            )
-            .await
-        };
-
-        // 处理子 Agent 结果
-        let mut performances = Vec::new();
-        for (i, result) in subagent_results.into_iter().enumerate() {
-            match result {
-                Ok(perf) => {
-                    let _ = event_tx.send(PipelineEvent::SubagentDone {
-                        character_id: perf.character_id.clone(),
-                        index: i,
-                        full_text: perf.full_text.clone(),
-                    });
-                    performances.push(perf);
-                }
-                Err(e) => {
-                    let char_id = plan.subagent_tasks[i].character_id.clone();
-                    let _ = event_tx.send(PipelineEvent::SubagentCancelled {
-                        character_id: char_id.clone(),
-                        index: i,
-                    });
-                    error!(target: "app-pipeline", "子 Agent {char_id} 失败: {e}");
-                    // 不中断，继续处理其他子 Agent
-                }
-            }
-        }
-
-        info!(target: "app-pipeline", "子 Agent 完成: {}/{}",
-            performances.len(), plan.subagent_tasks.len());
-
-        // 全部子 Agent 失败时，无法产出有效成文，提前中止
-        if performances.is_empty() && !plan.subagent_tasks.is_empty() {
-            let msg = "所有子 Agent 均失败，无法生成成文";
-            error!(target: "app-pipeline", "{msg}");
-            let _ = event_tx.send(PipelineEvent::Error {
-                message: msg.into(),
-            });
-            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
-        }
+            .await?;
+        let performances = subagent_output.performances;
+        let effective_runtime_for_prov = subagent_output.effective_runtime;
 
         // ─── 阶段 3：编剧 Agent ─────────────────────────────────────────
-        // 子 Agent 完成后、编剧开始前，检查取消
-        if *cancel.borrow() {
-            info!(target: "app-pipeline", "子 Agent 完成后取消，跳过编剧");
-            return Err(self.abort_with(&event_tx, PipelineError::Cancelled));
-        }
-
-        self.state = PipelineState::Editing;
-        let _ = event_tx.send(PipelineEvent::StateChanged {
-            state: self.state.clone(),
-        });
-        let _ = event_tx.send(PipelineEvent::EditorStarted);
-
-        let editor_config = make_editor_config(
-            ctx.profile.as_ref(),
-            &ctx.modules,
-            ctx.agent_profile_config.as_ref(),
-            template_context.as_ref(),
-            &self.reasoning_mode(),
-        );
-
-        let editor_contract =
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                &plan,
-                ctx.campaign_runtime.as_deref(),
-            );
-        // 构造编剧的用户消息（子 Agent 产出）：对异己 private 探针做硬 redaction。
-        let performances_text =
-            redact_performances_for_editor(&performances, Some(&editor_contract));
-
-        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
-        let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
-            &ctx.conversation_id,
-            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            history_before_node_id,
-        );
-        if let Some(info) = &editor_epoch {
-            tracing::debug!(
-                target: "context_compiler",
-                epoch_id = %info.epoch_id,
-                start = info.start,
-                len = info.len,
-                dropped = info.dropped,
-                has_checkpoint = info.has_checkpoint,
-                "Editor history epoch"
-            );
-        }
-        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
-            .system(editor_config.system_prompt.clone())
-            .history(editor_history)
-            .tail(|_| {
-                build_editor_tail(
-                    &plan.scene_brief,
-                    &performances_text,
-                    None,
-                    &ctx.recent_summaries,
-                    &ctx.far_memory_hits,
-                    plan.scene_plan.as_ref(),
-                    Some(&editor_contract),
-                )
-            });
-
-        // 流式：编剧的输出 token 实时转成 EditorProgress 事件
-        let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
-        let event_tx_clone2 = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(delta) = editor_prog_rx.recv().await {
-                let _ = event_tx_clone2.send(PipelineEvent::EditorProgress { delta });
-            }
-        });
-
-        let editor_resp = match self
-            .runtime
-            .run_tool_loop_with_layout(
-                &editor_config,
-                editor_layout,
-                &ToolRegistry::new(), // 编剧无工具，直接输出
-                cancel.clone(),
-                editor_prog_tx,
-                None, // 编剧无完成探测（无工具，直接返回）
+        let editor_output = self
+            .run_editor_stage(
+                EditorStageInput {
+                    plan: &plan,
+                    performances: &performances,
+                    conversation_id: &ctx.conversation_id,
+                    history_before_node_id,
+                    scene_brief: &plan.scene_brief,
+                    hint: None,
+                    profile: ctx.profile.as_ref(),
+                    modules: &ctx.modules,
+                    campaign_runtime: ctx.campaign_runtime.as_deref(),
+                    agent_profile_config: ctx.agent_profile_config.as_ref(),
+                    regex_scripts: &ctx.regex_scripts,
+                    template_context: template_context.as_ref(),
+                    recent_summaries: &ctx.recent_summaries,
+                    far_memory_hits: &ctx.far_memory_hits,
+                    scene_plan: plan.scene_plan.as_ref(),
+                    prompt_flavor: EditorPromptFlavor::Standard,
+                },
+                &event_tx,
+                cancel,
             )
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(target: "app-pipeline", "编剧失败: {e}");
-                return Err(self.abort_with(&event_tx, PipelineError::Agent(e)));
-            }
-        };
-
-        let final_text = match apply_editor_output_regex(&editor_resp.content, &ctx.regex_scripts) {
-            Ok(text) => text,
-            Err(e) => return Err(self.abort_with(&event_tx, e)),
-        };
-
-        let _ = event_tx.send(PipelineEvent::DraftReady {
-            text: final_text.clone(),
-        });
-
-        info!(target: "app-pipeline", "编剧完成: {} 字", final_text.len());
+            .await?;
+        let final_text = editor_output.final_text;
 
         // ─── 阶段 4：写入对话树 ─────────────────────────────────────────
         self.state = PipelineState::Review;
@@ -1198,8 +947,8 @@ impl PipelineOrchestrator {
             None, // last_hint（首次写作无 hint）
             effective_runtime_for_prov.as_deref(),
         );
-        provenance.director_reasoning = director_resp.reasoning_content.clone();
-        provenance.editor_reasoning = editor_resp.reasoning_content.clone();
+        provenance.director_reasoning = director_reasoning;
+        provenance.editor_reasoning = editor_output.reasoning_content;
         validate_provenance_reasoning_budget(&provenance)?;
 
         // 写入对话树（可 defer：SQLite pre-accept UoW 拥有原子落点）
@@ -1584,79 +1333,31 @@ impl PipelineOrchestrator {
             let message = "对手戏没有留下可定稿的公开场记";
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(message.into())));
         }
-        if *cancel.borrow() {
-            return Err(self.abort_with(&event_tx, PipelineError::Cancelled));
-        }
-
-        self.state = PipelineState::Editing;
-        let _ = event_tx.send(PipelineEvent::StateChanged {
-            state: self.state.clone(),
-        });
-        let _ = event_tx.send(PipelineEvent::EditorStarted);
-        let editor_config = make_duet_editor_config(
-            ctx.profile.as_ref(),
-            &ctx.modules,
-            ctx.agent_profile_config.as_ref(),
-            template_context.as_ref(),
-            &self.reasoning_mode(),
-        );
-        let contract =
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                &plan,
-                ctx.campaign_runtime.as_deref(),
-            );
-        let performances_text = redact_performances_for_editor(&performances, Some(&contract));
-        let (history, _) = self.conv_store.recent_history_with_epoch(
-            &ctx.conversation_id,
-            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            history_before_node_id,
-        );
-        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
-            .system(editor_config.system_prompt.clone())
-            .history(history)
-            .tail(|_| {
-                build_editor_tail(
-                    &duet_intent,
-                    &performances_text,
-                    None,
-                    &[],
-                    &[],
-                    None,
-                    Some(&contract),
-                )
-            });
-        let (editor_progress_tx, mut editor_progress_rx) = mpsc::unbounded_channel::<String>();
-        let editor_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(delta) = editor_progress_rx.recv().await {
-                let _ = editor_event_tx.send(PipelineEvent::EditorProgress { delta });
-            }
-        });
-        let editor_response = match self
-            .runtime
-            .run_tool_loop_with_layout(
-                &editor_config,
-                editor_layout,
-                &ToolRegistry::new(),
+        let editor_output = self
+            .run_editor_stage(
+                EditorStageInput {
+                    plan: &plan,
+                    performances: &performances,
+                    conversation_id: &ctx.conversation_id,
+                    history_before_node_id,
+                    scene_brief: &duet_intent,
+                    hint: None,
+                    profile: ctx.profile.as_ref(),
+                    modules: &ctx.modules,
+                    campaign_runtime: ctx.campaign_runtime.as_deref(),
+                    agent_profile_config: ctx.agent_profile_config.as_ref(),
+                    regex_scripts: &ctx.regex_scripts,
+                    template_context: template_context.as_ref(),
+                    recent_summaries: &[],
+                    far_memory_hits: &[],
+                    scene_plan: None,
+                    prompt_flavor: EditorPromptFlavor::Duet,
+                },
+                &event_tx,
                 cancel,
-                editor_progress_tx,
-                None,
             )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                return Err(self.abort_with(&event_tx, PipelineError::Agent(error)));
-            }
-        };
-        let final_text =
-            match apply_editor_output_regex(&editor_response.content, &ctx.regex_scripts) {
-                Ok(text) => text,
-                Err(error) => return Err(self.abort_with(&event_tx, error)),
-            };
-        let _ = event_tx.send(PipelineEvent::DraftReady {
-            text: final_text.clone(),
-        });
+            .await?;
+        let final_text = editor_output.final_text;
 
         self.state = PipelineState::Review;
         let mut provenance = build_provenance_with_campaign(
@@ -1669,7 +1370,7 @@ impl PipelineOrchestrator {
             None,
             ctx.campaign_runtime.as_deref(),
         );
-        provenance.editor_reasoning = editor_response.reasoning_content;
+        provenance.editor_reasoning = editor_output.reasoning_content;
         validate_provenance_reasoning_budget(&provenance)?;
         let node_id = if self.defer_conversation_land {
             Id::new()
@@ -2104,246 +1805,44 @@ impl PipelineOrchestrator {
 
         // ─── 路径 A：整体重 roll（含 Director 或 targets 为空）──────────────
         if rerun_director || req.targets.is_empty() {
-            self.state = PipelineState::Directing;
-            let _ = event_tx.send(PipelineEvent::StateChanged {
-                state: self.state.clone(),
-            });
-            let _ = event_tx.send(PipelineEvent::DirectorStarted);
-
-            // 前置校验：没有可用角色时提前返回友好错误（同 start_writing，兼容 Campaign）
-            if !has_available_characters(ctx) {
-                let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
-                let _ = event_tx.send(PipelineEvent::Error {
-                    message: msg.into(),
-                });
-                return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
-            }
-
-            let director_config = make_director_config(
-                ctx.profile.as_ref(),
-                &ctx.modules,
-                &build_director_system_extra(ctx),
-                ctx.agent_profile_config.as_ref(),
-                template_context.as_ref(),
-                &self.reasoning_mode(),
-            );
-            let mut director_registry = ToolRegistry::new();
-            register_director_tools(&mut director_registry);
-            // 应用 AgentProfileConfig 的 tool_whitelist（None=默认全部，Some=只保留指定工具）
-            if let Some(apc) = ctx.agent_profile_config.as_ref() {
-                let wl = apc
-                    .run_config_for(&AgentRole::Director)
-                    .tool_whitelist
-                    .as_deref();
-                filter_registry_by_whitelist(&mut director_registry, wl, "Director");
-            }
-
-            // 导演 intent：复用旧 Plan 的场景作 intent + 可选 hint
             let intent_text = provenance_old
                 .plan
                 .as_ref()
                 .map(|p| p.scene_brief.clone())
                 .unwrap_or_else(|| "重新创作".into());
-            let director_intent =
-                match apply_director_intent_regex(&intent_text, &ctx.regex_scripts) {
-                    Ok(text) => text,
-                    Err(e) => return Err(self.abort_with(&event_tx, e)),
-                };
-
-            // §22 cache 友好布局：history 排除重 roll 目标节点及之后
-            let (director_history, director_epoch) = self.conv_store.recent_history_with_epoch(
-                &req.conversation_id,
-                storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-                Some(&req.node_id),
-            );
-            if let Some(info) = &director_epoch {
-                tracing::debug!(
-                    target: "context_compiler",
-                    epoch_id = %info.epoch_id,
-                    start = info.start,
-                    len = info.len,
-                    dropped = info.dropped,
-                    has_checkpoint = info.has_checkpoint,
-                    "Director regenerate history epoch"
-                );
-            }
-            let chronicle_src = if ctx.chronicle_prompt_catalog.is_empty() {
-                &ctx.recent_summaries
-            } else {
-                &ctx.chronicle_prompt_catalog
-            };
-            let chronicle_part =
-                chronicle_partition_for_context(chronicle_src, ctx.context_epoch.as_ref());
-            let director_history =
-                prepend_chronicle_history_prefix(director_history, &chronicle_part);
-            let director_history =
-                filter_history_to_near_raw_turns(director_history, &chronicle_part.near_turns);
-            let director_layout = storyforge_domain::message_layout::MessageLayout::build()
-                .system(director_config.system_prompt.clone())
-                .history(director_history)
-                .tail(|_| {
-                    let mut t = build_director_tail(&director_intent, ctx);
-                    if let Some(h) = hint.as_deref() {
-                        let h = h.trim();
-                        if !h.is_empty() {
-                            t = t.push(format!("{EDITOR_HINT_MARKER}{h}"));
-                        }
-                    }
-                    t
-                });
-
-            // 流式：导演输出实时推 DirectorProgress
-            let (director_prog_tx, mut director_prog_rx) = mpsc::unbounded_channel::<String>();
-            let event_tx_clone = event_tx.clone();
-            tokio::spawn(async move {
-                while let Some(delta) = director_prog_rx.recv().await {
-                    let _ = event_tx_clone.send(PipelineEvent::DirectorProgress { delta });
-                }
-            });
-
-            let director_resp = match self
-                .runtime
-                .run_tool_loop_with_layout(
-                    &director_config,
-                    director_layout,
-                    &director_registry,
+            let director_output = self
+                .run_director_stage(
+                    DirectorStageInput {
+                        intent: &intent_text,
+                        ctx,
+                        conversation_id: &req.conversation_id,
+                        history_before_node_id: Some(&req.node_id),
+                        hint: hint.as_deref(),
+                        template_context: template_context.as_ref(),
+                    },
+                    &event_tx,
                     cancel.clone(),
-                    director_prog_tx,
-                    Some(&|content: &str| {
-                        let fake_resp = storyforge_domain::llm::ChatResponse {
-                            content: content.to_string(),
-                            reasoning_content: None,
-                            tool_calls: vec![],
-                            finish_reason: None,
-                            usage: None,
-                        };
-                        parse_plan_from_response(&fake_resp).is_ok()
-                    }),
                 )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(e) => return Err(self.abort_with(&event_tx, PipelineError::Agent(e))),
-            };
+                .await?;
+            let plan = director_output.plan;
+            let director_config = director_output.director_config;
+            let director_reasoning = director_output.reasoning_content;
 
-            let plan = match parse_plan_from_response(&director_resp) {
-                Ok(plan) => plan,
-                Err(e) => return Err(self.abort_with(&event_tx, e)),
-            };
-            let _ = event_tx.send(PipelineEvent::DirectorDone {
-                scene_brief: plan.scene_brief.clone(),
-                subagent_count: plan.subagent_tasks.len(),
-            });
-
-            // 子 Agent
-            self.state = PipelineState::Delegating;
-            let _ = event_tx.send(PipelineEvent::StateChanged {
-                state: self.state.clone(),
-            });
-            for (i, task) in plan.subagent_tasks.iter().enumerate() {
-                let _ = event_tx.send(PipelineEvent::SubagentStarted {
-                    character_id: task.character_id.clone(),
-                    index: i,
-                    total: plan.subagent_tasks.len(),
-                });
-            }
-
-            // Phase 6：为未匹配的角色创建临时 instance（临场角色）
-            // 从 Director 的 context_package.character_brief 提取 persona 作为 override
-            let char_specs: Vec<(String, Option<String>, Option<String>)> = plan
-                .subagent_tasks
-                .iter()
-                .map(|t| {
-                    let persona = if t.context_package.character_brief.is_empty() {
-                        None
-                    } else {
-                        Some(t.context_package.character_brief.clone())
-                    };
-                    (t.character_id.clone(), persona, None)
-                })
-                .collect();
-            let effective_runtime = if let Some(cr) = &ctx.campaign_runtime {
-                let (updated, temps) = cr.with_temporaries_for(&char_specs);
-                if !temps.is_empty() {
-                    info!(target: "app-pipeline", "创建 {} 个临时 instance（重 roll）: {:?}",
-                        temps.len(), temps.iter().map(|t| t.id.as_str()).collect::<Vec<_>>());
-                }
-                self.pending_temporary_instances = temps;
-                Some(Arc::new(updated))
-            } else {
-                ctx.campaign_runtime.clone()
-            };
-
-            let effective_runtime_for_prov = effective_runtime.clone();
-            let max_concurrent = ctx
-                .agent_profile_config
-                .as_ref()
-                .map(|c| c.effective_max_concurrent_subagents())
-                .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
-            let summary_block = render_recent_summaries_for_injection(
-                &ctx.recent_summaries,
-                RECENT_SUMMARIES_INJECT_LIMIT,
-            );
-            let recent_texts: Vec<String> = ctx
-                .recent_summaries
-                .iter()
-                .map(|s| s.content.clone())
-                .collect();
-            let far_block = render_far_memory_for_injection_excluding(
-                &ctx.far_memory_hits,
-                FAR_MEMORY_INJECT_LIMIT,
-                &recent_texts,
-            );
-            let subagent_base = assemble_subagent_base_prompt(
-                ctx.profile.as_ref(),
-                &ctx.modules,
-                &self.reasoning_mode(),
-            );
-            let subagent_results = spawn_subagents(
-                plan.subagent_tasks.clone(),
-                self.runtime.clone(),
-                &director_config,
-                &subagent_base,
-                cancel.clone(),
-                event_tx.clone(),
-                effective_runtime,
-                max_concurrent,
-                ctx.agent_profile_config.as_ref(),
-                summary_block.as_deref(),
-                far_block.as_deref(),
-            )
-            .await;
-
-            let mut performances = Vec::new();
-            for (i, result) in subagent_results.into_iter().enumerate() {
-                match result {
-                    Ok(perf) => {
-                        let _ = event_tx.send(PipelineEvent::SubagentDone {
-                            character_id: perf.character_id.clone(),
-                            index: i,
-                            full_text: perf.full_text.clone(),
-                        });
-                        performances.push(perf);
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(PipelineEvent::SubagentCancelled {
-                            character_id: plan.subagent_tasks[i].character_id.clone(),
-                            index: i,
-                        });
-                        error!(target: "app-pipeline", "重 roll 子 Agent 失败: {e}");
-                    }
-                }
-            }
-
-            // 全部子 Agent 失败时，无法产出有效成文，提前中止
-            if performances.is_empty() && !plan.subagent_tasks.is_empty() {
-                let msg = "所有子 Agent 均失败，无法生成成文";
-                error!(target: "app-pipeline", "{msg}");
-                let _ = event_tx.send(PipelineEvent::Error {
-                    message: msg.into(),
-                });
-                return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
-            }
+            let subagent_output = self
+                .run_subagent_stage(
+                    SubagentStageInput {
+                        plan: &plan,
+                        director_config: &director_config,
+                        generation_mode: GenerationMode::BigScene,
+                        intent: &intent_text,
+                        ctx,
+                    },
+                    &event_tx,
+                    cancel.clone(),
+                )
+                .await?;
+            let performances = subagent_output.performances;
+            let effective_runtime_for_prov = subagent_output.effective_runtime;
 
             // 编剧（注入 hint）
             let (final_text, provenance) = self
@@ -2365,7 +1864,7 @@ impl PipelineOrchestrator {
                     template_context.as_ref(),
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
-                    director_resp.reasoning_content.clone(),
+                    director_reasoning,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -2391,12 +1890,6 @@ impl PipelineOrchestrator {
                 .plan
                 .clone()
                 .ok_or_else(|| PipelineError::Regenerate("旧 Provenance 无 Plan".into()))?;
-
-            self.state = PipelineState::Editing;
-            let _ = event_tx.send(PipelineEvent::StateChanged {
-                state: self.state.clone(),
-            });
-            // EditorStarted 由 run_editor_and_commit 统一发射（此前双发会重置前端已流式的编剧输出）。
 
             let (final_text, provenance) = self
                 .run_editor_and_commit(
@@ -2620,12 +2113,6 @@ impl PipelineOrchestrator {
                     });
                 }
             }
-
-            self.state = PipelineState::Editing;
-            let _ = event_tx.send(PipelineEvent::StateChanged {
-                state: self.state.clone(),
-            });
-            // EditorStarted 由 run_editor_and_commit 统一发射（此前双发会重置前端已流式的编剧输出）。
 
             let (final_text, provenance) = self
                 .run_editor_and_commit(
@@ -2871,10 +2358,6 @@ impl PipelineOrchestrator {
 
         let mut performances = prefix_performances;
         performances.extend(replayed);
-        self.state = PipelineState::Editing;
-        let _ = event_tx.send(PipelineEvent::StateChanged {
-            state: self.state.clone(),
-        });
         self.run_editor_and_commit(
             &plan,
             &performances,
@@ -2896,6 +2379,412 @@ impl PipelineOrchestrator {
             provenance_old.director_reasoning.clone(),
         )
         .await
+    }
+
+    /// Shared Director execution stage. Subagent execution and durable landing
+    /// remain in the caller-specific layers.
+    async fn run_director_stage(
+        &mut self,
+        input: DirectorStageInput<'_>,
+        event_tx: &mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<DirectorStageOutput, PipelineError> {
+        self.state = PipelineState::Directing;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        let _ = event_tx.send(PipelineEvent::DirectorStarted);
+
+        if !has_available_characters(input.ctx) {
+            let message = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: message.into(),
+            });
+            return Err(self.abort_with(event_tx, PipelineError::InvalidState(message.into())));
+        }
+
+        let director_intent =
+            match apply_director_intent_regex(input.intent, &input.ctx.regex_scripts) {
+                Ok(text) => text,
+                Err(error) => return Err(self.abort_with(event_tx, error)),
+            };
+        let director_config = make_director_config(
+            input.ctx.profile.as_ref(),
+            &input.ctx.modules,
+            &build_director_system_extra(input.ctx),
+            input.ctx.agent_profile_config.as_ref(),
+            input.template_context,
+            &self.reasoning_mode(),
+        );
+        let mut director_registry = ToolRegistry::new();
+        register_director_tools(&mut director_registry);
+        if let Some(agent_profile) = input.ctx.agent_profile_config.as_ref() {
+            let whitelist = agent_profile
+                .run_config_for(&AgentRole::Director)
+                .tool_whitelist
+                .as_deref();
+            filter_registry_by_whitelist(&mut director_registry, whitelist, "Director");
+        }
+
+        let (history, epoch_info) = self.conv_store.recent_history_with_epoch(
+            input.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            input.history_before_node_id,
+        );
+        if let Some(info) = &epoch_info {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Director history epoch"
+            );
+        }
+        let chronicle_source = if input.ctx.chronicle_prompt_catalog.is_empty() {
+            &input.ctx.recent_summaries
+        } else {
+            &input.ctx.chronicle_prompt_catalog
+        };
+        let chronicle_partition =
+            chronicle_partition_for_context(chronicle_source, input.ctx.context_epoch.as_ref());
+        tracing::debug!(
+            target: "context_compiler",
+            overview = chronicle_partition.overview_lines.len(),
+            band = chronicle_partition.band_lines.len(),
+            near_turns = ?chronicle_partition.near_turns,
+            "Director chronicle history prefix"
+        );
+        let history = prepend_chronicle_history_prefix(history, &chronicle_partition);
+        let history = filter_history_to_near_raw_turns(history, &chronicle_partition.near_turns);
+        let director_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(director_config.system_prompt.clone())
+            .history(history)
+            .tail(|_| {
+                let mut tail = build_director_tail(&director_intent, input.ctx);
+                if let Some(hint) = input.hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+                    tail = tail.push(format!("{EDITOR_HINT_MARKER}{hint}"));
+                }
+                tail
+            });
+
+        let (director_progress_tx, mut director_progress_rx) = mpsc::unbounded_channel::<String>();
+        let director_event_tx = event_tx.clone();
+        let progress_forwarder = tokio::spawn(async move {
+            while let Some(delta) = director_progress_rx.recv().await {
+                let _ = director_event_tx.send(PipelineEvent::DirectorProgress { delta });
+            }
+        });
+        let director_result = self
+            .runtime
+            .run_tool_loop_with_layout(
+                &director_config,
+                director_layout,
+                &director_registry,
+                cancel,
+                director_progress_tx,
+                Some(&|content: &str| {
+                    let response = storyforge_domain::llm::ChatResponse {
+                        content: content.to_string(),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        finish_reason: None,
+                        usage: None,
+                    };
+                    parse_plan_from_response(&response).is_ok()
+                }),
+            )
+            .await;
+        let _ = progress_forwarder.await;
+        let director_response = match director_result {
+            Ok(response) => response,
+            Err(error) => {
+                error!(target: "app-pipeline", "导演失败: {error}");
+                return Err(self.abort_with(event_tx, PipelineError::Agent(error)));
+            }
+        };
+        let plan = match parse_plan_from_response(&director_response) {
+            Ok(plan) => plan,
+            Err(error) => return Err(self.abort_with(event_tx, error)),
+        };
+        let _ = event_tx.send(PipelineEvent::DirectorDone {
+            scene_brief: plan.scene_brief.clone(),
+            subagent_count: plan.subagent_tasks.len(),
+        });
+        info!(target: "app-pipeline", "导演完成: {} 个子任务", plan.subagent_tasks.len());
+
+        Ok(DirectorStageOutput {
+            plan,
+            director_config,
+            reasoning_content: director_response.reasoning_content,
+        })
+    }
+
+    /// Shared Subagent execution stage. Editor execution and durable landing
+    /// remain in the caller-specific layers.
+    async fn run_subagent_stage(
+        &mut self,
+        input: SubagentStageInput<'_>,
+        event_tx: &mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<SubagentStageOutput, PipelineError> {
+        self.state = PipelineState::Delegating;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        for (index, task) in input.plan.subagent_tasks.iter().enumerate() {
+            let _ = event_tx.send(PipelineEvent::SubagentStarted {
+                character_id: task.character_id.clone(),
+                index,
+                total: input.plan.subagent_tasks.len(),
+            });
+        }
+
+        let character_specs = input
+            .plan
+            .subagent_tasks
+            .iter()
+            .map(|task| {
+                let persona = (!task.context_package.character_brief.is_empty())
+                    .then(|| task.context_package.character_brief.clone());
+                (task.character_id.clone(), persona, None)
+            })
+            .collect::<Vec<_>>();
+        let effective_runtime = if let Some(campaign_runtime) = &input.ctx.campaign_runtime {
+            let (updated, temporaries) = campaign_runtime.with_temporaries_for(&character_specs);
+            if !temporaries.is_empty() {
+                info!(
+                    target: "app-pipeline",
+                    "创建 {} 个临时 instance: {:?}",
+                    temporaries.len(),
+                    temporaries
+                        .iter()
+                        .map(|temporary| temporary.id.as_str())
+                        .collect::<Vec<_>>()
+                );
+            }
+            self.pending_temporary_instances = temporaries;
+            Some(Arc::new(updated))
+        } else {
+            input.ctx.campaign_runtime.clone()
+        };
+        let effective_runtime_for_provenance = effective_runtime.clone();
+        let max_concurrent = input
+            .ctx
+            .agent_profile_config
+            .as_ref()
+            .map(|config| config.effective_max_concurrent_subagents())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
+        let summary_block = render_recent_summaries_for_injection(
+            &input.ctx.recent_summaries,
+            RECENT_SUMMARIES_INJECT_LIMIT,
+        );
+        let recent_texts = input
+            .ctx
+            .recent_summaries
+            .iter()
+            .map(|summary| summary.content.clone())
+            .collect::<Vec<_>>();
+        let far_block = render_far_memory_for_injection_excluding(
+            &input.ctx.far_memory_hits,
+            FAR_MEMORY_INJECT_LIMIT,
+            &recent_texts,
+        );
+        let subagent_base = assemble_subagent_base_prompt(
+            input.ctx.profile.as_ref(),
+            &input.ctx.modules,
+            &self.reasoning_mode(),
+        );
+        let results = if input.generation_mode == GenerationMode::SequentialCrew {
+            sequential_crew::run_sequential_crew(
+                input.plan.subagent_tasks.clone(),
+                self.runtime.clone(),
+                input.director_config,
+                &subagent_base,
+                cancel.clone(),
+                event_tx.clone(),
+                effective_runtime,
+                input.ctx.agent_profile_config.as_ref(),
+                summary_block.as_deref(),
+                far_block.as_deref(),
+                input.intent,
+            )
+            .await
+        } else {
+            spawn_subagents(
+                input.plan.subagent_tasks.clone(),
+                self.runtime.clone(),
+                input.director_config,
+                &subagent_base,
+                cancel,
+                event_tx.clone(),
+                effective_runtime,
+                max_concurrent,
+                input.ctx.agent_profile_config.as_ref(),
+                summary_block.as_deref(),
+                far_block.as_deref(),
+            )
+            .await
+        };
+
+        let mut performances = Vec::new();
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(performance) => {
+                    let _ = event_tx.send(PipelineEvent::SubagentDone {
+                        character_id: performance.character_id.clone(),
+                        index,
+                        full_text: performance.full_text.clone(),
+                    });
+                    performances.push(performance);
+                }
+                Err(error) => {
+                    let character_id = input.plan.subagent_tasks[index].character_id.clone();
+                    let _ = event_tx.send(PipelineEvent::SubagentCancelled {
+                        character_id: character_id.clone(),
+                        index,
+                    });
+                    error!(target: "app-pipeline", "子 Agent {character_id} 失败: {error}");
+                }
+            }
+        }
+        info!(
+            target: "app-pipeline",
+            "子 Agent 完成: {}/{}",
+            performances.len(),
+            input.plan.subagent_tasks.len()
+        );
+        if performances.is_empty() && !input.plan.subagent_tasks.is_empty() {
+            let message = "所有子 Agent 均失败，无法生成成文";
+            error!(target: "app-pipeline", "{message}");
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: message.into(),
+            });
+            return Err(self.abort_with(event_tx, PipelineError::InvalidState(message.into())));
+        }
+
+        Ok(SubagentStageOutput {
+            performances,
+            effective_runtime: effective_runtime_for_provenance,
+        })
+    }
+
+    /// Shared Editor execution stage. Durable draft/variant landing and
+    /// provenance/session assembly remain in the caller-specific commit layer.
+    async fn run_editor_stage(
+        &mut self,
+        input: EditorStageInput<'_>,
+        event_tx: &mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<EditorStageOutput, PipelineError> {
+        if *cancel.borrow() {
+            info!(target: "app-pipeline", "编剧开始前取消");
+            return Err(self.abort_with(event_tx, PipelineError::Cancelled));
+        }
+
+        self.state = PipelineState::Editing;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        let _ = event_tx.send(PipelineEvent::EditorStarted);
+
+        let editor_config = match input.prompt_flavor {
+            EditorPromptFlavor::Standard => make_editor_config(
+                input.profile,
+                input.modules,
+                input.agent_profile_config,
+                input.template_context,
+                &self.reasoning_mode(),
+            ),
+            EditorPromptFlavor::Duet => make_duet_editor_config(
+                input.profile,
+                input.modules,
+                input.agent_profile_config,
+                input.template_context,
+                &self.reasoning_mode(),
+            ),
+        };
+        let editor_contract =
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                input.plan,
+                input.campaign_runtime,
+            );
+        let performances_text =
+            redact_performances_for_editor(input.performances, Some(&editor_contract));
+
+        let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
+            input.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            input.history_before_node_id,
+        );
+        if let Some(info) = &editor_epoch {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Editor history epoch"
+            );
+        }
+        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(editor_config.system_prompt.clone())
+            .history(editor_history)
+            .tail(|_| {
+                build_editor_tail(
+                    input.scene_brief,
+                    &performances_text,
+                    input.hint,
+                    input.recent_summaries,
+                    input.far_memory_hits,
+                    input.scene_plan,
+                    Some(&editor_contract),
+                )
+            });
+
+        let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
+        let editor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(delta) = editor_prog_rx.recv().await {
+                let _ = editor_event_tx.send(PipelineEvent::EditorProgress { delta });
+            }
+        });
+
+        let editor_response = match self
+            .runtime
+            .run_tool_loop_with_layout(
+                &editor_config,
+                editor_layout,
+                &ToolRegistry::new(),
+                cancel,
+                editor_prog_tx,
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                error!(target: "app-pipeline", "编剧失败: {error}");
+                return Err(self.abort_with(event_tx, PipelineError::Agent(error)));
+            }
+        };
+
+        let final_text =
+            match apply_editor_output_regex(&editor_response.content, input.regex_scripts) {
+                Ok(text) => text,
+                Err(error) => return Err(self.abort_with(event_tx, error)),
+            };
+        let _ = event_tx.send(PipelineEvent::DraftReady {
+            text: final_text.clone(),
+        });
+        info!(target: "app-pipeline", "编剧完成: {} 字", final_text.len());
+
+        Ok(EditorStageOutput {
+            final_text,
+            reasoning_content: editor_response.reasoning_content,
+        })
     }
 
     /// 内部：跑编剧 + 写入对话树（新 variant），返回 (成文, Provenance)
@@ -2924,98 +2813,31 @@ impl PipelineOrchestrator {
         far_memory_hits: &[FarMemoryHit],
         director_reasoning: Option<String>,
     ) -> Result<(String, Provenance), PipelineError> {
-        // 编剧开始前，检查取消
-        if *cancel.borrow() {
-            info!(target: "app-pipeline", "编剧开始前取消");
-            return Err(self.abort_with(&event_tx, PipelineError::Cancelled));
-        }
-
-        self.state = PipelineState::Editing;
-        let _ = event_tx.send(PipelineEvent::EditorStarted);
-
-        let editor_config = make_editor_config(
-            profile,
-            modules,
-            agent_profile_config,
-            template_context,
-            &self.reasoning_mode(),
-        );
-
-        let editor_contract =
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                plan,
-                campaign_runtime,
-            );
-        let performances_text =
-            redact_performances_for_editor(performances, Some(&editor_contract));
-
-        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
-        let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
-            &req.conversation_id,
-            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            Some(&req.node_id),
-        );
-        if let Some(info) = &editor_epoch {
-            tracing::debug!(
-                target: "context_compiler",
-                epoch_id = %info.epoch_id,
-                start = info.start,
-                len = info.len,
-                dropped = info.dropped,
-                has_checkpoint = info.has_checkpoint,
-                "Editor regenerate history epoch"
-            );
-        }
-        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
-            .system(editor_config.system_prompt.clone())
-            .history(editor_history)
-            .tail(|_| {
-                build_editor_tail(
-                    &plan.scene_brief,
-                    &performances_text,
+        let editor_output = self
+            .run_editor_stage(
+                EditorStageInput {
+                    plan,
+                    performances,
+                    conversation_id: &req.conversation_id,
+                    history_before_node_id: Some(&req.node_id),
+                    scene_brief: &plan.scene_brief,
                     hint,
+                    profile,
+                    modules,
+                    campaign_runtime,
+                    agent_profile_config,
+                    regex_scripts,
+                    template_context,
                     recent_summaries,
                     far_memory_hits,
-                    plan.scene_plan.as_ref(),
-                    Some(&editor_contract),
-                )
-            });
-
-        // 流式：编剧输出实时推 EditorProgress
-        let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
-        let event_tx_clone = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(delta) = editor_prog_rx.recv().await {
-                let _ = event_tx_clone.send(PipelineEvent::EditorProgress { delta });
-            }
-        });
-
-        let editor_resp = match self
-            .runtime
-            .run_tool_loop_with_layout(
-                &editor_config,
-                editor_layout,
-                &ToolRegistry::new(),
+                    scene_plan: plan.scene_plan.as_ref(),
+                    prompt_flavor: EditorPromptFlavor::Standard,
+                },
+                &event_tx,
                 cancel,
-                editor_prog_tx,
-                None,
             )
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(target: "app-pipeline", "编剧失败: {e}");
-                return Err(self.abort_with(&event_tx, PipelineError::Agent(e)));
-            }
-        };
-
-        let final_text = match apply_editor_output_regex(&editor_resp.content, regex_scripts) {
-            Ok(text) => text,
-            Err(e) => return Err(self.abort_with(&event_tx, e)),
-        };
-        let _ = event_tx.send(PipelineEvent::DraftReady {
-            text: final_text.clone(),
-        });
+            .await?;
+        let final_text = editor_output.final_text;
 
         let mut provenance = build_provenance_with_campaign(
             session_id.clone(),
@@ -3028,7 +2850,7 @@ impl PipelineOrchestrator {
             campaign_runtime,
         );
         provenance.director_reasoning = director_reasoning;
-        provenance.editor_reasoning = editor_resp.reasoning_content.clone();
+        provenance.editor_reasoning = editor_output.reasoning_content;
         validate_provenance_reasoning_budget(&provenance)?;
 
         // 写入对话树（variant 保留语义）：
@@ -4421,6 +4243,976 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CapturingDirectorLlm {
+        requests: Arc<std::sync::Mutex<Vec<storyforge_domain::llm::ChatRequest>>>,
+        response: storyforge_domain::llm::ChatResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CapturingDirectorLlm {
+        async fn chat(
+            &self,
+            request: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            Ok(self.response.clone())
+        }
+
+        async fn chat_stream(
+            &self,
+            request: &storyforge_domain::llm::ChatRequest,
+            progress: mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            let _ = progress.send(storyforge_domain::llm::StreamChunk {
+                delta_content: Some("DIRECTOR_DELTA".into()),
+                delta_reasoning_content: None,
+                delta_tool_calls: None,
+                finish_reason: None,
+            });
+            Ok(self.response.clone())
+        }
+    }
+
+    fn capturing_director_llm() -> (
+        Arc<dyn LlmClient>,
+        Arc<std::sync::Mutex<Vec<storyforge_domain::llm::ChatRequest>>>,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response = storyforge_domain::llm::ChatResponse {
+            content: serde_json::json!({
+                "scene_brief": "SHARED_DIRECTOR_SCENE",
+                "subagent_tasks": [{
+                    "character_id": "actor-a",
+                    "brief": "perform the scene",
+                    "context_package": {
+                        "character_brief": "guarded",
+                        "scene_brief": "SHARED_DIRECTOR_SCENE",
+                        "relevant_lore": [],
+                        "constant_lore": [],
+                        "recent_window": [],
+                        "task": "perform the scene"
+                    }
+                }]
+            })
+            .to_string(),
+            reasoning_content: Some("DIRECTOR_REASONING".into()),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        };
+        (
+            Arc::new(CapturingDirectorLlm {
+                requests: requests.clone(),
+                response,
+            }),
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_director_stage_owns_prompt_tools_events_parse_and_no_land() {
+        let (llm, captured_requests) = capturing_director_llm();
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_director_stage_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        for turn in 1..=6 {
+            conv_store
+                .append_user_message(&conversation_id, format!("RAW_HISTORY_USER_{turn}"))
+                .unwrap();
+            conv_store
+                .append_ai_draft(&conversation_id, format!("RAW_HISTORY_AI_{turn}"), None)
+                .unwrap();
+        }
+        let history_boundary = conv_store
+            .append_user_message(&conversation_id, "HIDDEN_DIRECTOR_HISTORY".into())
+            .unwrap();
+        let nodes_before = conv_store.get(&conversation_id).unwrap().nodes.len();
+
+        let mut ctx = WritingContext::legacy(
+            vec![mock_character("actor-a")],
+            None,
+            conversation_id.clone(),
+        );
+        ctx.regex_scripts = vec![mock_regex_script(
+            "shared-director-intent",
+            "RAW_DIRECTOR_INTENT",
+            "FILTERED_DIRECTOR_INTENT",
+            RegexPlacement::Input,
+        )];
+        ctx.chronicle_prompt_catalog = (1..=7)
+            .map(|turn| {
+                storyforge_domain::agent::RoundSummary::new(
+                    Id::from_str("campaign-director-stage"),
+                    conversation_id.clone(),
+                    turn,
+                    format!("CHRONICLE_{turn}"),
+                )
+                .with_code(format!("A{turn:04}"))
+                .with_headline(format!("HEADLINE_{turn}"))
+            })
+            .collect();
+        let mut agent_profile =
+            storyforge_domain::agent_profile_config::default_agent_profile_config();
+        agent_profile.agent_configs.insert(
+            AgentRole::Director,
+            storyforge_domain::agent_profile_config::AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: None,
+                tool_whitelist: Some(vec!["search_world_info".into()]),
+            },
+        );
+        ctx.agent_profile_config = Some(agent_profile);
+
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let output = orchestrator
+            .run_director_stage(
+                DirectorStageInput {
+                    intent: "RAW_DIRECTOR_INTENT",
+                    ctx: &ctx,
+                    conversation_id: &conversation_id,
+                    history_before_node_id: Some(&history_boundary),
+                    hint: Some("REGENERATE_DIRECTOR_HINT"),
+                    template_context: None,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("shared Director stage should succeed");
+
+        assert_eq!(output.plan.scene_brief, "SHARED_DIRECTOR_SCENE");
+        assert_eq!(
+            output.reasoning_content.as_deref(),
+            Some("DIRECTOR_REASONING")
+        );
+        assert_eq!(output.director_config.role, AgentRole::Director);
+        assert_eq!(orchestrator.state(), &PipelineState::Directing);
+        assert_eq!(
+            conv_store.get(&conversation_id).unwrap().nodes.len(),
+            nodes_before,
+            "the Director stage must not land conversation nodes"
+        );
+
+        let requests = captured_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let tool_names = request
+            .tools
+            .as_ref()
+            .expect("whitelisted Director tool should be sent")
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["search_world_info"]);
+        let message_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message_text.contains("FILTERED_DIRECTOR_INTENT"));
+        assert!(!message_text.contains("RAW_DIRECTOR_INTENT"));
+        assert!(message_text.contains("【中距纪要带】"));
+        assert!(!message_text.contains("RAW_HISTORY_USER_1"));
+        assert!(message_text.contains("RAW_HISTORY_USER_2"));
+        assert!(!message_text.contains("HIDDEN_DIRECTOR_HISTORY"));
+        assert!(
+            request
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains(&format!("{EDITOR_HINT_MARKER}REGENERATE_DIRECTOR_HINT")),
+            "regenerate hint must be confined to the volatile tail"
+        );
+        assert!(
+            request.messages[..request.messages.len() - 1]
+                .iter()
+                .all(|message| !message.content.contains("REGENERATE_DIRECTOR_HINT"))
+        );
+        drop(requests);
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let director_sequence = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Directing,
+                } => Some("directing"),
+                PipelineEvent::DirectorStarted => Some("director_started"),
+                PipelineEvent::DirectorProgress { delta } => {
+                    assert_eq!(delta, "DIRECTOR_DELTA");
+                    Some("director_progress")
+                }
+                PipelineEvent::DirectorDone {
+                    scene_brief,
+                    subagent_count,
+                } => {
+                    assert_eq!(scene_brief, "SHARED_DIRECTOR_SCENE");
+                    assert_eq!(*subagent_count, 1);
+                    Some("director_done")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            director_sequence,
+            vec![
+                "directing",
+                "director_started",
+                "director_progress",
+                "director_done"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn shared_director_stage_fails_before_llm_when_no_characters_exist() {
+        let (llm, captured_requests) = capturing_director_llm();
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_director_no_characters_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+        let mut orchestrator =
+            PipelineOrchestrator::new(llm, conv_store, Arc::new(ToolContext::empty()), None);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let result = orchestrator
+            .run_director_stage(
+                DirectorStageInput {
+                    intent: "no characters",
+                    ctx: &ctx,
+                    conversation_id: &conversation_id,
+                    history_before_node_id: None,
+                    hint: None,
+                    template_context: None,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await;
+
+        assert!(matches!(result, Err(PipelineError::InvalidState(_))));
+        assert_eq!(orchestrator.state(), &PipelineState::Aborted);
+        assert!(
+            captured_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "Director fail-fast must not call the LLM"
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[derive(Clone)]
+    struct SelectiveSubagentLlm {
+        requests: Arc<std::sync::Mutex<Vec<storyforge_domain::llm::ChatRequest>>>,
+        fail_marker: Option<String>,
+        structured: bool,
+    }
+
+    impl SelectiveSubagentLlm {
+        fn response_for(
+            &self,
+            request: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            let prompt = request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if self
+                .fail_marker
+                .as_deref()
+                .is_some_and(|marker| prompt.contains(marker))
+            {
+                return Err(storyforge_domain::llm::LlmError::ServerError(
+                    "SELECTIVE_SUBAGENT_FAILURE".into(),
+                ));
+            }
+            let content = if self.structured {
+                serde_json::json!({
+                    "narrative": "演员沿着桌边移动，把公开线索留给下一位演员继续回应。",
+                    "dialogue": "我已经把能公开的部分说清楚了。",
+                    "inner_thoughts": "这一段保持私密。",
+                    "scene_close": false
+                })
+                .to_string()
+            } else {
+                "BIGSCENE_SUBAGENT_SUCCESS：角色完成了足够长的公开表演文本，用于验证并发 runner 的成功结果收集。"
+                    .into()
+            };
+            Ok(storyforge_domain::llm::ChatResponse {
+                content,
+                reasoning_content: Some("SUBAGENT_REASONING".into()),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SelectiveSubagentLlm {
+        async fn chat(
+            &self,
+            request: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            self.response_for(request)
+        }
+
+        async fn chat_stream(
+            &self,
+            request: &storyforge_domain::llm::ChatRequest,
+            progress: mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            let response = self.response_for(request)?;
+            let _ = progress.send(storyforge_domain::llm::StreamChunk {
+                delta_content: Some(response.content.clone()),
+                delta_reasoning_content: None,
+                delta_tool_calls: None,
+                finish_reason: None,
+            });
+            Ok(response)
+        }
+    }
+
+    fn subagent_stage_task(character_id: &str, task_marker: &str) -> SubagentTask {
+        SubagentTask {
+            character_id: character_id.into(),
+            brief: task_marker.into(),
+            context_package: ContextPackage {
+                character_brief: format!("PERSONA_{character_id}"),
+                scene_brief: "SHARED_SUBAGENT_SCENE".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: task_marker.into(),
+            },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
+        }
+    }
+
+    fn subagent_stage_director_config() -> AgentConfig {
+        AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: "SHARED_SUBAGENT_PARENT".into(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        }
+    }
+
+    fn assert_shared_subagent_event_contract(events: &[PipelineEvent], task_count: usize) {
+        let delegating_positions = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| {
+                matches!(
+                    event,
+                    PipelineEvent::StateChanged {
+                        state: PipelineState::Delegating
+                    }
+                )
+                .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let editing_positions = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| {
+                matches!(
+                    event,
+                    PipelineEvent::StateChanged {
+                        state: PipelineState::Editing
+                    }
+                )
+                .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delegating_positions.len(),
+            1,
+            "Delegating 应由共享 stage 单发"
+        );
+        assert_eq!(
+            editing_positions.len(),
+            1,
+            "Editing 应由共享 Editor stage 单发"
+        );
+        let delegating = delegating_positions[0];
+        let editing = editing_positions[0];
+
+        for task_index in 0..task_count {
+            let started = events
+                .iter()
+                .enumerate()
+                .filter_map(|(position, event)| match event {
+                    PipelineEvent::SubagentStarted { index, .. } if *index == task_index => {
+                        Some(position)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let terminal = events
+                .iter()
+                .enumerate()
+                .filter_map(|(position, event)| match event {
+                    PipelineEvent::SubagentDone { index, .. }
+                    | PipelineEvent::SubagentCancelled { index, .. }
+                        if *index == task_index =>
+                    {
+                        Some(position)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(started.len(), 1, "task {task_index} 的 Started 应单发");
+            assert_eq!(terminal.len(), 1, "task {task_index} 的完成/取消事件应单发");
+            assert!(delegating < started[0]);
+            assert!(started[0] < terminal[0]);
+            assert!(terminal[0] < editing);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_subagent_stage_runs_bigscene_maps_events_temporaries_and_does_not_land() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmClient> = Arc::new(SelectiveSubagentLlm {
+            requests: requests.clone(),
+            fail_marker: Some("FAIL_TASK_MARKER".into()),
+            structured: false,
+        });
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_subagent_bigscene_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        let nodes_before = conv_store.get(&conversation_id).unwrap().nodes.len();
+        let mut ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+        ctx.campaign_runtime = Some(Arc::new(
+            storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                campaign: storyforge_domain::campaign::Campaign::new(
+                    Id::from_str("subagent-stage-card"),
+                    "subagent-stage-campaign",
+                ),
+                instances: vec![],
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 1,
+            },
+        ));
+        ctx.recent_summaries = vec![storyforge_domain::agent::RoundSummary::new(
+            Id::from_str("subagent-stage-campaign"),
+            conversation_id.clone(),
+            1,
+            "SHARED_SUBAGENT_SUMMARY".into(),
+        )];
+        ctx.far_memory_hits = vec![FarMemoryHit::new(
+            "subagent-memory",
+            "SHARED_SUBAGENT_FAR_MEMORY",
+            0.9,
+            "summary",
+        )];
+        let plan = Plan {
+            scene_brief: "SHARED_SUBAGENT_SCENE".into(),
+            subagent_tasks: vec![
+                subagent_stage_task("actor-ok", "OK_TASK_MARKER"),
+                subagent_stage_task("actor-fail", "FAIL_TASK_MARKER"),
+            ],
+            scene_plan: None,
+        };
+        let director_config = subagent_stage_director_config();
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let output = orchestrator
+            .run_subagent_stage(
+                SubagentStageInput {
+                    plan: &plan,
+                    director_config: &director_config,
+                    generation_mode: GenerationMode::BigScene,
+                    intent: "BIGSCENE_STAGE_INTENT",
+                    ctx: &ctx,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("one successful BigScene subagent keeps the stage alive");
+
+        assert_eq!(orchestrator.state(), &PipelineState::Delegating);
+        assert_eq!(output.performances.len(), 1);
+        assert_eq!(output.performances[0].character_id, "actor-ok");
+        let effective_runtime = output
+            .effective_runtime
+            .as_ref()
+            .expect("campaign stage should return its effective runtime");
+        assert_eq!(effective_runtime.instances.len(), 2);
+        assert!(
+            effective_runtime
+                .instances
+                .iter()
+                .all(|instance| instance.is_temporary)
+        );
+        assert_eq!(orchestrator.pending_temporary_instances.len(), 2);
+        assert_eq!(
+            conv_store.get(&conversation_id).unwrap().nodes.len(),
+            nodes_before,
+            "the Subagent stage must not land conversation nodes"
+        );
+        let captured = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(captured.len(), 2);
+        let prompts = captured
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompts.contains("SHARED_SUBAGENT_SUMMARY"));
+        assert!(prompts.contains("SHARED_SUBAGENT_FAR_MEMORY"));
+        assert!(!prompts.contains("顺序剧组演员协议"));
+        drop(captured);
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let sequence = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Delegating,
+                } => Some("delegating"),
+                PipelineEvent::SubagentStarted { index: 0, .. } => Some("started-0"),
+                PipelineEvent::SubagentStarted { index: 1, .. } => Some("started-1"),
+                PipelineEvent::SubagentDone { index: 0, .. } => Some("done-0"),
+                PipelineEvent::SubagentCancelled { index: 1, .. } => Some("cancelled-1"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequence,
+            vec![
+                "delegating",
+                "started-0",
+                "started-1",
+                "done-0",
+                "cancelled-1"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn shared_subagent_stage_selects_sequential_runner_and_passes_intent() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmClient> = Arc::new(SelectiveSubagentLlm {
+            requests: requests.clone(),
+            fail_marker: None,
+            structured: true,
+        });
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_subagent_sequential_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        let ctx = WritingContext::legacy(vec![], None, conversation_id);
+        let plan = Plan {
+            scene_brief: "SHARED_SEQUENTIAL_SCENE".into(),
+            subagent_tasks: vec![
+                subagent_stage_task("actor-a", "SEQUENTIAL_TASK_A"),
+                subagent_stage_task("actor-b", "SEQUENTIAL_TASK_B"),
+            ],
+            scene_plan: None,
+        };
+        let director_config = subagent_stage_director_config();
+        let mut orchestrator =
+            PipelineOrchestrator::new(llm, conv_store, Arc::new(ToolContext::empty()), None);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let output = orchestrator
+            .run_subagent_stage(
+                SubagentStageInput {
+                    plan: &plan,
+                    director_config: &director_config,
+                    generation_mode: GenerationMode::SequentialCrew,
+                    intent: "SEQUENTIAL_SHARED_INTENT",
+                    ctx: &ctx,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("SequentialCrew shared stage should succeed");
+
+        assert_eq!(output.performances.len(), 2);
+        assert!(output.effective_runtime.is_none());
+        let prompts = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompts.contains("顺序剧组演员协议"));
+        assert!(prompts.contains("SEQUENTIAL_SHARED_INTENT"));
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn shared_subagent_stage_guards_all_failed_but_allows_empty_plan() {
+        let failed_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed_llm: Arc<dyn LlmClient> = Arc::new(SelectiveSubagentLlm {
+            requests: failed_requests,
+            fail_marker: Some("FAIL_ALL_TASKS".into()),
+            structured: false,
+        });
+        let failed_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_subagent_all_failed_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let failed_store = Arc::new(ConversationStore::new(failed_dir.clone()));
+        let failed_conversation_id = failed_store.create(None, None).id;
+        let failed_ctx = WritingContext::legacy(vec![], None, failed_conversation_id);
+        let failed_plan = Plan {
+            scene_brief: "failed".into(),
+            subagent_tasks: vec![subagent_stage_task("actor-fail", "FAIL_ALL_TASKS")],
+            scene_plan: None,
+        };
+        let director_config = subagent_stage_director_config();
+        let mut failed_orchestrator = PipelineOrchestrator::new(
+            failed_llm,
+            failed_store,
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let (failed_event_tx, mut failed_event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_failed_cancel_tx, failed_cancel_rx) = watch::channel(false);
+
+        let failed = failed_orchestrator
+            .run_subagent_stage(
+                SubagentStageInput {
+                    plan: &failed_plan,
+                    director_config: &director_config,
+                    generation_mode: GenerationMode::BigScene,
+                    intent: "failed",
+                    ctx: &failed_ctx,
+                },
+                &failed_event_tx,
+                failed_cancel_rx,
+            )
+            .await;
+        assert!(matches!(failed, Err(PipelineError::InvalidState(_))));
+        assert_eq!(failed_orchestrator.state(), &PipelineState::Aborted);
+        let failed_events =
+            std::iter::from_fn(|| failed_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            failed_events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::SubagentCancelled { index: 0, .. }))
+        );
+        assert!(failed_events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::StateChanged {
+                state: PipelineState::Aborted
+            }
+        )));
+
+        let empty_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let empty_llm: Arc<dyn LlmClient> = Arc::new(SelectiveSubagentLlm {
+            requests: empty_requests.clone(),
+            fail_marker: None,
+            structured: false,
+        });
+        let empty_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_subagent_empty_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let empty_store = Arc::new(ConversationStore::new(empty_dir.clone()));
+        let empty_conversation_id = empty_store.create(None, None).id;
+        let empty_ctx = WritingContext::legacy(vec![], None, empty_conversation_id);
+        let empty_plan = Plan::new("empty", vec![]);
+        let mut empty_orchestrator =
+            PipelineOrchestrator::new(empty_llm, empty_store, Arc::new(ToolContext::empty()), None);
+        let (empty_event_tx, _empty_event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_empty_cancel_tx, empty_cancel_rx) = watch::channel(false);
+
+        let empty = empty_orchestrator
+            .run_subagent_stage(
+                SubagentStageInput {
+                    plan: &empty_plan,
+                    director_config: &director_config,
+                    generation_mode: GenerationMode::BigScene,
+                    intent: "empty",
+                    ctx: &empty_ctx,
+                },
+                &empty_event_tx,
+                empty_cancel_rx,
+            )
+            .await
+            .expect("empty Subagent stage should continue to Editor");
+        assert!(empty.performances.is_empty());
+        assert_eq!(empty_orchestrator.state(), &PipelineState::Delegating);
+        assert!(
+            empty_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "empty task lists must not call the LLM"
+        );
+
+        let _ = std::fs::remove_dir_all(&failed_dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
+    #[tokio::test]
+    async fn shared_editor_stage_owns_prompt_events_regex_and_no_durable_land() {
+        let captured_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_hook = captured_messages.clone();
+        let prompt_hook: PromptHook = Arc::new(move |context| {
+            let captured = captured_for_hook.clone();
+            Box::pin(async move {
+                captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(context.messages.clone());
+                Ok(context.messages)
+            })
+        });
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: EDITOR_SYSTEM_PROMPT.chars().take(8).collect(),
+            response_content: "RAW_EDITOR_DRAFT".into(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_editor_stage_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        conv_store
+            .append_user_message(&conversation_id, "VISIBLE_EDITOR_HISTORY".into())
+            .unwrap();
+        let history_boundary = conv_store
+            .append_user_message(&conversation_id, "HIDDEN_EDITOR_HISTORY".into())
+            .unwrap();
+        let nodes_before = conv_store.get(&conversation_id).unwrap().nodes.len();
+        let mut orchestrator = PipelineOrchestrator::new_with_prompt_hook(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+            prompt_hook,
+        );
+        let plan = Plan::new("SHARED_EDITOR_SCENE", vec![]);
+        let performances = vec![storyforge_domain::agent::Performance {
+            character_id: "actor-a".into(),
+            narrative: String::new(),
+            dialogue: String::new(),
+            inner_thoughts: String::new(),
+            full_text: "SHARED_EDITOR_PERFORMANCE".into(),
+            reasoning_content: None,
+        }];
+        let regex_scripts = vec![mock_regex_script(
+            "shared-editor-output",
+            "RAW_EDITOR_DRAFT",
+            "FILTERED_EDITOR_DRAFT",
+            RegexPlacement::Output,
+        )];
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let output = orchestrator
+            .run_editor_stage(
+                EditorStageInput {
+                    plan: &plan,
+                    performances: &performances,
+                    conversation_id: &conversation_id,
+                    history_before_node_id: Some(&history_boundary),
+                    scene_brief: &plan.scene_brief,
+                    hint: Some("SHARED_EDITOR_HINT"),
+                    profile: None,
+                    modules: &[],
+                    campaign_runtime: None,
+                    agent_profile_config: None,
+                    regex_scripts: &regex_scripts,
+                    template_context: None,
+                    recent_summaries: &[],
+                    far_memory_hits: &[],
+                    scene_plan: plan.scene_plan.as_ref(),
+                    prompt_flavor: EditorPromptFlavor::Standard,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("shared Editor stage should succeed");
+
+        assert_eq!(output.final_text, "FILTERED_EDITOR_DRAFT");
+        assert_eq!(
+            output.reasoning_content.as_deref(),
+            Some("mock provider reasoning")
+        );
+        assert_eq!(orchestrator.state(), &PipelineState::Editing);
+        assert_eq!(
+            conv_store.get(&conversation_id).unwrap().nodes.len(),
+            nodes_before,
+            "the Editor stage must not own draft/variant landing"
+        );
+        let prompt_text = captured_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flat_map(|messages| messages.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("VISIBLE_EDITOR_HISTORY"));
+        assert!(!prompt_text.contains("HIDDEN_EDITOR_HISTORY"));
+        assert!(prompt_text.contains("SHARED_EDITOR_HINT"));
+        assert!(prompt_text.contains("SHARED_EDITOR_PERFORMANCE"));
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let relevant = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Editing,
+                } => Some("editing"),
+                PipelineEvent::EditorStarted => Some("editor_started"),
+                PipelineEvent::DraftReady { text } => {
+                    assert_eq!(text, "FILTERED_EDITOR_DRAFT");
+                    Some("draft_ready")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relevant, vec!["editing", "editor_started", "draft_ready"]);
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn shared_editor_stage_cancels_before_editor_events_or_llm_work() {
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_shared_editor_cancel_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        let mut orchestrator = PipelineOrchestrator::new(
+            Arc::new(MockLlmClient::with_defaults()),
+            conv_store,
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let plan = Plan::new("cancelled Editor", vec![]);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+
+        let result = orchestrator
+            .run_editor_stage(
+                EditorStageInput {
+                    plan: &plan,
+                    performances: &[],
+                    conversation_id: &conversation_id,
+                    history_before_node_id: None,
+                    scene_brief: &plan.scene_brief,
+                    hint: None,
+                    profile: None,
+                    modules: &[],
+                    campaign_runtime: None,
+                    agent_profile_config: None,
+                    regex_scripts: &[],
+                    template_context: None,
+                    recent_summaries: &[],
+                    far_memory_hits: &[],
+                    scene_plan: None,
+                    prompt_flavor: EditorPromptFlavor::Standard,
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await;
+
+        assert!(matches!(result, Err(PipelineError::Cancelled)));
+        assert_eq!(orchestrator.state(), &PipelineState::Aborted);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::StateChanged {
+                state: PipelineState::Aborted
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::EditorStarted | PipelineEvent::DraftReady { .. }
+        )));
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
     #[tokio::test]
     async fn sequential_crew_mode_runs_real_pipeline_in_actor_order() {
         let plan = serde_json::json!({
@@ -4843,6 +5635,12 @@ mod tests {
 
         // 验证 Provenance
         let provenance = provenance.expect("应有 Provenance");
+        let task_count = provenance
+            .plan
+            .as_ref()
+            .expect("standard start provenance should retain the Plan")
+            .subagent_tasks
+            .len();
         assert_eq!(
             provenance.director_reasoning.as_deref(),
             Some("mock provider reasoning")
@@ -4860,6 +5658,7 @@ mod tests {
         while let Ok(event) = event_rx.try_recv() {
             events.push(event);
         }
+        assert_shared_subagent_event_contract(&events, task_count);
         let event_types: Vec<String> = events
             .iter()
             .map(|e| match e {
@@ -4875,6 +5674,45 @@ mod tests {
                 _ => "other".into(),
             })
             .collect();
+        let director_sequence = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Directing,
+                } => Some("directing"),
+                PipelineEvent::DirectorStarted => Some("director_started"),
+                PipelineEvent::DirectorDone { .. } => Some("director_done"),
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Delegating,
+                } => Some("delegating"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            director_sequence,
+            vec![
+                "directing",
+                "director_started",
+                "director_done",
+                "delegating"
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PipelineEvent::DirectorStarted))
+                .count(),
+            1,
+            "standard start must emit DirectorStarted once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PipelineEvent::DirectorDone { .. }))
+                .count(),
+            1,
+            "standard start must emit DirectorDone once"
+        );
 
         // 验证关键事件都出现了
         assert!(event_types.contains(&"started".into()), "应有 started 事件");
@@ -5479,7 +6317,7 @@ mod tests {
             seed: Some(42),
         };
         let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
-        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
         let result = orchestrator
             .regenerate(req, &ctx, event_tx, cancel_rx)
@@ -5489,6 +6327,83 @@ mod tests {
         let (_text, provenance) = result.unwrap();
         assert_eq!(provenance.last_hint.as_deref(), Some("角色 B 语气太冷"));
         assert_eq!(provenance.seed, 42);
+        let task_count = provenance
+            .plan
+            .as_ref()
+            .expect("full regenerate provenance should retain the Plan")
+            .subagent_tasks
+            .len();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_shared_subagent_event_contract(&events, task_count);
+        let pipeline_sequence = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Directing,
+                } => Some("directing"),
+                PipelineEvent::DirectorStarted => Some("director_started"),
+                PipelineEvent::DirectorDone { .. } => Some("director_done"),
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Delegating,
+                } => Some("delegating"),
+                PipelineEvent::StateChanged {
+                    state: PipelineState::Editing,
+                } => Some("editing"),
+                PipelineEvent::EditorStarted => Some("editor_started"),
+                PipelineEvent::DraftReady { .. } => Some("draft_ready"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pipeline_sequence,
+            vec![
+                "directing",
+                "director_started",
+                "director_done",
+                "delegating",
+                "editing",
+                "editor_started",
+                "draft_ready"
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PipelineEvent::DirectorStarted))
+                .count(),
+            1,
+            "整体重 roll 的 DirectorStarted 应由共享 stage 单发"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PipelineEvent::DirectorDone { .. }))
+                .count(),
+            1,
+            "整体重 roll 的 DirectorDone 应由共享 stage 单发"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PipelineEvent::StateChanged {
+                        state: PipelineState::Editing
+                    }
+                ))
+                .count(),
+            1,
+            "整体重 roll 的 Editing 状态事件应由共享 stage 单发"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PipelineEvent::EditorStarted))
+                .count(),
+            1,
+            "整体重 roll 的 EditorStarted 应由共享 stage 单发"
+        );
 
         // variant 保留语义：旧 node 仍在，多 1 个 variant，active 切到新的
         let conv_after = conv_store.get(&conv_id).unwrap();

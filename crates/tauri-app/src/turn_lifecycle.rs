@@ -300,6 +300,58 @@ pub struct AcceptDecisionInput<'a> {
     pub current_campaign_revision: u64,
 }
 
+/// Validate the request-owned identifiers before an adapter reads any
+/// request-selected campaign or conversation state.
+pub(crate) fn ensure_accept_scope(
+    campaign_id: &Id,
+    conversation_id: &Id,
+    turn: &TurnRecord,
+) -> Result<(), AcceptError> {
+    if &turn.campaign_id != campaign_id {
+        return Err(AcceptError::CampaignScopeMismatch {
+            turn_campaign: turn.campaign_id.to_string(),
+            requested: campaign_id.to_string(),
+        });
+    }
+    if &turn.conversation_id != conversation_id {
+        return Err(AcceptError::ConversationScopeMismatch {
+            turn_conversation: turn.conversation_id.to_string(),
+            requested: conversation_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Return the shared terminal replay decision before adapters perform reads
+/// that are unnecessary for an already committed attempt.
+pub(crate) fn evaluate_accept_replay(
+    turn: &TurnRecord,
+    attempt: &TurnAttempt,
+) -> Result<Option<AcceptOutcome>, AcceptError> {
+    if attempt.status == AttemptStatus::Committed
+        && matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded)
+        && turn.accepted_attempt_id.as_ref() == Some(&attempt.attempt_id)
+    {
+        let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
+            AcceptError::Storage(format!(
+                "terminal turn {} has no persisted MutationBatch for replay",
+                turn.turn_id
+            ))
+        })?;
+        return Ok(Some(AcceptOutcome {
+            turn_id: turn.turn_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            turn_status: turn.status.clone(),
+            attempt_status: AttemptStatus::Committed,
+            commit_as_degraded: turn.status == TurnStatus::Degraded,
+            campaign_revision_before: batch.expected_revision,
+            campaign_revision_after: batch.target_revision,
+            batch,
+        }));
+    }
+    Ok(None)
+}
+
 /// Pure Accept decision shared by JSON and SQLite (Gate 2).
 ///
 /// Performs the full permanent-guard sequence exactly once:
@@ -325,41 +377,12 @@ pub fn evaluate_accept_decision(
     let force_accept = *force_accept;
     let current_campaign_revision = *current_campaign_revision;
 
-    if &turn.campaign_id != *campaign_id {
-        return Err(AcceptError::CampaignScopeMismatch {
-            turn_campaign: turn.campaign_id.to_string(),
-            requested: campaign_id.to_string(),
-        });
-    }
-    if &turn.conversation_id != *conversation_id {
-        return Err(AcceptError::ConversationScopeMismatch {
-            turn_conversation: turn.conversation_id.to_string(),
-            requested: conversation_id.to_string(),
-        });
-    }
+    ensure_accept_scope(campaign_id, conversation_id, turn)?;
 
     // Idempotent replay: same attempt already accepted and turn is terminal.
     // Both backends re-confirm durability in their own store before returning.
-    if attempt.status == AttemptStatus::Committed
-        && matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded)
-        && turn.accepted_attempt_id.as_ref() == Some(&attempt.attempt_id)
-    {
-        let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
-            AcceptError::Storage(format!(
-                "terminal turn {} has no persisted MutationBatch for replay",
-                turn.turn_id
-            ))
-        })?;
-        return Ok(AcceptDecision::Replay(AcceptOutcome {
-            turn_id: turn.turn_id.clone(),
-            attempt_id: attempt.attempt_id.clone(),
-            turn_status: turn.status.clone(),
-            attempt_status: AttemptStatus::Committed,
-            commit_as_degraded: turn.status == TurnStatus::Degraded,
-            campaign_revision_before: batch.expected_revision,
-            campaign_revision_after: batch.target_revision,
-            batch,
-        }));
+    if let Some(outcome) = evaluate_accept_replay(turn, attempt)? {
+        return Ok(AcceptDecision::Replay(outcome));
     }
 
     if attempt.status != AttemptStatus::AwaitingAcceptance {

@@ -1074,7 +1074,12 @@ fn resolve_instance_by_id_or_name(
 ) -> Option<storyforge_domain::campaign::CharacterInstance> {
     instances
         .iter()
-        .find(|instance| instance.id == *value || instance.name == value.as_str())
+        .find(|instance| instance.id == *value)
+        .or_else(|| {
+            instances
+                .iter()
+                .find(|instance| instance.name == value.as_str())
+        })
         .cloned()
 }
 
@@ -1522,6 +1527,30 @@ mod tests {
             summary_attempted: true,
             post_process_attempted: true,
         }
+    }
+
+    #[test]
+    fn instance_resolution_prefers_exact_id_over_an_earlier_name_match() {
+        let campaign_id = Id::from_str("campaign-id-priority");
+        let requested_id = Id::from_str("instance-target-id");
+
+        let mut earlier_name_match = storyforge_domain::campaign::CharacterInstance::temporary(
+            campaign_id.clone(),
+            requested_id.to_string(),
+        );
+        earlier_name_match.id = Id::from_str("instance-name-match");
+
+        let mut later_id_match =
+            storyforge_domain::campaign::CharacterInstance::temporary(campaign_id, "Actual target");
+        later_id_match.id = requested_id.clone();
+
+        let resolved = resolve_instance_by_id_or_name(
+            &[earlier_name_match, later_id_match.clone()],
+            &requested_id,
+        )
+        .expect("the exact id must resolve");
+
+        assert_eq!(resolved.id, later_id_match.id);
     }
 
     #[test]

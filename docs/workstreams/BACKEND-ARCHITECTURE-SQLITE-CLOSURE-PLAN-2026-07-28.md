@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**进行中（Gate 1 最终边界返修已通过；Gate 2–8 backend facade、SQLite 迁移与平台验收仍未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> code-under-test：`main@d340d99`。
+> 状态：**进行中（Gate 1、Gate 2 已通过；Gate 3–8 backend facade、SQLite 迁移与平台验收仍未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> code-under-test：`main@b6cad53` 加当前 Gate 2 verifier-repair 工作树（尚未提交）。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
@@ -691,4 +691,15 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 最终验证态：`cargo fmt/clippy/test`（360 passed）、`app-agent`（125）、`app-pipeline`（110）、`app-meta`（110）、前端合同（8/8）、baseline（175/175、sqlite 68）全绿；命令 175/175、invoke 162、缺失 0；IPC 合同全程未改。
 - Gate 2 PARTIAL 后进入 Gate 3（单一 backend facade）。
 
+## 28. Gate 2 verifier 返修与最终通过检查点（2026-07-29）
 
+- verifier 将 Gate 2 标记为 incomplete 后，本批没有沿用旧的 PARTIAL 结论，而是逐项复现并修复：
+  - `resolve_instance_by_id_or_name` 改为严格的 ID 优先、名称回退两阶段解析，避免更早出现的同名实例抢占精确 ID；
+  - SQLite Accept 在读取请求所指会话/Campaign 前先执行 scope 校验和终态 replay 判定，错误分类重新与 JSON 路径一致，并用零副作用快照测试钉住；
+  - `harness-real-llm` 所需的两个 postprocess helper 以最小 crate-root re-export 恢复可见性，未重新公开整个 commands 模块。
+- 按原建议顺序完成 Batch 2.6 的三段共享阶段抽取：`run_editor_stage`、`run_director_stage`、`run_subagent_stage`。标准 start 与 full regenerate 路径复用同一阶段实现；Duet、subagent-only reroll、Sequential suffix 等确有不同语义的路径继续保留专用编排。持久化落地仍由调用方负责。
+- 新增/强化行为测试覆盖 ID 优先、SQLite scope/replay 零副作用、Editor 事件顺序与单发、Director 配置/历史/计划解析、Subagent 模式/临时实例/失败守卫/溯源。`storyforge-app-pipeline` 由 110 项增至 117 项并全绿。
+- Gate 2 计划 §7.5 的五项通过条件现为 **5/5 PASS**：Accept parity、start/regenerate 共享完整阶段实现、单一 tool-loop 核心、单一 postprocess mutation 规则、typed patch preview/apply 共用前置条件纯函数。
+- `SubagentCancelled` 区分真取消与失败仍需新增事件变体或字段，属于明确排除在本 Gate 硬约束之外的 IPC/事件词汇迁移；不再把它计作 §7.5 阻塞项。SQLite typed patch 完整落地属于 Gate 4，也不计作 Gate 2 未完成。
+- 最终确定性证据：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`cargo test -p storyforge --no-default-features`（361 passed、3 ignored）、`cargo test -p harness-real-llm --no-run`、前端 `npm.cmd test`（476/476）、`npm.cmd run build`、architecture baseline（175/175 commands、162 invokes、0 missing、sqlite flag 68）全部通过。
+- 最终结论：**Gate 2 PASS**。下一阶段为 Gate 3（单一 backend facade）；当前工作树应在提交后把 code-under-test 更新为对应提交 SHA。
