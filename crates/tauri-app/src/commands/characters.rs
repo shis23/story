@@ -275,7 +275,7 @@ pub(crate) fn delete_character_cascade_source_ids(
 }
 
 #[tauri::command]
-pub(crate) fn delete_character(
+pub fn delete_character(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
@@ -309,6 +309,8 @@ pub(crate) fn delete_character(
     //
     // 删除前先取该角色关联的 Campaign ids（用于清活跃指针 + 失效会话缓存）。
     // 候选 source 覆盖：存储 id / 源卡 id / 卡实际 source_character_id。
+    // 收集错误传播（Gate 4 五审 P2：不得用 if let Ok / .ok() 吞掉——否则删除
+    // 成功却漏清活跃指针/会话缓存，出现与四审 P1 同类的半成功状态）。
     let affected_campaign_ids = {
         let mut candidates: Vec<Id> = source_ids.clone();
         if let Some(s) = stored_source_character_id {
@@ -323,25 +325,47 @@ pub(crate) fn delete_character(
         }
         let mut ids = Vec::new();
         for source_id in &candidates {
-            if let Ok(Some(stored_card)) = state.storage().get_card_by_source(source_id)
-                && let Ok(campaigns) = state.storage().list_campaigns(Some(&stored_card.card.id))
+            if let Some(stored_card) =
+                state.storage().get_card_by_source(source_id).map_err(|e| {
+                    TauriCommandError::storage(format!(
+                        "收集受影响 Campaign 时反查卡失败 source={source_id}: {e}"
+                    ))
+                })?
             {
+                let campaigns = state
+                    .storage()
+                    .list_campaigns(Some(&stored_card.card.id))
+                    .map_err(|e| {
+                        TauriCommandError::storage(format!(
+                            "收集受影响 Campaign 时列出 Campaign 失败 card={}: {e}",
+                            stored_card.card.id
+                        ))
+                    })?;
                 ids.extend(campaigns.into_iter().map(|r| r.campaign.id));
             }
         }
         ids
     };
     // 被删 Campaign 绑定的会话 ids（删除前收集；删除后 campaign 已不存在）。
+    // 读取失败传播，同样不做静默跳过。
     let affected_conv_ids: Vec<Id> = affected_campaign_ids
         .iter()
-        .filter_map(|campaign_id| {
-            state
-                .storage()
-                .get_campaign(campaign_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.campaign.conversation_id)
+        .map(|campaign_id| {
+            Ok::<_, TauriCommandError>(
+                state
+                    .storage()
+                    .get_campaign(campaign_id)
+                    .map_err(|e| {
+                        TauriCommandError::storage(format!(
+                            "收集受影响会话时读取 Campaign 失败 campaign={campaign_id}: {e}"
+                        ))
+                    })?
+                    .and_then(|r| r.campaign.conversation_id),
+            )
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
     let removed = state
         .storage()

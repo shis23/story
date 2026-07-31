@@ -932,5 +932,64 @@ fault-injection 回滚测试。
 （`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
 `npm test` 476/476 / `npm run build` / `git diff --check`。
 
+### 30.12 Gate 4 五审修复（2026-07-31）
+
+> 四审判定 INCOMPLETE（1 P1 + 2 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 `set_active_campaign` 失败后仍会留下新指针（属实）**：旧实现先
+`set_active_campaign_in_state` 提交活跃指针，之后才读世界书/卡/角色模板——
+任意读取、解析或写入失败，命令返回错误但指针已改变（违反“命令失败不改变
+状态”）。
+- 修复：世界书读取 / 模板解析 / 惰性种子（`ensure_world_info_from_book`）全部
+  **前移到指针提交之前**，结果暂存于 `prepared_book`；世界书就绪后才调用
+  `set_active_campaign_in_state`（锁内重新校验存在性，删除无法使选择失效）；
+  指针提交成功后才 `apply_campaign_world_info_to_tool_ctx`。任意前置步骤失败
+  → 命令返回错误，指针保持原值、tool_ctx 不被改写。
+- 测试：新独立二进制 `tests/sqlite_command_lifecycle.rs`——对目标 Campaign 的
+  `campaign_world_info` 行注入非法 JSON payload（经 `sqlite_runtime::with_db_
+  raw_write` 测试写钩子），`set_active_campaign` 必须失败，且活跃指针保持原值、
+  tool_ctx 世界书不被改写。
+
+**P2 所谓命令级测试实际是 JSON，不是 SQLite（属实）**：既有两个命令级测试
+（`set_active_campaign_command_routes_world_info_through_facade` /
+`delete_character_command_clears_active_pointer_and_conversation_cache`）用
+`AppState::new_for_test()`，它固定 `StorageBackend::Json`；激活测试也未断言
+`tool_ctx.world_info`，不能证明 SQLite 命令闭环成立。
+- 修复：新增**独立 SQLite 命令测试二进制** `tests/sqlite_command_lifecycle.rs`
+  （与既有 sqlite_* 集成测试同模式：`sqlite_runtime::activate` 进程全局 →
+  单测试函数）：真实 SQLite AppState（`AppState::new_with_backend` + SQLite
+  facade，`validate_runtime_authority` 校验路径一致）+ 真实命令
+  （`storyforge_lib::set_active_campaign` / `delete_character`），覆盖：
+  - `set_active_campaign` 成功：活跃指针置位 + `tool_ctx.world_info` 注入模板
+    + 世界书已落库（V006 `campaign_world_info`）；
+  - 失败原子性（见上 P1）：命令失败 → 指针不变 + tool_ctx 不改写；
+  - `delete_character`：真实级联删除后活跃指针清空 + 会话缓存失效 +
+    tool_ctx 角色移除 + 库内行删除。
+- 可见性最小改动：`set_active_campaign` / `delete_character` 由 `pub(crate)`
+  提升为 `pub`（签名不变），lib.rs `pub use` 导出；`AppState::new_with_backend`
+  与 `storage()` 提升为 `pub`；命令级源码测试字符串锚定同步更新
+  （`pub fn delete_character(`）。Gate 1 契约仍通过：lib.rs 不含任何 tauri
+  command 属性字面量。
+
+**P2 部分错误仍被吞掉（属实）**：`merge_global_entries_into_book_facade` 用
+`list_characters().unwrap_or_default()`——读取失败静默丢失全局条目；`delete_
+character` 收集受影响 Campaign/会话时用 `if let Ok` / `.ok()` 忽略错误——收集
+失败后数据库仍删除，活跃指针与会话缓存可能漏清。
+- 修复：
+  - `merge_global_entries_into_book_facade` 改为返回 `Result`，读取失败传播
+    （调用方 `resolve_character_world_info_template` 的 SQLite 分支同步改）。
+  - `delete_character` 收集 `affected_campaign_ids` / `affected_conv_ids` 全部
+    改为 `?` 传播——反查卡、列 Campaign、读 Campaign 任一步失败，命令返回错误
+    而非“删除成功却漏清状态”。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings`（0 警告）/ `cargo test --workspace`
+（全绿，405 lib + 104 等）/ 9 个 sqlite 集成测试（含新
+`sqlite_command_lifecycle`）全过 / `backend-baseline.mjs`
+（`commandAttributes=175`、`registered=175`、`unsupported: []`、
+`applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
+`npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

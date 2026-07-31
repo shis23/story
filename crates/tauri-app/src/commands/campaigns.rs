@@ -454,12 +454,15 @@ pub(crate) fn merge_global_entries_into_book(
 
 /// backend-neutral 版本的全局条目 merge：经 facade 读角色库（SQLite 走 V007
 /// characters 表），供 set_active_campaign 激活时注入模板（Gate 4 四审 P1）。
+/// 读取错误传播（Gate 4 五审 P2：不得用 unwrap_or_default 静默丢全局条目）。
 pub(crate) fn merge_global_entries_into_book_facade(
     facade: &crate::storage_backend::StorageFacade,
     mut book: storyforge_domain::world_info::WorldInfoBook,
     active_name: &str,
-) -> storyforge_domain::world_info::WorldInfoBook {
-    let all = facade.list_characters().unwrap_or_default();
+) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+    let all = facade
+        .list_characters()
+        .map_err(|e| format!("merge global world-info entries: 角色库读取失败: {e}"))?;
     for stored in all {
         if stored.info.name == active_name {
             continue;
@@ -477,7 +480,7 @@ pub(crate) fn merge_global_entries_into_book_facade(
             book.entries.push(entry);
         }
     }
-    book
+    Ok(book)
 }
 
 pub(crate) fn fork_campaign_in_store(
@@ -674,27 +677,25 @@ pub(crate) fn delete_campaign(
 }
 
 #[tauri::command]
-pub(crate) fn set_active_campaign(
+pub fn set_active_campaign(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
-    set_active_campaign_in_state(state.inner().as_ref(), campaign_id.clone(), || {
-        if !state
-            .storage()
-            .campaign_exists(&campaign_id)
-            .map_err(TauriCommandError::internal)?
-        {
-            return Err(TauriCommandError::not_found(format!(
-                "找不到 campaign id={id}"
-            )));
-        }
-        Ok(())
-    })?;
+
     // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书（WorldInfo 能力声明式门控）。
-    // 经 backend-neutral facade 读取——SQLite 下不得触碰 JSON store
-    // （Gate 4 四审 P1：否则活跃指针已改、命令却因 JSON store 缺失而失败）。
-    if state.storage().capability(BackendCapability::WorldInfo) == CapabilityStatus::Supported {
+    // 经 backend-neutral facade 读取——SQLite 下不得触碰 JSON store。
+    //
+    // Gate 4 五审 P1 修复：世界书读取 / 模板解析 / 惰性种子全部前移到活跃指针
+    // 提交**之前**——任意一步失败，命令返回错误时指针尚未改变（失败原子性，
+    // 不再出现“指针已改、命令却失败”的半成功状态）。指针提交仍走
+    // set_active_campaign_in_state：锁内重新校验存在性，删除无法在读取与提交
+    // 之间使选择失效。
+    let prepared_book: Option<storyforge_domain::world_info::WorldInfoBook> = if state
+        .storage()
+        .capability(BackendCapability::WorldInfo)
+        == CapabilityStatus::Supported
+    {
         let mut book = state
             .storage()
             .get_world_info(&campaign_id)
@@ -733,6 +734,25 @@ pub(crate) fn set_active_campaign(
                     .map_err(TauriCommandError::storage)?;
             }
         }
+        Some(book)
+    } else {
+        None
+    };
+
+    // 世界书已就绪，此刻才提交活跃指针（失败不改指针）。
+    set_active_campaign_in_state(state.inner().as_ref(), campaign_id.clone(), || {
+        if !state
+            .storage()
+            .campaign_exists(&campaign_id)
+            .map_err(TauriCommandError::internal)?
+        {
+            return Err(TauriCommandError::not_found(format!(
+                "找不到 campaign id={id}"
+            )));
+        }
+        Ok(())
+    })?;
+    if let Some(book) = prepared_book {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
     }
     Ok(())

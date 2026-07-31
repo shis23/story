@@ -40,6 +40,12 @@ pub use commands::meta_typed::MetaSnapshot;
 pub use commands::writing::{
     is_postprocess_instance_present, normalize_knowledge_update_for_postprocess,
 };
+// Gate 4 五审 P2：独立 SQLite 命令测试二进制（tests/sqlite_command_lifecycle.rs）
+// 需要以真实 SQLite AppState 驱动真实命令。命令函数本体已提升为 `pub`（签名不变），
+// 这里仅向 crate 外暴露这两个命令名——无任何 backend 分派逻辑（gate3 源码级测试
+// 仍锚定 tauri command 属性标记的原函数，分派全部经 AppState::storage() facade）。
+pub use commands::campaigns::set_active_campaign;
+pub use commands::characters::delete_character;
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 use production_postprocess::TurnAttemptSink;
@@ -729,7 +735,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new_with_backend(
+    /// Build the application state over a process-pinned storage backend.
+    ///
+    /// Gate 4 五审 P2：独立 SQLite 命令测试二进制以真实 SQLite AppState 驱动
+    /// 真实命令（审查指出既有“命令级测试”实为 JSON 后端）。签名不变。
+    pub fn new_with_backend(
         data_dir: PathBuf,
         storage: Arc<storage_backend::StorageFacade>,
     ) -> Result<Self, String> {
@@ -946,7 +956,11 @@ impl AppState {
         Arc::new(ctx)
     }
 
-    pub(crate) fn storage(&self) -> &Arc<storage_backend::StorageFacade> {
+    /// Access the process-pinned storage backend facade.
+    ///
+    /// Gate 4 五审 P2：独立 SQLite 命令测试二进制需经该访问器操作存储
+    /// （读取断言/种子），签名不变。
+    pub fn storage(&self) -> &Arc<storage_backend::StorageFacade> {
         &self.storage
     }
 

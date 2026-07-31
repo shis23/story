@@ -1248,6 +1248,19 @@ pub fn fail_delete_cascade_for_test(fault: DeleteCascadeFault) {
     FAIL_DELETE_CASCADE.with(|slot| slot.set(fault));
 }
 
+/// 测试专用原始写钩子（失败注入测试用）。
+///
+/// Gate 4 五审 P1：验证 set_active_campaign 的失败原子性——世界书读取或种子
+/// 阶段故障注入后，命令返回错误但活跃指针不得改变。`execute` 让测试能直接
+/// 对进程权威库写入（如破坏 campaign_world_info 的 payload 使反序列化失败），
+/// 而无需在命令层新开任何 JSON/SQLite 分支。仅供 `#[cfg(test)]` 集成测试。
+#[doc(hidden)]
+pub fn with_db_raw_write<T>(
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    with_db_mut(|db| f(db.connection()))
+}
+
 fn delete_character_full_cascade_inner(
     db: &mut Database,
     id: &str,

@@ -859,20 +859,18 @@ impl StorageFacade {
             };
             let info = stored.info;
             if let Some(book) = info.embedded_world_info.clone() {
-                return Ok(Some(
-                    crate::commands::campaigns::merge_global_entries_into_book_facade(
-                        self, book, &info.name,
-                    ),
-                ));
+                return crate::commands::campaigns::merge_global_entries_into_book_facade(
+                    self, book, &info.name,
+                )
+                .map(Some);
             }
             if let Some(book) =
                 crate::startup_support::world_info_book_from_entries(&info.world_info_entries)
             {
-                return Ok(Some(
-                    crate::commands::campaigns::merge_global_entries_into_book_facade(
-                        self, book, &info.name,
-                    ),
-                ));
+                return crate::commands::campaigns::merge_global_entries_into_book_facade(
+                    self, book, &info.name,
+                )
+                .map(Some);
             }
             Ok(None)
         } else {

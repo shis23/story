@@ -11,9 +11,11 @@ fn gate3_character_commands_do_not_probe_the_sqlite_runtime() {
 
 #[test]
 fn character_delete_fails_closed_before_any_storage_mutation() {
+    // Gate 4 五审 P2：命令本体提升为 `pub` 供独立 SQLite 命令测试二进制驱动
+    // （lib.rs re-export），函数签名与内部逻辑不变。
     let source = include_str!("commands/characters.rs");
     let delete_start = source
-        .find("pub(crate) fn delete_character(")
+        .find("pub fn delete_character(")
         .expect("delete_character command must exist");
     let delete_body = source[delete_start..].replace("\r\n", "\n");
     let next_command_marker = ["\n#", "[tauri::command]"].concat();
