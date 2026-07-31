@@ -40,14 +40,6 @@ fn sqlite_meta_and_world_info_capabilities_are_supported_and_remaining_gaps_fail
             storage_backend::BackendCapability::ChronicleCompressor,
             "chronicle compression",
         ),
-    ] {
-        storage
-            .require_supported(capability, operation)
-            .expect("SQLite capability must be supported");
-    }
-    // 仍显式 unsupported 的剩余缺口（CharacterStore / Campaign lifecycle /
-    // Import/Export）必须带 operation 名 fail closed，不能静默空列表。
-    for (capability, operation) in [
         (
             storage_backend::BackendCapability::CharacterCommands,
             "character commands",
@@ -56,17 +48,21 @@ fn sqlite_meta_and_world_info_capabilities_are_supported_and_remaining_gaps_fail
             storage_backend::BackendCapability::ImportExport,
             "import/export",
         ),
-        (
+    ] {
+        storage
+            .require_supported(capability, operation)
+            .expect("SQLite capability must be supported");
+    }
+    // 仍显式 unsupported 的剩余缺口（Campaign lifecycle）必须带 operation
+    // 名 fail closed，不能静默空列表。
+    let error = storage
+        .require_supported(
             storage_backend::BackendCapability::CampaignLifecycle,
             "campaign lifecycle",
-        ),
-    ] {
-        let error = storage
-            .require_supported(capability, operation)
-            .expect_err("SQLite capability must fail closed before a JSON store is consulted");
-        assert!(error.contains(operation));
-        assert!(error.contains("Unsupported"));
-    }
+        )
+        .expect_err("SQLite capability must fail closed before a JSON store is consulted");
+    assert!(error.contains("campaign lifecycle"));
+    assert!(error.contains("Unsupported"));
     storage
         .require_supported(
             storage_backend::BackendCapability::MvuTranslation,

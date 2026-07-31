@@ -8,10 +8,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rusqlite::OptionalExtension;
 use storyforge_app_conversation::{ConversationError, ConversationPersistence};
 use storyforge_domain::Id;
-use storyforge_domain::campaign::Campaign;
+use storyforge_domain::agent::RoundSummary;
+use storyforge_domain::campaign::{Campaign, CharacterInstance};
+use storyforge_domain::character::CharacterCard;
+use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 use storyforge_domain::conversation::Conversation;
+use storyforge_domain::story_task::StoryTask;
 use storyforge_domain::turn::{AttemptStatus, TurnRecord, TurnStatus};
 use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::preaccept::{
@@ -23,6 +28,9 @@ use storyforge_infra_sqlite::production::{
     AcceptOutcome as SqliteAcceptOutcome, AcceptTurnRequest, SqliteProductionRepository,
 };
 use storyforge_infra_sqlite::{current_version, migrate};
+
+use crate::commands::characters::CharacterInfo;
+use crate::storage::StoredCharacter;
 
 /// Process-owned SQLite handle. Opened once when SQLite is selected.
 static SQLITE_DB: OnceLock<Arc<Mutex<Database>>> = OnceLock::new();
@@ -903,6 +911,7 @@ pub fn publish_chronicle_compress(
     parents: &[storyforge_domain::agent::RoundSummary],
     child_covered_by: &[(Id, Id)],
     job_id: Option<&str>,
+    batch_index: u32,
 ) -> Result<storyforge_infra_sqlite::publication::PublishOutcome, String> {
     with_db_mut(|db| {
         let request = storyforge_infra_sqlite::publication::PublishRequest {
@@ -911,6 +920,7 @@ pub fn publish_chronicle_compress(
             parents,
             child_covered_by,
             job_id,
+            batch_index,
         };
         storyforge_infra_sqlite::publication::SqliteChronicleRepository::publish_compress(
             db, request,
@@ -946,6 +956,7 @@ pub fn publish_chronicle_compress_with_fault_flag(
     parents: &[storyforge_domain::agent::RoundSummary],
     child_covered_by: &[(Id, Id)],
     job_id: Option<&str>,
+    batch_index: u32,
 ) -> Result<storyforge_infra_sqlite::publication::PublishOutcome, String> {
     with_db_mut(|db| {
         let fault = FAIL_CHRONICLE_PUBLISH.with(|slot| slot.get());
@@ -955,6 +966,7 @@ pub fn publish_chronicle_compress_with_fault_flag(
             parents,
             child_covered_by,
             job_id,
+            batch_index,
         };
         storyforge_infra_sqlite::publication::SqliteChronicleRepository::publish_compress_with_fault(
             db, request, fault,
@@ -981,6 +993,7 @@ thread_local! {
 pub fn meta_apply_typed_patch_actions(
     campaign_id: &Id,
     actions: &[storyforge_app_meta::TypedPatchAction],
+    expected_revision: Option<u64>,
 ) -> Result<(), String> {
     with_db_mut(|db| {
         let fault = FAIL_META_PATCH_UOW.with(|slot| slot.get());
@@ -988,8 +1001,470 @@ pub fn meta_apply_typed_patch_actions(
             db,
             campaign_id,
             actions,
+            expected_revision,
             fault,
         )
         .map_err(|e| e.to_string())
+    })
+}
+
+// ─── Gate 4 P1-4: SQLite character library (V007 `characters` table) ────────
+//
+// Mirrors the JSON `CharacterStore` (`characters.json`) semantics exactly:
+// save generates a fresh stored id and stamps `imported_at`; list returns all
+// stored characters; get/delete resolve by stored id **or** source
+// `Character.id`; world-info edits are read-modify-write over the full
+// `CharacterInfo` JSON with derived counters refreshed on every write.
+
+fn character_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCharacter> {
+    let character_id: String = row.get(0)?;
+    let source_character_id: Option<String> = row.get(1)?;
+    let _name: String = row.get(2)?;
+    let info_json: String = row.get(3)?;
+    let imported_at: String = row.get(4)?;
+    let info: CharacterInfo = serde_json::from_str(&info_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("角色卡 info_json 解析失败: {e}").into(),
+        )
+    })?;
+    if info.source_character_id.as_deref() != source_character_id.as_deref() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            "角色卡 source_character_id 与 info_json 不一致"
+                .to_string()
+                .into(),
+        ));
+    }
+    Ok(StoredCharacter {
+        id: character_id,
+        info,
+        imported_at,
+    })
+}
+
+const CHARACTER_SELECT: &str =
+    "SELECT character_id, source_character_id, name, info_json, imported_at FROM characters";
+
+fn character_select_by_id_or_source(
+    db: &Database,
+    id_or_source: &str,
+) -> Result<Option<StoredCharacter>, String> {
+    let mut stmt = db
+        .connection()
+        .prepare(
+            "SELECT character_id, source_character_id, name, info_json, imported_at \
+             FROM characters WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map([id_or_source], character_row)
+        .map_err(|e| e.to_string())?;
+    match rows.next() {
+        Some(row) => row.map(Some).map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+/// Persist an imported character card (fresh stored id, `imported_at` stamp).
+pub fn save_character(info: &CharacterInfo) -> Result<StoredCharacter, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let imported_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let stored = StoredCharacter {
+        id: id.clone(),
+        info: info.clone(),
+        imported_at: imported_at.clone(),
+    };
+    let info_json = serde_json::to_string(info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
+    with_db_mut(|db| {
+        db.connection()
+            .execute(
+                "INSERT INTO characters (character_id, source_character_id, name, info_json, imported_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, info.source_character_id, info.name, info_json, imported_at],
+            )
+            .map_err(|e| format!("保存角色卡失败: {e}"))?;
+        Ok(())
+    })?;
+    Ok(stored)
+}
+
+/// List every stored character (导入时间序，与 JSON 插入序语义对齐)。
+pub fn list_characters() -> Result<Vec<StoredCharacter>, String> {
+    with_db(|db| {
+        let mut stmt = db
+            .connection()
+            .prepare(&format!(
+                "{CHARACTER_SELECT} ORDER BY imported_at, character_id"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], character_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Get a stored character by stored id **or** source `Character.id`.
+pub fn get_character(id_or_source: &str) -> Result<Option<StoredCharacter>, String> {
+    with_db(|db| character_select_by_id_or_source(db, id_or_source))
+}
+
+/// Delete a stored character by stored id **or** source `Character.id`.
+/// Returns whether a row was actually removed.
+pub fn delete_character(id_or_source: &str) -> Result<bool, String> {
+    with_db_mut(|db| {
+        let removed = db
+            .connection()
+            .execute(
+                "DELETE FROM characters WHERE character_id = ?1 OR source_character_id = ?1",
+                [id_or_source],
+            )
+            .map_err(|e| format!("删除角色卡失败: {e}"))?;
+        Ok(removed > 0)
+    })
+}
+
+/// Read-modify-write a stored character's `CharacterInfo` under the
+/// process-owned SQLite lock. Mirrors the JSON `CharacterStore` world-info
+/// edit semantics: derived counters are refreshed on every write and the
+/// row's `name` / `source_character_id` columns stay in sync with the JSON.
+pub fn mutate_character<T>(
+    id_or_source: &str,
+    f: impl FnOnce(&mut CharacterInfo) -> Result<T, String>,
+) -> Result<T, String> {
+    with_db_mut(|db| {
+        let row: Option<(String, String)> = db
+            .connection()
+            .query_row(
+                "SELECT character_id, info_json FROM characters \
+                 WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
+                [id_or_source],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let (character_id, info_json) =
+            row.ok_or_else(|| format!("角色卡不存在: {id_or_source}"))?;
+        let mut info: CharacterInfo =
+            serde_json::from_str(&info_json).map_err(|e| format!("解析角色卡失败: {e}"))?;
+        let result = f(&mut info)?;
+        // 同步更新计数（对齐 JSON CharacterStore 编辑路径）。
+        info.world_info_count = info.world_info_entries.len();
+        info.has_world_info = !info.world_info_entries.is_empty();
+        let new_json =
+            serde_json::to_string(&info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
+        db.connection()
+            .execute(
+                "UPDATE characters SET info_json = ?1, name = ?2, source_character_id = ?3 \
+                 WHERE character_id = ?4",
+                rusqlite::params![new_json, info.name, info.source_character_id, character_id],
+            )
+            .map_err(|e| format!("更新角色卡失败: {e}"))?;
+        Ok(result)
+    })
+}
+
+/// Delete one card payload row (character delete cascade). Mirrors the JSON
+/// `CampaignStore::delete_card` scope: the card's campaigns cascade into
+/// instances / knowledge / tasks / summaries / world info / MVU rows.
+pub fn delete_card_payload(card_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        let tx = db
+            .connection_mut()
+            .transaction()
+            .map_err(|e| e.to_string())?;
+        let source_ids: Vec<Option<String>> = {
+            let mut stmt = tx
+                .prepare("SELECT source_character_id FROM character_cards WHERE card_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([card_id.as_str()], |row| row.get::<_, Option<String>>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let campaign_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT campaign_id FROM campaigns WHERE card_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([card_id.as_str()], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for campaign_id in &campaign_ids {
+            tx.execute(
+                "DELETE FROM round_summary_covers WHERE parent_id IN \
+                 (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1)",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM round_summaries WHERE campaign_id = ?1",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM story_tasks WHERE campaign_id = ?1",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM character_knowledge WHERE campaign_id = ?1",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM character_instances WHERE campaign_id = ?1",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
+                [campaign_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "DELETE FROM campaigns WHERE card_id = ?1",
+            [card_id.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+        for source_id in source_ids.iter().flatten() {
+            tx.execute(
+                "DELETE FROM mvu_translations WHERE source_character_id = ?1",
+                [source_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM character_cards WHERE card_id = ?1",
+                [card_id.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed > 0)
+    })
+}
+
+// ─── Gate 4 P1-4: atomic Campaign Bundle import (single transaction) ────────
+
+/// Test-only fault injection for the bundle import UoW (rollback proof).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleImportFault {
+    None,
+    AfterCard,
+    AfterCampaign,
+    AfterSummaries,
+}
+
+/// Test-only fault injection setter for the bundle import UoW.
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fail_bundle_import_for_test(fault: BundleImportFault) {
+    FAIL_BUNDLE_IMPORT.with(|slot| slot.set(fault));
+}
+
+thread_local! {
+    static FAIL_BUNDLE_IMPORT: std::cell::Cell<BundleImportFault> =
+        const { std::cell::Cell::new(BundleImportFault::None) };
+}
+
+/// Persist one full Campaign bundle (conversation + card + campaign +
+/// instances + knowledge + tasks + summaries/covers) in a **single** SQLite
+/// transaction. Any failure rolls the whole import back — no partial graph
+/// can survive. Insert order respects `foreign_keys=ON`: card → conversation
+/// → campaign → children → summaries (parents after leaves, then covered_by /
+/// covers patches).
+pub fn import_campaign_bundle_into_db(
+    conversation: &Conversation,
+    card: &CharacterCard,
+    campaign: &Campaign,
+    instances: &[CharacterInstance],
+    knowledge: &[CharacterKnowledgeEntry],
+    tasks: &[StoryTask],
+    summaries: &[RoundSummary],
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        let tx = db
+            .connection_mut()
+            .transaction()
+            .map_err(|e| e.to_string())?;
+        let fault = FAIL_BUNDLE_IMPORT.with(|slot| slot.get());
+
+        // 1. 角色卡（campaign 的 FK 依赖）。payload 必须是 StoredCard 包装
+        //    （`{ card, imported_at }`），与 `save_card_payload` / 生产读取
+        //    消费者（meta 健康检查、世界书模板等）的约定一致。
+        let imported_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let card_payload = serde_json::to_value(crate::campaign_store::StoredCard {
+            card: card.clone(),
+            imported_at: imported_at.clone(),
+        })
+        .map_err(|e| format!("序列化角色卡失败: {e}"))?;
+        tx.execute(
+            r#"
+            INSERT INTO character_cards (card_id, source_character_id, name, imported_at, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            rusqlite::params![
+                card.id.as_str(),
+                Some(card.source_character_id.as_str()),
+                card.name,
+                imported_at,
+                serde_json::to_string(&card_payload).map_err(|e| format!("序列化角色卡失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| format!("导入角色卡失败: {e}"))?;
+        if fault == BundleImportFault::AfterCard {
+            return Err("injected failure after bundle card import".to_string());
+        }
+
+        // 2. 对话（round_summaries 的 FK 依赖）。
+        tx.execute(
+            r#"
+            INSERT INTO conversations (
+                conversation_id, campaign_id, character_id, archived_upto,
+                created_at, updated_at, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            rusqlite::params![
+                conversation.id.as_str(),
+                conversation.campaign_id.as_ref().map(Id::as_str),
+                conversation.character_id,
+                conversation.archived_upto as u64,
+                conversation.created_at.to_rfc3339(),
+                conversation.updated_at.to_rfc3339(),
+                serde_json::to_string(conversation).map_err(|e| format!("序列化对话失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| format!("导入对话失败: {e}"))?;
+
+        // 3. Campaign。
+        tx.execute(
+            r#"
+            INSERT INTO campaigns (
+                campaign_id, card_id, name, conversation_id, revision, chronicle_revision,
+                lineage_id, story_clock, created_at, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            rusqlite::params![
+                campaign.id.as_str(),
+                campaign.card_id.as_str(),
+                campaign.name,
+                campaign.conversation_id.as_ref().map(Id::as_str),
+                campaign.revision,
+                campaign.chronicle_revision,
+                campaign.lineage_id.as_ref().map(Id::as_str),
+                campaign.current_story_clock(),
+                campaign.created_at,
+                serde_json::to_string(campaign)
+                    .map_err(|e| format!("序列化 Campaign 失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| format!("导入 Campaign 失败: {e}"))?;
+        if fault == BundleImportFault::AfterCampaign {
+            return Err("injected failure after bundle campaign import".to_string());
+        }
+
+        // 4. 实例 / 知识 / 任务。
+        for instance in instances {
+            tx.execute(
+                r#"
+                INSERT INTO character_instances (
+                    instance_id, campaign_id, definition_id, name, is_temporary, payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                rusqlite::params![
+                    instance.id.as_str(),
+                    instance.campaign_id.as_str(),
+                    instance.definition_id.as_ref().map(Id::as_str),
+                    instance.name,
+                    instance.is_temporary,
+                    serde_json::to_string(instance)
+                        .map_err(|e| format!("序列化角色实例失败: {e}"))?,
+                ],
+            )
+            .map_err(|e| format!("导入角色实例失败: {e}"))?;
+        }
+        for entry in knowledge {
+            tx.execute(
+                "INSERT INTO character_knowledge (knowledge_id, campaign_id, payload_json) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    entry.id.as_str(),
+                    entry.campaign_id.as_str(),
+                    serde_json::to_string(entry).map_err(|e| format!("序列化知识失败: {e}"))?,
+                ],
+            )
+            .map_err(|e| format!("导入知识失败: {e}"))?;
+        }
+        for task in tasks {
+            tx.execute(
+                "INSERT INTO story_tasks (task_id, campaign_id, payload_json) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    task.id.as_str(),
+                    task.campaign_id.as_str(),
+                    serde_json::to_string(task).map_err(|e| format!("序列化任务失败: {e}"))?,
+                ],
+            )
+            .map_err(|e| format!("导入任务失败: {e}"))?;
+        }
+
+        // 5. 摘要：先全部落行（covered_by 置空），再回填 covered_by + covers
+        //    （父行可能在子行之后，foreign_keys=ON 下必须两趟）。
+        for summary in summaries {
+            tx.execute(
+                r#"
+                INSERT INTO round_summaries (
+                    summary_id, campaign_id, conversation_id, lineage_id, level, turn, turn_end,
+                    code, headline, covered_by, content, created_at, payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)
+                "#,
+                rusqlite::params![
+                    summary.id.as_str(),
+                    summary.campaign_id.as_str(),
+                    summary.conversation_id.as_str(),
+                    summary.lineage_id.as_ref().map(Id::as_str),
+                    summary.level,
+                    summary.turn,
+                    summary.effective_turn_end(),
+                    summary.code,
+                    summary.headline,
+                    summary.content,
+                    summary.created_at,
+                    serde_json::to_string(summary).map_err(|e| format!("序列化摘要失败: {e}"))?,
+                ],
+            )
+            .map_err(|e| format!("导入摘要失败: {e}"))?;
+        }
+        for summary in summaries {
+            if let Some(parent) = &summary.covered_by {
+                tx.execute(
+                    "UPDATE round_summaries SET covered_by = ?1 WHERE summary_id = ?2",
+                    rusqlite::params![parent.as_str(), summary.id.as_str()],
+                )
+                .map_err(|e| format!("导入摘要 covered_by 失败: {e}"))?;
+            }
+            for child_id in &summary.covers {
+                tx.execute(
+                    "INSERT INTO round_summary_covers (parent_id, child_id) VALUES (?1, ?2)",
+                    rusqlite::params![summary.id.as_str(), child_id.as_str()],
+                )
+                .map_err(|e| format!("导入摘要 covers 失败: {e}"))?;
+            }
+        }
+        if fault == BundleImportFault::AfterSummaries {
+            return Err("injected failure after bundle summaries import".to_string());
+        }
+
+        tx.commit().map_err(|e| format!("导入事务提交失败: {e}"))?;
+        Ok(())
     })
 }

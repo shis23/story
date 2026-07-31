@@ -61,6 +61,17 @@ fn default_story_clock() -> String {
     "Day 1".into()
 }
 
+/// 故事时钟双表示修复结果（Gate 4 评审 P2-6）：调用方据此发出可审计日志。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryClockRepair {
+    /// 无分歧，无需修复。
+    NoChange,
+    /// 顶层字段与字符串权威分歧，已用 `variables["story_clock"]` 覆盖字段。
+    FieldRepaired,
+    /// 权威项存在但非字符串（数据损坏），已用顶层字段字符串归一化变量项。
+    InvalidAuthorityNormalized,
+}
+
 impl Campaign {
     pub fn new(card_id: Id, name: impl Into<String>) -> Self {
         Self::new_with_variable_schema(card_id, name, &[])
@@ -147,6 +158,11 @@ impl Campaign {
     /// `variables["story_clock"]`（字符串值）是唯一权威；顶层字段仅为旧数据
     /// 保留的兼容镜像。两者不一致属于历史双表示残留，须经
     /// [`Campaign::repair_story_clock_authority`] 产生可审核修复，不得静默任选。
+    ///
+    /// 非字符串 authority 属于数据损坏：载入路径（SQLite/JSON）会经
+    /// [`Campaign::repair_story_clock_authority`] 归一化（
+    /// [`StoryClockRepair::InvalidAuthorityNormalized`]）并告警；本函数在该
+    /// 状态下的返回值与归一化结果一致，不做静默任选（Gate 4 评审 P2-6）。
     pub fn current_story_clock(&self) -> &str {
         self.variables
             .iter()
@@ -174,24 +190,33 @@ impl Campaign {
         }
     }
 
-    /// Repair the legacy top-level field from the variables authority.
-    /// Returns `true` when a divergence was corrected so callers can emit an
-    /// auditable warning. This is the only sanctioned way to settle the old
-    /// dual representation — never silently pick one side without repairing.
-    pub fn repair_story_clock_authority(&mut self) -> bool {
-        let Some(authoritative) = self
-            .variables
-            .iter()
-            .find(|v| v.key == "story_clock")
-            .and_then(|v| v.value.as_str())
-        else {
-            return false;
+    /// Repair the story-clock dual representation and return what was done.
+    ///
+    /// This is the only sanctioned way to settle the old dual representation —
+    /// never silently pick one side without repairing (Gate 4 review P2-6).
+    /// A non-string `variables["story_clock"]` value is corrupted data (it is
+    /// never accepted as a clock update by `set_variable`): it is normalized
+    /// back to the top-level string field as an auditable repair instead of
+    /// being silently ignored.
+    pub fn repair_story_clock_authority(&mut self) -> StoryClockRepair {
+        let Some(variable) = self.variables.iter_mut().find(|v| v.key == "story_clock") else {
+            return StoryClockRepair::NoChange;
         };
-        if authoritative != self.story_clock {
-            self.story_clock = authoritative.to_string();
-            true
-        } else {
-            false
+        match variable.value.as_str() {
+            Some(authoritative) => {
+                if authoritative != self.story_clock {
+                    self.story_clock = authoritative.to_string();
+                    StoryClockRepair::FieldRepaired
+                } else {
+                    StoryClockRepair::NoChange
+                }
+            }
+            None => {
+                // 非字符串 authority：无法作为时钟权威，显式归一化为顶层字段
+                // 的字符串表示（顶层字段恒为 String），可审计、不静默。
+                variable.value = serde_json::Value::String(self.story_clock.clone());
+                StoryClockRepair::InvalidAuthorityNormalized
+            }
         }
     }
 
@@ -563,26 +588,29 @@ mod tests {
             "variables 权威优先"
         );
 
-        assert!(
+        assert_eq!(
             campaign.repair_story_clock_authority(),
+            StoryClockRepair::FieldRepaired,
             "repair must report the correction for audit"
         );
         assert_eq!(campaign.story_clock, "Day 47");
         assert!(!campaign.story_clock_diverged());
-        assert!(
-            !campaign.repair_story_clock_authority(),
+        assert_eq!(
+            campaign.repair_story_clock_authority(),
+            StoryClockRepair::NoChange,
             "second repair must be a no-op"
         );
     }
 
     #[test]
-    fn test_story_clock_non_string_variable_is_not_a_divergence() {
+    fn test_story_clock_non_string_authority_is_normalized_not_silently_ignored() {
         // 非字符串 story_clock 变量不是合法权威（set_variable 不把它当 clock
-        // 更新）；此时不得把它当作「与字段分歧」处理，也不得用它覆盖字段。
+        // 更新），属于数据损坏：修复必须显式归一化并上报，绝不静默任选
+        // （Gate 4 评审 P2-6——旧行为是静默回退字段）。
         let mut campaign = Campaign::new(Id::new(), "test");
         campaign.set_variable("story_clock", serde_json::json!("Day 9"), 0);
         // 人为制造旧数据形态：字段 = "Day 1"（老值），variables 项被替换成
-        // 非字符串（set_variable 从不接受非字符串 clock 更新 → 不是合法权威）。
+        // 非字符串。
         campaign.story_clock = "Day 1".to_string();
         campaign.variables.retain(|v| v.key != "story_clock");
         campaign
@@ -593,8 +621,24 @@ mod tests {
                 0,
             ));
         assert!(!campaign.story_clock_diverged());
-        assert!(!campaign.repair_story_clock_authority());
-        assert_eq!(campaign.current_story_clock(), "Day 1", "field fallback");
+        assert_eq!(
+            campaign.repair_story_clock_authority(),
+            StoryClockRepair::InvalidAuthorityNormalized,
+            "non-string authority must be repaired, not silently skipped"
+        );
+        // 归一化后 authority 是字符串（取字段值），与 current 一致。
+        assert_eq!(campaign.current_story_clock(), "Day 1");
+        let authority = campaign
+            .get_variable("story_clock")
+            .expect("variable exists")
+            .as_str()
+            .expect("normalized to string");
+        assert_eq!(authority, "Day 1");
+        assert_eq!(
+            campaign.repair_story_clock_authority(),
+            StoryClockRepair::NoChange,
+            "second repair must be a no-op"
+        );
     }
 
     #[test]

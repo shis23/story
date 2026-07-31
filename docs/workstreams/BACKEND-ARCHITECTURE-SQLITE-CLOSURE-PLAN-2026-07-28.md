@@ -288,7 +288,7 @@ facade 必须能显式报告：
 
 四项标准全部达成（逐项证据与统计见 RESULT §15）：命令/应用服务层 `.is_sqlite()`/`.is_json()` 30 → 0；六个 SQLite-only facade API 移除并由注入的 `TurnWorkflow`（`backend_workflows.rs`）以 backend-neutral DTO 取代；静态门禁（Rust 测试 + baseline 字段）钉住白名单 = {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs}；SQLite 活跃时四个 JSON writer 无构造机会不变。Gate 4 起不再有任何应用层 JSON/SQLite 分支需要迁移。
 
-## 9. Gate 4：SQLite 缺口补齐（**已完成，2026-07-31**，见 RESULT §30）
+## 9. Gate 4：SQLite 缺口补齐（**已完成，2026-07-31**，见 RESULT §30；一审 INCOMPLETE，二审修复见 RESULT §30.9——P1-1 至 P2-6 全部关闭，CharacterCommands/ImportExport 按 §15.7 交接范围补齐）
 
 ### 9.1 Meta UoW
 

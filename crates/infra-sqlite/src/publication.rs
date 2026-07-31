@@ -40,6 +40,9 @@ pub struct PublishRequest<'a> {
     pub parents: &'a [RoundSummary],
     pub child_covered_by: &'a [(Id, Id)],
     pub job_id: Option<&'a str>,
+    /// 同一 compress job 内的批次序号（A→B 为 0，B→C 为 1…）。唯一性按
+    /// (job_id, batch_index) 判定：一个 job 可发布多批结果，互不误判为重复。
+    pub batch_index: u32,
 }
 
 struct JobRow {
@@ -115,10 +118,11 @@ impl SqliteChronicleRepository {
         }
 
         if let Some(job_id) = request.job_id
-            && job_id_exists(tx, job_id)?
+            && job_batch_exists(tx, job_id, request.batch_index)?
         {
             return Err(SqliteError::Conflict(format!(
-                "publication job_id {job_id} is already used"
+                "publication job_id {job_id} batch {} is already used",
+                request.batch_index
             )));
         }
 
@@ -212,15 +216,17 @@ impl SqliteChronicleRepository {
         tx.execute(
             r#"
             INSERT INTO chronicle_publication_jobs (
-                publication_id, campaign_id, job_id, base_chronicle_revision,
-                target_chronicle_revision, parent_ids_json, child_covered_by_json,
-                payload_hash, status, created_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9, ?10)
+                publication_id, campaign_id, job_id, batch_index,
+                base_chronicle_revision, target_chronicle_revision,
+                parent_ids_json, child_covered_by_json, payload_hash,
+                status, created_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'completed', ?10, ?11)
             "#,
             rusqlite::params![
                 request.publication_id.as_str(),
                 request.campaign_id.as_str(),
                 request.job_id,
+                request.batch_index as i64,
                 base_rev,
                 campaign.chronicle_revision,
                 json(&pending.parent_ids)?,
@@ -576,11 +582,13 @@ fn verify_completed_publication_state(
     Ok(())
 }
 
-fn job_id_exists(tx: &Transaction<'_>, job_id: &str) -> Result<bool> {
+/// 是否存在同一 (job_id, batch_index) 的已发布记录。唯一索引
+/// `idx_chronicle_publication_jobs_job_batch`（V007）是最后一层防线。
+fn job_batch_exists(tx: &Transaction<'_>, job_id: &str, batch_index: u32) -> Result<bool> {
     let found: Option<i64> = tx
         .query_row(
-            "SELECT 1 FROM chronicle_publication_jobs WHERE job_id = ?1 LIMIT 1",
-            [job_id],
+            "SELECT 1 FROM chronicle_publication_jobs WHERE job_id = ?1 AND batch_index = ?2 LIMIT 1",
+            rusqlite::params![job_id, batch_index as i64],
             |row| row.get(0),
         )
         .optional()?;
@@ -772,6 +780,7 @@ fn request_fingerprint(request: &PublishRequest<'_>) -> Result<String> {
         "campaign_id": request.campaign_id,
         "publication_id": request.publication_id,
         "job_id": request.job_id,
+        "batch_index": request.batch_index,
         "parents": parents,
         "child_covered_by": covered,
     });

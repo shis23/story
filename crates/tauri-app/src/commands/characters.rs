@@ -162,13 +162,12 @@ pub(crate) fn import_character(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterSummary, TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "import character")?;
-    let character_store =
-        state.json_character_store(BackendCapability::CharacterCommands, "import character")?;
     let character =
         storyforge_infra_import::import_character(&data).map_err(TauriCommandError::from)?;
     let info = CharacterInfo::from(&character);
-    let stored = character_store
-        .save(info)
+    let stored = state
+        .storage()
+        .save_character(info)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // 同步到 tool_ctx：角色卡 + 世界书（覆盖为当前角色的，符合"当前角色"语义）
@@ -231,8 +230,9 @@ pub(crate) fn list_characters(
 ) -> Result<Vec<CharacterSummary>, TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "list characters")?;
     Ok(state
-        .json_character_store(BackendCapability::CharacterCommands, "list characters")?
-        .list()
+        .storage()
+        .list_characters()
+        .map_err(TauriCommandError::storage)?
         .into_iter()
         .map(CharacterSummary::from)
         .collect())
@@ -244,9 +244,10 @@ pub(crate) fn get_character(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterInfo, TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "get character")?;
-    let character_store =
-        state.json_character_store(BackendCapability::CharacterCommands, "get character")?;
-    stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&id))
+    state
+        .storage()
+        .get_character(&id)
+        .map_err(TauriCommandError::storage)?
         .map(|stored| stored.info)
         .ok_or_else(|| TauriCommandError::from(format!("角色卡不存在: {id}")))
 }
@@ -285,16 +286,11 @@ pub(crate) fn delete_character(
             "character delete cascade",
         )
         .map_err(TauriCommandError::validation)?;
-    let campaign_store = state.json_campaign_store(
-        BackendCapability::CampaignLifecycle,
-        "character delete cascade",
-    )?;
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "character delete cascade",
-    )?;
     // 先取出 name（用于同步 tool_ctx）
-    let stored = character_store.get(&id);
+    let stored = state
+        .storage()
+        .get_character(&id)
+        .map_err(TauriCommandError::storage)?;
     let name = stored.as_ref().map(|s| s.info.name.clone());
     let stored_source_character_id = stored
         .as_ref()
@@ -308,8 +304,9 @@ pub(crate) fn delete_character(
             &ctx.characters,
         )
     };
-    if !character_store
-        .delete(&id)
+    if !state
+        .storage()
+        .delete_character(&id)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
     {
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
@@ -324,18 +321,18 @@ pub(crate) fn delete_character(
             ctx.world_info = None;
         }
     }
-    // 级联删除：该卡的 MVU 翻译 + CampaignStore 的 CharacterCard（含其所有 Campaign）
+    // 级联删除：该卡的 MVU 翻译 + CharacterCard（含其所有 Campaign）
     //
     // 注意 id 语义：delete_character 的 `id` 是 StoredCharacter.id（存储层 UUID），
     // 而 CharacterCard.source_character_id 是 Character.id（domain 层 UUID，导入时生成）。
     // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
     // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
     for source_id in &source_ids {
-        let _ = campaign_store.delete_mvu(source_id);
+        let _ = state.storage().delete_mvu(source_id);
         // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
-        if let Some(stored_card) = campaign_store.get_card_by_source(source_id) {
+        if let Ok(Some(stored_card)) = state.storage().get_card_by_source(source_id) {
             // 桥接：通过角色名找到 Character.id，再查 card
-            let _ = campaign_store.delete_card(&stored_card.card.id);
+            let _ = state.storage().delete_card(&stored_card.card.id);
         }
     }
     // 级联删除：清理向量库中该角色相关的记录（M-2）
@@ -366,14 +363,12 @@ pub(crate) fn update_world_info_route(
         }
     }
 
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "update character world info route",
-    )?;
-    character_store.update_world_info_route(&character_id, entry_index, &route)?;
+    state
+        .storage()
+        .update_character_world_info_route(&character_id, entry_index, &route)?;
 
     // 同步更新 tool_ctx 中的世界书路由
-    if let Some(stored) = character_store.get(&character_id)
+    if let Ok(Some(stored)) = state.storage().get_character(&character_id)
         && stored.info.world_info_entries.get(entry_index).is_some()
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -410,21 +405,16 @@ pub(crate) fn update_world_info_entry(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "update character world info entry")?;
-    state
-        .json_character_store(
-            BackendCapability::CharacterCommands,
-            "update character world info entry",
-        )?
-        .update_world_info_entry(
-            &character_id,
-            entry_index,
-            keys.clone(),
-            content.clone(),
-            constant,
-            is_global,
-            depth,
-            order,
-        )?;
+    state.storage().update_character_world_info_entry(
+        &character_id,
+        entry_index,
+        keys.clone(),
+        content.clone(),
+        constant,
+        is_global,
+        depth,
+        order,
+    )?;
 
     // 同步 tool_ctx 的世界书（含全局条目 merge）
     rebuild_world_info_in_tool_ctx(&state);
@@ -442,18 +432,13 @@ pub(crate) fn add_world_info_entry(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "add character world info entry")?;
-    let new_index = state
-        .json_character_store(
-            BackendCapability::CharacterCommands,
-            "add character world info entry",
-        )?
-        .add_world_info_entry(
-            &character_id,
-            keys.clone(),
-            content.clone(),
-            constant,
-            is_global.unwrap_or(false),
-        )?;
+    let new_index = state.storage().add_character_world_info_entry(
+        &character_id,
+        keys.clone(),
+        content.clone(),
+        constant,
+        is_global.unwrap_or(false),
+    )?;
 
     // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目入向量库
     rebuild_world_info_in_tool_ctx(&state);
@@ -480,11 +465,8 @@ pub(crate) fn delete_world_info_entry(
 ) -> Result<(), TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "delete character world info entry")?;
     state
-        .json_character_store(
-            BackendCapability::CharacterCommands,
-            "delete character world info entry",
-        )?
-        .delete_world_info_entry(&character_id, entry_index)?;
+        .storage()
+        .delete_character_world_info_entry(&character_id, entry_index)?;
     rebuild_world_info_in_tool_ctx(&state);
     Ok(())
 }
@@ -585,5 +567,207 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
             metadata: Default::default(),
         };
         ctx.world_info = Some(Arc::new(book));
+    }
+}
+
+// ─── 世界书编辑纯变换（SQLite 路径经 facade 复用；JSON 路径走 CharacterStore）──
+//
+// 这些纯函数与 `CharacterStore` 的内联变换保持字节级相同的语义与错误消息
+// （索引越界 / 新增条目默认路由 / 计数刷新由 `mutate_character` 统一完成）。
+
+/// 更新世界书条目路由（entry.route）。
+pub(crate) fn apply_world_info_route_update(
+    info: &mut CharacterInfo,
+    entry_index: usize,
+    new_route: &str,
+) -> Result<(), String> {
+    let entry = info
+        .world_info_entries
+        .get_mut(entry_index)
+        .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
+    entry.route = new_route.to_string();
+    Ok(())
+}
+
+/// 更新世界书条目的 keys / content / constant / is_global / depth / order。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_world_info_entry_update(
+    info: &mut CharacterInfo,
+    entry_index: usize,
+    keys: Vec<String>,
+    content: String,
+    constant: bool,
+    is_global: bool,
+    depth: i32,
+    order: i32,
+) -> Result<(), String> {
+    let entry = info
+        .world_info_entries
+        .get_mut(entry_index)
+        .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
+    entry.keys = keys;
+    entry.content = content;
+    entry.constant = constant;
+    entry.is_global = is_global;
+    entry.depth = depth;
+    entry.order = order;
+    Ok(())
+}
+
+/// 新增世界书条目，返回新条目的索引。默认路由：蓝灯→Constant，绿灯→Selective。
+pub(crate) fn apply_add_world_info_entry(
+    info: &mut CharacterInfo,
+    keys: Vec<String>,
+    content: String,
+    constant: bool,
+    is_global: bool,
+) -> Result<usize, String> {
+    let route = if constant { "Constant" } else { "Selective" }.to_string();
+    let entry = WorldInfoEntryInfo {
+        keys,
+        content,
+        constant,
+        route,
+        is_global,
+        depth: 2,
+        order: 100,
+    };
+    info.world_info_entries.push(entry);
+    Ok(info.world_info_entries.len() - 1)
+}
+
+/// 删除世界书条目。
+pub(crate) fn apply_delete_world_info_entry(
+    info: &mut CharacterInfo,
+    entry_index: usize,
+) -> Result<(), String> {
+    if entry_index >= info.world_info_entries.len() {
+        return Err(format!("世界书条目索引越界: {entry_index}"));
+    }
+    info.world_info_entries.remove(entry_index);
+    Ok(())
+}
+
+/// 批量替换世界书条目（meta_accept_patch 持久化用）。
+pub(crate) fn apply_update_world_info_entries_bulk(
+    info: &mut CharacterInfo,
+    entries: Vec<WorldInfoEntryInfo>,
+) -> Result<(), String> {
+    info.world_info_entries = entries;
+    Ok(())
+}
+
+#[cfg(test)]
+mod world_info_transform_tests {
+    use super::*;
+
+    fn info_with_entries(count: usize) -> CharacterInfo {
+        let mut info = sample_info("Transform Hero");
+        info.world_info_entries = (0..count)
+            .map(|i| WorldInfoEntryInfo {
+                keys: vec![format!("key{i}")],
+                content: format!("content{i}"),
+                constant: false,
+                route: "Selective".into(),
+                is_global: false,
+                depth: 2,
+                order: 100,
+            })
+            .collect();
+        info
+    }
+
+    fn sample_info(name: &str) -> CharacterInfo {
+        CharacterInfo {
+            source_character_id: Some("source-transform".into()),
+            name: name.into(),
+            description: String::new(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            post_history_instructions: String::new(),
+            alternate_greetings: vec![],
+            system_prompt: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            spec_version: "3.0".into(),
+            extensions: serde_json::json!({}),
+            embedded_world_info: None,
+            renderable_assets: None,
+            raw_card_json: serde_json::json!({}),
+            has_world_info: false,
+            has_renderable_assets: false,
+            world_info_count: 0,
+            world_info_entries: vec![],
+        }
+    }
+
+    #[test]
+    fn route_update_mutates_only_route() {
+        let mut info = info_with_entries(1);
+        apply_world_info_route_update(&mut info, 0, "Constant").unwrap();
+        assert_eq!(info.world_info_entries[0].route, "Constant");
+        assert_eq!(info.world_info_entries[0].keys, vec!["key0"]);
+        assert!(apply_world_info_route_update(&mut info, 3, "Constant").is_err());
+    }
+
+    #[test]
+    fn entry_update_replaces_fields() {
+        let mut info = info_with_entries(1);
+        apply_world_info_entry_update(
+            &mut info,
+            0,
+            vec!["new".into()],
+            "new content".into(),
+            true,
+            true,
+            5,
+            9,
+        )
+        .unwrap();
+        let entry = &info.world_info_entries[0];
+        assert_eq!(entry.keys, vec!["new"]);
+        assert_eq!(entry.content, "new content");
+        assert!(entry.constant && entry.is_global);
+        assert_eq!((entry.depth, entry.order), (5, 9));
+        assert!(
+            apply_world_info_entry_update(&mut info, 7, vec![], String::new(), false, false, 0, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn add_entry_defaults_route_depth_and_order() {
+        let mut info = info_with_entries(0);
+        let idx = apply_add_world_info_entry(&mut info, vec!["k".into()], "c".into(), true, true)
+            .unwrap();
+        assert_eq!(idx, 0);
+        let entry = &info.world_info_entries[0];
+        assert_eq!(entry.route, "Constant");
+        assert_eq!((entry.depth, entry.order), (2, 100));
+        assert!(entry.is_global);
+        let idx =
+            apply_add_world_info_entry(&mut info, vec!["k2".into()], "c2".into(), false, false)
+                .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(info.world_info_entries[1].route, "Selective");
+    }
+
+    #[test]
+    fn delete_entry_removes_and_rejects_out_of_range() {
+        let mut info = info_with_entries(2);
+        apply_delete_world_info_entry(&mut info, 0).unwrap();
+        assert_eq!(info.world_info_entries.len(), 1);
+        assert_eq!(info.world_info_entries[0].keys, vec!["key1"]);
+        assert!(apply_delete_world_info_entry(&mut info, 5).is_err());
+    }
+
+    #[test]
+    fn bulk_replace_swaps_the_whole_list() {
+        let mut info = info_with_entries(2);
+        apply_update_world_info_entries_bulk(&mut info, vec![]).unwrap();
+        assert!(info.world_info_entries.is_empty());
     }
 }

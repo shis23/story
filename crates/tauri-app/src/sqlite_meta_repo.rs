@@ -9,6 +9,7 @@
 //! `TypedPatchAction` is an app-meta type, so the pure-domain `infra-sqlite`
 //! crate must not import it.
 
+use rusqlite::OptionalExtension;
 use storyforge_app_meta::TypedPatchAction;
 use storyforge_domain::Id;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
@@ -39,8 +40,15 @@ impl SqliteMetaRepository {
         db: &mut Database,
         campaign_id: &Id,
         actions: &[TypedPatchAction],
+        expected_revision: Option<u64>,
     ) -> SqliteResult<()> {
-        Self::apply_typed_patch_actions_with_fault(db, campaign_id, actions, MetaPatchFault::None)
+        Self::apply_typed_patch_actions_with_fault(
+            db,
+            campaign_id,
+            actions,
+            expected_revision,
+            MetaPatchFault::None,
+        )
     }
 
     #[doc(hidden)]
@@ -48,6 +56,7 @@ impl SqliteMetaRepository {
         db: &mut Database,
         campaign_id: &Id,
         actions: &[TypedPatchAction],
+        expected_revision: Option<u64>,
         fault: MetaPatchFault,
     ) -> SqliteResult<()> {
         if actions.is_empty() {
@@ -57,13 +66,42 @@ impl SqliteMetaRepository {
         let uow = UnitOfWork::begin(db.connection_mut())?;
         let tx = uow.transaction()?;
 
-        // 前置：campaign 必须存在（scope 锚点）。
-        let campaign = load_payload_tx::<Campaign>(
+        // 前置：active-turn barrier 与 revision 校验在事务内执行——与写入同
+        // 一事务，杜绝「先检查、后开事务」之间的竞态窗口（Gate 4 评审 P1-2）。
+        let active_turn_id: Option<String> = tx
+            .query_row(
+                r#"
+                SELECT turn_id FROM turns
+                WHERE campaign_id = ?1
+                  AND status IN ('generating', 'draft_ready', 'deriving_state',
+                                 'awaiting_acceptance', 'committing')
+                LIMIT 1
+                "#,
+                [campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(turn_id) = active_turn_id {
+            return Err(SqliteError::Conflict(format!(
+                "active turn {turn_id} exists for campaign {campaign_id}; typed Meta patch accept rejected"
+            )));
+        }
+
+        // 前置：campaign 必须存在（scope 锚点），revision 与提案盖章比对。
+        let mut campaign = load_payload_tx::<Campaign>(
             tx,
             "SELECT payload_json FROM campaigns WHERE campaign_id = ?1",
             rusqlite::params![campaign_id.as_str()],
         )?
         .ok_or_else(|| SqliteError::RecordNotFound(format!("campaign {}", campaign_id)))?;
+        if let Some(expected) = expected_revision
+            && expected != campaign.revision
+        {
+            return Err(SqliteError::Conflict(format!(
+                "campaign {campaign_id} revision mismatch: proposed {expected}, current {}",
+                campaign.revision
+            )));
+        }
         let card_payload = load_payload_tx::<serde_json::Value>(
             tx,
             "SELECT payload_json FROM character_cards WHERE card_id = ?1",
@@ -80,7 +118,7 @@ impl SqliteMetaRepository {
         };
 
         for (index, action) in actions.iter().enumerate() {
-            apply_action(tx, &campaign, &definitions, action)?;
+            apply_action(tx, &mut campaign, &definitions, action)?;
             if fault == MetaPatchFault::AfterFirstAction && index == 0 {
                 return Err(SqliteError::Other(
                     "injected failure after first meta action".into(),
@@ -99,7 +137,7 @@ impl SqliteMetaRepository {
 
 fn apply_action(
     tx: &rusqlite::Transaction<'_>,
-    campaign: &Campaign,
+    campaign: &mut Campaign,
     definitions: &[storyforge_domain::character::CharacterDefinition],
     action: &TypedPatchAction,
 ) -> SqliteResult<()> {
@@ -177,13 +215,19 @@ fn apply_action(
                 )));
             }
             instance.definition_id = new_definition_id.clone();
+            // 与纯函数预演一致（typed_patch.rs）：解除绑定后实例转为临时角色
+            // （Gate 4 评审 P2-5 落盘一致性）。
+            if new_definition_id.is_none() {
+                instance.is_temporary = true;
+            }
             write_instance(tx, &instance)?;
             Ok(())
         }
         TypedPatchAction::UpdateCampaignVariable { key, value } => {
-            let mut campaign = campaign.clone();
+            // 在同一个可变 campaign 上顺序应用：多个变量更新互不覆盖
+            // （Gate 4 评审 P1-3——不再从事务开始时的旧快照克隆）。
             campaign.set_variable(key, value.clone(), 0);
-            write_campaign(tx, &campaign)?;
+            write_campaign(tx, campaign)?;
             Ok(())
         }
         TypedPatchAction::UpdateInstanceVariable {
@@ -531,7 +575,7 @@ mod tests {
                 new_status: TaskStatus::Completed,
             },
         ];
-        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
             .unwrap();
 
         let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
@@ -559,7 +603,7 @@ mod tests {
             add_keys: vec!["hp".into(), "mana".into()],
             remove_keys: vec![],
         }];
-        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
             .unwrap();
         let instances = SqliteProductionRepository::list_instances(&f.db, &f.campaign_id).unwrap();
         assert_eq!(
@@ -581,9 +625,13 @@ mod tests {
             add_keys: vec![],
             remove_keys: vec![],
         }];
-        let err =
-            SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
-                .unwrap_err();
+        let err = SqliteMetaRepository::apply_typed_patch_actions(
+            &mut f.db,
+            &f.campaign_id,
+            &actions,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no longer bound"));
     }
 
@@ -604,6 +652,7 @@ mod tests {
             &mut f.db,
             &f.campaign_id,
             &actions,
+            None,
             MetaPatchFault::AfterFirstAction,
         )
         .unwrap_err();
@@ -632,6 +681,7 @@ mod tests {
             &mut f.db,
             &f.campaign_id,
             &actions,
+            None,
             MetaPatchFault::AfterAllActions,
         )
         .unwrap_err();
@@ -659,6 +709,7 @@ mod tests {
             &mut f.db,
             &foreign_campaign_id,
             &actions,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("campaign other-camp"));
@@ -671,9 +722,13 @@ mod tests {
             instance_id: f.instance_id.clone(),
             new_definition_id: Some(Id::from_str("ghost-def")),
         }];
-        let err =
-            SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
-                .unwrap_err();
+        let err = SqliteMetaRepository::apply_typed_patch_actions(
+            &mut f.db,
+            &f.campaign_id,
+            &actions,
+            None,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("not found in campaign card definitions")
@@ -699,7 +754,7 @@ mod tests {
                 orphan_character_ids: vec![f.instance_id.clone()],
             },
         ];
-        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
             .unwrap();
         assert!(
             SqliteProductionRepository::list_knowledge(&f.db, &f.campaign_id)
@@ -718,10 +773,142 @@ mod tests {
             knowledge_text: "new fact".into(),
             source: KnowledgeSource::Inferred,
         }];
-        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions)
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
             .unwrap();
         let entries = SqliteProductionRepository::list_knowledge(&f.db, &f.campaign_id).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(&entries[1].campaign_id, &f.campaign_id);
+    }
+
+    // ─── Gate 4 review regressions（P1-2 / P1-3 / P2-5）────────────────────
+
+    #[test]
+    fn multiple_campaign_variable_updates_all_apply() {
+        // P1-3：同一 patch 更新多个 Campaign 变量必须全部保留——后一 action 不得
+        // 覆盖前一 action 已写入的值（不再从事务开始时旧快照克隆）。
+        let mut f = setup();
+        let actions = vec![
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "gate4_weather".into(),
+                value: serde_json::json!("rain"),
+            },
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "gate4_mood".into(),
+                value: serde_json::json!("tense"),
+            },
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "gate4_weather".into(),
+                value: serde_json::json!("sunny"),
+            },
+        ];
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
+            .unwrap();
+
+        let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            campaign.get_variable("gate4_weather"),
+            Some(&serde_json::json!("sunny")),
+            "later update to same key wins"
+        );
+        assert_eq!(
+            campaign.get_variable("gate4_mood"),
+            Some(&serde_json::json!("tense")),
+            "earlier update to a different key must not be lost"
+        );
+    }
+
+    #[test]
+    fn revision_mismatch_rejected_without_writes() {
+        // P1-2：提案盖章 revision 与事务内读取的最新 revision 不一致 → 拒绝，
+        // 且任何 action 都不得落库。
+        let mut f = setup();
+        let actions = vec![TypedPatchAction::UpdateCampaignVariable {
+            key: "gate4_weather".into(),
+            value: serde_json::json!("rain"),
+        }];
+        let err = SqliteMetaRepository::apply_typed_patch_actions(
+            &mut f.db,
+            &f.campaign_id,
+            &actions,
+            Some(7),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("revision mismatch"), "got: {err}");
+        let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(campaign.get_variable("gate4_weather"), None);
+
+        // 匹配的 revision 正常通过。
+        SqliteMetaRepository::apply_typed_patch_actions(
+            &mut f.db,
+            &f.campaign_id,
+            &actions,
+            Some(campaign.revision),
+        )
+        .unwrap();
+        let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            campaign.get_variable("gate4_weather"),
+            Some(&serde_json::json!("rain"))
+        );
+    }
+
+    #[test]
+    fn active_turn_blocks_accept_without_writes() {
+        // P1-2：active-turn barrier 与写入同事务——事务内有活动 Turn 即拒绝，
+        // 关闭「检查与写入之间」的竞态窗口。
+        let mut f = setup();
+        let mut conversation =
+            storyforge_domain::conversation::Conversation::new(None, Some(f.campaign_id.clone()));
+        conversation.id = Id::from_str("meta-conv-1");
+        SqliteProductionRepository::save_conversation(&mut f.db, &conversation).unwrap();
+        let turn = storyforge_domain::turn::TurnRecord::new(
+            f.campaign_id.clone(),
+            conversation.id.clone(),
+            Id::from_str("meta-node-1"),
+            0,
+        );
+        SqliteProductionRepository::save_turn(&mut f.db, &turn).unwrap();
+
+        let actions = vec![TypedPatchAction::UpdateCampaignVariable {
+            key: "gate4_weather".into(),
+            value: serde_json::json!("rain"),
+        }];
+        let err = SqliteMetaRepository::apply_typed_patch_actions(
+            &mut f.db,
+            &f.campaign_id,
+            &actions,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("active turn"), "got: {err}");
+        let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(campaign.get_variable("gate4_weather"), None);
+    }
+
+    #[test]
+    fn repoint_to_none_marks_instance_temporary() {
+        // P2-5：解除 definition 绑定后实例转为临时角色——落盘必须与纯函数
+        // 预演（typed_patch.rs 设 is_temporary）一致。
+        let mut f = setup();
+        let actions = vec![TypedPatchAction::RepointInstanceDefinition {
+            instance_id: f.instance_id.clone(),
+            new_definition_id: None,
+        }];
+        SqliteMetaRepository::apply_typed_patch_actions(&mut f.db, &f.campaign_id, &actions, None)
+            .unwrap();
+        let instances = SqliteProductionRepository::list_instances(&f.db, &f.campaign_id).unwrap();
+        assert!(
+            instances[0].is_temporary,
+            "repoint to None must mark temporary"
+        );
+        assert!(instances[0].definition_id.is_none());
     }
 }

@@ -57,6 +57,11 @@ pub fn builtin_migrations() -> Vec<Migration> {
             name: "gate4_gap_closure",
             sql: include_str!("../migrations/V006__gate4_gap_closure.sql"),
         },
+        Migration {
+            version: 7,
+            name: "gate4_review_fixups",
+            sql: include_str!("../migrations/V007__gate4_fixups.sql"),
+        },
     ]
 }
 
@@ -229,12 +234,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(current_version(&db).unwrap(), 6);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(current_version(&db).unwrap(), 7);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 6);
+        assert_eq!(current_version(&db).unwrap(), 7);
 
         // 核心表应存在
         for table in [
@@ -252,6 +257,7 @@ mod tests {
             "mvu_translations",
             "chronicle_compress_jobs",
             "campaign_world_info",
+            "characters",
         ] {
             let exists: i64 = db
                 .connection()
@@ -277,8 +283,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6]);
-        assert_eq!(current_version(&db).unwrap(), 6);
+        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(current_version(&db).unwrap(), 7);
         let cards: i64 = db
             .connection()
             .query_row(

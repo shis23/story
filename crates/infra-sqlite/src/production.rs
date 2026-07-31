@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
-use storyforge_domain::campaign::{Campaign, CharacterInstance};
+use storyforge_domain::campaign::{Campaign, CharacterInstance, StoryClockRepair};
 use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 use storyforge_domain::conversation::{Conversation, VariantStatus};
 use storyforge_domain::story_task::StoryTask;
@@ -1295,13 +1295,18 @@ fn load_campaign_payload(
     id: &str,
 ) -> Result<Option<Campaign>> {
     let mut campaign: Option<Campaign> = load_payload(conn, sql, id)?;
-    if let Some(c) = campaign.as_mut()
-        && c.repair_story_clock_authority()
-    {
-        tracing::warn!(
-            campaign_id = %c.id,
-            "campaign story_clock field diverged from variables authority; repaired from variables"
-        );
+    if let Some(c) = campaign.as_mut() {
+        match c.repair_story_clock_authority() {
+            StoryClockRepair::NoChange => {}
+            StoryClockRepair::FieldRepaired => tracing::warn!(
+                campaign_id = %c.id,
+                "campaign story_clock field diverged from variables authority; repaired from variables"
+            ),
+            StoryClockRepair::InvalidAuthorityNormalized => tracing::warn!(
+                campaign_id = %c.id,
+                "campaign story_clock variable was non-string (corrupted); normalized to top-level field string"
+            ),
+        }
     }
     Ok(campaign)
 }
@@ -1313,11 +1318,16 @@ fn load_campaign_payload_list<const N: usize>(
 ) -> Result<Vec<Campaign>> {
     let mut campaigns: Vec<Campaign> = load_payload_list(conn, sql, params)?;
     for campaign in campaigns.iter_mut() {
-        if campaign.repair_story_clock_authority() {
-            tracing::warn!(
+        match campaign.repair_story_clock_authority() {
+            StoryClockRepair::NoChange => {}
+            StoryClockRepair::FieldRepaired => tracing::warn!(
                 campaign_id = %campaign.id,
                 "campaign story_clock field diverged from variables authority; repaired from variables"
-            );
+            ),
+            StoryClockRepair::InvalidAuthorityNormalized => tracing::warn!(
+                campaign_id = %campaign.id,
+                "campaign story_clock variable was non-string (corrupted); normalized to top-level field string"
+            ),
         }
     }
     Ok(campaigns)

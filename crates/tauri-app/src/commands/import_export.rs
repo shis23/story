@@ -23,7 +23,7 @@ pub(crate) const BUNDLE_FORMAT_VERSION: u32 = 2;
 
 /// StoryForge Campaign 完整 JSON Bundle
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CampaignBundle {
+pub struct CampaignBundle {
     pub(crate) format_version: u32,
     pub(crate) exported_at: String,
     /// v2 起保留完整 CharacterCard，便于跨设备导入后继续开新档。
@@ -392,11 +392,9 @@ pub(crate) fn export_st_card_png(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<u8>, TauriCommandError> {
     let stored = state
-        .json_character_store(
-            storage_backend::BackendCapability::ImportExport,
-            "export ST character card",
-        )?
-        .get(&character_id)
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
 
     // 从 CharacterStore 恢复 Character（精简版，但够 to_st_data 用）
@@ -423,38 +421,45 @@ pub(crate) fn export_campaign_st_cards(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignExportResult, TauriCommandError> {
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::ImportExport,
-        "export campaign ST cards",
-    )?;
     let camp_id = Id::from_str(&campaign_id);
 
-    let campaign = store
+    let campaign = state
+        .storage()
         .get_campaign(&camp_id)
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+    let campaign = campaign.campaign;
 
-    let stored_card = store.get_card(&campaign.card_id).ok_or_else(|| {
-        TauriCommandError::not_found(format!("Campaign 关联的卡不存在: {}", campaign.card_id))
-    })?;
+    let stored_card = state
+        .storage()
+        .get_card(&campaign.card_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("Campaign 关联的卡不存在: {}", campaign.card_id))
+        })?;
 
-    let instances = store.list_instances(&camp_id);
+    let instances = state
+        .storage()
+        .list_instances(&camp_id)
+        .map_err(TauriCommandError::storage)?;
     if instances.is_empty() {
         return Err("Campaign 无角色实例，无法导出".into());
     }
 
     // 构建共享 lorebook（Campaign 级知识 → ST WorldInfoBook）
-    let shared_knowledge = store.list_knowledge(&camp_id);
+    let shared_knowledge = state
+        .storage()
+        .list_knowledge(&camp_id)
+        .map_err(TauriCommandError::storage)?;
     let shared_lorebook = knowledge_to_st_book(&shared_knowledge);
     let shared_lorebook_json =
         serde_json::to_string_pretty(&shared_lorebook).unwrap_or_else(|_| "{}".into());
 
-    // 尝试从 CharacterStore 获取原始 Character（用于 raw_card_json）
+    // 尝试从角色库获取原始 Character（用于 raw_card_json）
     let original_character = state
-        .json_character_store(
-            storage_backend::BackendCapability::ImportExport,
-            "export campaign ST cards",
-        )?
-        .get(stored_card.card.source_character_id.as_str())
+        .storage()
+        .get_character(stored_card.card.source_character_id.as_str())
+        .map_err(TauriCommandError::storage)?
         .map(|s| stored_info_to_character(&s));
 
     let mut cards = Vec::new();
@@ -517,11 +522,7 @@ pub(crate) fn export_campaign_bundle(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<String, TauriCommandError> {
     let camp_id = Id::from_str(&campaign_id);
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::ImportExport,
-        "export campaign bundle",
-    )?;
-    export_campaign_bundle_from_store(store, camp_id)
+    state.storage().export_campaign_bundle(&camp_id)
 }
 
 pub(crate) fn export_campaign_bundle_from_store(
@@ -568,11 +569,67 @@ pub(crate) fn import_campaign_bundle(
 ) -> Result<CampaignImportResult, TauriCommandError> {
     let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
         .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::ImportExport,
-        "import campaign bundle",
-    )?;
-    import_campaign_bundle_into_store(store, state.conv_store.as_ref(), bundle)
+    state
+        .storage()
+        .import_campaign_bundle(bundle, state.conv_store.as_ref())
+}
+
+/// SQLite 分支：与 JSON 路径相同的校验/重写，但整包（含 conversation）在
+/// 一个 SQLite 事务内落库 —— 失败整体回滚（`import_campaign_bundle_into_db`
+/// 自带 fault-injection 证明）。成功后刷新 ConversationStore 缓存。
+pub(crate) fn import_campaign_bundle_into_sqlite(
+    conv_store: &ConversationStore,
+    bundle: CampaignBundle,
+) -> Result<CampaignImportResult, TauriCommandError> {
+    if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
+        return Err(TauriCommandError::validation(format!(
+            "不支持的 Campaign Bundle 版本: {}",
+            bundle.format_version
+        )));
+    }
+    validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+
+    let rewritten = rewrite_bundle_ids(bundle)?;
+    let mut campaign = rewritten.campaign;
+    let conversation = storyforge_domain::conversation::Conversation::new(
+        Some(rewritten.card.id.as_str().to_string()),
+        Some(campaign.id.clone()),
+    );
+    campaign.conversation_id = Some(conversation.id.clone());
+    let mut rewritten_summaries = rewritten.rewritten_summaries;
+    for summary in &mut rewritten_summaries {
+        summary.conversation_id = conversation.id.clone();
+    }
+
+    crate::sqlite_runtime::import_campaign_bundle_into_db(
+        &conversation,
+        &rewritten.card,
+        &campaign,
+        &rewritten.rewritten_instances,
+        &rewritten.rewritten_knowledge,
+        &rewritten.rewritten_tasks,
+        &rewritten_summaries,
+    )
+    .map_err(|e| TauriCommandError::storage(format!("导入 Campaign Bundle 失败: {e}")))?;
+
+    // SQLite 会话权威按需重载：让新 conversation 对会话缓存可见。
+    conv_store.invalidate();
+
+    tracing::info!(
+        "Imported Campaign Bundle {} -> {}",
+        rewritten.old_campaign_id,
+        campaign.id
+    );
+
+    Ok(CampaignImportResult {
+        campaign_id: campaign.id.as_str().to_string(),
+        card_id: rewritten.card.id.as_str().to_string(),
+        conversation_id: conversation.id.as_str().to_string(),
+        instance_count: rewritten.rewritten_instances.len(),
+        knowledge_count: rewritten.rewritten_knowledge.len(),
+        task_count: rewritten.rewritten_tasks.len(),
+        summary_count: rewritten_summaries.len(),
+    })
 }
 
 pub(crate) fn import_campaign_bundle_into_store(
@@ -583,24 +640,25 @@ pub(crate) fn import_campaign_bundle_into_store(
     import_campaign_bundle_into_store_with_after_campaign(store, conv_store, bundle, || Ok(()))
 }
 
-pub(crate) fn import_campaign_bundle_into_store_with_after_campaign<F>(
-    store: &campaign_store::CampaignStore,
-    conv_store: &ConversationStore,
-    bundle: CampaignBundle,
-    after_campaign_saved: F,
-) -> Result<CampaignImportResult, TauriCommandError>
-where
-    F: FnOnce() -> Result<(), TauriCommandError>,
-{
-    use std::collections::HashMap;
+/// 完整重写后的导入载荷（后端无关：JSON 与 SQLite 路径共用）。
+pub(crate) struct RewrittenBundle {
+    pub old_campaign_id: Id,
+    pub card: storyforge_domain::character::CharacterCard,
+    pub campaign: storyforge_domain::campaign::Campaign,
+    pub rewritten_instances: Vec<storyforge_domain::campaign::CharacterInstance>,
+    pub rewritten_knowledge: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>,
+    pub rewritten_tasks: Vec<storyforge_domain::story_task::StoryTask>,
+    pub rewritten_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+}
 
-    if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
-        return Err(TauriCommandError::validation(format!(
-            "不支持的 Campaign Bundle 版本: {}",
-            bundle.format_version
-        )));
-    }
-    validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+/// 纯函数：为导入生成全新 ID 并重写全部内部引用（card / campaign /
+/// instances / knowledge / tasks / summaries 的 id、FK、covers、covered_by）。
+///
+/// 不做任何存储写入；调用方负责在写入失败时回滚。
+pub(crate) fn rewrite_bundle_ids(
+    bundle: CampaignBundle,
+) -> Result<RewrittenBundle, TauriCommandError> {
+    use std::collections::HashMap;
 
     let old_campaign_id = bundle.campaign.id.clone();
     let new_card_id = Id::new();
@@ -779,6 +837,45 @@ where
         // conversation id filled after conversation is created.
         rewritten_summaries.push(summary);
     }
+
+    Ok(RewrittenBundle {
+        old_campaign_id,
+        card,
+        campaign,
+        rewritten_instances,
+        rewritten_knowledge,
+        rewritten_tasks,
+        rewritten_summaries,
+    })
+}
+
+pub(crate) fn import_campaign_bundle_into_store_with_after_campaign<F>(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    bundle: CampaignBundle,
+    after_campaign_saved: F,
+) -> Result<CampaignImportResult, TauriCommandError>
+where
+    F: FnOnce() -> Result<(), TauriCommandError>,
+{
+    if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
+        return Err(TauriCommandError::validation(format!(
+            "不支持的 Campaign Bundle 版本: {}",
+            bundle.format_version
+        )));
+    }
+    validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+
+    let rewritten = rewrite_bundle_ids(bundle)?;
+    let old_campaign_id = rewritten.old_campaign_id;
+    let new_card_id = rewritten.card.id.clone();
+    let new_campaign_id = rewritten.campaign.id.clone();
+    let card = rewritten.card;
+    let mut campaign = rewritten.campaign;
+    let rewritten_instances = rewritten.rewritten_instances;
+    let rewritten_knowledge = rewritten.rewritten_knowledge;
+    let rewritten_tasks = rewritten.rewritten_tasks;
+    let rewritten_summaries = rewritten.rewritten_summaries;
 
     let mut created_conversation_id: Option<Id> = None;
     let memory_baseline = bundle_store_snapshot_in_memory(store, conv_store)

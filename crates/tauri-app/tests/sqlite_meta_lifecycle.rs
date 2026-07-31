@@ -177,7 +177,7 @@ fn sqlite_meta_health_proposal_and_atomic_patch_apply() {
             remove_keys: vec![],
         },
     ];
-    sqlite_runtime::meta_apply_typed_patch_actions(&campaign_id, &actions)
+    sqlite_runtime::meta_apply_typed_patch_actions(&campaign_id, &actions, None)
         .expect("atomic Meta patch apply must work under SQLite");
 
     let instances = sqlite_runtime::list_instances(&campaign_id).unwrap();
@@ -206,7 +206,7 @@ fn sqlite_meta_health_proposal_and_atomic_patch_apply() {
     sqlite_runtime::fail_meta_patch_uow_for_test(
         storyforge_lib::sqlite_meta_repo::MetaPatchFault::AfterFirstAction,
     );
-    let err = sqlite_runtime::meta_apply_typed_patch_actions(&campaign_id, &actions2)
+    let err = sqlite_runtime::meta_apply_typed_patch_actions(&campaign_id, &actions2, None)
         .expect_err("fault injection must fail the UoW");
     assert!(err.contains("injected failure after first meta action"));
     sqlite_runtime::fail_meta_patch_uow_for_test(
@@ -228,7 +228,7 @@ fn sqlite_meta_health_proposal_and_atomic_patch_apply() {
 
     // 5. scope 校验：外部 campaign 的 patch 必须被拒绝（fail closed）。
     let foreign_campaign_id = Id::from_str("other-campaign");
-    let err = sqlite_runtime::meta_apply_typed_patch_actions(&foreign_campaign_id, &actions2)
+    let err = sqlite_runtime::meta_apply_typed_patch_actions(&foreign_campaign_id, &actions2, None)
         .expect_err("foreign-campaign patch must fail closed");
     assert!(err.contains("other-campaign"));
 

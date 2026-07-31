@@ -219,6 +219,7 @@ fn publish(
             parents,
             child_covered_by,
             job_id: Some(job.as_str()),
+            batch_index: 0,
         },
     )
 }
@@ -590,6 +591,7 @@ fn fault_leaves_zero_side_effects(fault: PublishFault) {
             parents: &parents,
             child_covered_by: &child_covered_by,
             job_id: Some("job-fault"),
+            batch_index: 0,
         },
         fault,
     )
@@ -1008,6 +1010,7 @@ fn duplicate_job_id_is_rejected() {
             parents: &parents2,
             child_covered_by: &covers2,
             job_id: Some(first_job.as_str()),
+            batch_index: 0,
         },
     )
     .unwrap_err();

@@ -741,19 +741,96 @@ Gate 3 计划 §8.1 允许「trait 或启动时选择的 **enum-dispatched struc
 
 ### 30.6 诚实记录：仍为 Unsupported 的 SQLite 缺口（Gate 4 外）
 
-- CampaignLifecycle（create/fork/delete）、CardCommands、CharacterCommands、
-  ImportExport、KnowledgeTaskCommands、VariableCommands 在 SQLite 下仍显式
-  Unsupported（capability 声明式 fail-closed，不静默空列表）。
-- 无活跃 Campaign 时 legacy Meta patch 的 CharacterStore 回写分支在 SQLite 下
-  显式拒绝（CharacterStore 未 SQLite 化）。
+> 二审（2026-07-31）修订：CharacterCommands、ImportExport 已按 Gate 3 交接
+> §15.7 的范围补齐（见 §30.9 P1-4），从本清单移除；legacy Meta patch 的
+> CharacterStore 回写分支已改走 facade（见 §30.9 P1-4 闭环），不再拒绝。
+
+- CampaignLifecycle（create/fork/delete）、CardCommands、KnowledgeTaskCommands、
+  VariableCommands 在 SQLite 下仍显式 Unsupported（capability 声明式
+  fail-closed，不静默空列表）。
 - 这些项的「unsupported 字段归零」要求在 Gate 4 通过条件之外；能力矩阵测试与
   baseline 均已钉住剩余集合，不构成静默回退。
 
 ### 30.7 提交
 
-- Gate 4 完成提交：未 push；SHA 以 git log 为准（本段不引用自身提交）。
+- Gate 4 完成提交（`5dfa719`）：未 push；SHA 以 git log 为准（本段不引用自身提交）。
+- Gate 4 评审修复提交（二审，见 §30.9）：独立提交，未 amend；SHA 以 git log 为准。
 
 ### 30.8 下一阶段
+
+Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
+回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。
+
+### 30.9 Gate 4 评审修复（2026-07-31 二审）
+
+> 一审判定 INCOMPLETE（六个问题：P1-1 至 P2-6），本段逐项记录修复与证据。
+> 修复为独立提交（未 amend `5dfa719`），未 push。
+
+**P1-1 Chronicle A→B→C 连续压缩中断（属实）**：worker 对每批结果复用同一
+`job_id`，V003 `idx_chronicle_publication_jobs_job_id` 唯一索引把第二批误判为
+重复/迟到结果丢弃，job 停在 Running。
+- 修复：V007 迁移新增 `chronicle_publication_jobs.batch_index` 列并改唯一索引为
+  `(job_id, batch_index)`；`PublishRequest.batch_index` 贯通 publication UoW /
+  sqlite_runtime / worker（`enumerate` 逐批传号）；迟到结果判定区分 job 状态：
+  终态 = 真迟到丢弃，仍 open = 重试部分完成 → `mark_failed_or_retry`（耗尽
+  attempts 至 Failed），绝不卡 Running。
+- 回归测试：新增 `crates/tauri-app/tests/sqlite_chronicle_multibatch.rs`
+  （同一 job 下 A→B 与 B→C 两批均 Applied、同批次重复仍拒绝、job 可达
+  Succeeded）；`sqlite_chronicle_compressor.rs` 故障注入改用未占用批次键，
+  断言注入错误（此前被迟到拒绝抢先，注入实际未生效）。
+
+**P1-2 Meta active-turn/revision 检查不在事务里（属实）**：先检查、再读快照、
+后开事务，检查与写入间存在竞态窗口。
+- 修复：`SqliteMetaRepository::apply_typed_patch_actions(…, expected_revision)`
+  在**事务内**执行 active-turn 查询（turns 表活动态）与 revision 比对，与写入
+  同一 UoW 原子化；`meta_accept_typed_patch_with_writer` 把提案盖章
+  `campaign_revision` 传入写盘闭包（JSON 路径保持既有全局锁语义，双保险）。
+- 回归测试：`revision_mismatch_rejected_without_writes`、
+  `active_turn_blocks_accept_without_writes`（含真实 running turn 行）。
+
+**P1-3 同一 patch 多变量更新互相覆盖（属实）**：每个 action 从事务开始时旧
+campaign 快照克隆，后项覆盖前项。
+- 修复：`apply_action` 接收 `&mut Campaign`，`UpdateCampaignVariable` 在同一
+  可变对象上顺序应用。
+- 回归测试：`multiple_campaign_variable_updates_all_apply`（两键 + 同键覆盖）。
+
+**P1-4 CharacterCommands / ImportExport 范围缺口（属实）**：Gate 3 交接
+§15.7 明确列入 Gate 4，交付未实现，能力矩阵仍 Unsupported。
+- 修复（子代理 + 主会话闭环）：V007 新增 `characters` 角色库表（镜像 JSON
+  CharacterStore）；sqlite_runtime 新增 save/list/get/delete/mutate_character、
+  `delete_card_payload` 级联、`import_campaign_bundle_into_db` 单事务导入
+  （`BundleImportFault` 三阶段注入回滚）；storage_backend 能力矩阵翻转 +
+  14 个 facade 分派方法；characters.rs / import_export.rs 命令改走 facade
+  （零新增 JSON/SQLite 判断）；bundle 导出/导入与 JSON 路径共用同一 DTO 与
+  纯函数（`rewrite_bundle_ids`、`validate_bundle_summary_graph`）；
+  commands/meta.rs legacy 世界书回写分支改走 facade（子代理遗留闭环）。
+- 测试：`crates/tauri-app/tests/sqlite_character_lifecycle.rs`（角色库生命周期、
+  世界书编辑、bundle roundtrip、三种 fault 整体回滚、级联删除、PNG 导出链）。
+
+**P2-5 预演与 SQLite 落盘 is_temporary 不一致（属实）**：解除 definition 绑定
+时纯函数预演设 `is_temporary=true`，落盘未设（SQLite 与 JSON 两处都漏）。
+- 修复：`sqlite_meta_repo.rs` 与 `meta_typed.rs` 两处落盘路径补上。
+- 回归测试：`repoint_to_none_marks_instance_temporary`。
+
+**P2-6 story_clock 非字符串 authority 静默回退（属实）**：非字符串变量项被
+当作无效权威、静默回退顶层字段；测试固定了该行为。
+- 修复：`Campaign::repair_story_clock_authority` 改为三态
+  `StoryClockRepair`（NoChange / FieldRepaired / InvalidAuthorityNormalized），
+  非字符串 authority 显式归一化为顶层字段字符串并产出可审计日志；SQLite 与
+  JSON 载入路径均接入；`current_story_clock()` 文档更新（损坏态与归一化结果
+  一致，不做静默任选）。
+- 测试：`test_story_clock_non_string_authority_is_normalized_not_silently_ignored`
+  改写固定旧行为的测试。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings` / `cargo test --workspace`
+（47 个测试二进制，1754 passed）/ 7 个 sqlite 集成测试（optin、preaccept、
+meta、mvu、chronicle_compressor、chronicle_multibatch、character_lifecycle）/
+`backend-baseline.mjs`（162 invoke、0 missing、`unsupported: []`、
+`applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
+`npm run build` / `git diff --check` 全绿。V007 版本号断言同步至 7
+（migrations / audit_snapshot / migration_concurrency / migration_readiness /
+preaccept_lifecycle）。
 
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

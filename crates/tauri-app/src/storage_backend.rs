@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use storyforge_app_conversation::ConversationStore;
 use storyforge_infra_sqlite::backend::{
     BackendDiagnostics, BackendSelection, PinnedBackend, StorageBackend,
 };
@@ -20,13 +21,22 @@ use storyforge_infra_sqlite::cutover::{
 };
 use storyforge_infra_sqlite::migrations::current_version;
 
-use crate::campaign_store::CampaignStore;
+use crate::campaign_store::{CampaignStore, StoredCard};
 use crate::compress_job_store::CompressJobStore;
+use crate::error::TauriCommandError;
 use crate::sqlite_runtime;
 use crate::storage::CharacterStore;
+use crate::stored_character_for_id_or_source_in_store;
 use crate::turn_store::TurnStore;
 use storyforge_domain::Id;
 use storyforge_domain::campaign::Campaign;
+
+/// Gate 4 P1-4: the character library DTO re-exported through the facade so
+/// both backends expose one application-level character contract.
+pub use crate::commands::characters::CharacterInfo;
+/// Gate 4 P1-4: the stored-character DTO shared by the JSON and SQLite
+/// character libraries.
+pub use crate::storage::StoredCharacter;
 
 /// The pinned backend for this process, resolved once at startup.
 static PINNED: OnceLock<PinnedBackend> = OnceLock::new();
@@ -214,12 +224,12 @@ impl StorageFacade {
             | BackendCapability::TypedMetaPatch
             | BackendCapability::MvuSchemaApply
             | BackendCapability::ChronicleCompressor
-            | BackendCapability::StoryClock => CapabilityStatus::Supported,
+            | BackendCapability::StoryClock
+            | BackendCapability::CharacterCommands
+            | BackendCapability::ImportExport => CapabilityStatus::Supported,
             BackendCapability::ActiveCampaignPersistence => CapabilityStatus::Degraded,
             BackendCapability::CampaignLifecycle
             | BackendCapability::CardCommands
-            | BackendCapability::CharacterCommands
-            | BackendCapability::ImportExport
             | BackendCapability::KnowledgeTaskCommands
             | BackendCapability::VariableCommands => CapabilityStatus::Unsupported,
         }
@@ -625,6 +635,323 @@ impl StorageFacade {
                 )?
                 .list_summaries(campaign_id))
         }
+    }
+
+    // ─── Gate 4 P1-4: character library (backend-neutral facade) ──────────
+
+    /// Persist an imported character card. JSON writes `characters.json`;
+    /// SQLite writes the V007 `characters` table.
+    pub fn save_character(&self, info: CharacterInfo) -> Result<StoredCharacter, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_character(&info)
+        } else {
+            self.json_character_store(BackendCapability::CharacterCommands, "save character")?
+                .save(info)
+        }
+    }
+
+    /// List every stored character.
+    pub fn list_characters(&self) -> Result<Vec<StoredCharacter>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_characters()
+        } else {
+            Ok(self
+                .json_character_store(BackendCapability::CharacterCommands, "list characters")?
+                .list())
+        }
+    }
+
+    /// Get a stored character by stored id or source `Character.id`.
+    pub fn get_character(&self, id_or_source: &str) -> Result<Option<StoredCharacter>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_character(id_or_source)
+        } else {
+            let store =
+                self.json_character_store(BackendCapability::CharacterCommands, "get character")?;
+            Ok(stored_character_for_id_or_source_in_store(
+                store,
+                &Id::from_str(id_or_source),
+            ))
+        }
+    }
+
+    /// Delete a stored character by stored id or source `Character.id`.
+    pub fn delete_character(&self, id_or_source: &str) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_character(id_or_source)
+        } else {
+            self.json_character_store(BackendCapability::CharacterCommands, "delete character")?
+                .delete(id_or_source)
+        }
+    }
+
+    /// Update a character world-info entry route (world_info_entries[i].route).
+    pub fn update_character_world_info_route(
+        &self,
+        id_or_source: &str,
+        entry_index: usize,
+        new_route: &str,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, |info| {
+                crate::commands::characters::apply_world_info_route_update(
+                    info,
+                    entry_index,
+                    new_route,
+                )
+            })
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "update character world info route",
+            )?
+            .update_world_info_route(id_or_source, entry_index, new_route)
+        }
+    }
+
+    /// Update a character world-info entry's keys/content/constant/is_global/depth/order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_character_world_info_entry(
+        &self,
+        id_or_source: &str,
+        entry_index: usize,
+        keys: Vec<String>,
+        content: String,
+        constant: bool,
+        is_global: bool,
+        depth: i32,
+        order: i32,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, |info| {
+                crate::commands::characters::apply_world_info_entry_update(
+                    info,
+                    entry_index,
+                    keys,
+                    content,
+                    constant,
+                    is_global,
+                    depth,
+                    order,
+                )
+            })
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "update character world info entry",
+            )?
+            .update_world_info_entry(
+                id_or_source,
+                entry_index,
+                keys,
+                content,
+                constant,
+                is_global,
+                depth,
+                order,
+            )
+        }
+    }
+
+    /// Append a character world-info entry, returning its new index.
+    pub fn add_character_world_info_entry(
+        &self,
+        id_or_source: &str,
+        keys: Vec<String>,
+        content: String,
+        constant: bool,
+        is_global: bool,
+    ) -> Result<usize, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, |info| {
+                crate::commands::characters::apply_add_world_info_entry(
+                    info, keys, content, constant, is_global,
+                )
+            })
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "add character world info entry",
+            )?
+            .add_world_info_entry(id_or_source, keys, content, constant, is_global)
+        }
+    }
+
+    /// Remove a character world-info entry.
+    pub fn delete_character_world_info_entry(
+        &self,
+        id_or_source: &str,
+        entry_index: usize,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, |info| {
+                crate::commands::characters::apply_delete_world_info_entry(info, entry_index)
+            })
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "delete character world info entry",
+            )?
+            .delete_world_info_entry(id_or_source, entry_index)
+        }
+    }
+
+    /// Replace a character's whole world-info entry list (bulk patch).
+    pub fn update_character_world_info_entries_bulk(
+        &self,
+        id_or_source: &str,
+        entries: Vec<crate::WorldInfoEntryInfo>,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, |info| {
+                crate::commands::characters::apply_update_world_info_entries_bulk(info, entries)
+            })
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "replace character world info entries",
+            )?
+            .update_world_info_entries_bulk(id_or_source, entries)
+        }
+    }
+
+    // ─── Gate 4 P1-4: character delete cascade (backend-neutral) ──────────
+
+    /// MVU translation delete (character delete cascade).
+    pub fn delete_mvu(&self, source_character_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_mvu(source_character_id)
+        } else {
+            self.json_campaign_store(BackendCapability::MvuTranslation, "delete MVU cascade")?
+                .delete_mvu(source_character_id)
+        }
+    }
+
+    /// Look up a card wrapper by its ST source character id (cascade bridge).
+    pub fn get_card_by_source(
+        &self,
+        source_character_id: &Id,
+    ) -> Result<Option<StoredCard>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_card_payload_by_source(source_character_id)?
+                .map(|payload| {
+                    serde_json::from_value(payload)
+                        .map_err(|e| format!("解析角色卡 payload 失败: {e}"))
+                })
+                .transpose()
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::CampaignLifecycle, "get card by source")?
+                .get_card_by_source(source_character_id))
+        }
+    }
+
+    /// Delete a card payload with its campaign cascade (character delete).
+    pub fn delete_card(&self, card_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_card_payload(card_id)
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "delete card")?
+                .delete_card(card_id)
+        }
+    }
+
+    // ─── Gate 4 P1-4: ImportExport (backend-neutral facade) ───────────────
+
+    /// Get one card wrapper payload as a `StoredCard`.
+    pub fn get_card(&self, card_id: &Id) -> Result<Option<StoredCard>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_card_payload(card_id)?
+                .map(|payload| {
+                    serde_json::from_value(payload)
+                        .map_err(|e| format!("解析角色卡 payload 失败: {e}"))
+                })
+                .transpose()
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::ImportExport, "get card")?
+                .get_card(card_id))
+        }
+    }
+
+    /// Export the full Campaign bundle JSON. Both backends produce the exact
+    /// same `CampaignBundle` structure (format_version 2).
+    pub fn export_campaign_bundle(&self, camp_id: &Id) -> Result<String, TauriCommandError> {
+        if self.is_sqlite() {
+            self.export_campaign_bundle_from_sqlite(camp_id)
+        } else {
+            let store = self
+                .json_campaign_store(BackendCapability::ImportExport, "export campaign bundle")?;
+            crate::commands::import_export::export_campaign_bundle_from_store(
+                store,
+                camp_id.clone(),
+            )
+        }
+    }
+
+    /// Import a Campaign bundle. JSON path keeps its snapshot-verified
+    /// rollback; SQLite path lands everything in one transaction.
+    pub fn import_campaign_bundle(
+        &self,
+        bundle: crate::commands::import_export::CampaignBundle,
+        conv_store: &ConversationStore,
+    ) -> Result<crate::commands::import_export::CampaignImportResult, TauriCommandError> {
+        if self.is_sqlite() {
+            crate::commands::import_export::import_campaign_bundle_into_sqlite(conv_store, bundle)
+        } else {
+            let store = self
+                .json_campaign_store(BackendCapability::ImportExport, "import campaign bundle")
+                .map_err(TauriCommandError::validation)?;
+            crate::commands::import_export::import_campaign_bundle_into_store(
+                store, conv_store, bundle,
+            )
+        }
+    }
+
+    fn export_campaign_bundle_from_sqlite(
+        &self,
+        camp_id: &Id,
+    ) -> Result<String, TauriCommandError> {
+        use crate::commands::import_export::{BUNDLE_FORMAT_VERSION, CampaignBundle};
+
+        let campaign = sqlite_runtime::get_campaign(camp_id)
+            .map_err(TauriCommandError::storage)?
+            .ok_or_else(|| {
+                TauriCommandError::not_found(format!("Campaign 不存在: {}", camp_id.as_str()))
+            })?;
+        let stored_card = match sqlite_runtime::get_card_payload(&campaign.card_id)
+            .map_err(TauriCommandError::storage)?
+        {
+            Some(payload) => Some(serde_json::from_value::<StoredCard>(payload).map_err(|e| {
+                TauriCommandError::storage(format!("角色卡 payload 解析失败: {e}"))
+            })?),
+            None => None,
+        };
+        let instances =
+            sqlite_runtime::list_instances(camp_id).map_err(TauriCommandError::storage)?;
+        let definitions = stored_card
+            .as_ref()
+            .map(|c| c.card.character_definitions.clone())
+            .unwrap_or_default();
+        let knowledge =
+            sqlite_runtime::list_knowledge(camp_id).map_err(TauriCommandError::storage)?;
+        let tasks = sqlite_runtime::list_tasks(camp_id).map_err(TauriCommandError::storage)?;
+        let summaries =
+            sqlite_runtime::list_summaries(camp_id).map_err(TauriCommandError::storage)?;
+
+        let bundle = CampaignBundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            card: stored_card.map(|c| c.card),
+            campaign,
+            instances,
+            definitions,
+            knowledge,
+            tasks,
+            summaries,
+        };
+        serde_json::to_string_pretty(&bundle)
+            .map_err(|e| TauriCommandError::internal(format!("Bundle 序列化失败: {e}")))
     }
 
     // ─── Gate 4: campaign world info (backend-neutral facade) ─────────────
@@ -1090,11 +1417,11 @@ mod tests {
         );
         assert_eq!(
             facade.capability(BackendCapability::CharacterCommands),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::ImportExport),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::CampaignHealth),
@@ -1151,13 +1478,13 @@ mod tests {
             BackendCapability::MvuSchemaApply,
             BackendCapability::ChronicleCompressor,
             BackendCapability::StoryClock,
+            BackendCapability::CharacterCommands,
+            BackendCapability::ImportExport,
         ];
         let degraded = [BackendCapability::ActiveCampaignPersistence];
         let unsupported = [
             BackendCapability::CampaignLifecycle,
             BackendCapability::CardCommands,
-            BackendCapability::CharacterCommands,
-            BackendCapability::ImportExport,
             BackendCapability::KnowledgeTaskCommands,
             BackendCapability::VariableCommands,
         ];
@@ -1182,7 +1509,10 @@ mod tests {
             Ok(_) => panic!("SQLite facade must not expose a legacy CharacterStore"),
             Err(error) => error,
         };
-        assert!(character_error.contains("CharacterCommands"));
+        assert!(
+            character_error.contains("legacy CharacterStore"),
+            "SQLite facade must refuse the legacy JSON CharacterStore, got: {character_error}"
+        );
         assert!(!dir.path().join("characters.json").exists());
     }
 

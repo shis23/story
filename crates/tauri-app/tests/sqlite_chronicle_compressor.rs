@@ -121,6 +121,7 @@ fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
         &outcome.parent_summaries,
         &outcome.publish.child_covered_by,
         Some(job.id.as_str()),
+        0,
     )
     .expect("publish");
     assert!(matches!(
@@ -148,7 +149,7 @@ fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
         sqlite_runtime::compress_count_uncovered(&campaign_id).expect("count after");
     assert_eq!(uncovered_a_after, 0);
 
-    // 6. 迟到结果：同一 job 再次发布 → publication job_id 唯一索引拒绝。
+    // 6. 迟到结果：同一 (job_id, batch=0) 再次发布 → 唯一索引拒绝（批次键内判重）。
     let late_publication_id = Id::new();
     let late_result = sqlite_runtime::publish_chronicle_compress(
         &campaign_id,
@@ -156,15 +157,17 @@ fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
         &outcome.parent_summaries,
         &outcome.publish.child_covered_by,
         Some(job.id.as_str()),
+        0,
     );
     assert!(
         late_result.is_err(),
-        "duplicate job_id publication must be rejected"
+        "duplicate (job_id, batch) publication must be rejected"
     );
     let late_err = late_result.unwrap_err();
     assert!(late_err.contains("job_id"), "got: {late_err}");
 
     // 7. 故障注入回滚：publish 在 parent 插入后失败 → 事务回滚 + job 回队。
+    // 用 batch=1（未占用的批次键）确保注入路径真正执行，而非被迟到拒绝抢先。
     sqlite_runtime::fail_chronicle_publish_for_test(PublishFault::AfterParentInsert);
     let fault_pub_id = Id::new();
     let fault_result = sqlite_runtime::publish_chronicle_compress_with_fault_flag(
@@ -173,8 +176,14 @@ fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
         &outcome.parent_summaries,
         &outcome.publish.child_covered_by,
         Some(job.id.as_str()),
+        1,
     );
     assert!(fault_result.is_err());
+    let fault_err = fault_result.unwrap_err();
+    assert!(
+        fault_err.contains("injected failure after parent insert"),
+        "fault injection must be the failure, got: {fault_err}"
+    );
     sqlite_runtime::fail_chronicle_publish_for_test(PublishFault::None);
 
     // 回滚证据：没有新的 B 条目、covered_by 未变、ledger 无 fault 记录。

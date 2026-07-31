@@ -10,7 +10,7 @@ fn gate3_character_commands_do_not_probe_the_sqlite_runtime() {
 }
 
 #[test]
-fn character_delete_checks_campaign_lifecycle_before_any_legacy_mutation() {
+fn character_delete_fails_closed_before_any_storage_mutation() {
     let source = include_str!("commands/characters.rs");
     let delete_start = source
         .find("pub(crate) fn delete_character(")
@@ -22,15 +22,23 @@ fn character_delete_checks_campaign_lifecycle_before_any_legacy_mutation() {
         .unwrap_or(delete_body.len());
     let delete_body = &delete_body[..next_command];
 
+    // Gate 4 P1-4：delete_character 不再直接触碰 CampaignStore / CharacterStore
+    // —— 数据源分派全部收敛到 StorageFacade（SQLite 分支绝不读 JSON）。
+    // 命令自身的 fail-closed 守卫是 CharacterCommands capability。
     let capability_guard = delete_body
-        .find("BackendCapability::CampaignLifecycle")
-        .expect("delete_character must fail closed on unsupported campaign lifecycle");
-    let first_character_mutation = delete_body
-        .find("character_store\n        .delete")
-        .expect("delete_character must still delete the JSON character after the guard");
+        .find("BackendCapability::CharacterCommands")
+        .expect("delete_character must fail closed on unsupported character commands");
+    let first_storage_access = delete_body
+        .find("get_character(&id)")
+        .expect("delete_character must resolve the stored character through the facade");
     assert!(
-        capability_guard < first_character_mutation,
-        "capability check must run before CharacterStore mutation"
+        capability_guard < first_storage_access,
+        "capability check must run before any storage access"
+    );
+    assert!(
+        !delete_body.contains("json_character_store")
+            && !delete_body.contains("json_campaign_store"),
+        "delete_character must route storage through the facade, never JSON stores directly"
     );
 }
 

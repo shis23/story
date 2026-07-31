@@ -292,11 +292,12 @@ pub(crate) fn meta_accept_typed_patch(
     let snapshot = load_meta_snapshot_for_backend(state.storage(), &cid)?;
     let storage = state.storage().clone();
     meta_accept_typed_patch_with_writer(
-        move |campaign_id, actions| {
+        move |campaign_id, actions, expected_revision| {
             crate::backend_workflows::apply_typed_patch_actions_for_backend(
                 &storage,
                 campaign_id,
                 actions,
+                expected_revision,
             )
             .map_err(TauriCommandError::storage)
         },
@@ -316,7 +317,9 @@ pub(crate) fn meta_accept_typed_patch_in_store(
 ) -> Result<(), TauriCommandError> {
     let snapshot = load_meta_snapshot_from_store(store, &Id::from_str(campaign_id))?;
     meta_accept_typed_patch_with_writer(
-        |campaign_id, actions| {
+        |campaign_id, actions, _expected_revision| {
+            // JSON 路径：barrier + 快照 revision 校验 + with_campaign_lock 全局
+            // 锁已原子化，事务内重校验仅 SQLite 单事务 UoW 需要。
             crate::turn_coordinator::with_campaign_lock(|| {
                 for (index, action) in actions.iter().enumerate() {
                     apply_typed_action(store, campaign_id, action).map_err(|error| {
@@ -347,7 +350,11 @@ pub(crate) fn meta_accept_typed_patch_with_writer<F>(
     state: &AppState,
 ) -> Result<(), TauriCommandError>
 where
-    F: FnOnce(&Id, &[storyforge_app_meta::TypedPatchAction]) -> Result<(), TauriCommandError>,
+    F: FnOnce(
+        &Id,
+        &[storyforge_app_meta::TypedPatchAction],
+        Option<u64>,
+    ) -> Result<(), TauriCommandError>,
 {
     let _accept_guard = state
         .typed_patch_accept_lock
@@ -424,7 +431,9 @@ where
     }
     // 5. 真正写盘（后端分派：JSON 逐 action + 全局锁 / SQLite 单事务 UoW）。
     //    写盘失败，patch 保持 Pending（不标记 Accepted）。
-    write(&cid, &patch.actions)?;
+    //    expected_revision 传给 SQLite UoW：事务内与最新 revision 原子比对
+    //    （Gate 4 评审 P1-2，与快照层 stale 校验互为双保险）。
+    write(&cid, &patch.actions, patch.campaign_revision)?;
 
     // 6. 写盘成功，标记 Accepted
     {
@@ -588,6 +597,11 @@ pub(crate) fn apply_typed_action(
                 })?;
 
             instance.definition_id = new_definition_id.clone();
+            // 与纯函数预演一致（typed_patch.rs）：解除绑定后实例转为临时角色
+            // （Gate 4 评审 P2-5：预览与落盘结果一致）。
+            if new_definition_id.is_none() {
+                instance.is_temporary = true;
+            }
             store
                 .update_instance(instance)
                 .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;

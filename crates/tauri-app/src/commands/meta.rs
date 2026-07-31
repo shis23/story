@@ -143,11 +143,12 @@ pub(crate) fn meta_accept_patch(
             let global_keys_set: std::collections::HashSet<String> =
                 global_entries.iter().map(|e| e.keys.join(",")).collect();
 
-            let character_store = state.json_character_store(
-                BackendCapability::TypedMetaPatch,
-                "persist legacy Meta character world info patch",
-            )?;
-            let all_stored = character_store.list();
+            // P1-4 闭环：角色库维护路径经 facade 分派（SQLite 走 V007
+            // characters 表，JSON 走既有 CharacterStore），不再直连 JSON store。
+            let storage = state.storage().clone();
+            let all_stored = storage
+                .list_characters()
+                .map_err(|e| TauriCommandError::storage(format!("角色库读取失败: {e}")))?;
             for stored in &all_stored {
                 let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
                     .info
@@ -158,7 +159,7 @@ pub(crate) fn meta_accept_patch(
                     .collect();
                 let mut new_entries = preserved_private;
                 new_entries.extend(global_entries.clone());
-                let _ = character_store.update_world_info_entries_bulk(&stored.id, new_entries);
+                let _ = storage.update_character_world_info_entries_bulk(&stored.id, new_entries);
             }
         }
     }

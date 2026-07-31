@@ -43,13 +43,24 @@ pub struct StoredMvuTranslation {
 }
 
 /// Gate 4 story-clock authority repair for a batch of JSON-loaded campaigns.
+/// 每次修复都产出可审计日志；非字符串 authority 同样显式归一化，不静默回退
+/// （Gate 4 评审 P2-6）。
 fn repair_story_clock_authority(campaigns: &mut [storyforge_domain::campaign::Campaign]) {
     for campaign in campaigns.iter_mut() {
-        if campaign.repair_story_clock_authority() {
-            tracing::warn!(
-                campaign_id = %campaign.id,
-                "campaign story_clock field diverged from variables authority; repaired from variables (JSON store)"
-            );
+        match campaign.repair_story_clock_authority() {
+            storyforge_domain::campaign::StoryClockRepair::NoChange => {}
+            storyforge_domain::campaign::StoryClockRepair::FieldRepaired => {
+                tracing::warn!(
+                    campaign_id = %campaign.id,
+                    "campaign story_clock field diverged from variables authority; repaired from variables (JSON store)"
+                );
+            }
+            storyforge_domain::campaign::StoryClockRepair::InvalidAuthorityNormalized => {
+                tracing::warn!(
+                    campaign_id = %campaign.id,
+                    "campaign story_clock variable was non-string (corrupted); normalized to top-level field string (JSON store)"
+                );
+            }
         }
     }
 }
@@ -365,13 +376,14 @@ impl CampaignStore {
             .iter()
             .find(|c| c.id == *id)
             .cloned();
-        if let Some(c) = campaign.as_mut()
-            && c.repair_story_clock_authority()
-        {
-            tracing::warn!(
-                campaign_id = %c.id,
-                "campaign story_clock field diverged from variables authority; repaired from variables (JSON store)"
-            );
+        if let Some(c) = campaign.as_mut() {
+            match c.repair_story_clock_authority() {
+                storyforge_domain::campaign::StoryClockRepair::NoChange => {}
+                other => tracing::warn!(
+                    campaign_id = %c.id,
+                    "campaign story_clock repaired on load (JSON store): {other:?}"
+                ),
+            }
         }
         campaign
     }

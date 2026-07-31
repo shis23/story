@@ -1316,9 +1316,16 @@ pub fn apply_typed_patch_actions_for_backend(
     storage: &StorageFacade,
     campaign_id: &Id,
     actions: &[storyforge_app_meta::TypedPatchAction],
+    expected_revision: Option<u64>,
 ) -> Result<(), String> {
     if storage.is_sqlite() {
-        crate::sqlite_runtime::meta_apply_typed_patch_actions(campaign_id, actions)
+        // SQLite：expected_revision（提案盖章）在事务内与最新 revision 比对
+        // （Gate 4 评审 P1-2：revision/barrier 检查与写入原子化）。
+        crate::sqlite_runtime::meta_apply_typed_patch_actions(
+            campaign_id,
+            actions,
+            expected_revision,
+        )
     } else {
         let store = storage
             .json_campaign_store(BackendCapability::TypedMetaPatch, "accept typed Meta patch")?;
@@ -1873,7 +1880,7 @@ pub fn spawn_compress_job_worker_with(
         {
             Ok(outcomes) => {
                 let mut publish_err: Option<String> = None;
-                for out in outcomes {
+                for (batch_index, out) in outcomes.into_iter().enumerate() {
                     let result = if storage.is_sqlite() {
                         let publication_id = Id::new();
                         crate::sqlite_runtime::publish_chronicle_compress_with_fault_flag(
@@ -1882,6 +1889,7 @@ pub fn spawn_compress_job_worker_with(
                             &out.parent_summaries,
                             &out.publish.child_covered_by,
                             Some(job_id.as_str()),
+                            batch_index as u32,
                         )
                     } else {
                         match campaign_store.as_ref() {
@@ -1902,6 +1910,7 @@ pub fn spawn_compress_job_worker_with(
                             tracing::info!(
                                 target: "chronicle_compressor",
                                 job_id = %job_id,
+                                batch = batch_index,
                                 level = ?out.output_level,
                                 parents = out.parent_summaries.len(),
                                 children = out.publish.child_covered_by.len(),
@@ -1909,18 +1918,29 @@ pub fn spawn_compress_job_worker_with(
                             );
                         }
                         Err(e) => {
-                            // 迟到结果 / 并发 worker 已发布同一 job：publication 的
-                            // job_id 唯一索引拒绝重复发布，job 已终态 → 直接退出。
+                            // 同一 (job_id, batch_index) 已被发布（V007 唯一索引）：
+                            // - job 已终态 = 其它 worker 处理过的迟到结果 → 丢弃退出；
+                            // - job 仍 open（本 worker 重试运行）→ 该 job 此前部分
+                            //   发布过，本次重试无法推进，回队重试/耗尽 attempts，
+                            //   绝不把任务卡在 Running。
                             if storage.is_sqlite()
                                 && e.contains("job_id")
                                 && e.contains("already used")
                             {
-                                tracing::debug!(
-                                    target: "chronicle_compressor",
-                                    job_id = %job_id,
-                                    "compress publication already published by another worker; late result dropped"
-                                );
-                                return;
+                                let job_still_open = crate::sqlite_runtime::compress_list_all()
+                                    .ok()
+                                    .and_then(|jobs| jobs.into_iter().find(|j| j.id == job_id))
+                                    .map(|j| j.status.is_open())
+                                    .unwrap_or(false);
+                                if !job_still_open {
+                                    tracing::debug!(
+                                        target: "chronicle_compressor",
+                                        job_id = %job_id,
+                                        batch = batch_index,
+                                        "compress publication already published by another worker; late result dropped"
+                                    );
+                                    return;
+                                }
                             }
                             publish_err = Some(e);
                             break;
