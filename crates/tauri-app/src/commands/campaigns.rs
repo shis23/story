@@ -452,6 +452,34 @@ pub(crate) fn merge_global_entries_into_book(
     book
 }
 
+/// backend-neutral 版本的全局条目 merge：经 facade 读角色库（SQLite 走 V007
+/// characters 表），供 set_active_campaign 激活时注入模板（Gate 4 四审 P1）。
+pub(crate) fn merge_global_entries_into_book_facade(
+    facade: &crate::storage_backend::StorageFacade,
+    mut book: storyforge_domain::world_info::WorldInfoBook,
+    active_name: &str,
+) -> storyforge_domain::world_info::WorldInfoBook {
+    let all = facade.list_characters().unwrap_or_default();
+    for stored in all {
+        if stored.info.name == active_name {
+            continue;
+        }
+        for e in &stored.info.world_info_entries {
+            if !e.is_global {
+                continue;
+            }
+            let mut entry = world_info_entry_from_info(e);
+            if let Some(obj) = entry.extensions.as_object_mut() {
+                obj.insert("sf_source".into(), serde_json::json!("merged_global"));
+            } else {
+                entry.extensions = serde_json::json!({ "sf_source": "merged_global" });
+            }
+            book.entries.push(entry);
+        }
+    }
+    book
+}
+
 pub(crate) fn fork_campaign_in_store(
     store: &campaign_store::CampaignStore,
     character_store: &storage::CharacterStore,
@@ -663,26 +691,49 @@ pub(crate) fn set_active_campaign(
         }
         Ok(())
     })?;
-    // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书（WorldInfo 能力声明式门控）
+    // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书（WorldInfo 能力声明式门控）。
+    // 经 backend-neutral facade 读取——SQLite 下不得触碰 JSON store
+    // （Gate 4 四审 P1：否则活跃指针已改、命令却因 JSON store 缺失而失败）。
     if state.storage().capability(BackendCapability::WorldInfo) == CapabilityStatus::Supported {
-        let store = state
-            .json_campaign_store(BackendCapability::WorldInfo, "activate campaign world info")?;
-        if let Ok(mut book) = store.get_world_info(&campaign_id) {
-            if book.entries.is_empty()
-                && let Some(camp) = store.get_campaign(&campaign_id)
-                && let Some(card) = store.get_card(&camp.card_id)
+        let mut book = state
+            .storage()
+            .get_world_info(&campaign_id)
+            .map_err(TauriCommandError::storage)?;
+        if book.entries.is_empty()
+            && let Some(camp) = state
+                .storage()
+                .get_campaign(&campaign_id)
+                .map_err(TauriCommandError::storage)?
+        {
+            // 模板来源：角色库内嵌世界书（backend-neutral facade），其次 ST 卡
+            // 模板（SQLite 专用 facade 方法）。读取错误传播（不静默吞掉）。
+            let mut template: Option<storyforge_domain::world_info::WorldInfoBook> = None;
+            if let Some(card) = state
+                .storage()
+                .get_card(&camp.campaign.card_id)
+                .map_err(TauriCommandError::storage)?
             {
-                let character_store = state.json_character_store(
-                    BackendCapability::CharacterCommands,
-                    "activate campaign character world info template",
-                )?;
-                let template = resolve_template_world_info_for_card(character_store, &card);
-                if let Ok(seeded) = store.ensure_world_info_from_book(&campaign_id, &template) {
-                    book = seeded;
+                template = state
+                    .storage()
+                    .resolve_character_world_info_template(&card.card.source_character_id)
+                    .map_err(TauriCommandError::storage)?;
+                if template.is_none() {
+                    template = state
+                        .storage()
+                        .template_world_info_from_card(&serde_json::to_value(&card).map_err(
+                            |e| TauriCommandError::internal(format!("卡序列化失败: {e}")),
+                        )?)
+                        .map_err(TauriCommandError::storage)?;
                 }
             }
-            apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
+            if let Some(template) = template {
+                book = state
+                    .storage()
+                    .ensure_world_info_from_book(&campaign_id, &template)
+                    .map_err(TauriCommandError::storage)?;
+            }
         }
+        apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
     }
     Ok(())
 }

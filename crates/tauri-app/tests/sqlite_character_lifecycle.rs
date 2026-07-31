@@ -816,6 +816,69 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
         assert_eq!(turns, 0, "turns must be gone after full cascade");
     });
 
+    // ─── 8c. 删除级联 fault-injection 回滚（四审 P2：新事务必须有真实
+    //          fault-injection rollback 测试）───────────────────────────────
+    {
+        let roll_char = facade
+            .save_character(sample_character_info(
+                "Rollback Hero",
+                Some("rollback-source-1".to_string()),
+            ))
+            .expect("save rollback character");
+        let roll_card_id = Id::new();
+        sqlite_runtime::save_card_payload(
+            &roll_card_id,
+            "Rollback Card",
+            Some("rollback-source-1"),
+            Some("2026-07-31T00:00:00Z"),
+            &serde_json::json!({"card": {"id": roll_card_id.as_str(), "name": "Rollback Card"}}),
+        )
+        .expect("save rollback card");
+        let roll_camp_id = Id::new();
+        let mut camp = Campaign::new(roll_card_id.clone(), "Rollback Camp");
+        camp.id = roll_camp_id.clone();
+        sqlite_runtime::save_campaign(&camp).expect("save rollback campaign");
+        // 注入 MidCascade 失败 → 级联整体回滚，角色/卡/campaign 全部保留。
+        storyforge_lib::sqlite_runtime::fail_delete_cascade_for_test(
+            storyforge_lib::sqlite_runtime::DeleteCascadeFault::MidCascade,
+        );
+        let roll_result = facade
+            .delete_character_full_cascade(&roll_char.id, &[Id::from_str("rollback-source-1")]);
+        assert!(
+            roll_result.is_err(),
+            "fault injection must fail the cascade"
+        );
+        let roll_err = roll_result.unwrap_err();
+        assert!(
+            roll_err.contains("injected failure mid delete cascade"),
+            "got: {roll_err}"
+        );
+        storyforge_lib::sqlite_runtime::fail_delete_cascade_for_test(
+            storyforge_lib::sqlite_runtime::DeleteCascadeFault::None,
+        );
+        // 回滚证据：角色、卡、campaign 都还在。
+        assert!(
+            facade.get_character(&roll_char.id).unwrap().is_some(),
+            "character must survive rollback"
+        );
+        assert!(
+            sqlite_runtime::get_card_payload(&roll_card_id)
+                .unwrap()
+                .is_some(),
+            "card must survive rollback"
+        );
+        assert!(
+            sqlite_runtime::get_campaign(&roll_camp_id)
+                .unwrap()
+                .is_some(),
+            "campaign must survive rollback"
+        );
+        // 清理，避免影响后续断言。
+        facade
+            .delete_character_full_cascade(&roll_char.id, &[Id::from_str("rollback-source-1")])
+            .expect("cleanup rollback character");
+    }
+
     // ─── 9. ST PNG 导出链可执行（SQLite 数据源）───────────────────────────
     let png_stored = facade
         .save_character(sample_character_info(

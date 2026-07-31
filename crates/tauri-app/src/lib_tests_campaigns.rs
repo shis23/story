@@ -1544,3 +1544,140 @@ fn campaign_variable_input_validation_accepts_unicode_keys_and_bounds_user_text(
         .is_err()
     );
 }
+
+#[test]
+fn set_active_campaign_command_routes_world_info_through_facade() {
+    // Gate 4 四审 P1：set_active_campaign 不再触碰 JSON store——世界书读取经
+    // backend-neutral facade。JSON 后端命令必须成功，且 tool_ctx 世界书注入。
+    let state = Arc::new(AppState::new_for_test());
+    // 造一个卡 + campaign + 会话。
+    let card_id = Id::new();
+    let campaign_id = Id::new();
+    {
+        let conv = state
+            .conv_store
+            .create_persisted(Some(card_id.as_str().into()), None)
+            .unwrap();
+        let conv_id = conv.id.clone();
+        let mut campaign =
+            storyforge_domain::campaign::Campaign::new(card_id.clone(), "Active Test");
+        campaign.id = campaign_id.clone();
+        campaign.conversation_id = Some(conv_id.clone());
+        let store = state
+            .storage()
+            .json_campaign_store(
+                storage_backend::BackendCapability::CampaignLifecycle,
+                "seed active test",
+            )
+            .unwrap();
+        store.save_campaign(campaign).unwrap();
+        assert!(
+            state.conv_store.get(&conv_id).is_some(),
+            "conversation must be in cache before activation"
+        );
+    }
+    crate::commands::campaigns::set_active_campaign(
+        campaign_id.as_str().to_string(),
+        tauri_state_for_test(&state),
+    )
+    .expect("set_active_campaign must succeed (world info via facade)");
+    assert_eq!(
+        *state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        Some(campaign_id.clone()),
+        "active pointer must be set"
+    );
+}
+
+#[test]
+fn delete_character_command_clears_active_pointer_and_conversation_cache() {
+    // Gate 4 四审 P1：delete_character 成功后必须清活跃指针 + 失效会话缓存，
+    // 避免 ConversationStore 持续返回已删除 Campaign 的缓存会话。
+    let state = Arc::new(AppState::new_for_test());
+    let card_id = Id::new();
+    let (char_id, campaign_id, conv_id) = {
+        let store = state
+            .storage()
+            .json_campaign_store(
+                storage_backend::BackendCapability::CampaignLifecycle,
+                "seed delete test",
+            )
+            .unwrap();
+        // 造一个源角色 + 卡。
+        store
+            .save_card(storyforge_domain::character::CharacterCard {
+                id: card_id.clone(),
+                name: "Delete Hero".into(),
+                source_character_id: Id::from_str("del-source-1"),
+                character_definitions: vec![],
+                campaign_variable_schema: vec![],
+                raw_card_json: serde_json::json!({}),
+                extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
+                extraction_message: None,
+            })
+            .unwrap();
+        // 用真实入口创建 campaign + 绑定会话（conv 缓存正常）。
+        let dto = crate::commands::campaigns::create_campaign_in_store(
+            store,
+            state
+                .storage()
+                .json_character_store(
+                    storage_backend::BackendCapability::CharacterCommands,
+                    "seed delete test",
+                )
+                .unwrap(),
+            state.conv_store.as_ref(),
+            card_id.as_str().to_string(),
+            "Delete Camp".into(),
+            None,
+        )
+        .expect("create campaign");
+        let created_campaign_id = Id::from_str(&dto.id);
+        let created_conv_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
+        // 导入角色：source_character_id 必须与卡的 source 一致，命令级级联
+        // 才能通过 source 反查到 campaign（四审 P1）。
+        let mut info = CharacterInfo::from(&make_test_character("Delete Hero"));
+        info.source_character_id = Some("del-source-1".to_string());
+        let stored = state.storage().save_character(info).unwrap();
+        (stored.id, created_campaign_id, created_conv_id)
+    };
+    // 设置为活跃。
+    *state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
+    // 会话缓存已加载。
+    assert!(
+        state.conv_store.get(&conv_id).is_some(),
+        "cache must hold the conversation before delete"
+    );
+
+    crate::commands::characters::delete_character(char_id, tauri_state_for_test(&state))
+        .expect("delete_character must succeed");
+
+    assert!(
+        state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none(),
+        "active campaign pointer must clear after deleting the active character's campaign"
+    );
+    assert!(
+        state.conv_store.get(&conv_id).is_none(),
+        "conversation cache must be invalidated after delete"
+    );
+    // tool_ctx 角色同步移除。
+    assert!(
+        state
+            .tool_ctx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .characters
+            .iter()
+            .all(|c| c.name != "Delete Hero"),
+        "tool_ctx characters must drop the deleted character"
+    );
+}

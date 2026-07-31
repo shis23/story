@@ -846,6 +846,66 @@ impl StorageFacade {
         }
     }
 
+    /// Resolve the character-library world-info template for a source
+    /// character id, backend-neutral (Gate 4 四审 P1: set_active_campaign 不再
+    /// 触碰 JSON store)。JSON 复用既有 CharacterStore 语义；SQLite 读角色库。
+    pub fn resolve_character_world_info_template(
+        &self,
+        source_character_id: &Id,
+    ) -> Result<Option<storyforge_domain::world_info::WorldInfoBook>, String> {
+        if self.is_sqlite() {
+            let Some(stored) = sqlite_runtime::get_character(source_character_id.as_str())? else {
+                return Ok(None);
+            };
+            let info = stored.info;
+            if let Some(book) = info.embedded_world_info.clone() {
+                return Ok(Some(
+                    crate::commands::campaigns::merge_global_entries_into_book_facade(
+                        self, book, &info.name,
+                    ),
+                ));
+            }
+            if let Some(book) =
+                crate::startup_support::world_info_book_from_entries(&info.world_info_entries)
+            {
+                return Ok(Some(
+                    crate::commands::campaigns::merge_global_entries_into_book_facade(
+                        self, book, &info.name,
+                    ),
+                ));
+            }
+            Ok(None)
+        } else {
+            let store = self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "world info template",
+            )?;
+            let Some(stored) =
+                stored_character_for_id_or_source_in_store(store, source_character_id)
+            else {
+                return Ok(None);
+            };
+            let info = stored.info;
+            if let Some(book) = info.embedded_world_info.clone() {
+                return Ok(Some(
+                    crate::commands::campaigns::merge_global_entries_into_book(
+                        store, book, &info.name,
+                    ),
+                ));
+            }
+            if let Some(book) =
+                crate::startup_support::world_info_book_from_entries(&info.world_info_entries)
+            {
+                return Ok(Some(
+                    crate::commands::campaigns::merge_global_entries_into_book(
+                        store, book, &info.name,
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+    }
+
     /// Delete a card payload with its campaign cascade (character delete).
     pub fn delete_card(&self, card_id: &Id) -> Result<bool, String> {
         if self.is_sqlite() {

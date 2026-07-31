@@ -306,12 +306,76 @@ pub(crate) fn delete_character(
     };
     // 整个删除（角色库 + MVU + 卡 + Campaign 全量级联）在一个原子操作内完成，
     // 错误传播给调用方（Gate 4 三审 P1：不得报告成功却只删了一半）。
+    //
+    // 删除前先取该角色关联的 Campaign ids（用于清活跃指针 + 失效会话缓存）。
+    // 候选 source 覆盖：存储 id / 源卡 id / 卡实际 source_character_id。
+    let affected_campaign_ids = {
+        let mut candidates: Vec<Id> = source_ids.clone();
+        if let Some(s) = stored_source_character_id {
+            let s_id = Id::from_str(s);
+            if !candidates.iter().any(|c| c == &s_id) {
+                candidates.push(s_id);
+            }
+        }
+        let id_id = Id::from_str(&id);
+        if !candidates.iter().any(|c| c == &id_id) {
+            candidates.push(id_id);
+        }
+        let mut ids = Vec::new();
+        for source_id in &candidates {
+            if let Ok(Some(stored_card)) = state.storage().get_card_by_source(source_id)
+                && let Ok(campaigns) = state.storage().list_campaigns(Some(&stored_card.card.id))
+            {
+                ids.extend(campaigns.into_iter().map(|r| r.campaign.id));
+            }
+        }
+        ids
+    };
+    // 被删 Campaign 绑定的会话 ids（删除前收集；删除后 campaign 已不存在）。
+    let affected_conv_ids: Vec<Id> = affected_campaign_ids
+        .iter()
+        .filter_map(|campaign_id| {
+            state
+                .storage()
+                .get_campaign(campaign_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.campaign.conversation_id)
+        })
+        .collect();
     let removed = state
         .storage()
         .delete_character_full_cascade(&id, &source_ids)
         .map_err(|e| TauriCommandError::storage(format!("删除失败（已整体回滚）: {e}")))?;
     if !removed {
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
+    }
+    // 应用内状态清理（Gate 4 四审 P1）：删除成功后必须同步内存态，否则
+    // ConversationStore 会持续返回已删除会话的缓存、活跃指针残留、后续
+    // 修改甚至可能把已删数据重新写回。
+    let _update = state
+        .active_campaign_update
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut active_campaign = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(active_id) = active_campaign.as_ref()
+        && affected_campaign_ids.iter().any(|id| id == active_id)
+    {
+        crate::backend_workflows::save_active_pointer(state.storage(), None)
+            .map_err(|e| TauriCommandError::storage(format!("清除活跃活动指针失败: {e}")))?;
+        *active_campaign = None;
+    }
+    drop(active_campaign);
+    drop(_update);
+    // 删除被删 Campaign 绑定的会话（文件 + 缓存），避免 ConversationStore
+    // 持续返回已从存储删除的会话、后续修改重新写回。
+    for conv_id in &affected_conv_ids {
+        if let Err(e) = state.conv_store.delete(conv_id) {
+            tracing::warn!("删除角色后清理会话失败 conv={conv_id}: {e}");
+        }
     }
     // 同步从 tool_ctx 移除
     if let Some(name) = name {
@@ -480,12 +544,24 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        if let Some(campaign_id) = active
-            && let Ok(book) = state.storage().get_world_info(&campaign_id)
-            && !book.entries.is_empty()
-        {
-            apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
-            return;
+        if let Some(campaign_id) = active {
+            match state.storage().get_world_info(&campaign_id) {
+                Ok(book) if !book.entries.is_empty() => {
+                    apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
+                    return;
+                }
+                Ok(_) => {
+                    // 本局世界书为空：回退角色库模板合并。
+                }
+                Err(e) => {
+                    // Gate 4 四审 P2：世界书读取失败不得静默吞掉——告警后
+                    // 回退角色库世界书（而非假装读到空书）。
+                    tracing::warn!(
+                        "rebuild world info: 读取活动 Campaign 世界书失败 campaign={}: {e}",
+                        campaign_id
+                    );
+                }
+            }
         }
     }
 

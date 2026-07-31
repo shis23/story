@@ -1227,64 +1227,91 @@ fn delete_card_payload_inner(db: &mut Database, card_id: &Id) -> Result<bool, St
 /// **single** SQLite transaction (Gate 4 三审 P1：真实玩过的 Campaign 的
 /// FK 依赖全部清理，失败整体回滚，绝不报告成功却留下不一致数据）。
 pub fn delete_character_full_cascade(id: &str, extra_source_ids: &[Id]) -> Result<bool, String> {
-    with_db_mut(|db| {
-        let tx = db
-            .connection_mut()
-            .transaction()
-            .map_err(|e| e.to_string())?;
-        let row: Option<(String, Option<String>)> = tx
+    with_db_mut(|db| delete_character_full_cascade_inner(db, id, extra_source_ids))
+}
+
+/// 测试 fault 注入点：删除级联的中间失败点（回滚证明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteCascadeFault {
+    None,
+    /// 级联清理中途注入失败（发生在事务内、commit 前）。
+    MidCascade,
+}
+
+thread_local! {
+    static FAIL_DELETE_CASCADE: std::cell::Cell<DeleteCascadeFault> =
+        const { std::cell::Cell::new(DeleteCascadeFault::None) };
+}
+
+#[doc(hidden)]
+pub fn fail_delete_cascade_for_test(fault: DeleteCascadeFault) {
+    FAIL_DELETE_CASCADE.with(|slot| slot.set(fault));
+}
+
+fn delete_character_full_cascade_inner(
+    db: &mut Database,
+    id: &str,
+    extra_source_ids: &[Id],
+) -> Result<bool, String> {
+    let tx = db
+        .connection_mut()
+        .transaction()
+        .map_err(|e| e.to_string())?;
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT character_id, source_character_id FROM characters \
+             WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((character_id, source_from_row)) = row else {
+        return Ok(false);
+    };
+    // 候选 source id：库行自带 + 调用方（tool_ctx 域 id）提供。
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push_source = |s: &str| {
+        if !candidates.iter().any(|c| c == s) {
+            candidates.push(s.to_string());
+        }
+    };
+    if let Some(s) = source_from_row.as_deref() {
+        push_source(s);
+    }
+    for id in extra_source_ids {
+        push_source(id.as_str());
+    }
+    for source in &candidates {
+        tx.execute(
+            "DELETE FROM mvu_translations WHERE source_character_id = ?1",
+            [source],
+        )
+        .map_err(|e| e.to_string())?;
+        let card_id: Option<String> = tx
             .query_row(
-                "SELECT character_id, source_character_id FROM characters \
-                 WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT card_id FROM character_cards WHERE source_character_id = ?1 LIMIT 1",
+                [source],
+                |r| r.get(0),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        let Some((character_id, source_from_row)) = row else {
-            return Ok(false);
-        };
-        // 候选 source id：库行自带 + 调用方（tool_ctx 域 id）提供。
-        let mut candidates: Vec<String> = Vec::new();
-        let mut push_source = |s: &str| {
-            if !candidates.iter().any(|c| c == s) {
-                candidates.push(s.to_string());
+        if let Some(card_id) = card_id {
+            delete_card_cascade_tx(&tx, &card_id)?;
+            if FAIL_DELETE_CASCADE.with(|slot| slot.get()) == DeleteCascadeFault::MidCascade {
+                return Err("injected failure mid delete cascade".into());
             }
-        };
-        if let Some(s) = source_from_row.as_deref() {
-            push_source(s);
-        }
-        for id in extra_source_ids {
-            push_source(id.as_str());
-        }
-        for source in &candidates {
-            tx.execute(
-                "DELETE FROM mvu_translations WHERE source_character_id = ?1",
-                [source],
-            )
-            .map_err(|e| e.to_string())?;
-            let card_id: Option<String> = tx
-                .query_row(
-                    "SELECT card_id FROM character_cards WHERE source_character_id = ?1 LIMIT 1",
-                    [source],
-                    |r| r.get(0),
-                )
-                .optional()
+            tx.execute("DELETE FROM character_cards WHERE card_id = ?1", [&card_id])
                 .map_err(|e| e.to_string())?;
-            if let Some(card_id) = card_id {
-                delete_card_cascade_tx(&tx, &card_id)?;
-                tx.execute("DELETE FROM character_cards WHERE card_id = ?1", [&card_id])
-                    .map_err(|e| e.to_string())?;
-            }
         }
-        tx.execute(
-            "DELETE FROM characters WHERE character_id = ?1",
-            [&character_id],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(true)
-    })
+    }
+    tx.execute(
+        "DELETE FROM characters WHERE character_id = ?1",
+        [&character_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Full dependency-ordered campaign cascade inside an open transaction.

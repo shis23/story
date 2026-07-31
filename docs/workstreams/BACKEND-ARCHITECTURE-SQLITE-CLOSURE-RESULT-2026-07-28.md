@@ -887,5 +887,50 @@ preaccept_lifecycle）。
 （`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
 `npm test` 476/476 / `npm run build` / `git diff --check`。
 
+### 30.11 Gate 4 四审修复（2026-07-31）
+
+> 三审判定 INCOMPLETE（2 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 SQLite 切换活动仍调用 JSON store（属实）**：`set_active_campaign` 先更新
+活跃指针，随后在 WorldInfo Supported 时调 `json_campaign_store`——SQLite 下
+JSON store 不存在，命令返回失败但指针已改、世界书未载入。
+- 修复：整段改经 backend-neutral facade——`get_world_info` / `get_campaign` /
+  `get_card` / `ensure_world_info_from_book` / 新 `resolve_character_world_info_
+  template`（角色库内嵌书，JSON 复用既有语义、SQLite 读 V007 角色库）/
+  `template_world_info_from_card`（ST 模板）。读取错误全部传播（`?`），不再
+  静默。
+- 测试：`lib_tests_campaigns.rs` 命令级测试
+  `set_active_campaign_command_routes_world_info_through_facade`（JSON 后端
+  真实命令成功 + 活跃指针设置 + 会话缓存断言）。
+
+**P1 角色删除后应用内状态仍是旧的（属实）**：`delete_character` 数据库事务
+完整，但删除成功后未清被删 Campaign 的 `active_campaign`、未与
+`active_campaign_update` 锁协调、未删/失效会话缓存——ConversationStore 持续
+返回已删除会话，后续修改可能重新写回。
+- 修复：命令在删除前收集受影响 campaign ids 与绑定的 conv ids；删除成功后：
+  在 `active_campaign_update` 锁内清活跃指针（若指向被删 Campaign），逐一
+  `conv_store.delete(conv_id)`（删文件 + 清缓存，彻底消除重写回风险），
+  tool_ctx 角色同步移除。顺带修复 affected 收集漏掉卡真实 source 的 bug。
+- 测试：`delete_character_command_clears_active_pointer_and_conversation_cache`
+  （JSON 后端真实命令：活跃指针清空 + 会话缓存清空 + tool_ctx 移除）。
+
+**P2 世界书读取错误仍被静默吞掉（属实）**：`rebuild_world_info_in_tool_ctx` 的
+`let Ok(book)` 忽略读取错误、回退角色库；且新级联事务只有成功测试、无
+fault-injection 回滚测试。
+- 修复：
+  - `rebuild_world_info_in_tool_ctx` 改为显式 match——读取成功且非空 → 注入本局
+    世界书；读取失败 → 告警日志后回退角色库（不静默）。
+  - `delete_character_full_cascade` 新增 `DeleteCascadeFault::MidCascade` 注入点
+    （事务内、commit 前）+ `fail_delete_cascade_for_test` setter。
+- 测试：`sqlite_character_lifecycle.rs` 8c 段——注入 MidCascade 失败 → 角色/卡/
+  campaign 全部保留（整体回滚），错误断言含注入消息。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings` / `cargo test --workspace`（全绿）/
+8 个 sqlite 集成测试 + 2 个新命令级测试全过 / `backend-baseline.mjs`
+（`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
+`npm test` 476/476 / `npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。
