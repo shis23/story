@@ -878,10 +878,8 @@ pub fn prepare_start_conversation(
 // ─── Campaign instance DTO enrichment ─────────────────────────────────────
 
 /// Build the display DTO for one CharacterInstance through the pinned backend.
-///
-/// JSON enriches `role_type` from the card definitions. SQLite keeps the base
-/// DTO (role_type stays `None`) — a documented Gate 4 data-enrichment gap, not
-/// a silent fallback.
+/// Both backends enrich `role_type` from the card definitions (SQLite reads
+/// the card payload from the process authority).
 pub fn character_instance_dto_for_backend(
     storage: &StorageFacade,
     instance: &storyforge_domain::campaign::CharacterInstance,
@@ -891,12 +889,24 @@ pub fn character_instance_dto_for_backend(
             BackendCapability::CampaignInstanceRead,
             "enrich campaign instance DTO",
         )?;
-        Ok(character_instance_dto_from_store(store, instance))
-    } else {
-        Ok(crate::commands::campaigns::CharacterInstanceDto::from(
-            instance,
-        ))
+        return Ok(character_instance_dto_from_store(store, instance));
     }
+    use crate::commands::campaigns::CharacterInstanceDto;
+    let role_type = instance.definition_id.as_ref().and_then(|definition_id| {
+        let campaign = crate::sqlite_runtime::get_campaign(&instance.campaign_id).ok()??;
+        let payload = crate::sqlite_runtime::get_card_payload(&campaign.card_id).ok()??;
+        let stored = serde_json::from_value::<crate::campaign_store::StoredCard>(payload).ok()?;
+        stored
+            .card
+            .character_definitions
+            .iter()
+            .find(|definition| definition.id == *definition_id)
+            .map(|definition| definition.role_type.clone())
+    });
+    Ok(match role_type.as_ref() {
+        Some(role_type) => CharacterInstanceDto::with_role_type(instance, role_type),
+        None => CharacterInstanceDto::from(instance),
+    })
 }
 
 pub fn character_instance_dto_from_store(
@@ -926,21 +936,22 @@ pub fn character_instance_dto_from_store(
 /// JSON builds one `card_id → name` snapshot from the CampaignStore and
 /// resolves every summary against it (by `character_id` first, then campaign
 /// → card fallback) — a single `list_cards()` per call, not per conversation.
-/// SQLite returns an empty map (card_name stays `None`, documented Gate 4 gap).
+/// SQLite reads one `character_cards` snapshot from the process authority.
 pub fn conversation_card_names_for_backend(
     storage: &StorageFacade,
     summaries: &[storyforge_app_conversation::ConversationSummary],
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    if !storage.is_json() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let store =
-        storage.json_campaign_store(BackendCapability::CampaignRead, "list conversations")?;
-    let card_by_id: std::collections::HashMap<Id, String> = store
-        .list_cards()
-        .iter()
-        .map(|sc| (sc.card.id.clone(), sc.card.name.clone()))
-        .collect();
+    let card_by_id: std::collections::HashMap<Id, String> = if storage.is_sqlite() {
+        crate::sqlite_runtime::list_card_names()?
+    } else {
+        let store =
+            storage.json_campaign_store(BackendCapability::CampaignRead, "list conversations")?;
+        store
+            .list_cards()
+            .iter()
+            .map(|sc| (sc.card.id.clone(), sc.card.name.clone()))
+            .collect()
+    };
     let mut out = std::collections::HashMap::new();
     for summary in summaries {
         let card_name = summary
@@ -953,9 +964,11 @@ pub fn conversation_card_names_for_backend(
             .or_else(|| {
                 // 兜底:campaign_id → campaign.card_id → card.name
                 summary.campaign_id.as_ref().and_then(|camp_id| {
-                    store
+                    storage
                         .get_campaign(camp_id)
-                        .and_then(|campaign| card_by_id.get(&campaign.card_id).cloned())
+                        .ok()
+                        .flatten()
+                        .and_then(|record| card_by_id.get(&record.campaign.card_id).cloned())
                 })
             });
         if let Some(name) = card_name {
@@ -967,24 +980,29 @@ pub fn conversation_card_names_for_backend(
 
 /// Campaign-scoped regex scripts through the pinned backend.
 ///
-/// JSON reads the CampaignStore; SQLite has no campaign-scoped regex source
-/// and reports `Ok(None)` so the caller keeps the character-dimension fallback
-/// (same behavior as before).
+/// JSON reads the CampaignStore; SQLite reads the campaign card payload and
+/// resolves the card's scoped regex scripts the same way (`scoped_regex_scripts()`).
 pub fn campaign_scoped_regex_scripts_for_backend(
     storage: &StorageFacade,
     campaign_id: &Id,
 ) -> Result<Option<Vec<RegexScript>>, String> {
     if storage.is_json() {
-        Ok(Some(collect_campaign_scoped_regex_scripts(
+        return Ok(Some(collect_campaign_scoped_regex_scripts(
             campaign_id,
             storage.json_campaign_store(
                 BackendCapability::CampaignRead,
                 "conversation regex context",
             )?,
-        )))
-    } else {
-        Ok(None)
+        )));
     }
+    let scripts = crate::sqlite_runtime::get_campaign(campaign_id)?
+        .and_then(|campaign| crate::sqlite_runtime::get_card_payload(&campaign.card_id).ok()?)
+        .and_then(|payload| {
+            serde_json::from_value::<crate::campaign_store::StoredCard>(payload).ok()
+        })
+        .map(|stored| stored.card.scoped_regex_scripts())
+        .unwrap_or_default();
+    Ok(Some(scripts))
 }
 
 // ─── Campaign health ──────────────────────────────────────────────────────
@@ -1246,9 +1264,222 @@ pub async fn persist_postprocess_outcome_async(
     Ok(())
 }
 
+// ─── Typed Meta patch snapshot load (Gate 4 backend-neutral reads) ────────
+
+/// Load the pure `app-meta` snapshot for a Campaign through the pinned backend.
+/// JSON reads the CampaignStore; SQLite reads the process-owned authority and
+/// decodes the StoredCard payload. Both produce the same domain snapshot shape
+/// consumed by `check_campaign_health` / `build_patch_for_issue` /
+/// `validate_patch_preconditions`.
+pub fn load_meta_snapshot_for_backend(
+    storage: &StorageFacade,
+    campaign_id: &Id,
+) -> Result<crate::commands::meta_typed::MetaSnapshot, String> {
+    if storage.is_json() {
+        let store =
+            storage.json_campaign_store(BackendCapability::TypedMetaPatch, "load Meta snapshot")?;
+        return crate::commands::meta_typed::load_meta_snapshot_from_store(store, campaign_id)
+            .map_err(|e| e.to_string());
+    }
+    let campaign = storage
+        .get_campaign(campaign_id)?
+        .map(|record| record.campaign)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+    let definitions = match storage.get_card_payload(&campaign.card_id)? {
+        Some(payload) => serde_json::from_value::<crate::campaign_store::StoredCard>(payload)
+            .map(|stored| stored.card.character_definitions)
+            .map_err(|e| format!("invalid SQLite card payload: {e}"))?,
+        None => Vec::new(),
+    };
+    let instances = storage.list_instances(campaign_id)?;
+    let knowledge = storage.list_knowledge(campaign_id)?;
+    let tasks = storage.list_tasks(campaign_id)?;
+    Ok(crate::commands::meta_typed::MetaSnapshot {
+        campaign,
+        definitions,
+        instances,
+        knowledge,
+        tasks,
+    })
+}
+
+// ─── Typed Meta patch apply (Gate 4 SQLite-native atomic UoW) ─────────────
+
+/// Apply every action of one typed Meta patch through the pinned backend.
+///
+/// JSON: the legacy per-action `apply_typed_action` loop under the shared
+/// campaign commit lock. SQLite: a single atomic UoW
+/// (`SqliteMetaRepository`) with scope/stale/definition validation and fault
+/// injection points. Both paths reject when any single action fails — nothing
+/// is partially applied.
+pub fn apply_typed_patch_actions_for_backend(
+    storage: &StorageFacade,
+    campaign_id: &Id,
+    actions: &[storyforge_app_meta::TypedPatchAction],
+) -> Result<(), String> {
+    if storage.is_sqlite() {
+        crate::sqlite_runtime::meta_apply_typed_patch_actions(campaign_id, actions)
+    } else {
+        let store = storage
+            .json_campaign_store(BackendCapability::TypedMetaPatch, "accept typed Meta patch")?;
+        crate::turn_coordinator::with_campaign_lock(|| {
+            for (index, action) in actions.iter().enumerate() {
+                crate::commands::meta_typed::apply_typed_action(store, campaign_id, action)
+                    .map_err(|error| {
+                        crate::turn_coordinator::CommitError::Storage(format!(
+                            "第 {} 个 action 失败: {error}",
+                            index + 1
+                        ))
+                    })?;
+            }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+    }
+}
+
+// ─── MVU schema apply (Gate 4 SQLite-native atomic UoW) ───────────────────
+
+/// Preview MVU schema merges through the pinned backend.
+/// JSON reads the CampaignStore; SQLite reads the `mvu_translations` table and
+/// resolves the source card from `character_cards`. Both produce the same
+/// `MvuApplyPreview` list (one per definition) via the shared pure function.
+pub fn preview_mvu_apply_for_backend(
+    storage: &StorageFacade,
+    source_character_id: &Id,
+) -> Result<Vec<storyforge_app_meta::MvuApplyPreview>, String> {
+    let mvu = storage.get_mvu(source_character_id)?.ok_or_else(|| {
+        storyforge_app_meta::MvuApplyError::TranslationNotFound(
+            source_character_id.as_str().to_string(),
+        )
+        .to_string()
+    })?;
+    let stored_card = if storage.is_sqlite() {
+        let payload = crate::sqlite_runtime::get_card_payload_by_source(source_character_id)?
+            .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?;
+        serde_json::from_value::<crate::campaign_store::StoredCard>(payload)
+            .map_err(|e| format!("invalid SQLite card payload: {e}"))?
+    } else {
+        storage
+            .json_campaign_store(
+                BackendCapability::MvuSchemaApply,
+                "MVU schema apply preview",
+            )?
+            .get_card_by_source(source_character_id)
+            .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?
+    };
+    let previews: Vec<storyforge_app_meta::MvuApplyPreview> = stored_card
+        .card
+        .character_definitions
+        .iter()
+        .map(|def| {
+            storyforge_app_meta::compute_apply_preview(
+                &def.variable_schema,
+                &mvu.translation.variable_schema,
+                def.id.as_str(),
+                &def.name,
+                source_character_id.as_str(),
+            )
+        })
+        .collect();
+    Ok(previews)
+}
+
+/// Apply the MVU schema through the pinned backend.
+///
+/// JSON: `update_card` + per-instance backfill (existing path). SQLite: one
+/// atomic UoW covering the card payload update and every cross-campaign
+/// instance backfill, with ownership validation and fault-injection rollback.
+pub fn apply_mvu_schema_for_backend(
+    storage: &StorageFacade,
+    source_character_id: &Id,
+    definition_id: &Id,
+) -> Result<(), String> {
+    if storage.is_sqlite() {
+        crate::sqlite_runtime::mvu_apply_schema(source_character_id, definition_id)?;
+        Ok(())
+    } else {
+        let store =
+            storage.json_campaign_store(BackendCapability::MvuSchemaApply, "MVU schema apply")?;
+        crate::commands::meta_typed::meta_apply_mvu_schema_in_store(
+            store,
+            source_character_id,
+            definition_id,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+// ─── Campaign world info (Gate 4 SQLite-native) ──────────────────────────
+
+/// Load the campaign world info book through the pinned backend, lazily seeding
+/// it from the card template when the campaign book is still empty (JSON: the
+/// CharacterStore template; SQLite: `raw_card_json.character_book` in the card
+/// payload). Never silently returns an empty book when a template exists.
+pub fn load_campaign_world_info_for_backend(
+    storage: &StorageFacade,
+    state: &crate::AppState,
+    campaign_id: &Id,
+) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+    let mut book = storage.get_world_info(campaign_id)?;
+    if !book.entries.is_empty() {
+        return Ok(book);
+    }
+    let template = if storage.is_sqlite() {
+        let card_payload = storage.get_card_payload(&campaign_card_id(storage, campaign_id)?)?;
+        match card_payload {
+            Some(payload) => storage
+                .template_world_info_from_card(&payload)?
+                .unwrap_or_else(empty_world_info_book_for_template),
+            None => empty_world_info_book_for_template(),
+        }
+    } else {
+        let store = storage.json_campaign_store(
+            BackendCapability::CampaignRead,
+            "seed campaign world info from card template",
+        )?;
+        let campaign = store
+            .get_campaign(campaign_id)
+            .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        let card = store
+            .get_card(&campaign.card_id)
+            .ok_or_else(|| format!("Campaign card 不存在: {}", campaign.card_id))?;
+        let character_store = state
+            .json_character_store(
+                BackendCapability::CharacterCommands,
+                "seed campaign world info from character template",
+            )
+            .map_err(|e| e.to_string())?;
+        crate::commands::campaigns::resolve_template_world_info_for_card(character_store, &card)
+    };
+    if !template.entries.is_empty() {
+        book = storage.ensure_world_info_from_book(campaign_id, &template)?;
+    }
+    Ok(book)
+}
+
+fn campaign_card_id(
+    storage: &StorageFacade,
+    campaign_id: &Id,
+) -> Result<storyforge_domain::Id, String> {
+    storage
+        .get_campaign(campaign_id)?
+        .map(|record| record.campaign.card_id)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))
+}
+
+fn empty_world_info_book_for_template() -> storyforge_domain::world_info::WorldInfoBook {
+    storyforge_domain::world_info::WorldInfoBook {
+        entries: Vec::new(),
+        source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
+    }
+}
+
 // ─── Chronicle compressor ─────────────────────────────────────────────────
 
-/// 统计 campaign 未覆盖 A/B 数量。
+/// 统计 campaign 未覆盖 A/B 数量（JSON store 版；SQLite 版见
+/// `SqliteCompressJobRepository::count_uncovered`）。
 pub fn count_uncovered_chronicle_levels(store: &CampaignStore, campaign_id: &Id) -> (usize, usize) {
     let entries = store.list_summaries(campaign_id);
     let uncovered_a = entries
@@ -1265,43 +1496,38 @@ pub fn count_uncovered_chronicle_levels(store: &CampaignStore, campaign_id: &Id)
     (uncovered_a, uncovered_b)
 }
 
-/// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
-pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: Id) {
-    if state.storage().is_sqlite() {
-        // Chronicle publication jobs are already typed in infra-sqlite, but
-        // the background worker still depends on the JSON job store. Refuse
-        // that secondary authority rather than silently reading/writing it.
-        tracing::debug!(
-            campaign_id = %campaign_id,
-            "sqlite backend skips JSON-only chronicle compressor worker"
-        );
-        return;
+/// 未覆盖 A/B 数量（pinned backend 分派；SQLite 读权威表）。
+pub fn count_uncovered_chronicle_levels_for_backend(
+    storage: &StorageFacade,
+    campaign_id: &Id,
+) -> Result<(usize, usize), String> {
+    if storage.is_sqlite() {
+        crate::sqlite_runtime::compress_count_uncovered(campaign_id)
+    } else {
+        let store = storage.json_campaign_store(
+            BackendCapability::ChronicleCompressor,
+            "count uncovered chronicle levels",
+        )?;
+        Ok(count_uncovered_chronicle_levels(store, campaign_id))
     }
-    let store = match state.storage().json_campaign_store(
-        BackendCapability::ChronicleCompressor,
-        "enqueue chronicle compressor",
-    ) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(
-                target: "chronicle_compressor",
-                campaign_id = %campaign_id,
-                "chronicle campaign store unavailable: {error}"
-            );
-            return;
-        }
-    };
-    let job_store = match state
-        .storage()
-        .json_compress_job_store("enqueue chronicle compression")
-    {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(target: "chronicle_compressor", "compress job store unavailable: {error}");
-            return;
-        }
-    };
-    let (uncovered_a, uncovered_b) = count_uncovered_chronicle_levels(store, &campaign_id);
+}
+
+/// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
+/// SQLite 走 V006 `chronicle_compress_jobs` 表；JSON 走 CompressJobStore。
+pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: Id) {
+    let storage = state.storage().clone();
+    let (uncovered_a, uncovered_b) =
+        match count_uncovered_chronicle_levels_for_backend(&storage, &campaign_id) {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::error!(
+                    target: "chronicle_compressor",
+                    campaign_id = %campaign_id,
+                    "chronicle uncovered count unavailable: {error}"
+                );
+                return;
+            }
+        };
     let need_a = storyforge_domain::chronicle::should_enqueue_compress(
         uncovered_a,
         storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
@@ -1313,17 +1539,17 @@ pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: 
     if !need_a && !need_b {
         return;
     }
-    let camp = store.get_campaign(&campaign_id);
-    let conversation_id = camp.as_ref().and_then(|c| c.conversation_id.clone());
-    let lineage_id = camp.as_ref().and_then(|c| c.lineage_id.clone());
-    match job_store.enqueue_or_get_open(
-        &campaign_id,
-        conversation_id,
-        lineage_id,
-        uncovered_a as u32,
-        uncovered_b as u32,
-    ) {
-        Ok((job, created)) => {
+    let enqueue = || -> Result<(), String> {
+        if storage.is_sqlite() {
+            let campaign = crate::sqlite_runtime::get_campaign(&campaign_id)?
+                .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
+            let (job, created) = crate::sqlite_runtime::compress_enqueue_or_get_open(
+                &campaign_id,
+                campaign.conversation_id.clone(),
+                campaign.lineage_id.clone(),
+                uncovered_a as u32,
+                uncovered_b as u32,
+            )?;
             tracing::info!(
                 target: "chronicle_compressor",
                 campaign_id = %campaign_id,
@@ -1331,37 +1557,83 @@ pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: 
                 created,
                 uncovered_a,
                 uncovered_b,
-                "compress job enqueued"
+                "compress job enqueued (SQLite)"
             );
-            // Pending（含失败回队）允许再次 spawn；Running 不重复 spawn。
-            // 实际互斥靠 try_claim_pending。
-            if created || job.status == crate::compress_job_store::CompressJobStatus::Pending {
-                spawn_compress_job_worker(state, job.id);
+            if created || job.status == crate::sqlite_compress_jobs::CompressJobStatus::Pending {
+                spawn_compress_job_worker(state.clone(), job.id);
             }
+            return Ok(());
         }
-        Err(e) => {
-            tracing::error!(
-                target: "chronicle_compressor",
-                "enqueue compress job failed: {e}"
-            );
+        let store = storage.json_campaign_store(
+            BackendCapability::ChronicleCompressor,
+            "enqueue chronicle compressor",
+        )?;
+        let job_store = storage.json_compress_job_store("enqueue chronicle compression")?;
+        let camp = store.get_campaign(&campaign_id);
+        let conversation_id = camp.as_ref().and_then(|c| c.conversation_id.clone());
+        let lineage_id = camp.as_ref().and_then(|c| c.lineage_id.clone());
+        let (job, created) = job_store.enqueue_or_get_open(
+            &campaign_id,
+            conversation_id,
+            lineage_id,
+            uncovered_a as u32,
+            uncovered_b as u32,
+        )?;
+        tracing::info!(
+            target: "chronicle_compressor",
+            campaign_id = %campaign_id,
+            job_id = %job.id,
+            created,
+            uncovered_a,
+            uncovered_b,
+            "compress job enqueued"
+        );
+        // Pending（含失败回队）允许再次 spawn；Running 不重复 spawn。
+        if created || job.status == crate::compress_job_store::CompressJobStatus::Pending {
+            spawn_compress_job_worker(state.clone(), job.id);
         }
+        Ok(())
+    };
+    if let Err(e) = enqueue() {
+        tracing::error!(target: "chronicle_compressor", "enqueue compress job failed: {e}");
     }
 }
 
-pub fn should_recover_json_compress_jobs(storage: &StorageFacade) -> bool {
-    !storage.is_sqlite()
-}
-
 /// 启动恢复：Running→Pending，然后为所有 open job spawn worker。
+/// SQLite 与 JSON 各走自己的队列权威；worker 重复启动由原子 claim 幂等。
 pub fn recover_compress_jobs_on_startup(app_state: Arc<crate::AppState>) {
-    // Chronicle compression still has a JSON job-store implementation only.
-    // An opt-in SQLite process must neither resume nor mutate that secondary
-    // store until the SQLite-native job path exists.
-    if !should_recover_json_compress_jobs(app_state.storage()) {
+    let storage = app_state.storage().clone();
+    if storage.is_sqlite() {
+        match crate::sqlite_runtime::compress_reset_running_to_pending() {
+            Ok(reset) => {
+                if reset > 0 {
+                    tracing::info!(
+                        target: "chronicle_compressor",
+                        reset,
+                        "startup: reset Running compress jobs to Pending (SQLite)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "chronicle_compressor", "SQLite compress recovery: {e}");
+                return;
+            }
+        }
+        let open = match crate::sqlite_runtime::compress_list_open() {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::error!(target: "chronicle_compressor", "SQLite compress list: {e}");
+                return;
+            }
+        };
         tracing::info!(
             target: "chronicle_compressor",
-            "startup: skipping JSON chronicle-job recovery in SQLite mode"
+            count = open.len(),
+            "startup: replaying open compress jobs (SQLite)"
         );
+        for job in open {
+            spawn_compress_job_worker(app_state.clone(), job.id);
+        }
         return;
     }
     let job_store = match app_state
@@ -1396,14 +1668,90 @@ pub fn recover_compress_jobs_on_startup(app_state: Arc<crate::AppState>) {
     }
 }
 
+/// 生产压缩执行器：走真实 LLM（run_compress_if_needed）。
+fn production_compress(
+    state: Arc<crate::AppState>,
+    campaign_id: Id,
+    lineage_id: Id,
+    conversation_id: Id,
+    entries: Vec<storyforge_domain::agent::RoundSummary>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Vec<storyforge_app_agent::CompressRunOutcome>,
+                    storyforge_app_agent::ChronicleCompressorError,
+                >,
+            > + Send,
+    >,
+> {
+    Box::pin(async move {
+        let llm = match state.require_active_llm() {
+            Ok(llm) => llm,
+            Err(error) => {
+                return Err(storyforge_app_agent::ChronicleCompressorError::Parse(
+                    error.to_string(),
+                ));
+            }
+        };
+        let tool_snapshot = state.snapshot_tool_ctx();
+        let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
+        storyforge_app_agent::run_compress_if_needed(
+            &runtime,
+            &campaign_id,
+            &lineage_id,
+            &conversation_id,
+            entries,
+            cancel,
+            None,
+            None,
+            None,
+        )
+        .await
+    })
+}
+
 /// 消费单个 compress job（可崩溃重试：失败回到 Pending 或 Failed）。
+/// JSON 走 CampaignStore + CompressJobStore；SQLite 走 compress_jobs 表 +
+/// 原子 publication UoW。可注入 `compress` 供确定性测试（无 LLM）。
 pub fn spawn_compress_job_worker(state: Arc<crate::AppState>, job_id: Id) {
+    spawn_compress_job_worker_with(state, job_id, production_compress);
+}
+
+#[allow(clippy::type_complexity)]
+pub fn spawn_compress_job_worker_with(
+    state: Arc<crate::AppState>,
+    job_id: Id,
+    compress: impl Fn(
+        Arc<crate::AppState>,
+        Id,
+        Id,
+        Id,
+        Vec<storyforge_domain::agent::RoundSummary>,
+        tokio::sync::watch::Receiver<bool>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Vec<storyforge_app_agent::CompressRunOutcome>,
+                        storyforge_app_agent::ChronicleCompressorError,
+                    >,
+                > + Send,
+        >,
+    > + Send
+    + Sync
+    + 'static,
+) {
+    let storage = state.storage().clone();
+    let compress = std::sync::Arc::new(compress);
     tokio::spawn(async move {
-        let store = match state.storage().json_campaign_store(
+        let campaign_store = match storage.json_campaign_store_owned(
             BackendCapability::ChronicleCompressor,
             "run chronicle compressor",
         ) {
-            Ok(store) => store,
+            Ok(store) => Some(store),
+            Err(_) if storage.is_sqlite() => None,
             Err(error) => {
                 tracing::error!(
                     target: "chronicle_compressor",
@@ -1413,104 +1761,177 @@ pub fn spawn_compress_job_worker(state: Arc<crate::AppState>, job_id: Id) {
                 return;
             }
         };
-        let job_store = match state
-            .storage()
-            .json_compress_job_store("run chronicle compressor")
-        {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::error!(target: "chronicle_compressor", "compress job store unavailable: {error}");
-                return;
+        let job: Option<(Id, Id, Option<Id>, Option<Id>)> = if storage.is_sqlite() {
+            match crate::sqlite_runtime::compress_list_all() {
+                Ok(jobs) => jobs.into_iter().find_map(|j| {
+                    (j.id == job_id
+                        && j.status == crate::sqlite_compress_jobs::CompressJobStatus::Pending)
+                        .then_some((j.id, j.campaign_id, j.conversation_id, j.lineage_id))
+                }),
+                Err(e) => {
+                    tracing::error!(target: "chronicle_compressor", "SQLite compress list: {e}");
+                    return;
+                }
+            }
+        } else {
+            let job_store = match storage.json_compress_job_store("run chronicle compressor") {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::error!(target: "chronicle_compressor", "compress job store unavailable: {e}");
+                    return;
+                }
+            };
+            job_store.list_all().into_iter().find_map(|j| {
+                (j.id == job_id
+                    && j.status == crate::compress_job_store::CompressJobStatus::Pending)
+                    .then_some((j.id, j.campaign_id, j.conversation_id, j.lineage_id))
+            })
+        };
+        let Some((job_id, campaign_id, job_conversation_id, job_lineage_id)) = job else {
+            return;
+        };
+        let claimed = if storage.is_sqlite() {
+            match crate::sqlite_runtime::compress_try_claim_pending(&job_id) {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    tracing::warn!(target: "chronicle_compressor", "try_claim_pending {job_id}: {e}");
+                    return;
+                }
+            }
+        } else {
+            let job_store = match storage.json_compress_job_store("run chronicle compressor") {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::warn!(target: "chronicle_compressor", "try_claim_pending {job_id}: {e}");
+                    return;
+                }
+            };
+            match job_store.try_claim_pending(&job_id) {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    tracing::warn!(target: "chronicle_compressor", "try_claim_pending {job_id}: {e}");
+                    return;
+                }
             }
         };
-        let job = match job_store.list_all().into_iter().find(|j| j.id == job_id) {
-            Some(j) if j.status == crate::compress_job_store::CompressJobStatus::Pending => j,
-            _ => return,
-        };
-        match job_store.try_claim_pending(&job_id) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(
-                    target: "chronicle_compressor",
-                    job_id = %job_id,
-                    "compress job already claimed; worker exit"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: "chronicle_compressor", "try_claim_pending {job_id}: {e}");
-                return;
-            }
+        if !claimed {
+            tracing::debug!(
+                target: "chronicle_compressor",
+                job_id = %job_id,
+                "compress job already claimed; worker exit"
+            );
+            return;
         }
 
-        let campaign_id = job.campaign_id.clone();
-        let camp = match store.get_campaign(&campaign_id) {
-            Some(c) => c,
-            None => {
-                let _ = job_store.mark_failed_or_retry(&job_id, "campaign missing");
-                return;
-            }
+        let camp = match crate::sqlite_runtime::get_campaign(&campaign_id) {
+            Ok(Some(c)) => c,
+            _ => match campaign_store
+                .as_ref()
+                .and_then(|s| s.get_campaign(&campaign_id))
+            {
+                Some(c) => c,
+                None => {
+                    let _ = mark_job_failed(&storage, &job_id, "campaign missing");
+                    return;
+                }
+            },
         };
-        let lineage = job
-            .lineage_id
-            .clone()
+        let lineage = job_lineage_id
             .or(camp.lineage_id.clone())
             .unwrap_or_else(Id::new);
-        let conversation_id = job
-            .conversation_id
-            .clone()
+        let conversation_id = job_conversation_id
             .or(camp.conversation_id.clone())
             .unwrap_or_else(|| Id::from_str("unknown-conv"));
-        let entries = store.list_summaries(&campaign_id);
-
-        let llm = match state.require_active_llm() {
-            Ok(llm) => llm,
-            Err(error) => {
-                let _ = job_store.mark_failed_or_retry(&job_id, error.to_string());
-                return;
+        let entries = if storage.is_sqlite() {
+            match crate::sqlite_runtime::list_summaries(&campaign_id) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = mark_job_failed(&storage, &job_id, &e);
+                    return;
+                }
+            }
+        } else {
+            match campaign_store.as_ref() {
+                Some(store) => store.list_summaries(&campaign_id),
+                None => {
+                    let _ = mark_job_failed(&storage, &job_id, "campaign store unavailable");
+                    return;
+                }
             }
         };
-        let tool_snapshot = state.snapshot_tool_ctx();
-        let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
-        let (_tx, cancel) = tokio::sync::watch::channel(false);
 
-        match storyforge_app_agent::run_compress_if_needed(
-            &runtime,
-            &campaign_id,
-            &lineage,
-            &conversation_id,
+        let (_tx, cancel) = tokio::sync::watch::channel(false);
+        match compress(
+            state,
+            campaign_id.clone(),
+            lineage,
+            conversation_id,
             entries,
             cancel,
-            None,
-            None,
-            None,
         )
         .await
         {
             Ok(outcomes) => {
                 let mut publish_err: Option<String> = None;
                 for out in outcomes {
-                    if let Err(e) = store.publish_compress_result(
-                        &campaign_id,
-                        &out.parent_summaries,
-                        &out.publish.child_covered_by,
-                    ) {
-                        publish_err = Some(e);
-                        break;
+                    let result = if storage.is_sqlite() {
+                        let publication_id = Id::new();
+                        crate::sqlite_runtime::publish_chronicle_compress_with_fault_flag(
+                            &campaign_id,
+                            &publication_id,
+                            &out.parent_summaries,
+                            &out.publish.child_covered_by,
+                            Some(job_id.as_str()),
+                        )
+                    } else {
+                        match campaign_store.as_ref() {
+                            Some(store) => store
+                                .publish_compress_result(
+                                    &campaign_id,
+                                    &out.parent_summaries,
+                                    &out.publish.child_covered_by,
+                                )
+                                .map(|_| {
+                                    storyforge_infra_sqlite::publication::PublishOutcome::Applied
+                                }),
+                            None => Err("campaign store unavailable".into()),
+                        }
+                    };
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(
+                                target: "chronicle_compressor",
+                                job_id = %job_id,
+                                level = ?out.output_level,
+                                parents = out.parent_summaries.len(),
+                                children = out.publish.child_covered_by.len(),
+                                "compress batch published"
+                            );
+                        }
+                        Err(e) => {
+                            // 迟到结果 / 并发 worker 已发布同一 job：publication 的
+                            // job_id 唯一索引拒绝重复发布，job 已终态 → 直接退出。
+                            if storage.is_sqlite()
+                                && e.contains("job_id")
+                                && e.contains("already used")
+                            {
+                                tracing::debug!(
+                                    target: "chronicle_compressor",
+                                    job_id = %job_id,
+                                    "compress publication already published by another worker; late result dropped"
+                                );
+                                return;
+                            }
+                            publish_err = Some(e);
+                            break;
+                        }
                     }
-                    tracing::info!(
-                        target: "chronicle_compressor",
-                        job_id = %job_id,
-                        level = ?out.output_level,
-                        parents = out.parent_summaries.len(),
-                        children = out.publish.child_covered_by.len(),
-                        "compress batch published"
-                    );
                 }
                 if let Some(e) = publish_err {
-                    // 仅当 marker 仍在且 summaries 校验可通过时 heal 才能完成；
-                    // 校验失败会保留 marker，并让 job 回 Pending 下次 Accept/启动再试。
-                    if store.needs_compress_metadata_heal(&campaign_id) {
+                    if !storage.is_sqlite()
+                        && let Some(store) = &campaign_store
+                        && store.needs_compress_metadata_heal(&campaign_id)
+                    {
                         match store.heal_compress_publication_metadata(&campaign_id) {
                             Ok(()) => {}
                             Err(he) => tracing::warn!(
@@ -1519,34 +1940,33 @@ pub fn spawn_compress_job_worker(state: Arc<crate::AppState>, job_id: Id) {
                             ),
                         }
                     }
-                    if let Err(me) = job_store.mark_failed_or_retry(&job_id, e) {
+                    if let Err(me) = mark_job_failed(&storage, &job_id, &e) {
                         tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
                     }
-                } else if let Err(e) = job_store.mark_succeeded(&job_id) {
+                } else if let Err(e) = mark_job_succeeded(&storage, &job_id) {
                     tracing::error!(target: "chronicle_compressor", "mark_succeeded: {e}");
                 }
             }
             Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress) => {
-                // 可能是：并发已压缩完，或 summaries 已写但 metadata 未 heal
-                if store.needs_compress_metadata_heal(&campaign_id) {
-                    if let Err(e) = store.heal_compress_publication_metadata(&campaign_id) {
-                        tracing::warn!(
-                            target: "chronicle_compressor",
-                            job_id = %job_id,
-                            "heal metadata on NothingToCompress failed: {e}"
-                        );
-                        if let Err(me) = job_store.mark_failed_or_retry(&job_id, e) {
-                            tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
+                if !storage.is_sqlite()
+                    && let Some(store) = &campaign_store
+                    && store.needs_compress_metadata_heal(&campaign_id)
+                {
+                    match store.heal_compress_publication_metadata(&campaign_id) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "chronicle_compressor",
+                                "heal metadata on NothingToCompress failed: {e}"
+                            );
+                            if let Err(me) = mark_job_failed(&storage, &job_id, &e) {
+                                tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
+                            }
+                            return;
                         }
-                        return;
                     }
-                    tracing::info!(
-                        target: "chronicle_compressor",
-                        job_id = %job_id,
-                        "healed compress metadata after NothingToCompress"
-                    );
                 }
-                if let Err(e) = job_store.mark_succeeded(&job_id) {
+                if let Err(e) = mark_job_succeeded(&storage, &job_id) {
                     tracing::error!(target: "chronicle_compressor", "mark_succeeded: {e}");
                 } else {
                     tracing::info!(
@@ -1562,10 +1982,28 @@ pub fn spawn_compress_job_worker(state: Arc<crate::AppState>, job_id: Id) {
                     job_id = %job_id,
                     "compress run failed: {e}"
                 );
-                if let Err(me) = job_store.mark_failed_or_retry(&job_id, e.to_string()) {
+                if let Err(me) = mark_job_failed(&storage, &job_id, &e.to_string()) {
                     tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
                 }
             }
         }
     });
+}
+
+fn mark_job_failed(storage: &StorageFacade, job_id: &Id, err: &str) -> Result<bool, String> {
+    if storage.is_sqlite() {
+        crate::sqlite_runtime::compress_mark_failed_or_retry(job_id, err)
+    } else {
+        let job_store = storage.json_compress_job_store("mark compress job failed")?;
+        job_store.mark_failed_or_retry(job_id, err).map(|_| true)
+    }
+}
+
+fn mark_job_succeeded(storage: &StorageFacade, job_id: &Id) -> Result<bool, String> {
+    if storage.is_sqlite() {
+        crate::sqlite_runtime::compress_mark_succeeded(job_id)
+    } else {
+        let job_store = storage.json_compress_job_store("mark compress job succeeded")?;
+        job_store.mark_succeeded(job_id).map(|_| true)
+    }
 }

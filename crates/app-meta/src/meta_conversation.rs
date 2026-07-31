@@ -1523,6 +1523,7 @@ mod tests {
             actions: vec![],
             diff: vec![],
             created_at: chrono::Utc::now(),
+            campaign_revision: None,
             status: crate::typed_patch::TypedPatchStatus::Pending,
         });
 

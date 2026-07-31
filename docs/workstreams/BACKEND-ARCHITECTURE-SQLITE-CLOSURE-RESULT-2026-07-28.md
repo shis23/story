@@ -1,6 +1,6 @@
 # 后端架构拆分与 SQLite 收口：执行结果（2026-07-28 起）
 
-> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS（2026-07-31）**；Gate 4–8 尚未完成。
+> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS；Gate 4 PASS（2026-07-31）**；Gate 5–8 尚未完成。
 >
 > code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 >
@@ -599,3 +599,161 @@ Gate 3 计划 §8.1 允许「trait 或启动时选择的 **enum-dispatched struc
 
 - Gate 4 起补齐 SQLite 缺口：Meta UoW（typed patch preview/accept/dismiss、active-turn barrier、故障注入回滚）、MVU schema apply/definition 更新/backfill、WorldInfo、CharacterCommands/ImportExport、Chronicle compressor 的 SQLite-native 实现，以及 card_name/role_type/campaign-scoped regex 数据完整性收口。
 - 记录为后续任务（本次**不处理**）：CardShell 路径泄露审查、Import/Export 导出脱敏等无关安全待办。
+
+## 30. Gate 4 完成：SQLite 缺口补齐（2026-07-31）
+
+> 结论：**Gate 4 PASS**。四项通过条件逐项核对见 §30.4；本 Gate 只实现了
+> SQLite-native 能力，未改变默认后端（仍是 JSON），未 push。
+>
+> code-under-test：`main@102c8d0` 之上新建 Gate 4 提交（SHA 以 git log 为准）。
+
+### 30.1 交付内容
+
+**一、Meta 原子事务（SQLite-native）**
+- 新 `crates/tauri-app/src/sqlite_meta_repo.rs`：`SqliteMetaRepository::apply_typed_patch_actions`
+  单事务 UoW，承载 8 类 `TypedPatchAction`；每条 action 做 campaign scope 校验
+  （instance/task/knowledge 归属、definition 绑定、new_definition_id 存在性），
+  任一失败整体回滚。`MetaPatchFault::{AfterFirstAction, AfterAllActions}` 故障注入。
+- `meta_propose_campaign_repairs` / `meta_preview_typed_patch` / `meta_accept_typed_patch`
+  改为后端无关快照（`load_meta_snapshot_for_backend`，JSON store 或 SQLite 权威），
+  propose/preview/accept 共用同一 `check_campaign_health` + `build_patch_for_issue` +
+  `validate_patch_preconditions` 纯函数链；accept 的写盘经
+  `apply_typed_patch_actions_for_backend` 分派（JSON 逐 action + 全局锁 / SQLite 单事务）。
+- **revision 校验**：`TypedPatch.campaign_revision: Option<u64>`（serde default 兼容），
+  propose 盖章、accept 比对，不一致标 Stale 拒绝；active-turn barrier（
+  `reject_if_active_turn`）与 scope/stale 校验保持。
+- legacy `meta_accept_patch`：活动 Campaign 分支改为经 facade `set_world_info`
+  （SQLite 走 V006 表）；无活动 Campaign 的 CharacterStore 分支在 SQLite 下保持
+  显式 capability fail-closed（CharacterStore 仍未 SQLite 化，见 §30.6）。
+- `meta_backend.rs` 删除 `ensure_typed_patch_backend_supported` /
+  `ensure_json_meta_backend_supported` 两个过时守卫——「unsupported until an
+  atomic SQLite Meta UoW」字符串全库归零。
+
+**二、MVU 补齐**
+- 新 `crates/tauri-app/src/sqlite_mvu_repo.rs`：`SqliteMvuRepository::apply_schema`
+  单事务 UoW（translation → source 卡反查 → definition 归属校验 → 归一化 +
+  `compute_apply_preview` → card payload 更新 → 跨 campaign instance 默认值回填），
+  `MvuApplyFault::{AfterCardUpdate, AfterInstanceBackfill}` 故障注入。
+- `meta_preview_mvu_apply` / `meta_apply_mvu_schema` 经 backend_workflows 分派
+  （`preview_mvu_apply_for_backend` / `apply_mvu_schema_for_backend`）；JSON 既有
+  `meta_apply_mvu_schema_in_store` 保留为 JSON writer，测试签名改为 `&Id`。
+
+**三、Chronicle compressor（SQLite-native）**
+- 新 V006 迁移：`chronicle_compress_jobs`（campaign 级 open 去重部分唯一索引、
+  attempts/max_attempts/status 列）+ `campaign_world_info` 表。
+- 新 `crates/tauri-app/src/sqlite_compress_jobs.rs`：enqueue（幂等去重）、原子
+  claim（Pending→Running）、succeeded/failed_or_retry（仅 Running 终态化，迟到
+  结果安全）、Running→Pending 崩溃恢复、uncovered A/B 计数（SQLite 权威）。
+- `backend_workflows` chronicle 段重写：`maybe_spawn_chronicle_compress` /
+  `recover_compress_jobs_on_startup` / `spawn_compress_job_worker` 三处 JSON/SQLite
+  分派；worker 可注入压缩执行器（生产 = `run_compress_if_needed` 真实 LLM，测试 =
+  确定性 `publish_with_deterministic_texts`）；发布走既有
+  `SqliteChronicleRepository::publish_compress` UoW（job_id 唯一索引拒绝重复发布/
+  迟到结果，revision CAS 冲突 → job 回队重试）。
+- **删除两个「sqlite backend skips」生产分支**；Gate 3 的
+  `should_recover_json_compress_jobs` 删除，对应测试改写为「SQLite 门面不构造
+  JSON CompressJobStore」契约。
+
+**四、story_clock 与数据完整性**
+- 唯一权威 = `variables["story_clock"]`（字符串值）。`Campaign` 新增
+  `story_clock_diverged()` / `repair_story_clock_authority()`（可审核修复：不一致
+  时字段从 variables 权威同步并记 warning，绝不静默任选；非字符串 variables 项
+  不是合法权威，维持字段回退）。SQLite `get_campaign`/`list_campaigns` 与 JSON
+  `CampaignStore` 读取均执行修复；`runtime_support`/campaigns DTO/fork 全部改读
+  `current_story_clock()`；importer 索引列与 exporter 归一均以 variables 为准。
+- **reverse export**：导出 campaign 载荷前归一 story_clock；新增 `campaign_world_info/`
+  、`compress_jobs.json`、`mvu_translations.json` 导出（JSON 布局无损表达）；
+  `mutation_commits` / `chronicle_publication_jobs` 显式分类为 unsupported（只读
+  台账）；**pending pre-accept outbox 行存在时明确阻止导出**（活跃状态无法无损
+  表达）；manifest hash 覆盖新增集合；importer 回读三者并保持老目录 hash 稳定。
+- **WorldInfo**：V006 `campaign_world_info` 表 + `sqlite_runtime::get/set/mutate/
+  ensure/delete` + facade 7 个分派方法 + world_info 命令全部改经 facade；
+  惰性模板 seed 在 SQLite 下从 card payload `raw_card_json.character_book` 解析。
+- **card_name / role_type / campaign-scoped regex**：`conversation_card_names_for_backend`
+  （SQLite 一次 `list_card_names()` 快照）、`character_instance_dto_for_backend`
+  （SQLite 从卡 payload 富化 role_type）、`campaign_scoped_regex_scripts_for_backend`
+  （SQLite 从卡 payload 解析 scoped regex），三个「SQLite 保持 None/空」缺口关闭。
+- **FK/scope/orphan**：FK ON 由 connection.rs PRAGMA 强制并有校验测试；Meta/MVU
+  仓库行级 scope 校验；orphan Turn/Attempt 恢复（`fail_incomplete_turns` +
+  `fail_incomplete_preaccept`）与 compress job 崩溃恢复在启动路径均覆盖。
+- **能力矩阵**：SQLite 下 WorldInfo / TypedMetaPatch / MvuSchemaApply /
+  ChronicleCompressor / StoryClock 由 Unsupported/Degraded 转 Supported；
+  ActiveCampaignPersistence 保持 Degraded（进程内选择，文档化行为）；剩余
+  Unsupported = CampaignLifecycle / CardCommands / CharacterCommands / ImportExport /
+  KnowledgeTaskCommands / VariableCommands（§30.6）。
+
+### 30.2 新增测试（先写失败/回滚测试，再实现）
+
+| 测试 | 位置 | 覆盖 |
+|---|---|---|
+| 8 个 Meta UoW 单测（含 AfterFirstAction/AfterAllActions 回滚、scope 拒绝、stale definition、repoint 校验） | `sqlite_meta_repo.rs` | 单事务 + 故障注入回滚 |
+| 6 个 MVU UoW 单测（含 AfterCardUpdate/AfterInstanceBackfill 回滚、跨 campaign 回填、NoChanges/归属拒绝） | `sqlite_mvu_repo.rs` | 单事务 + 故障注入回滚 |
+| 6 个 compress job 单测（claim 原子、崩溃恢复、max-attempts、迟到结果终态保护、uncovered 计数） | `sqlite_compress_jobs.rs` | 队列事务语义 |
+| `sqlite_chronicle_compressor.rs` 集成（阈值→入队→claim→确定性 A→B 发布→迟到结果拒绝→发布故障注入回滚→job 回队→Running→Pending 恢复→迟到 worker 终态拒绝） | tests/ | 崩溃/迟到/revision 冲突故障注入 |
+| `sqlite_meta_lifecycle.rs` 重写（健康→提案→原子 apply→回滚→scope 拒绝→WorldInfo 读写路由） | tests/ | Meta + WorldInfo SQLite 全链路 |
+| `sqlite_mvu_translations.rs` 扩展（preview→apply→回滚→schema/instance 验证） | tests/ | MVU SQLite 全链路 |
+| `reverse_export_gate4.rs`（story_clock 归一、pending outbox 阻止导出、world info/compress jobs/MVU round trip + 幂等） | infra-sqlite tests/ | 反向导出一致性 |
+| domain story_clock 分歧/修复/非字符串 3 测 + infra 载入修复测 | domain / reverse_export_gate4 | 单一权威 + 可审核修复 |
+
+### 30.3 验证证据（全部通过）
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo check --workspace`：通过，零警告。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：76 个测试二进制全部通过（storyforge lib 394 passed /
+  3 ignored；domain 313 passed；app-meta / app-agent / app-pipeline 等全绿）。
+- `cargo test -p storyforge --test sqlite_optin_lifecycle`、`sqlite_preaccept_production_lifecycle`、
+  `sqlite_meta_lifecycle`、`sqlite_mvu_translations`、`sqlite_chronicle_compressor`：各 1 passed。
+- `cargo test -p storyforge-infra-sqlite`：全绿（含新增 reverse_export_gate4 4 项）。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 命令、162 invoke、0 missing、
+  `applicationMethodFlagReferences=0`、**`unsupported: []`**（四个过时标记族归零）。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8/8（Gate 4 断言
+  `unsupported.length === 0`）。
+- `frontend npm test`：476 passed / 0 failed；`npm run build`：通过（仅既有 chunk 警告）。
+- `git diff --check`：通过（仅 LF→CRLF 行尾提示）。
+
+### 30.4 Gate 4 通过条件逐项核对
+
+- [x] **SQLite 不再因 Meta、MVU、Chronicle 等核心操作回退或拒绝**：能力矩阵
+  WorldInfo/TypedMetaPatch/MvuSchemaApply/ChronicleCompressor/StoryClock → Supported；
+  `sqlite_meta_lifecycle` / `sqlite_mvu_translations` / `sqlite_chronicle_compressor`
+  集成测试走通全链路。
+- [x] **`rg "unsupported until an atomic SQLite Meta UoW"` 无生产调用点**：守卫函数
+  已删除，全库 0 命中。
+- [x] **`rg "sqlite backend skips"` 无核心能力跳过点**：两处跳过分支已由 SQLite-native
+  实现取代，全库 0 命中（baseline `unsupported: []` 钉住）。
+- [x] **所有新增事务均有真实 fault-injection rollback 测试**：Meta（2 注入点）、
+  MVU（2 注入点）、Chronicle 发布（AfterParentInsert 注入 + job 回队）、compress
+  job 终态（Running-only 保护），均有回滚断言。
+- [x] **全量验证通过、工作树干净**（提交后）。
+
+### 30.5 关键行为保持
+
+- Gate 3 约束全程未破：commands/应用服务无新增 JSON/SQLite 判断（静态白名单测试
+  通过）；backend 分派只在 facade / backend_workflows / sqlite_runtime；SQLite
+  活跃时四个 JSON writer 无构造机会（facadeSelectedWriterConstructors=4 不变）；
+  `applicationMethodFlagReferences=0` 不变。
+- 前端 IPC 合同未改：命令 175/175、invoke 162、0 missing；前端契约测试 8/8。
+- JSON 路径行为未变：typed patch JSON 写盘（全局锁 + 逐 action）、MVU JSON apply、
+  JSON compressor worker、WorldInfo JSON 文件路径全部保留原语义；既有 JSON 测试
+  全绿。
+- story_clock 修复为确定性可审核（warning 日志），未破坏既有 `set_variable` 双同步。
+
+### 30.6 诚实记录：仍为 Unsupported 的 SQLite 缺口（Gate 4 外）
+
+- CampaignLifecycle（create/fork/delete）、CardCommands、CharacterCommands、
+  ImportExport、KnowledgeTaskCommands、VariableCommands 在 SQLite 下仍显式
+  Unsupported（capability 声明式 fail-closed，不静默空列表）。
+- 无活跃 Campaign 时 legacy Meta patch 的 CharacterStore 回写分支在 SQLite 下
+  显式拒绝（CharacterStore 未 SQLite 化）。
+- 这些项的「unsupported 字段归零」要求在 Gate 4 通过条件之外；能力矩阵测试与
+  baseline 均已钉住剩余集合，不构成静默回退。
+
+### 30.7 提交
+
+- Gate 4 完成提交：未 push；SHA 以 git log 为准（本段不引用自身提交）。
+
+### 30.8 下一阶段
+
+Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
+回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

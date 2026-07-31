@@ -372,6 +372,155 @@ pub fn capture_audit_snapshot() -> Result<storyforge_infra_sqlite::SqliteAuditSn
     with_db_mut(|db| storyforge_infra_sqlite::capture_audit_snapshot(db).map_err(|e| e.to_string()))
 }
 
+/// Look up a card wrapper payload by its ST source character id (SQLite).
+pub fn get_card_payload_by_source(
+    source_character_id: &Id,
+) -> Result<Option<serde_json::Value>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_card_payload_by_source(db, source_character_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// One `card_id → name` snapshot from the SQLite card authority
+/// (Gate 4: conversation card-name enrichment).
+pub fn list_card_names() -> Result<std::collections::HashMap<Id, String>, String> {
+    with_db(|db| {
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT card_id, name FROM character_cards")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let card_id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                Ok((Id::from_str(&card_id), name))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (card_id, name) = row.map_err(|e| e.to_string())?;
+            out.insert(card_id, name);
+        }
+        Ok(out)
+    })
+}
+
+// ─── Gate 4: MVU schema apply (atomic single-transaction) ─────────────────
+
+/// Test-only fault injection for the MVU schema apply UoW (rollback proof).
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fail_mvu_apply_uow_for_test(fault: crate::sqlite_mvu_repo::MvuApplyFault) {
+    FAIL_MVU_APPLY_UOW.with(|slot| slot.set(fault));
+}
+
+thread_local! {
+    static FAIL_MVU_APPLY_UOW: std::cell::Cell<crate::sqlite_mvu_repo::MvuApplyFault> =
+        const { std::cell::Cell::new(crate::sqlite_mvu_repo::MvuApplyFault::None) };
+}
+
+/// Apply the MVU schema for one source card + definition in a single SQLite
+/// transaction (card payload update + cross-campaign instance default backfill).
+pub fn mvu_apply_schema(
+    source_character_id: &Id,
+    definition_id: &Id,
+) -> Result<crate::sqlite_mvu_repo::MvuApplySummary, String> {
+    with_db_mut(|db| {
+        let fault = FAIL_MVU_APPLY_UOW.with(|slot| slot.get());
+        crate::sqlite_mvu_repo::SqliteMvuRepository::apply_schema_with_fault(
+            db,
+            source_character_id,
+            definition_id,
+            fault,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+// ─── Gate 4: campaign world info (V006 campaign_world_info table) ──────────
+
+/// Load the campaign world info book from the SQLite authority.
+/// A missing row returns `Ok(None)` — callers decide whether to seed from the
+/// card template (the JSON store treats a missing file as an empty book).
+pub fn get_world_info(
+    campaign_id: &Id,
+) -> Result<Option<storyforge_domain::world_info::WorldInfoBook>, String> {
+    with_db(|db| {
+        let payload = SqliteProductionRepository::get_world_info_payload(db, campaign_id)
+            .map_err(|e| e.to_string())?;
+        payload
+            .map(|value| {
+                serde_json::from_value(value).map_err(|e| format!("反序列化世界书失败: {e}"))
+            })
+            .transpose()
+    })
+}
+
+/// Replace the whole campaign world info book (idempotent upsert).
+pub fn set_world_info(
+    campaign_id: &Id,
+    book: &storyforge_domain::world_info::WorldInfoBook,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(book).map_err(|e| format!("序列化世界书失败: {e}"))?;
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_world_info_payload(db, campaign_id, &payload)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Read-modify-write a campaign world info book under the process-owned SQLite
+/// lock. Mirrors the JSON `CampaignStore::mutate_world_info` semantics and
+/// returns the closure's result alongside the persisted book.
+pub fn mutate_world_info<T>(
+    campaign_id: &Id,
+    f: impl FnOnce(&mut storyforge_domain::world_info::WorldInfoBook) -> Result<T, String>,
+) -> Result<T, String> {
+    with_db_mut(|db| {
+        let mut book: storyforge_domain::world_info::WorldInfoBook =
+            match SqliteProductionRepository::get_world_info_payload(db, campaign_id)
+                .map_err(|e| e.to_string())?
+            {
+                Some(value) => {
+                    serde_json::from_value(value).map_err(|e| format!("反序列化世界书失败: {e}"))?
+                }
+                None => storyforge_domain::world_info::WorldInfoBook {
+                    entries: Vec::new(),
+                    source: storyforge_domain::Source::Native,
+                    metadata: Default::default(),
+                },
+            };
+        let result = f(&mut book)?;
+        let payload = serde_json::to_value(&book).map_err(|e| format!("序列化世界书失败: {e}"))?;
+        SqliteProductionRepository::save_world_info_payload(db, campaign_id, &payload)
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    })
+}
+
+/// Seed the campaign world info from a card template when the campaign book is
+/// still empty (lazy migration, same semantics as the JSON store).
+pub fn ensure_world_info_from_book(
+    campaign_id: &Id,
+    template: &storyforge_domain::world_info::WorldInfoBook,
+) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+    let book = mutate_world_info(campaign_id, |existing| {
+        if existing.entries.is_empty() {
+            *existing = template.clone();
+        }
+        Ok(existing.clone())
+    })?;
+    Ok(book)
+}
+
+/// Delete the campaign world info row (campaign teardown).
+pub fn delete_world_info(campaign_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::delete_world_info_payload(db, campaign_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn reconfirm_accept_replay(
     attempt: &storyforge_domain::turn::TurnAttempt,
     outcome: crate::turn_lifecycle::AcceptOutcome,
@@ -669,5 +818,178 @@ pub fn recover_active_preaccept_state(
 ) -> Result<PreacceptRecoverySnapshot, String> {
     with_db(|db| {
         SqlitePreacceptRepository::recover_active_state(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+// ─── Gate 4: Chronicle compressor jobs (V006 table) ───────────────────────
+
+pub fn compress_enqueue_or_get_open(
+    campaign_id: &Id,
+    conversation_id: Option<Id>,
+    lineage_id: Option<Id>,
+    uncovered_a: u32,
+    uncovered_b: u32,
+) -> Result<(crate::sqlite_compress_jobs::SqliteCompressJob, bool), String> {
+    with_db_mut(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::enqueue_or_get_open(
+            db,
+            campaign_id,
+            conversation_id,
+            lineage_id,
+            uncovered_a,
+            uncovered_b,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_try_claim_pending(job_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::try_claim_pending(db, job_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Finalize a job only while it is still Running (late/concurrent worker safe).
+pub fn compress_mark_succeeded(job_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::mark_succeeded(db, job_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_mark_failed_or_retry(job_id: &Id, err: &str) -> Result<bool, String> {
+    with_db_mut(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::mark_failed_or_retry(
+            db, job_id, err,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_reset_running_to_pending() -> Result<usize, String> {
+    with_db_mut(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::reset_running_to_pending(db)
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_list_open() -> Result<Vec<crate::sqlite_compress_jobs::SqliteCompressJob>, String> {
+    with_db(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::list_open(db)
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_list_all() -> Result<Vec<crate::sqlite_compress_jobs::SqliteCompressJob>, String> {
+    with_db(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::list_all(db)
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn compress_count_uncovered(campaign_id: &Id) -> Result<(usize, usize), String> {
+    with_db(|db| {
+        crate::sqlite_compress_jobs::SqliteCompressJobRepository::count_uncovered(db, campaign_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Publish a compress batch through the typed Chronicle publication UoW
+/// (atomic parents + covered_by + revision bump + job ledger).
+pub fn publish_chronicle_compress(
+    campaign_id: &Id,
+    publication_id: &Id,
+    parents: &[storyforge_domain::agent::RoundSummary],
+    child_covered_by: &[(Id, Id)],
+    job_id: Option<&str>,
+) -> Result<storyforge_infra_sqlite::publication::PublishOutcome, String> {
+    with_db_mut(|db| {
+        let request = storyforge_infra_sqlite::publication::PublishRequest {
+            campaign_id,
+            publication_id,
+            parents,
+            child_covered_by,
+            job_id,
+        };
+        storyforge_infra_sqlite::publication::SqliteChronicleRepository::publish_compress(
+            db, request,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Seed a leaf/stage summary row directly (test/bootstrap helper).
+pub fn seed_summary(summary: &storyforge_domain::agent::RoundSummary) -> Result<(), String> {
+    with_db_mut(|db| {
+        storyforge_infra_sqlite::publication::SqliteChronicleRepository::seed_summary(db, summary)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Test-only fault injection for the publication UoW (rollback proof).
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fail_chronicle_publish_for_test(fault: storyforge_infra_sqlite::publication::PublishFault) {
+    FAIL_CHRONICLE_PUBLISH.with(|slot| slot.set(fault));
+}
+
+thread_local! {
+    static FAIL_CHRONICLE_PUBLISH: std::cell::Cell<storyforge_infra_sqlite::publication::PublishFault> =
+        const { std::cell::Cell::new(storyforge_infra_sqlite::publication::PublishFault::None) };
+}
+
+/// Publish with the test fault flag applied (used by the worker when set).
+pub fn publish_chronicle_compress_with_fault_flag(
+    campaign_id: &Id,
+    publication_id: &Id,
+    parents: &[storyforge_domain::agent::RoundSummary],
+    child_covered_by: &[(Id, Id)],
+    job_id: Option<&str>,
+) -> Result<storyforge_infra_sqlite::publication::PublishOutcome, String> {
+    with_db_mut(|db| {
+        let fault = FAIL_CHRONICLE_PUBLISH.with(|slot| slot.get());
+        let request = storyforge_infra_sqlite::publication::PublishRequest {
+            campaign_id,
+            publication_id,
+            parents,
+            child_covered_by,
+            job_id,
+        };
+        storyforge_infra_sqlite::publication::SqliteChronicleRepository::publish_compress_with_fault(
+            db, request, fault,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+// ─── Gate 4: typed Meta patch atomic apply ─────────────────────────────────
+
+/// Test-only fault injection for the typed Meta patch UoW (rollback proof).
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fail_meta_patch_uow_for_test(fault: crate::sqlite_meta_repo::MetaPatchFault) {
+    FAIL_META_PATCH_UOW.with(|slot| slot.set(fault));
+}
+
+thread_local! {
+    static FAIL_META_PATCH_UOW: std::cell::Cell<crate::sqlite_meta_repo::MetaPatchFault> =
+        const { std::cell::Cell::new(crate::sqlite_meta_repo::MetaPatchFault::None) };
+}
+
+/// Apply every action of one typed Meta patch in a single SQLite transaction.
+pub fn meta_apply_typed_patch_actions(
+    campaign_id: &Id,
+    actions: &[storyforge_app_meta::TypedPatchAction],
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        let fault = FAIL_META_PATCH_UOW.with(|slot| slot.get());
+        crate::sqlite_meta_repo::SqliteMetaRepository::apply_typed_patch_actions_with_fault(
+            db,
+            campaign_id,
+            actions,
+            fault,
+        )
+        .map_err(|e| e.to_string())
     })
 }

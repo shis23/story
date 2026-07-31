@@ -35,6 +35,10 @@ tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 sha2.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
+# Gate 4: SQLite-native Meta/MVU/Chronicle job repositories run inside this
+# composition root against infra-sqlite's UnitOfWork. Feature set is unified
+# with infra-sqlite (bundled+backup) by Cargo; no connection is opened here.
+rusqlite = "0.32"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -78,6 +78,11 @@ pub struct TypedPatch {
     pub diff: Vec<FieldDiff>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub status: TypedPatchStatus,
+    /// 提案时的 campaign revision（Gate 4 revision 校验）。
+    /// propose 时盖章；accept 时若与当前 revision 不一致则拒绝（stale）。
+    /// 旧内存 patch 无此字段（serde default）时跳过校验，保持向后兼容。
+    #[serde(default)]
+    pub campaign_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,6 +330,7 @@ fn build_orphan_instance_patch(issue: &HealthIssue, input: &PreviewInput) -> Opt
         diff,
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     })
 }
 
@@ -362,6 +368,7 @@ fn build_unresolved_knowledge_patch(
         diff,
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     })
 }
 
@@ -423,6 +430,7 @@ fn build_orphan_task_reference_patch(
         diff,
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     })
 }
 
@@ -511,6 +519,7 @@ fn build_variable_schema_mismatch_patch(
         diff,
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     })
 }
 
@@ -752,6 +761,7 @@ pub fn build_patch_from_action(
         diff,
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     })
 }
 
@@ -1183,6 +1193,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         let mut instances = vec![inst];
@@ -1249,6 +1260,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         let mut instances = vec![];
@@ -1299,6 +1311,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         let mut instances = vec![];
@@ -1339,6 +1352,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         let mut instances = vec![inst];
@@ -1376,6 +1390,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         let mut instances = vec![];
@@ -1599,6 +1614,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -1640,6 +1656,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -1678,6 +1695,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -1725,6 +1743,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -1747,6 +1766,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
         let input = PreviewInput {
             instances: &[],
@@ -1773,6 +1793,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
         let input = PreviewInput {
             instances: &[],
@@ -1798,6 +1819,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_revision: None,
         };
         let input = PreviewInput {
             instances: &[],

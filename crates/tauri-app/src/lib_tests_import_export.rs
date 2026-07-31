@@ -1758,8 +1758,8 @@ async fn test_real_complex_card_offline_mvu_plumbing_smoke() {
     .unwrap();
     meta_apply_mvu_schema_in_store(
         &store,
-        character.id.as_str().to_string(),
-        stored.card.character_definitions[0].id.as_str().to_string(),
+        &character.id,
+        &stored.card.character_definitions[0].id,
     )
     .unwrap();
 

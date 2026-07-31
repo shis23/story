@@ -60,26 +60,3 @@ pub fn sqlite_campaign_health_issues(campaign_id: &Id) -> Result<Vec<HealthIssue
     };
     Ok(check_campaign_health(&snapshot))
 }
-
-/// Typed patch preview/accept currently relies on the multi-file JSON
-/// CampaignStore. In an SQLite-authoritative process that would either read a
-/// disabled sentinel or create a second authority, so reject it explicitly.
-pub fn ensure_typed_patch_backend_supported(sqlite_active: bool) -> Result<(), String> {
-    ensure_json_meta_backend_supported(sqlite_active, "typed patch preview/accept")
-}
-
-/// Reject any Meta operation whose implementation still reads or writes the
-/// legacy multi-file JSON campaign authority. Returning an explicit
-/// unsupported error is safer than consulting a stale/disabled store or
-/// creating a second writer while SQLite is authoritative.
-pub fn ensure_json_meta_backend_supported(
-    sqlite_active: bool,
-    capability: &str,
-) -> Result<(), String> {
-    if sqlite_active {
-        return Err(format!(
-            "SQLite {capability} is unsupported until an atomic SQLite Meta UoW exists"
-        ));
-    }
-    Ok(())
-}

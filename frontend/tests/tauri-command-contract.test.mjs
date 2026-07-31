@@ -38,7 +38,11 @@ test('Gate 3 records the shrinking ambient SQLite branch surface', () => {
   // else (mirrors the Rust static whitelist test).
   assert.equal(baseline.sqlite.applicationMethodFlagReferences, 0)
   assert.ok(baseline.sqlite.facadeMethodFlagReferences > 0)
-  assert.ok(baseline.sqlite.unsupported.length > 0)
+  // Gate 4: the four SQLite-unsupported marker families
+  // (ensure_json_meta_backend_supported / ensure_typed_patch_backend_supported /
+  // "sqlite backend skips" / "unsupported until an atomic SQLite Meta UoW")
+  // must be gone — SQLite is native for Meta/MVU/Chronicle/WorldInfo.
+  assert.deepEqual(baseline.sqlite.unsupported, [])
 })
 
 test('Gate 1 keeps concrete Tauri commands out of lib.rs', () => {

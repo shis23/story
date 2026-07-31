@@ -1,4 +1,4 @@
-mod backend_workflows;
+pub mod backend_workflows;
 pub mod campaign_store;
 mod card_shell_cache;
 mod card_studio_api;
@@ -16,6 +16,9 @@ mod preset_store;
 pub mod production_postprocess;
 mod runtime_support;
 mod shell_doc_protocol;
+pub mod sqlite_compress_jobs;
+pub mod sqlite_meta_repo;
+pub mod sqlite_mvu_repo;
 pub mod sqlite_runtime;
 mod startup_support;
 mod storage;
@@ -32,6 +35,8 @@ use commands::{
 };
 // Stable crate-root surface used by deterministic/real-LLM harnesses. Keep the
 // command module private while exposing only the shared postprocess helpers.
+/// Gate 4: backend-neutral Meta snapshot DTO (typed patch propose/preview).
+pub use commands::meta_typed::MetaSnapshot;
 pub use commands::writing::{
     is_postprocess_instance_present, normalize_knowledge_update_for_postprocess,
 };

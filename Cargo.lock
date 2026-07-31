@@ -3806,6 +3806,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -4021,6 +4022,7 @@ dependencies = [
  "storyforge-domain",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

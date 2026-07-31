@@ -209,20 +209,19 @@ impl StorageFacade {
             | BackendCapability::KnowledgeTaskRead
             | BackendCapability::VariableRead
             | BackendCapability::MvuTranslation
-            | BackendCapability::ChroniclePublication => CapabilityStatus::Supported,
-            BackendCapability::ActiveCampaignPersistence | BackendCapability::StoryClock => {
-                CapabilityStatus::Degraded
-            }
+            | BackendCapability::ChroniclePublication
+            | BackendCapability::WorldInfo
+            | BackendCapability::TypedMetaPatch
+            | BackendCapability::MvuSchemaApply
+            | BackendCapability::ChronicleCompressor
+            | BackendCapability::StoryClock => CapabilityStatus::Supported,
+            BackendCapability::ActiveCampaignPersistence => CapabilityStatus::Degraded,
             BackendCapability::CampaignLifecycle
             | BackendCapability::CardCommands
             | BackendCapability::CharacterCommands
             | BackendCapability::ImportExport
             | BackendCapability::KnowledgeTaskCommands
-            | BackendCapability::VariableCommands
-            | BackendCapability::WorldInfo
-            | BackendCapability::TypedMetaPatch
-            | BackendCapability::MvuSchemaApply
-            | BackendCapability::ChronicleCompressor => CapabilityStatus::Unsupported,
+            | BackendCapability::VariableCommands => CapabilityStatus::Unsupported,
         }
     }
 
@@ -627,6 +626,210 @@ impl StorageFacade {
                 .list_summaries(campaign_id))
         }
     }
+
+    // ─── Gate 4: campaign world info (backend-neutral facade) ─────────────
+
+    /// Read the campaign world info book. Missing data yields an empty book on
+    /// both backends (JSON treats a missing file as empty; SQLite a missing row).
+    pub fn get_world_info(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+        if self.is_sqlite() {
+            Ok(sqlite_runtime::get_world_info(campaign_id)?.unwrap_or_else(empty_world_info_book))
+        } else {
+            self.json_campaign_store(BackendCapability::WorldInfo, "get campaign world info")?
+                .get_world_info(campaign_id)
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    pub fn set_world_info(
+        &self,
+        campaign_id: &Id,
+        book: &storyforge_domain::world_info::WorldInfoBook,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::set_world_info(campaign_id, book)
+        } else {
+            self.json_campaign_store(BackendCapability::WorldInfo, "set campaign world info")?
+                .set_world_info(campaign_id, book.clone())
+        }
+    }
+
+    /// Seed the campaign book from a card template when it is still empty.
+    pub fn ensure_world_info_from_book(
+        &self,
+        campaign_id: &Id,
+        template: &storyforge_domain::world_info::WorldInfoBook,
+    ) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::ensure_world_info_from_book(campaign_id, template)
+        } else {
+            self.json_campaign_store(BackendCapability::WorldInfo, "ensure campaign world info")?
+                .ensure_world_info_from_book(campaign_id, template)
+        }
+    }
+
+    pub fn add_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        entry: storyforge_domain::world_info::WorldInfoEntry,
+    ) -> Result<usize, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_world_info(campaign_id, |book| {
+                let mut entry = entry.clone();
+                if entry.extensions.is_null() {
+                    entry.extensions = serde_json::json!({ "sf_source": "user" });
+                } else if let Some(obj) = entry.extensions.as_object_mut() {
+                    obj.entry("sf_source")
+                        .or_insert_with(|| serde_json::json!("user"));
+                }
+                book.entries.push(entry);
+                Ok(book.entries.len() - 1)
+            })
+        } else {
+            self.json_campaign_store(
+                BackendCapability::WorldInfo,
+                "add campaign world info entry",
+            )?
+            .add_world_info_entry(campaign_id, entry)
+        }
+    }
+
+    pub fn update_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        entry: storyforge_domain::world_info::WorldInfoEntry,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_world_info(campaign_id, |book| {
+                if entry_index >= book.entries.len() {
+                    return Err(format!("世界书条目索引越界: {entry_index}"));
+                }
+                book.entries[entry_index] = entry;
+                Ok(())
+            })?;
+            Ok(())
+        } else {
+            self.json_campaign_store(
+                BackendCapability::WorldInfo,
+                "update campaign world info entry",
+            )?
+            .update_world_info_entry(campaign_id, entry_index, entry)
+        }
+    }
+
+    pub fn delete_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_world_info(campaign_id, |book| {
+                if entry_index >= book.entries.len() {
+                    return Err(format!("世界书条目索引越界: {entry_index}"));
+                }
+                book.entries.remove(entry_index);
+                Ok(())
+            })?;
+            Ok(())
+        } else {
+            self.json_campaign_store(
+                BackendCapability::WorldInfo,
+                "delete campaign world info entry",
+            )?
+            .delete_world_info_entry(campaign_id, entry_index)
+        }
+    }
+
+    pub fn set_world_info_route(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        route: storyforge_domain::world_info::LoreRoute,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_world_info(campaign_id, |book| {
+                if entry_index >= book.entries.len() {
+                    return Err(format!("世界书条目索引越界: {entry_index}"));
+                }
+                book.entries[entry_index].route = route;
+                book.entries[entry_index].disabled = matches!(
+                    book.entries[entry_index].route,
+                    storyforge_domain::world_info::LoreRoute::Disabled
+                );
+                Ok(())
+            })?;
+            Ok(())
+        } else {
+            self.json_campaign_store(
+                BackendCapability::WorldInfo,
+                "set campaign world info route",
+            )?
+            .set_world_info_route(campaign_id, entry_index, route)
+        }
+    }
+
+    pub fn set_world_info_entry_enabled(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        enabled: bool,
+    ) -> Result<storyforge_domain::world_info::WorldInfoBook, String> {
+        if self.is_sqlite() {
+            let book = sqlite_runtime::mutate_world_info(campaign_id, |book| {
+                let entry = book
+                    .entries
+                    .get_mut(entry_index)
+                    .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
+                entry.set_enabled(enabled)?;
+                Ok(book.clone())
+            })?;
+            Ok(book)
+        } else {
+            self.json_campaign_store(
+                BackendCapability::WorldInfo,
+                "set campaign world info enabled",
+            )?
+            .set_world_info_entry_enabled(campaign_id, entry_index, enabled)
+        }
+    }
+
+    /// Template world info resolvable from the SQLite card authority
+    /// (`raw_card_json.character_book`), used when a campaign book is empty.
+    pub fn template_world_info_from_card(
+        &self,
+        card_payload: &serde_json::Value,
+    ) -> Result<Option<storyforge_domain::world_info::WorldInfoBook>, String> {
+        if !self.is_sqlite() {
+            return Ok(None);
+        }
+        let stored: crate::campaign_store::StoredCard =
+            serde_json::from_value(card_payload.clone())
+                .map_err(|e| format!("invalid SQLite card payload: {e}"))?;
+        let template = stored
+            .card
+            .raw_card_json
+            .get("character_book")
+            .and_then(|value| {
+                serde_json::from_value::<storyforge_domain::character::StWorldInfoBook>(
+                    value.clone(),
+                )
+                .ok()
+            })
+            .map(storyforge_domain::world_info::WorldInfoBook::from_st);
+        Ok(template)
+    }
+}
+
+fn empty_world_info_book() -> storyforge_domain::world_info::WorldInfoBook {
+    storyforge_domain::world_info::WorldInfoBook {
+        entries: Vec::new(),
+        source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
+    }
 }
 
 /// Resolve and pin the storage backend for this process.
@@ -907,31 +1110,28 @@ mod tests {
         );
         assert_eq!(
             facade.capability(BackendCapability::WorldInfo),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::TypedMetaPatch),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::ChronicleCompressor),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
-        let error = facade
+        assert_eq!(
+            facade.capability(BackendCapability::StoryClock),
+            CapabilityStatus::Supported
+        );
+        facade
             .require_supported(
                 BackendCapability::ChronicleCompressor,
                 "chronicle compression",
             )
-            .expect_err("unsupported SQLite capability must fail closed");
-        assert!(error.contains("ChronicleCompressor"));
-        assert!(error.contains("Unsupported"));
-        assert!(!error.contains(dir.path().to_string_lossy().as_ref()));
+            .expect("SQLite chronicle compressor must be supported");
         assert_eq!(
             facade.capability(BackendCapability::ActiveCampaignPersistence),
-            CapabilityStatus::Degraded
-        );
-        assert_eq!(
-            facade.capability(BackendCapability::StoryClock),
             CapabilityStatus::Degraded
         );
 
@@ -946,11 +1146,13 @@ mod tests {
             BackendCapability::VariableRead,
             BackendCapability::MvuTranslation,
             BackendCapability::ChroniclePublication,
-        ];
-        let degraded = [
-            BackendCapability::ActiveCampaignPersistence,
+            BackendCapability::WorldInfo,
+            BackendCapability::TypedMetaPatch,
+            BackendCapability::MvuSchemaApply,
+            BackendCapability::ChronicleCompressor,
             BackendCapability::StoryClock,
         ];
+        let degraded = [BackendCapability::ActiveCampaignPersistence];
         let unsupported = [
             BackendCapability::CampaignLifecycle,
             BackendCapability::CardCommands,
@@ -958,10 +1160,6 @@ mod tests {
             BackendCapability::ImportExport,
             BackendCapability::KnowledgeTaskCommands,
             BackendCapability::VariableCommands,
-            BackendCapability::WorldInfo,
-            BackendCapability::TypedMetaPatch,
-            BackendCapability::MvuSchemaApply,
-            BackendCapability::ChronicleCompressor,
         ];
         assert_eq!(
             supported.len() + degraded.len() + unsupported.len(),

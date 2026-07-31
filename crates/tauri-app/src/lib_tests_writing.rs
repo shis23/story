@@ -2648,7 +2648,8 @@ fn test_campaign_context_snapshot_applies_runtime_to_contexts() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let mut campaign = Campaign::new(Id::from_str("card-1"), "run");
-    campaign.story_clock = "Day 3".into();
+    // Gate 4：story_clock 唯一权威 = variables；必须经 set_variable 设置。
+    campaign.set_variable("story_clock", serde_json::json!("Day 3"), 0);
     store.save_campaign(campaign.clone()).unwrap();
 
     let instance = CharacterInstance::temporary(campaign.id.clone(), "Ghost");

@@ -146,7 +146,7 @@ impl SqliteProductionRepository {
     }
 
     pub fn get_campaign(db: &Database, campaign_id: &Id) -> Result<Option<Campaign>> {
-        load_payload(
+        load_campaign_payload(
             db.connection(),
             "SELECT payload_json FROM campaigns WHERE campaign_id = ?1",
             campaign_id.as_str(),
@@ -157,7 +157,7 @@ impl SqliteProductionRepository {
     /// campaign picker uses this in opt-in mode instead of consulting the
     /// legacy JSON store after cutover.
     pub fn list_campaigns(db: &Database) -> Result<Vec<Campaign>> {
-        load_payload_list(
+        load_campaign_payload_list(
             db.connection(),
             "SELECT payload_json FROM campaigns ORDER BY campaign_id",
             [],
@@ -411,6 +411,97 @@ impl SqliteProductionRepository {
         write_task(tx, task)?;
         uow.commit()?;
         Ok(())
+    }
+
+    // ─── Gate 4: Meta / MVU / WorldInfo shared row helpers ─────────────────
+
+    /// Delete a campaign-scoped knowledge row (Meta typed-patch orphan prune).
+    /// Returns whether a row was actually removed.
+    pub fn delete_knowledge(db: &mut Database, knowledge_id: &Id) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM character_knowledge WHERE knowledge_id = ?1",
+            [knowledge_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// List every instance across all campaigns (MVU apply backfill scans all
+    /// campaigns that reference a definition).
+    pub fn list_all_instances(db: &Database) -> Result<Vec<CharacterInstance>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM character_instances ORDER BY instance_id",
+            [],
+        )
+    }
+
+    /// Look up a card wrapper payload by its ST source character id
+    /// (def→source reverse lookup / MVU apply entry point).
+    pub fn get_card_payload_by_source(
+        db: &Database,
+        source_character_id: &Id,
+    ) -> Result<Option<serde_json::Value>> {
+        load_payload(
+            db.connection(),
+            "SELECT payload_json FROM character_cards WHERE source_character_id = ?1",
+            source_character_id.as_str(),
+        )
+    }
+
+    /// Persist the campaign-scoped world info book (V006 `campaign_world_info`).
+    /// Payload is the opaque `WorldInfoBook` JSON owned by the application layer.
+    pub fn save_world_info_payload(
+        db: &mut Database,
+        campaign_id: &Id,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO campaign_world_info (campaign_id, payload_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(campaign_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            "#,
+            rusqlite::params![
+                campaign_id.as_str(),
+                json(payload)?,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    pub fn get_world_info_payload(
+        db: &Database,
+        campaign_id: &Id,
+    ) -> Result<Option<serde_json::Value>> {
+        load_payload(
+            db.connection(),
+            "SELECT payload_json FROM campaign_world_info WHERE campaign_id = ?1",
+            campaign_id.as_str(),
+        )
+    }
+
+    /// Delete the campaign world info row (campaign teardown / re-import).
+    pub fn delete_world_info_payload(db: &mut Database, campaign_id: &Id) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(removed > 0)
     }
 
     // ─── MVU 翻译缓存（V005；payload 为上层 StoredMvuTranslation 全量 JSON）───
@@ -1193,6 +1284,43 @@ fn load_payload<T: DeserializeOwned>(
     payload
         .map(|value| serde_json::from_str(&value).map_err(Into::into))
         .transpose()
+}
+
+/// Campaign load with Gate 4 story-clock authority repair: the legacy top-level
+/// `story_clock` field is synced from the authoritative `variables` entry and
+/// the correction is logged for audit. Never silently pick one side.
+fn load_campaign_payload(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    id: &str,
+) -> Result<Option<Campaign>> {
+    let mut campaign: Option<Campaign> = load_payload(conn, sql, id)?;
+    if let Some(c) = campaign.as_mut()
+        && c.repair_story_clock_authority()
+    {
+        tracing::warn!(
+            campaign_id = %c.id,
+            "campaign story_clock field diverged from variables authority; repaired from variables"
+        );
+    }
+    Ok(campaign)
+}
+
+fn load_campaign_payload_list<const N: usize>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: [&str; N],
+) -> Result<Vec<Campaign>> {
+    let mut campaigns: Vec<Campaign> = load_payload_list(conn, sql, params)?;
+    for campaign in campaigns.iter_mut() {
+        if campaign.repair_story_clock_authority() {
+            tracing::warn!(
+                campaign_id = %campaign.id,
+                "campaign story_clock field diverged from variables authority; repaired from variables"
+            );
+        }
+    }
+    Ok(campaigns)
 }
 
 fn load_payload_list<T, const N: usize>(

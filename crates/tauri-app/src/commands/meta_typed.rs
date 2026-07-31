@@ -3,21 +3,58 @@ use crate::storage_backend::BackendCapability;
 
 // ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
 
-/// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
-pub(crate) fn build_preview_input<'a>(
-    _store: &campaign_store::CampaignStore,
-    campaign: &'a storyforge_domain::campaign::Campaign,
-    instances: &'a [storyforge_domain::campaign::CharacterInstance],
-    definitions: &'a Vec<storyforge_domain::character::CharacterDefinition>,
-    knowledge: &'a [storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
-    tasks: &'a [storyforge_domain::story_task::StoryTask],
-) -> storyforge_app_meta::PreviewInput<'a> {
-    storyforge_app_meta::PreviewInput {
-        instances,
+/// Meta 纯函数所需的当前 Campaign 快照（后端无关：JSON store 或 SQLite 权威）。
+pub struct MetaSnapshot {
+    pub campaign: storyforge_domain::campaign::Campaign,
+    pub definitions: Vec<storyforge_domain::character::CharacterDefinition>,
+    pub instances: Vec<storyforge_domain::campaign::CharacterInstance>,
+    pub knowledge: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>,
+    pub tasks: Vec<storyforge_domain::story_task::StoryTask>,
+}
+
+/// 从 JSON CampaignStore 组装快照（既有 in_store 路径）。
+pub(crate) fn load_meta_snapshot_from_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+) -> Result<MetaSnapshot, TauriCommandError> {
+    let campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .map(|c| c.card.character_definitions)
+        .unwrap_or_default();
+    let instances = store.list_instances(campaign_id);
+    let knowledge = store.list_knowledge(campaign_id);
+    let tasks = store.list_tasks(campaign_id);
+    Ok(MetaSnapshot {
+        campaign,
         definitions,
+        instances,
         knowledge,
         tasks,
-        campaign: Some(campaign),
+    })
+}
+
+/// 从 pinned backend 组装 Meta 快照（分派在 backend_workflows 白名单内）。
+pub(crate) fn load_meta_snapshot_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+) -> Result<MetaSnapshot, TauriCommandError> {
+    crate::backend_workflows::load_meta_snapshot_for_backend(storage, campaign_id)
+        .map_err(TauriCommandError::storage)
+}
+
+/// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
+pub(crate) fn build_preview_input<'a>(
+    snapshot: &'a MetaSnapshot,
+) -> storyforge_app_meta::PreviewInput<'a> {
+    storyforge_app_meta::PreviewInput {
+        instances: &snapshot.instances,
+        definitions: &snapshot.definitions,
+        knowledge: &snapshot.knowledge,
+        tasks: &snapshot.tasks,
+        campaign: Some(&snapshot.campaign),
     }
 }
 
@@ -34,52 +71,51 @@ pub(crate) fn meta_propose_campaign_repairs(
             "campaign repair proposals",
         )
         .map_err(TauriCommandError::validation)?;
-    let store = state.json_campaign_store(
-        BackendCapability::TypedMetaPatch,
-        "campaign repair proposals",
-    )?;
-    meta_propose_campaign_repairs_in_store(store, &campaign_id, state.inner().as_ref())
+    meta_propose_campaign_repairs_for_backend(state.storage(), &campaign_id, state.inner().as_ref())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn meta_propose_campaign_repairs_in_store(
     store: &campaign_store::CampaignStore,
     campaign_id: &str,
     state: &AppState,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let cid = Id::from_str(campaign_id);
-    let campaign = store
-        .get_campaign(&cid)
-        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+    let snapshot = load_meta_snapshot_from_store(store, &cid)?;
+    propose_patches_from_snapshot(&snapshot, state, &cid)
+}
 
-    let definitions = store
-        .get_card(&campaign.card_id)
-        .map(|c| c.card.character_definitions)
-        .unwrap_or_default();
+pub(crate) fn meta_propose_campaign_repairs_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
+    let snapshot = load_meta_snapshot_for_backend(storage, &cid)?;
+    propose_patches_from_snapshot(&snapshot, state, &cid)
+}
 
-    let instances = store.list_instances(&cid);
-    let knowledge = store.list_knowledge(&cid);
-    let tasks = store.list_tasks(&cid);
-
-    let input = build_preview_input(
-        store,
-        &campaign,
-        &instances,
-        &definitions,
-        &knowledge,
-        &tasks,
-    );
+/// 快照 → health issue → typed patch（纯函数），propose 时盖章 campaign_revision。
+fn propose_patches_from_snapshot(
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+    _cid: &Id,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let input = build_preview_input(snapshot);
 
     let issues =
         storyforge_app_meta::check_campaign_health(&storyforge_app_meta::CampaignHealthSnapshot {
-            instances: &instances,
-            definitions: &definitions,
-            knowledge: &knowledge,
-            tasks: &tasks,
+            instances: &snapshot.instances,
+            definitions: &snapshot.definitions,
+            knowledge: &snapshot.knowledge,
+            tasks: &snapshot.tasks,
         });
 
     let mut patches: Vec<storyforge_app_meta::TypedPatch> = Vec::new();
     for issue in &issues {
-        if let Some(patch) = storyforge_app_meta::build_patch_for_issue(issue, &input) {
+        if let Some(mut patch) = storyforge_app_meta::build_patch_for_issue(issue, &input) {
+            // Gate 4 revision 校验：提案盖章，accept 时比对。
+            patch.campaign_revision = Some(snapshot.campaign.revision);
             patches.push(patch);
         }
     }
@@ -179,20 +215,33 @@ pub(crate) fn meta_preview_typed_patch(
             "typed Meta patch preview",
         )
         .map_err(TauriCommandError::validation)?;
-    let store = state.json_campaign_store(
-        BackendCapability::TypedMetaPatch,
-        "typed Meta patch preview",
-    )?;
-    meta_preview_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
+    let snapshot = load_meta_snapshot_for_backend(state.storage(), &Id::from_str(&campaign_id))?;
+    meta_preview_typed_patch_with_snapshot(
+        &patch_id,
+        &campaign_id,
+        &snapshot,
+        state.inner().as_ref(),
+    )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn meta_preview_typed_patch_in_store(
     store: &campaign_store::CampaignStore,
     patch_id: &str,
     campaign_id: &str,
     state: &AppState,
 ) -> Result<serde_json::Value, TauriCommandError> {
-    let cid = Id::from_str(campaign_id);
+    let snapshot = load_meta_snapshot_from_store(store, &Id::from_str(campaign_id))?;
+    meta_preview_typed_patch_with_snapshot(patch_id, campaign_id, &snapshot, state)
+}
+
+pub(crate) fn meta_preview_typed_patch_with_snapshot(
+    patch_id: &str,
+    campaign_id: &str,
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+) -> Result<serde_json::Value, TauriCommandError> {
+    let _cid = Id::from_str(campaign_id);
     // 找到 patch
     let mut typed = state
         .typed_patches
@@ -203,25 +252,7 @@ pub(crate) fn meta_preview_typed_patch_in_store(
         .find(|p| p.id == patch_id)
         .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
 
-    // 取当前 campaign 快照
-    let campaign = store
-        .get_campaign(&cid)
-        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
-    let definitions = store
-        .get_card(&campaign.card_id)
-        .map(|c| c.card.character_definitions)
-        .unwrap_or_default();
-    let instances = store.list_instances(&cid);
-    let knowledge = store.list_knowledge(&cid);
-    let tasks = store.list_tasks(&cid);
-
-    let input = storyforge_app_meta::PreviewInput {
-        instances: &instances,
-        definitions: &definitions,
-        knowledge: &knowledge,
-        tasks: &tasks,
-        campaign: Some(&campaign),
-    };
+    let input = build_preview_input(snapshot);
 
     // Preview 与 Accept 共用同一前置条件纯函数（Gate 2 Batch 2.4）：
     // target 缺失或 definition/schema 前置条件不满足时都标 Stale，确保 Preview 看到的
@@ -258,17 +289,66 @@ pub(crate) fn meta_accept_typed_patch(
     // Phase A 屏障：活动 Turn 存在时拒绝 Meta patch accept（防并发写竞争）
     let cid = Id::from_str(&campaign_id);
     reject_if_active_turn(state.storage(), &cid)?;
-    let store =
-        state.json_campaign_store(BackendCapability::TypedMetaPatch, "typed Meta patch accept")?;
-    meta_accept_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
+    let snapshot = load_meta_snapshot_for_backend(state.storage(), &cid)?;
+    let storage = state.storage().clone();
+    meta_accept_typed_patch_with_writer(
+        move |campaign_id, actions| {
+            crate::backend_workflows::apply_typed_patch_actions_for_backend(
+                &storage,
+                campaign_id,
+                actions,
+            )
+            .map_err(TauriCommandError::storage)
+        },
+        &patch_id,
+        &campaign_id,
+        &snapshot,
+        state.inner().as_ref(),
+    )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn meta_accept_typed_patch_in_store(
     store: &campaign_store::CampaignStore,
     patch_id: &str,
     campaign_id: &str,
     state: &AppState,
 ) -> Result<(), TauriCommandError> {
+    let snapshot = load_meta_snapshot_from_store(store, &Id::from_str(campaign_id))?;
+    meta_accept_typed_patch_with_writer(
+        |campaign_id, actions| {
+            crate::turn_coordinator::with_campaign_lock(|| {
+                for (index, action) in actions.iter().enumerate() {
+                    apply_typed_action(store, campaign_id, action).map_err(|error| {
+                        crate::turn_coordinator::CommitError::Storage(format!(
+                            "第 {} 个 action 失败: {error}",
+                            index + 1
+                        ))
+                    })?;
+                }
+                Ok(())
+            })
+            .map_err(|e| TauriCommandError::storage(e.to_string()))
+        },
+        patch_id,
+        campaign_id,
+        &snapshot,
+        state,
+    )
+}
+
+/// Accept 核心：pending 校验 → revision/stale/前置条件 → 纯函数预演 →
+/// 注入的写盘闭包（JSON 逐 action + 全局锁 / SQLite 单事务 UoW）。
+pub(crate) fn meta_accept_typed_patch_with_writer<F>(
+    write: F,
+    patch_id: &str,
+    campaign_id: &str,
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+) -> Result<(), TauriCommandError>
+where
+    F: FnOnce(&Id, &[storyforge_app_meta::TypedPatchAction]) -> Result<(), TauriCommandError>,
+{
     let _accept_guard = state
         .typed_patch_accept_lock
         .lock()
@@ -292,45 +372,33 @@ pub(crate) fn meta_accept_typed_patch_in_store(
         p.clone()
     };
 
-    // 2. 取当前 campaign 快照
-    let campaign = store
-        .get_campaign(&cid)
-        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
-    let definitions = store
-        .get_card(&campaign.card_id)
-        .map(|c| c.card.character_definitions)
-        .unwrap_or_default();
-    let instances = store.list_instances(&cid);
-    let knowledge = store.list_knowledge(&cid);
-    let tasks = store.list_tasks(&cid);
+    // 2. revision 校验（Gate 4）：提案盖章的 revision 与当前不一致 = campaign
+    //    已被推进，patch 视为过期，拒绝而非静默应用到新状态。
+    if let Some(proposed_revision) = patch.campaign_revision
+        && proposed_revision != snapshot.campaign.revision
+    {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(TauriCommandError::validation(format!(
+            "patch 已过期：提案基于 campaign revision {proposed_revision}，当前为 {}",
+            snapshot.campaign.revision
+        )));
+    }
 
-    let input = storyforge_app_meta::PreviewInput {
-        instances: &instances,
-        definitions: &definitions,
-        knowledge: &knowledge,
-        tasks: &tasks,
-        campaign: Some(&campaign),
-    };
+    let input = build_preview_input(snapshot);
 
     // 3. stale 检查
     if storyforge_app_meta::is_patch_stale(&patch, &input) {
-        let mut typed = state
-            .typed_patches
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
-            p.status = storyforge_app_meta::TypedPatchStatus::Stale;
-        }
+        mark_typed_patch_stale(state, patch_id);
         return Err("patch 已过期，target 不存在".into());
     }
 
     if let Err(e) = validate_typed_patch_targets(
         &patch,
-        &campaign,
-        &definitions,
-        &instances,
-        &knowledge,
-        &tasks,
+        &snapshot.campaign,
+        &snapshot.definitions,
+        &snapshot.instances,
+        &snapshot.knowledge,
+        &snapshot.tasks,
     ) {
         mark_typed_patch_stale(state, patch_id);
         return Err(e);
@@ -338,12 +406,11 @@ pub(crate) fn meta_accept_typed_patch_in_store(
 
     // 4. 纯函数预演（clone 可变快照）
     {
-        // A 的 PreviewInputMut 字段为 &mut Vec<...>，需 clone 到本地变量再借。
-        let mut inst_clone = instances.clone();
-        let mut def_clone = definitions.clone();
-        let mut know_clone = knowledge.clone();
-        let mut task_clone = tasks.clone();
-        let mut camp_clone = campaign.clone();
+        let mut inst_clone = snapshot.instances.clone();
+        let mut def_clone = snapshot.definitions.clone();
+        let mut know_clone = snapshot.knowledge.clone();
+        let mut task_clone = snapshot.tasks.clone();
+        let mut camp_clone = snapshot.campaign.clone();
         let mut snap = storyforge_app_meta::PreviewInputMut {
             instances: &mut inst_clone,
             definitions: &mut def_clone,
@@ -355,22 +422,9 @@ pub(crate) fn meta_accept_typed_patch_in_store(
         storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
             .map_err(|e| TauriCommandError::pipeline(format!("纯函数预演失败: {e}"), false))?;
     }
-    // 5. 真正写盘（P0-6：与 TurnCommit 共享全局提交锁）
-    turn_coordinator::with_campaign_lock(|| {
-        for (idx, action) in patch.actions.iter().enumerate() {
-            let result = apply_typed_action(store, &cid, action);
-            if let Err(e) = result {
-                // 写盘失败，patch 保持 Pending，报错包含第几个 action
-                return Err(turn_coordinator::CommitError::Storage(format!(
-                    "第 {} 个 action 失败: {}",
-                    idx + 1,
-                    e
-                )));
-            }
-        }
-        Ok(())
-    })
-    .map_err(|e| TauriCommandError::storage(e.to_string()))?;
+    // 5. 真正写盘（后端分派：JSON 逐 action + 全局锁 / SQLite 单事务 UoW）。
+    //    写盘失败，patch 保持 Pending（不标记 Accepted）。
+    write(&cid, &patch.actions)?;
 
     // 6. 写盘成功，标记 Accepted
     {
@@ -812,40 +866,9 @@ pub(crate) fn meta_preview_mvu_apply(
             "MVU schema apply preview",
         )
         .map_err(TauriCommandError::validation)?;
-    let store = state.json_campaign_store(
-        BackendCapability::MvuSchemaApply,
-        "MVU schema apply preview",
-    )?;
     let id = Id::from_str(&source_character_id);
-    let mvu = store.get_mvu(&id).ok_or_else(|| {
-        TauriCommandError::not_found(
-            MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string(),
-        )
-    })?;
-
-    // 通过 source_character_id 找到 card
-    let stored_card = store.get_card_by_source(&id).ok_or_else(|| {
-        TauriCommandError::not_found(format!(
-            "找不到 source_character_id={source_character_id} 的 card"
-        ))
-    })?;
-
-    let previews: Vec<MvuApplyPreview> = stored_card
-        .card
-        .character_definitions
-        .iter()
-        .map(|def| {
-            compute_apply_preview(
-                &def.variable_schema,
-                &mvu.translation.variable_schema,
-                def.id.as_str(),
-                &def.name,
-                &source_character_id,
-            )
-        })
-        .collect();
-
-    Ok(previews)
+    crate::backend_workflows::preview_mvu_apply_for_backend(state.storage(), &id)
+        .map_err(TauriCommandError::storage)
 }
 
 /// Tauri command: 把 MVU schema 合并应用到指定 definition（写盘）
@@ -861,15 +884,19 @@ pub(crate) fn meta_apply_mvu_schema(
         .storage()
         .require_supported(BackendCapability::MvuSchemaApply, "MVU schema apply")
         .map_err(TauriCommandError::validation)?;
-    let store = state.json_campaign_store(BackendCapability::MvuSchemaApply, "MVU schema apply")?;
-    meta_apply_mvu_schema_in_store(store, source_character_id, definition_id)
+    let src_id = Id::from_str(&source_character_id);
+    let def_id = Id::from_str(&definition_id);
+    crate::backend_workflows::apply_mvu_schema_for_backend(state.storage(), &src_id, &def_id)
+        .map_err(TauriCommandError::storage)
 }
 
 pub(crate) fn meta_apply_mvu_schema_in_store(
     store: &campaign_store::CampaignStore,
-    source_character_id: String,
-    definition_id: String,
+    source_character_id: &Id,
+    definition_id: &Id,
 ) -> Result<(), TauriCommandError> {
+    let source_character_id = source_character_id.as_str().to_string();
+    let definition_id = definition_id.as_str().to_string();
     let src_id = Id::from_str(&source_character_id);
     let def_id = Id::from_str(&definition_id);
 

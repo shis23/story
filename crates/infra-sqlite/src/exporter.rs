@@ -124,7 +124,17 @@ pub fn export_sqlite_to_json(
 
     // Export each table's payload_json as a JSON array.
     let cards = export_table_array(&tx, "character_cards", "card_id", &mut unsupported)?;
-    let campaigns = export_table_array(&tx, "campaigns", "campaign_id", &mut unsupported)?;
+    // Campaigns are normalized so the legacy top-level `story_clock` field is
+    // repaired from the authoritative variables entry before export (Gate 4).
+    let campaigns = export_table_array_normalized(
+        &tx,
+        "campaigns",
+        "campaign_id",
+        &mut unsupported,
+        |value| {
+            normalize_campaign_story_clock(value);
+        },
+    )?;
     let instances =
         export_table_array(&tx, "character_instances", "instance_id", &mut unsupported)?;
     let knowledge =
@@ -132,27 +142,62 @@ pub fn export_sqlite_to_json(
     let tasks = export_table_array(&tx, "story_tasks", "task_id", &mut unsupported)?;
     let summaries = export_table_array(&tx, "round_summaries", "summary_id", &mut unsupported)?;
     let turns = export_table_array(&tx, "turns", "turn_id", &mut unsupported)?;
+    let mvu = export_table_array(
+        &tx,
+        "mvu_translations",
+        "source_character_id",
+        &mut unsupported,
+    )?;
 
-    // Pre-accept outbox is SQLite-native recovery ledger. JSON backend has no
-    // equivalent file; classify explicitly rather than silently dropping.
+    // 活跃 pre-accept 状态（pending outbox）无法无损表达：明确阻止导出，而不是丢弃。
     if table_exists(&tx, "preaccept_outbox")? {
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM preaccept_outbox WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending > 0 {
+            return Err(SqliteError::Other(format!(
+                "refusing reverse export: {pending} pending pre-accept outbox row(s) represent an active pre-accept state that the JSON backend cannot express losslessly"
+            )));
+        }
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM preaccept_outbox", [], |row| {
             row.get(0)
         })?;
         if count > 0 {
             unsupported.push(format!(
-                "preaccept_outbox:{count} rows (SQLite-native pre-accept recovery ledger; not represented in JSON backend)"
+                "preaccept_outbox:{count} rows (SQLite-native pre-accept recovery ledger; no JSON equivalent file)"
             ));
         } else {
             unsupported.push(
-                "preaccept_outbox:empty (SQLite-native table; unsupported by JSON reverse export)"
-                    .into(),
+                "preaccept_outbox:empty (SQLite-native table; no JSON equivalent file)".into(),
             );
+        }
+    }
+
+    // 只读恢复台账：JSON 后端无等价文件，显式分类而非静默丢弃。
+    for (table, label) in [
+        ("mutation_commits", "turn accept ledger"),
+        ("chronicle_publication_jobs", "chronicle publication ledger"),
+    ] {
+        if table_exists(&tx, table)? {
+            let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?;
+            unsupported.push(format!(
+                "{table}:{count} rows (SQLite-native {label}; no JSON equivalent file)"
+            ));
         }
     }
 
     // Conversations are stored as individual files matching the JSON layout.
     let conversations = export_conversations(&tx, &stage_dir, &mut unsupported)?;
+
+    // 本局世界书：JSON 布局 campaign_world_info/{campaign_id}.json（可无损表达）。
+    let world_info = export_world_info(&tx, &stage_dir)?;
+
+    // Chronicle 压缩任务：JSON 布局 compress_jobs.json（可无损表达）。
+    let compress_jobs = export_compress_jobs(&tx, &mut unsupported)?;
 
     // Write array files into the staging tree only.
     write_array_file(&stage_dir, "cards.json", &cards)?;
@@ -162,6 +207,8 @@ pub fn export_sqlite_to_json(
     write_array_file(&stage_dir, "tasks.json", &tasks)?;
     write_array_file(&stage_dir, "round_summaries.json", &summaries)?;
     write_array_file(&stage_dir, "turns.json", &turns)?;
+    write_array_file(&stage_dir, "mvu_translations.json", &mvu)?;
+    write_array_file(&stage_dir, "compress_jobs.json", &compress_jobs)?;
 
     tx.commit()?;
 
@@ -175,6 +222,9 @@ pub fn export_sqlite_to_json(
         &summaries,
         &turns,
         &conversations,
+        &mvu,
+        &world_info,
+        &compress_jobs,
     );
 
     let report = ReverseExportReport {
@@ -208,6 +258,11 @@ pub fn export_sqlite_to_json(
             "summaries": report.summaries,
             "conversations": report.conversations,
             "turns": report.turns,
+        },
+        "extras": {
+            "mvu_translations": mvu.len(),
+            "campaign_world_info": world_info.len(),
+            "compress_jobs": compress_jobs.len(),
         },
         "unsupported_fields": report.unsupported_fields,
         "note": "Import this directory via the JSON importer to roll back to JSON backend.",
@@ -264,6 +319,28 @@ fn export_table_array(
     id_column: &str,
     unsupported: &mut Vec<String>,
 ) -> Result<Vec<Value>> {
+    export_table_array_with(tx, table, id_column, unsupported, |_| {})
+}
+
+/// Like [`export_table_array`] but lets the caller normalize each payload
+/// (e.g. story-clock authority repair) before it is written.
+fn export_table_array_normalized(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_column: &str,
+    unsupported: &mut Vec<String>,
+    normalize: impl Fn(&mut Value),
+) -> Result<Vec<Value>> {
+    export_table_array_with(tx, table, id_column, unsupported, normalize)
+}
+
+fn export_table_array_with(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_column: &str,
+    unsupported: &mut Vec<String>,
+    normalize: impl Fn(&mut Value),
+) -> Result<Vec<Value>> {
     if !table_exists(tx, table)? {
         return Ok(Vec::new());
     }
@@ -291,9 +368,159 @@ fn export_table_array(
             map.insert("id".to_string(), Value::String(id));
         }
 
+        normalize(&mut value);
+
         // Redact secret-shaped values before writing to the export artifact.
         redact_secret_values(&mut value, unsupported);
 
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Gate 4 story-clock authority: repair the legacy top-level `story_clock`
+/// field from the authoritative `variables` entry inside the exported payload,
+/// so a reverse export never carries the stale half of the old dual
+/// representation.
+fn normalize_campaign_story_clock(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(variables)) = map.get("variables") else {
+        return;
+    };
+    let authoritative = variables.iter().find_map(|v| {
+        let obj = v.as_object()?;
+        if obj.get("key")?.as_str()? == "story_clock" {
+            obj.get("value").and_then(Value::as_str).map(str::to_string)
+        } else {
+            None
+        }
+    });
+    let Some(authoritative) = authoritative else {
+        return;
+    };
+    match map.get_mut("story_clock") {
+        Some(Value::String(field)) if field == &authoritative => {}
+        Some(slot) => *slot = Value::String(authoritative),
+        None => {
+            map.insert("story_clock".to_string(), Value::String(authoritative));
+        }
+    }
+}
+
+/// Export the per-campaign world info books into `campaign_world_info/` files
+/// (JSON store layout `campaign_world_info/{campaign_id}.json`).
+fn export_world_info(tx: &rusqlite::Transaction<'_>, stage_dir: &Path) -> Result<Vec<Value>> {
+    if !table_exists(tx, "campaign_world_info")? {
+        return Ok(Vec::new());
+    }
+    let info_dir = stage_dir.join("campaign_world_info");
+    fs::create_dir_all(&info_dir)?;
+
+    let mut stmt = tx.prepare(
+        "SELECT campaign_id, payload_json FROM campaign_world_info ORDER BY campaign_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let campaign_id: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        Ok((campaign_id, payload))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (campaign_id, payload) = row?;
+        let value: Value = serde_json::from_str(&payload).map_err(|e| {
+            SqliteError::Other(format!(
+                "corrupt payload_json in campaign_world_info id={campaign_id}: {e}"
+            ))
+        })?;
+        let file = info_dir.join(format!("{campaign_id}.json"));
+        fs::write(
+            &file,
+            serde_json::to_vec_pretty(&value).map_err(SqliteError::from)?,
+        )?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Export Chronicle compress jobs as `compress_jobs.json` in the JSON
+/// `CompressJob` shape (id/campaign_id/conversation_id/lineage_id/kind/status/
+/// attempts/max_attempts/last_error/uncovered_*/created_at/updated_at).
+fn export_compress_jobs(
+    tx: &rusqlite::Transaction<'_>,
+    unsupported: &mut Vec<String>,
+) -> Result<Vec<Value>> {
+    if !table_exists(tx, "chronicle_compress_jobs")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT job_id, campaign_id, conversation_id, lineage_id, kind, status, attempts,
+               max_attempts, last_error, uncovered_a_at_enqueue, uncovered_b_at_enqueue,
+               created_at, updated_at
+        FROM chronicle_compress_jobs ORDER BY job_id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (
+            job_id,
+            campaign_id,
+            conversation_id,
+            lineage_id,
+            kind,
+            status,
+            attempts,
+            max_attempts,
+            last_error,
+            uncovered_a,
+            uncovered_b,
+            created_at,
+            updated_at,
+        ) = row?;
+        let mut value = serde_json::json!({
+            "id": job_id,
+            "campaign_id": campaign_id,
+            "kind": kind,
+            "status": status,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "uncovered_a_at_enqueue": uncovered_a,
+            "uncovered_b_at_enqueue": uncovered_b,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        });
+        let obj = value.as_object_mut().expect("json! object is an object");
+        if let Some(v) = conversation_id {
+            obj.insert("conversation_id".to_string(), Value::String(v));
+        }
+        if let Some(v) = lineage_id {
+            obj.insert("lineage_id".to_string(), Value::String(v));
+        }
+        if let Some(v) = last_error {
+            obj.insert("last_error".to_string(), Value::String(v));
+        }
+        redact_secret_values(&mut value, unsupported);
         out.push(value);
     }
     Ok(out)
@@ -561,6 +788,9 @@ fn collect_export_hash(
     summaries: &[Value],
     turns: &[Value],
     conversations: &[Value],
+    mvu: &[Value],
+    world_info: &[Value],
+    compress_jobs: &[Value],
 ) -> String {
     compute_export_hash(&[
         ("cards", cards),
@@ -571,6 +801,9 @@ fn collect_export_hash(
         ("round_summaries", summaries),
         ("turns", turns),
         ("conversations", conversations),
+        ("mvu_translations", mvu),
+        ("campaign_world_info", world_info),
+        ("compress_jobs", compress_jobs),
     ])
 }
 

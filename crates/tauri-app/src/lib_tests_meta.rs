@@ -15,13 +15,14 @@ fn gate3_meta_and_world_info_commands_do_not_probe_the_sqlite_runtime() {
 }
 
 #[test]
-fn sqlite_meta_and_world_info_capabilities_fail_with_explicit_operation_errors() {
+fn sqlite_meta_and_world_info_capabilities_are_supported_and_remaining_gaps_fail_closed() {
     use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 
     let storage = storage_backend::StorageFacade::new(
-        std::env::temp_dir().join("storyforge-gate3-meta-capability"),
+        std::env::temp_dir().join("storyforge-gate4-meta-capability"),
         PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
     );
+    // Gate 4：Meta/MVU/WorldInfo 已是 SQLite 原生能力。
     for (capability, operation) in [
         (
             storage_backend::BackendCapability::TypedMetaPatch,
@@ -34,6 +35,30 @@ fn sqlite_meta_and_world_info_capabilities_fail_with_explicit_operation_errors()
         (
             storage_backend::BackendCapability::WorldInfo,
             "list campaign world info",
+        ),
+        (
+            storage_backend::BackendCapability::ChronicleCompressor,
+            "chronicle compression",
+        ),
+    ] {
+        storage
+            .require_supported(capability, operation)
+            .expect("SQLite capability must be supported");
+    }
+    // 仍显式 unsupported 的剩余缺口（CharacterStore / Campaign lifecycle /
+    // Import/Export）必须带 operation 名 fail closed，不能静默空列表。
+    for (capability, operation) in [
+        (
+            storage_backend::BackendCapability::CharacterCommands,
+            "character commands",
+        ),
+        (
+            storage_backend::BackendCapability::ImportExport,
+            "import/export",
+        ),
+        (
+            storage_backend::BackendCapability::CampaignLifecycle,
+            "campaign lifecycle",
         ),
     ] {
         let error = storage
@@ -103,12 +128,7 @@ fn test_meta_apply_mvu_schema_backfills_all_campaign_instances_without_overwriti
     instance_b.variables.retain(|value| value.key != "hp");
     store.update_instance(instance_b).unwrap();
 
-    meta_apply_mvu_schema_in_store(
-        &store,
-        character.id.as_str().to_string(),
-        definition.id.as_str().to_string(),
-    )
-    .unwrap();
+    meta_apply_mvu_schema_in_store(&store, &character.id, &definition.id).unwrap();
 
     let updated_card = store.get_card(&card.id).unwrap().card;
     let updated_def = updated_card
@@ -197,12 +217,7 @@ fn test_meta_apply_mvu_schema_normalizes_legacy_key_notation() {
         })
         .unwrap();
 
-    meta_apply_mvu_schema_in_store(
-        &store,
-        character.id.as_str().to_string(),
-        definition.id.as_str().to_string(),
-    )
-    .unwrap();
+    meta_apply_mvu_schema_in_store(&store, &character.id, &definition.id).unwrap();
 
     let updated_card = store.get_card(&card.id).unwrap().card;
     let updated_def = updated_card
@@ -476,6 +491,7 @@ fn test_meta_accept_typed_patch_prune_task_refs() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
 
     {
@@ -590,6 +606,7 @@ fn test_meta_accept_typed_patch_stale() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
 
     // 删掉 target instance（模拟 stale）：
@@ -698,6 +715,7 @@ fn test_meta_accept_typed_patch_preflights_all_actions_before_writing() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
     {
         let mut typed = state
@@ -830,6 +848,7 @@ fn test_meta_accept_typed_patch_rejects_stale_definition_binding() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
     {
         let mut typed = state
@@ -896,6 +915,7 @@ fn test_typed_patch_pending_dedupe_canonicalizes_unordered_actions() {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: storyforge_app_meta::TypedPatchStatus::Pending,
+            campaign_revision: None,
         }
     };
 
@@ -921,6 +941,7 @@ fn test_meta_dismiss_typed_patch() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
 
     {
@@ -1049,6 +1070,7 @@ fn typed_patch_preconditions_share_one_pure_function_between_preview_and_accept(
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_revision: None,
     };
     validate_patch_preconditions(&ok_patch, &input).expect("匹配的前置条件应通过");
 

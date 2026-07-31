@@ -93,13 +93,11 @@ pub(crate) fn meta_accept_patch(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     if let Some(campaign_id) = active_campaign_id {
-        let store = state.json_campaign_store(
-            BackendCapability::TypedMetaPatch,
-            "persist legacy Meta world info patch",
-        )?;
+        // Gate 4：本局世界书写回经 facade 分派（SQLite 走 V006 表，JSON 走
+        // campaign_world_info 目录），两条路径同一语义。
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         if let Some(ref world_info) = ctx.world_info {
-            if let Err(e) = store.set_world_info(&campaign_id, (**world_info).clone()) {
+            if let Err(e) = state.storage().set_world_info(&campaign_id, world_info) {
                 tracing::warn!(
                     "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
                     campaign_id

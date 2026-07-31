@@ -143,12 +143,56 @@ impl Campaign {
 
     /// Authoritative story clock: reads from `variables` first, falls back to
     /// the top-level `story_clock` field for old data that was never migrated.
+    ///
+    /// `variables["story_clock"]`（字符串值）是唯一权威；顶层字段仅为旧数据
+    /// 保留的兼容镜像。两者不一致属于历史双表示残留，须经
+    /// [`Campaign::repair_story_clock_authority`] 产生可审核修复，不得静默任选。
     pub fn current_story_clock(&self) -> &str {
         self.variables
             .iter()
             .find(|v| v.key == "story_clock")
             .and_then(|v| v.value.as_str())
             .unwrap_or(&self.story_clock)
+    }
+
+    /// Whether the legacy top-level `story_clock` field diverges from the
+    /// authoritative `variables["story_clock"]` string entry.
+    ///
+    /// A non-string `variables["story_clock"]` value is not a valid authority
+    /// (it is never accepted by `set_variable` as a clock update), so it is
+    /// not treated as divergence — `current_story_clock()` falls back to the
+    /// field in that case.
+    pub fn story_clock_diverged(&self) -> bool {
+        match self
+            .variables
+            .iter()
+            .find(|v| v.key == "story_clock")
+            .and_then(|v| v.value.as_str())
+        {
+            Some(authoritative) => authoritative != self.story_clock,
+            None => false,
+        }
+    }
+
+    /// Repair the legacy top-level field from the variables authority.
+    /// Returns `true` when a divergence was corrected so callers can emit an
+    /// auditable warning. This is the only sanctioned way to settle the old
+    /// dual representation — never silently pick one side without repairing.
+    pub fn repair_story_clock_authority(&mut self) -> bool {
+        let Some(authoritative) = self
+            .variables
+            .iter()
+            .find(|v| v.key == "story_clock")
+            .and_then(|v| v.value.as_str())
+        else {
+            return false;
+        };
+        if authoritative != self.story_clock {
+            self.story_clock = authoritative.to_string();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_variable(&mut self, key: &str, value: serde_json::Value, turn: u32) {
@@ -503,6 +547,54 @@ mod tests {
         campaign.variables.retain(|v| v.key != "story_clock");
         // Top-level field still has old value
         assert_eq!(campaign.current_story_clock(), "Day 1");
+    }
+
+    #[test]
+    fn test_story_clock_divergence_is_detected_and_repaired_from_variables_authority() {
+        // 旧数据：顶层字段与 variables 权威不一致（历史双表示残留）。
+        let mut campaign = Campaign::new(Id::new(), "test");
+        campaign.set_variable("story_clock", serde_json::json!("Day 47"), 5);
+        // 人为制造分歧：直接改顶层字段，绕过 set_variable 的同步。
+        campaign.story_clock = "Day 1".to_string();
+        assert!(campaign.story_clock_diverged());
+        assert_eq!(
+            campaign.current_story_clock(),
+            "Day 47",
+            "variables 权威优先"
+        );
+
+        assert!(
+            campaign.repair_story_clock_authority(),
+            "repair must report the correction for audit"
+        );
+        assert_eq!(campaign.story_clock, "Day 47");
+        assert!(!campaign.story_clock_diverged());
+        assert!(
+            !campaign.repair_story_clock_authority(),
+            "second repair must be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_story_clock_non_string_variable_is_not_a_divergence() {
+        // 非字符串 story_clock 变量不是合法权威（set_variable 不把它当 clock
+        // 更新）；此时不得把它当作「与字段分歧」处理，也不得用它覆盖字段。
+        let mut campaign = Campaign::new(Id::new(), "test");
+        campaign.set_variable("story_clock", serde_json::json!("Day 9"), 0);
+        // 人为制造旧数据形态：字段 = "Day 1"（老值），variables 项被替换成
+        // 非字符串（set_variable 从不接受非字符串 clock 更新 → 不是合法权威）。
+        campaign.story_clock = "Day 1".to_string();
+        campaign.variables.retain(|v| v.key != "story_clock");
+        campaign
+            .variables
+            .push(crate::variables::VariableValue::new(
+                "story_clock",
+                serde_json::json!(9),
+                0,
+            ));
+        assert!(!campaign.story_clock_diverged());
+        assert!(!campaign.repair_story_clock_authority());
+        assert_eq!(campaign.current_story_clock(), "Day 1", "field fallback");
     }
 
     #[test]

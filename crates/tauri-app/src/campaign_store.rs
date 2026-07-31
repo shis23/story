@@ -42,6 +42,18 @@ pub struct StoredMvuTranslation {
     pub analyzed_at: String,
 }
 
+/// Gate 4 story-clock authority repair for a batch of JSON-loaded campaigns.
+fn repair_story_clock_authority(campaigns: &mut [storyforge_domain::campaign::Campaign]) {
+    for campaign in campaigns.iter_mut() {
+        if campaign.repair_story_clock_authority() {
+            tracing::warn!(
+                campaign_id = %campaign.id,
+                "campaign story_clock field diverged from variables authority; repaired from variables (JSON store)"
+            );
+        }
+    }
+}
+
 pub const FORCE_RERUN_BLOCKED_BY_CAMPAIGN: &str =
     "这张角色卡已有游玩档，暂不支持重新识别；请先导入一份新卡再重跑识别。";
 
@@ -317,35 +329,51 @@ impl CampaignStore {
         if self.json_access_disabled() {
             return Vec::new();
         }
-        self.campaigns
+        let mut campaigns: Vec<Campaign> = self
+            .campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .clone();
+        repair_story_clock_authority(&mut campaigns);
+        campaigns
     }
 
     pub fn list_campaigns_of_card(&self, card_id: &Id) -> Vec<Campaign> {
         if self.json_access_disabled() {
             return Vec::new();
         }
-        self.campaigns
+        let mut campaigns: Vec<Campaign> = self
+            .campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|c| c.card_id == *card_id)
             .cloned()
-            .collect()
+            .collect();
+        repair_story_clock_authority(&mut campaigns);
+        campaigns
     }
 
     pub fn get_campaign(&self, id: &Id) -> Option<Campaign> {
         if self.json_access_disabled() {
             return None;
         }
-        self.campaigns
+        let mut campaign: Option<Campaign> = self
+            .campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .find(|c| c.id == *id)
-            .cloned()
+            .cloned();
+        if let Some(c) = campaign.as_mut()
+            && c.repair_story_clock_authority()
+        {
+            tracing::warn!(
+                campaign_id = %c.id,
+                "campaign story_clock field diverged from variables authority; repaired from variables (JSON store)"
+            );
+        }
+        campaign
     }
 
     pub fn save_campaign(&self, campaign: Campaign) -> Result<(), String> {

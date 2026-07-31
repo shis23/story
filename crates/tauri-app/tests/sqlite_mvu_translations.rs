@@ -197,6 +197,118 @@ fn sqlite_mvu_translation_authority_and_collectors() {
     )
     .expect("restore card payload after the error propagation probe");
 
+    // ── Gate 4：MVU schema apply（单事务：definition 更新 + instance 回填）──
+    // 修复损坏 payload，换成带新键 mvu_mana 的翻译。
+    let mut apply_translation = MvuTranslation::pure_data_fallback(vec![
+        storyforge_domain::variables::VariableField {
+            key: "hp".into(),
+            label: "HP".into(),
+            value_type: storyforge_domain::variables::VariableType::Int,
+            default: serde_json::json!(100),
+            description: None,
+            group: None,
+        },
+        storyforge_domain::variables::VariableField {
+            key: "mvu_mana".into(),
+            label: "Mana".into(),
+            value_type: storyforge_domain::variables::VariableType::Int,
+            default: serde_json::json!(50),
+            description: None,
+            group: None,
+        },
+    ]);
+    apply_translation.update_rules = stored_mvu.translation.update_rules.clone();
+    apply_translation.fallback_fragments = stored_mvu.translation.fallback_fragments.clone();
+    let apply_mvu = storyforge_lib::campaign_store::StoredMvuTranslation {
+        source_character_id: source_id.clone(),
+        character_name: "Alice".into(),
+        translation: apply_translation,
+        analyzed_at: "2026-07-27T00:00:00Z".into(),
+    };
+    sqlite_runtime::save_mvu(&apply_mvu).expect("apply translation persists");
+
+    // 建 campaign + 绑定 def-a 的 instance（跨 campaign 回填验证）。
+    let mut campaign = Campaign::new(card_id.clone(), "MVU Apply Camp");
+    campaign.id = Id::from_str("mvu-apply-camp");
+    sqlite_runtime::save_campaign(&campaign).expect("save apply campaign");
+    let mut instance = CharacterInstance::from_definition(campaign.id.clone(), &def_a);
+    instance.id = Id::from_str("mvu-apply-inst");
+    sqlite_runtime::save_instance(&instance).expect("save apply instance");
+
+    // 预览（backend 分派）：每个 definition 一条。
+    let previews =
+        storyforge_lib::backend_workflows::preview_mvu_apply_for_backend(&storage, &source_id)
+            .expect("preview under SQLite");
+    assert_eq!(previews.len(), 2);
+    assert!(previews.iter().any(|p| p.has_changes));
+
+    // 正式 apply（单事务）。
+    storyforge_lib::backend_workflows::apply_mvu_schema_for_backend(
+        &storage, &source_id, &def_a.id,
+    )
+    .expect("apply under SQLite");
+
+    // definition schema 已合并 + instance 回填默认值（hp 保持 100 不覆盖，
+    // mvu_mana 补 50）。
+    let payload = sqlite_runtime::get_card_payload(&card_id)
+        .expect("card payload")
+        .expect("card exists");
+    let stored: storyforge_lib::campaign_store::StoredCard =
+        serde_json::from_value(payload).expect("stored card");
+    let def = stored
+        .card
+        .character_definitions
+        .iter()
+        .find(|d| d.id == def_a.id)
+        .expect("def-a");
+    assert!(
+        def.variable_schema.iter().any(|f| f.key == "mvu_mana"),
+        "definition schema must include merged key"
+    );
+    let instances = sqlite_runtime::list_instances(&campaign.id).expect("instances");
+    assert_eq!(
+        instances[0].get_variable("hp"),
+        Some(&serde_json::json!(100))
+    );
+    assert_eq!(
+        instances[0].get_variable("mvu_mana"),
+        Some(&serde_json::json!(50))
+    );
+
+    // 故障注入回滚：AfterCardUpdate 后失败 → schema 与 instance 都不留痕迹。
+    sqlite_runtime::fail_mvu_apply_uow_for_test(
+        storyforge_lib::sqlite_mvu_repo::MvuApplyFault::AfterCardUpdate,
+    );
+    let err = storyforge_lib::backend_workflows::apply_mvu_schema_for_backend(
+        &storage, &source_id, &def_b.id,
+    )
+    .expect_err("fault injection must fail the MVU apply UoW");
+    assert!(err.contains("after MVU card update"), "got: {err}");
+    sqlite_runtime::fail_mvu_apply_uow_for_test(
+        storyforge_lib::sqlite_mvu_repo::MvuApplyFault::None,
+    );
+    let payload_after = sqlite_runtime::get_card_payload(&card_id)
+        .expect("card payload")
+        .expect("card exists");
+    let stored_after: storyforge_lib::campaign_store::StoredCard =
+        serde_json::from_value(payload_after).expect("stored card");
+    let def_b_after = stored_after
+        .card
+        .character_definitions
+        .iter()
+        .find(|d| d.id == def_b.id)
+        .expect("def-b");
+    assert!(
+        !def_b_after
+            .variable_schema
+            .iter()
+            .any(|f| f.key == "mvu_mana"),
+        "faulted def-b schema update must be rolled back"
+    );
+
+    // 恢复 def-a 翻译为原始 stored_mvu，继续后续删除级联段。
+    sqlite_runtime::save_mvu(&stored_mvu).expect("restore original translation");
+
     // ── 删除级联往返 ──
     assert!(sqlite_runtime::delete_mvu(&source_id).expect("delete ok"));
     assert!(!sqlite_runtime::delete_mvu(&source_id).expect("second delete ok"));

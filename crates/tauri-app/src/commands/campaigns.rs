@@ -22,7 +22,7 @@ impl From<&storyforge_domain::campaign::Campaign> for CampaignSummaryDto {
             card_id: c.card_id.as_str().to_string(),
             name: c.name.clone(),
             created_at: c.created_at.clone(),
-            story_clock: c.story_clock.clone(),
+            story_clock: c.current_story_clock().to_string(),
             instance_count: 0, // 调用方填
             fork_from: c
                 .fork_from
@@ -494,7 +494,9 @@ pub(crate) fn fork_campaign_in_store(
     );
     campaign.variables = source.variables.clone();
     campaign.variable_schema = source.variable_schema.clone();
-    campaign.story_clock = source.story_clock.clone();
+    // Gate 4：story_clock 唯一权威 = variables；fork 时随 variables 拷贝，
+    // 顶层字段从权威同步，避免双表示残留。
+    campaign.story_clock = source.current_story_clock().to_string();
 
     let forked_conversation =
         conv_store.fork_at(&source_conversation_id, campaign.id.clone(), &fork_node_id)?;

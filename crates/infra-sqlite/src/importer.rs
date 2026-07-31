@@ -25,6 +25,10 @@ pub struct ImportReport {
     pub conversations: usize,
     pub turns: usize,
     pub mvu_translations: usize,
+    /// 导入的本局世界书条目数（Gate 4）。
+    pub world_info: usize,
+    /// 导入的 Chronicle 压缩任务数（Gate 4）。
+    pub compress_jobs: usize,
     pub skipped_as_duplicate: bool,
 }
 
@@ -185,6 +189,12 @@ impl<'a> JsonImporter<'a> {
             for mvu in &snapshot.mvu_translations {
                 upsert_mvu_translation(tx, mvu)?;
             }
+            for (campaign_id, book) in &snapshot.world_info {
+                upsert_world_info(tx, campaign_id, book)?;
+            }
+            for job in &snapshot.compress_jobs {
+                upsert_compress_job(tx, job)?;
+            }
 
             tx.execute(
                 r#"
@@ -210,6 +220,8 @@ impl<'a> JsonImporter<'a> {
             conversations: snapshot.conversations.len(),
             turns: snapshot.turns.len(),
             mvu_translations: snapshot.mvu_translations.len(),
+            world_info: snapshot.world_info.len(),
+            compress_jobs: snapshot.compress_jobs.len(),
             skipped_as_duplicate: false,
         })
     }
@@ -229,6 +241,8 @@ fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
         conversations: snapshot.conversations.len(),
         turns: snapshot.turns.len(),
         mvu_translations: snapshot.mvu_translations.len(),
+        world_info: snapshot.world_info.len(),
+        compress_jobs: snapshot.compress_jobs.len(),
         skipped_as_duplicate: true,
     }
 }
@@ -245,6 +259,10 @@ struct SourceSnapshot {
     conversations: Vec<Value>,
     turns: Vec<Value>,
     mvu_translations: Vec<Value>,
+    /// (campaign_id, WorldInfoBook payload) — 本局世界书（Gate 4）。
+    world_info: Vec<(String, Value)>,
+    /// compress_jobs.json 中的 CompressJob 条目（Gate 4）。
+    compress_jobs: Vec<Value>,
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
@@ -257,6 +275,8 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
+    let world_info = read_world_info_dir(data_dir.join("campaign_world_info"))?;
+    let compress_jobs = read_json_array(data_dir.join("compress_jobs.json"), true)?;
 
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
@@ -268,9 +288,16 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     hash_named_array(&mut hasher, "turns", &turns);
     hash_named_array(&mut hasher, "conversations", &conversations);
     // 注意：为保持既有已完成 run 的 manifest hash 稳定（幂等去重不被打破），
-    // mvu_translations 仅在非空时参与 hash——无 MVU 数据的老目录 hash 不变。
+    // 这些可选集合仅在非空时参与 hash——无相应数据的老目录 hash 不变。
     if !mvu_translations.is_empty() {
         hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
+    }
+    if !world_info.is_empty() {
+        let payloads: Vec<Value> = world_info.iter().map(|(_, v)| v.clone()).collect();
+        hash_named_array(&mut hasher, "campaign_world_info", &payloads);
+    }
+    if !compress_jobs.is_empty() {
+        hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
     }
     let manifest_hash = hex_encode(hasher.finalize());
 
@@ -285,7 +312,39 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
         conversations,
         turns,
         mvu_translations,
+        world_info,
+        compress_jobs,
     })
+}
+
+/// 读 `campaign_world_info/{campaign_id}.json` 目录；文件名即 campaign_id。
+fn read_world_info_dir(dir: PathBuf) -> Result<Vec<(String, Value)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let campaign_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                SqliteError::CorruptImportInput(format!(
+                    "{}: world info file must have a file stem",
+                    path.display()
+                ))
+            })?
+            .to_string();
+        let text = fs::read_to_string(&path)?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
+        out.push((campaign_id, value));
+    }
+    Ok(out)
 }
 
 fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
@@ -402,6 +461,84 @@ fn upsert_card(tx: &rusqlite::Transaction<'_>, card: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Gate 4：本局世界书（JSON 布局 campaign_world_info/{campaign_id}.json）。
+fn upsert_world_info(
+    tx: &rusqlite::Transaction<'_>,
+    campaign_id: &str,
+    book: &Value,
+) -> Result<()> {
+    tx.execute(
+        r#"
+        INSERT INTO campaign_world_info (campaign_id, payload_json, updated_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(campaign_id) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        "#,
+        rusqlite::params![
+            campaign_id,
+            stable_json(book),
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Gate 4：Chronicle 压缩任务（JSON 布局 compress_jobs.json，CompressJob 形态）。
+fn upsert_compress_job(tx: &rusqlite::Transaction<'_>, job: &Value) -> Result<()> {
+    let job_id = required_str(job, "id", "compress_job")?;
+    let campaign_id = required_str(job, "campaign_id", "compress_job")?;
+    let conversation_id = optional_str(job, "conversation_id");
+    let lineage_id = optional_str(job, "lineage_id");
+    let kind = optional_str(job, "kind").unwrap_or_else(|| "auto".to_string());
+    let status = optional_str(job, "status").unwrap_or_else(|| "pending".to_string());
+    let attempts = optional_u64(job, "attempts").unwrap_or(0) as i64;
+    let max_attempts = optional_u64(job, "max_attempts").unwrap_or(5) as i64;
+    let last_error = optional_str(job, "last_error");
+    let uncovered_a = optional_u64(job, "uncovered_a_at_enqueue").unwrap_or(0) as i64;
+    let uncovered_b = optional_u64(job, "uncovered_b_at_enqueue").unwrap_or(0) as i64;
+    let created_at = optional_str(job, "created_at").unwrap_or_default();
+    let updated_at = optional_str(job, "updated_at").unwrap_or_default();
+    tx.execute(
+        r#"
+        INSERT INTO chronicle_compress_jobs (
+            job_id, campaign_id, conversation_id, lineage_id, kind, status, attempts,
+            max_attempts, last_error, uncovered_a_at_enqueue, uncovered_b_at_enqueue,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(job_id) DO UPDATE SET
+            campaign_id = excluded.campaign_id,
+            conversation_id = excluded.conversation_id,
+            lineage_id = excluded.lineage_id,
+            kind = excluded.kind,
+            status = excluded.status,
+            attempts = excluded.attempts,
+            max_attempts = excluded.max_attempts,
+            last_error = excluded.last_error,
+            uncovered_a_at_enqueue = excluded.uncovered_a_at_enqueue,
+            uncovered_b_at_enqueue = excluded.uncovered_b_at_enqueue,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
+        "#,
+        rusqlite::params![
+            job_id,
+            campaign_id,
+            conversation_id,
+            lineage_id,
+            kind,
+            status,
+            attempts,
+            max_attempts,
+            last_error,
+            uncovered_a,
+            uncovered_b,
+            created_at,
+            updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
 /// StoredMvuTranslation { source_character_id, character_name, translation, analyzed_at }
 fn upsert_mvu_translation(tx: &rusqlite::Transaction<'_>, mvu: &Value) -> Result<()> {
     let source_character_id = required_str(mvu, "source_character_id", "mvu_translation")?;
@@ -438,7 +575,23 @@ fn upsert_campaign(tx: &rusqlite::Transaction<'_>, campaign: &Value) -> Result<(
     let revision = optional_u64(campaign, "revision").unwrap_or(0) as i64;
     let chronicle_revision = optional_u64(campaign, "chronicle_revision").unwrap_or(0) as i64;
     let lineage_id = optional_str(campaign, "lineage_id");
-    let story_clock = optional_str(campaign, "story_clock").unwrap_or_else(|| "Day 1".into());
+    // Gate 4 story-clock authority：索引列取 variables["story_clock"] 权威值，
+    // 仅在缺失时回退旧顶层字段——与运行时 `current_story_clock()` 同口径。
+    let story_clock = campaign
+        .get("variables")
+        .and_then(|v| v.as_array())
+        .and_then(|variables| {
+            variables
+                .iter()
+                .find(|v| v.get("key").and_then(|k| k.as_str()) == Some("story_clock"))
+        })
+        .and_then(|v| {
+            v.get("value")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| optional_str(campaign, "story_clock"))
+        .unwrap_or_else(|| "Day 1".to_string());
     let created_at = optional_str(campaign, "created_at").unwrap_or_default();
     let payload = stable_json(campaign);
     tx.execute(

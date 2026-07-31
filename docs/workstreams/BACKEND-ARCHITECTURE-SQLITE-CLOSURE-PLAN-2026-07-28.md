@@ -1,6 +1,6 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**进行中（Gate 1、Gate 2、Gate 3 已通过；Gate 4–8 尚未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> 状态：**进行中（Gate 1–4 已通过；Gate 5–8 尚未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
 > code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
@@ -288,7 +288,7 @@ facade 必须能显式报告：
 
 四项标准全部达成（逐项证据与统计见 RESULT §15）：命令/应用服务层 `.is_sqlite()`/`.is_json()` 30 → 0；六个 SQLite-only facade API 移除并由注入的 `TurnWorkflow`（`backend_workflows.rs`）以 backend-neutral DTO 取代；静态门禁（Rust 测试 + baseline 字段）钉住白名单 = {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs}；SQLite 活跃时四个 JSON writer 无构造机会不变。Gate 4 起不再有任何应用层 JSON/SQLite 分支需要迁移。
 
-## 9. Gate 4：SQLite 缺口补齐
+## 9. Gate 4：SQLite 缺口补齐（**已完成，2026-07-31**，见 RESULT §30）
 
 ### 9.1 Meta UoW
 

@@ -821,7 +821,8 @@ pub(crate) fn load_campaign_context_snapshot(
 ) -> Option<CampaignContextSnapshot> {
     let mut camp = store.get_campaign(active_id)?;
     let lineage = ensure_campaign_lineage_persisted(store, &mut camp);
-    let story_clock = camp.story_clock.clone();
+    // Gate 4：story_clock 唯一权威 = variables["story_clock"]。
+    let story_clock = camp.current_story_clock().to_string();
     // turn 只计 A；注入 recent last-K；prompt catalog 覆盖 snapshot codes；工具目录含 B/C
     let mut all_summaries = store.list_summaries(active_id);
     backfill_summary_lineage_if_needed(store, &lineage, &mut all_summaries);
@@ -966,7 +967,8 @@ pub fn load_sqlite_campaign_context_snapshot(
         })
         .unwrap_or_default();
 
-    let story_clock = camp.story_clock.clone();
+    // Gate 4：story_clock 唯一权威 = variables["story_clock"]。
+    let story_clock = camp.current_story_clock().to_string();
     let runtime = Arc::new(CampaignRuntimeContext {
         campaign: camp,
         instances,
@@ -1175,7 +1177,7 @@ pub fn fill_campaign_runtime_from_store(
     };
     let lineage = ensure_campaign_lineage_persisted(store, &mut camp);
     ctx.campaign_id = Some(active_id.clone());
-    ctx.story_clock = camp.story_clock.clone();
+    ctx.story_clock = camp.current_story_clock().to_string();
     // turn = max(A.turn)+1；B/C 不计入
     let mut all_summaries = store.list_summaries(active_id);
     backfill_summary_lineage_if_needed(store, &lineage, &mut all_summaries);

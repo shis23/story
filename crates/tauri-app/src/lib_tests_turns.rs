@@ -723,10 +723,13 @@ fn postprocess_rejects_superseded_attempt_after_regenerate() {
     );
 }
 
+/// Gate 4：SQLite 门面绝不构造 JSON CompressJobStore；压缩队列走 SQLite 表。
+/// 该契约替代 Gate 3 的「SQLite 跳过 JSON compressor」分支——跳过已被
+/// SQLite-native 队列实现取代。
 #[test]
-fn sqlite_mode_never_recovers_the_legacy_json_compress_job_store() {
+fn sqlite_mode_never_constructs_the_legacy_json_compress_job_store() {
     let dir = std::env::temp_dir().join(format!(
-        "storyforge-gate3-compress-recovery-{}",
+        "storyforge-gate4-compress-recovery-{}",
         uuid::Uuid::new_v4()
     ));
     let sqlite_facade = crate::storage_backend::StorageFacade::new(
@@ -743,8 +746,9 @@ fn sqlite_mode_never_recovers_the_legacy_json_compress_job_store() {
             storyforge_infra_sqlite::backend::BackendSource::Default,
         ),
     );
-    assert!(!should_recover_json_compress_jobs(&sqlite_facade));
-    assert!(should_recover_json_compress_jobs(&json_facade));
+    // SQLite 门面读取 JSON 队列必须失败（fail closed），JSON 门面可用。
+    assert!(sqlite_facade.json_compress_job_store("test").is_err());
+    assert!(json_facade.json_compress_job_store("test").is_ok());
 }
 
 #[test]
