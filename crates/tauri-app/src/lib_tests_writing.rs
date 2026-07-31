@@ -1439,6 +1439,69 @@ fn scope_validation_errors_do_not_mark_turn_failed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn sqlite_postprocess_failure_never_mutates_the_injected_json_turn_store() {
+    use production_postprocess::{PostprocessIdentity, ProductionPostprocessError};
+    use storyforge_domain::turn::{TurnRecord, TurnStatus};
+
+    let dir = std::env::temp_dir().join(format!(
+        "storyforge-sqlite-fail-closed-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let turn_store = turn_store::TurnStore::new(&dir);
+    let campaign_id = Id::from_str("sqlite-fail-closed-campaign");
+    let conversation_id = Id::from_str("sqlite-fail-closed-conversation");
+    let attempt_id = Id::from_str("sqlite-fail-closed-attempt");
+    let mut record = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        Id::from_str("sqlite-fail-closed-input"),
+        0,
+    );
+    record.status = TurnStatus::DraftReady;
+    record.attempts.push(turn_lifecycle::new_draft_attempt(
+        attempt_id.clone(),
+        Id::from_str("sqlite-fail-closed-variant"),
+        "draft",
+        vec![],
+    ));
+    let turn_id = record.turn_id.clone();
+    turn_store.create_turn(record).unwrap();
+
+    let storage = Arc::new(storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Sqlite,
+            storyforge_infra_sqlite::backend::BackendSource::Env,
+        ),
+    ));
+    let sink = BackendTurnAttemptSink::for_backend_store(storage, &turn_store);
+    let identity = PostprocessIdentity {
+        turn_id: turn_id.clone(),
+        attempt_id,
+        campaign_id,
+        conversation_id,
+        turn_number: 1,
+    };
+
+    let combined = service_fail_turn(
+        &sink,
+        &identity,
+        ProductionPostprocessError::Storage("forced postprocess failure".into()),
+    );
+
+    assert!(matches!(
+        combined,
+        ProductionPostprocessError::MarkFailed { .. }
+    ));
+    let unchanged = turn_store.get_turn(&turn_id).unwrap();
+    assert_eq!(unchanged.status, TurnStatus::DraftReady);
+    assert_eq!(unchanged.failure_reason, None);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 生产入口必须在无连接时 fail closed，不能把开发 Mock 当成真实模型。
 
 #[test]
@@ -1895,12 +1958,12 @@ fn test_collect_scoped_regex_scripts_is_limited_to_selected_character() {
     });
     let characters = vec![Arc::new(selected), Arc::new(other)];
 
-    let scripts = collect_scoped_regex_scripts(Some("source-selected"), &characters);
+    let scripts = collect_scoped_regex_scripts(Some("source-selected"), &characters, None);
 
     assert_eq!(scripts.len(), 1);
     assert_eq!(scripts[0].id, "selected-regex");
-    assert!(collect_scoped_regex_scripts(None, &characters).is_empty());
-    assert!(collect_scoped_regex_scripts(Some("missing"), &characters).is_empty());
+    assert!(collect_scoped_regex_scripts(None, &characters, None).is_empty());
+    assert!(collect_scoped_regex_scripts(Some("missing"), &characters, None).is_empty());
 }
 
 #[test]

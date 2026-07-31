@@ -150,19 +150,32 @@ pub(crate) fn prepare_character_extraction_card(
 }
 
 #[tauri::command]
-pub(crate) fn list_cards() -> Vec<CardSummaryDto> {
-    get_campaign_store()
+pub(crate) fn list_cards(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<CardSummaryDto>, TauriCommandError> {
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::CardCommands,
+        "list cards",
+    )?;
+    Ok(store
         .list_cards()
         .iter()
         .map(CardSummaryDto::from)
-        .collect()
+        .collect())
 }
 
 /// 删除角色卡（按 CharacterCard.id，级联删 campaign/instances/mvu）
 #[tauri::command]
-pub(crate) fn delete_card(id: String) -> Result<(), TauriCommandError> {
+pub(crate) fn delete_card(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
     let card_id = Id::from_str(&id);
-    if !get_campaign_store()
+    if !state
+        .json_campaign_store(
+            storage_backend::BackendCapability::CardCommands,
+            "delete card",
+        )?
         .delete_card(&card_id)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
     {
@@ -172,11 +185,20 @@ pub(crate) fn delete_card(id: String) -> Result<(), TauriCommandError> {
 }
 
 #[tauri::command]
-pub(crate) fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
-    let stored = get_campaign_store()
+pub(crate) fn get_card(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CardDetailDto, TauriCommandError> {
+    let stored = state
+        .json_campaign_store(storage_backend::BackendCapability::CardCommands, "get card")?
         .get_card(&Id::from_str(&id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={id}")))?;
-    let source_character = stored_character_for_source_id(&stored.card.source_character_id);
+    let character_store = state.json_character_store(
+        storage_backend::BackendCapability::CardCommands,
+        "get card source character",
+    )?;
+    let source_character =
+        stored_character_for_source_id(character_store, &stored.card.source_character_id);
     let (raw_first_mes, raw_alternate_greetings) = raw_card_greetings(&stored.card.raw_card_json);
     let definition_count = stored.card.character_definitions.len();
     Ok(CardDetailDto {

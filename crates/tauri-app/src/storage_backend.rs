@@ -10,7 +10,7 @@
 //! consulted for those operations and are never dual-written.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use storyforge_infra_sqlite::backend::{
     BackendDiagnostics, BackendSelection, PinnedBackend, StorageBackend,
@@ -19,6 +19,14 @@ use storyforge_infra_sqlite::cutover::{
     CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, inspect_marker, recover_or_verify,
 };
 use storyforge_infra_sqlite::migrations::current_version;
+
+use crate::campaign_store::CampaignStore;
+use crate::compress_job_store::CompressJobStore;
+use crate::sqlite_runtime;
+use crate::storage::CharacterStore;
+use crate::turn_store::TurnStore;
+use storyforge_domain::Id;
+use storyforge_domain::campaign::Campaign;
 
 /// The pinned backend for this process, resolved once at startup.
 static PINNED: OnceLock<PinnedBackend> = OnceLock::new();
@@ -38,6 +46,586 @@ pub struct BackendResolution {
 impl BackendResolution {
     pub fn is_sqlite(&self) -> bool {
         self.pinned.is_sqlite()
+    }
+}
+
+/// Stable application-facing storage capabilities. Commands and application
+/// services consume this contract instead of probing the process-global
+/// SQLite handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCapability {
+    CampaignRead,
+    CampaignInstanceRead,
+    CampaignLifecycle,
+    CardCommands,
+    CharacterCommands,
+    ImportExport,
+    CampaignHealth,
+    ConversationRead,
+    TurnLifecycle,
+    Postprocess,
+    KnowledgeTaskRead,
+    KnowledgeTaskCommands,
+    VariableRead,
+    VariableCommands,
+    WorldInfo,
+    TypedMetaPatch,
+    MvuTranslation,
+    MvuSchemaApply,
+    ChroniclePublication,
+    ChronicleCompressor,
+    ActiveCampaignPersistence,
+    StoryClock,
+}
+
+impl BackendCapability {
+    pub const ALL: [Self; 22] = [
+        Self::CampaignRead,
+        Self::CampaignInstanceRead,
+        Self::CampaignLifecycle,
+        Self::CardCommands,
+        Self::CharacterCommands,
+        Self::ImportExport,
+        Self::CampaignHealth,
+        Self::ConversationRead,
+        Self::TurnLifecycle,
+        Self::Postprocess,
+        Self::KnowledgeTaskRead,
+        Self::KnowledgeTaskCommands,
+        Self::VariableRead,
+        Self::VariableCommands,
+        Self::WorldInfo,
+        Self::TypedMetaPatch,
+        Self::MvuTranslation,
+        Self::MvuSchemaApply,
+        Self::ChroniclePublication,
+        Self::ChronicleCompressor,
+        Self::ActiveCampaignPersistence,
+        Self::StoryClock,
+    ];
+}
+
+/// Availability is explicit so unsupported or recovery-only behavior cannot
+/// be mistaken for an empty successful result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Supported,
+    Degraded,
+    Unsupported,
+    MigrationRequired,
+    ReadOnlyRecovery,
+}
+
+/// Process-lifetime backend facade injected into `AppState`.
+///
+/// The facade owns the pinned selector and canonical data directory. Domain
+/// ports are added to this type as Gate 3 migrates each vertical slice.
+#[derive(Clone)]
+pub struct StorageFacade {
+    data_dir: PathBuf,
+    pinned: PinnedBackend,
+    json_campaign_store: Option<Arc<CampaignStore>>,
+    json_character_store: Option<Arc<CharacterStore>>,
+    json_turn_store: Option<Arc<TurnStore>>,
+    json_compress_job_store: Option<Arc<CompressJobStore>>,
+}
+
+impl std::fmt::Debug for StorageFacade {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StorageFacade")
+            .field("data_dir", &self.data_dir)
+            .field("pinned", &self.pinned)
+            .field("json_writers_constructed", &self.has_json_writers())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CampaignRecord {
+    pub campaign: Campaign,
+    pub instance_count: usize,
+}
+
+impl StorageFacade {
+    pub fn new(data_dir: PathBuf, pinned: PinnedBackend) -> Self {
+        let (json_campaign_store, json_character_store, json_turn_store, json_compress_job_store) =
+            if pinned.is_sqlite() {
+                (None, None, None, None)
+            } else {
+                (
+                    Some(Arc::new(CampaignStore::new(&data_dir))),
+                    Some(Arc::new(CharacterStore::new(&data_dir))),
+                    Some(Arc::new(TurnStore::new(&data_dir))),
+                    Some(Arc::new(CompressJobStore::new(&data_dir))),
+                )
+            };
+        Self {
+            data_dir,
+            pinned,
+            json_campaign_store,
+            json_character_store,
+            json_turn_store,
+            json_compress_job_store,
+        }
+    }
+
+    pub fn backend(&self) -> StorageBackend {
+        self.pinned.backend()
+    }
+
+    pub fn is_sqlite(&self) -> bool {
+        self.pinned.is_sqlite()
+    }
+
+    pub fn is_json(&self) -> bool {
+        !self.is_sqlite()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Whether this facade owns legacy JSON writer adapters. SQLite facades
+    /// never construct them.
+    pub fn has_json_writers(&self) -> bool {
+        self.json_campaign_store.is_some()
+            || self.json_character_store.is_some()
+            || self.json_turn_store.is_some()
+            || self.json_compress_job_store.is_some()
+    }
+
+    pub fn capability(&self, capability: BackendCapability) -> CapabilityStatus {
+        if self.is_json() {
+            return CapabilityStatus::Supported;
+        }
+        match capability {
+            BackendCapability::CampaignRead
+            | BackendCapability::CampaignInstanceRead
+            | BackendCapability::CampaignHealth
+            | BackendCapability::ConversationRead
+            | BackendCapability::TurnLifecycle
+            | BackendCapability::Postprocess
+            | BackendCapability::KnowledgeTaskRead
+            | BackendCapability::VariableRead
+            | BackendCapability::MvuTranslation
+            | BackendCapability::ChroniclePublication => CapabilityStatus::Supported,
+            BackendCapability::ActiveCampaignPersistence | BackendCapability::StoryClock => {
+                CapabilityStatus::Degraded
+            }
+            BackendCapability::CampaignLifecycle
+            | BackendCapability::CardCommands
+            | BackendCapability::CharacterCommands
+            | BackendCapability::ImportExport
+            | BackendCapability::KnowledgeTaskCommands
+            | BackendCapability::VariableCommands
+            | BackendCapability::WorldInfo
+            | BackendCapability::TypedMetaPatch
+            | BackendCapability::MvuSchemaApply
+            | BackendCapability::ChronicleCompressor => CapabilityStatus::Unsupported,
+        }
+    }
+
+    /// Require a fully supported capability before entering an application
+    /// path that would otherwise touch a backend-specific adapter.
+    pub fn require_supported(
+        &self,
+        capability: BackendCapability,
+        operation: &str,
+    ) -> Result<(), String> {
+        let status = self.capability(capability);
+        if status == CapabilityStatus::Supported {
+            return Ok(());
+        }
+        Err(format!(
+            "{operation} is unavailable for {:?}: capability {capability:?} is {status:?}",
+            self.backend()
+        ))
+    }
+
+    /// Fail closed when the injected facade and the process-owned SQLite
+    /// handle do not describe the same authority.
+    pub fn validate_runtime_authority(&self) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::validate_active_path(&self.data_dir.join(SQLITE_DB_FILENAME))
+        } else if sqlite_runtime::is_sqlite_active() {
+            Err("JSON facade cannot coexist with an active SQLite runtime".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn json_campaign_store(
+        &self,
+        capability: BackendCapability,
+        operation: &str,
+    ) -> Result<&CampaignStore, String> {
+        self.require_supported(capability, operation)?;
+        self.json_campaign_store.as_deref().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy CampaignStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub(crate) fn json_campaign_store_owned(
+        &self,
+        capability: BackendCapability,
+        operation: &str,
+    ) -> Result<Arc<CampaignStore>, String> {
+        self.require_supported(capability, operation)?;
+        self.json_campaign_store.clone().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy CampaignStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub fn json_character_store(
+        &self,
+        capability: BackendCapability,
+        operation: &str,
+    ) -> Result<&CharacterStore, String> {
+        self.require_supported(capability, operation)?;
+        self.json_character_store.as_deref().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy CharacterStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub(crate) fn json_character_store_owned(
+        &self,
+        capability: BackendCapability,
+        operation: &str,
+    ) -> Result<Arc<CharacterStore>, String> {
+        self.require_supported(capability, operation)?;
+        self.json_character_store.clone().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy CharacterStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub fn json_turn_store(&self, operation: &str) -> Result<&TurnStore, String> {
+        self.json_turn_store.as_deref().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy TurnStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub(crate) fn json_compress_job_store(
+        &self,
+        operation: &str,
+    ) -> Result<Arc<CompressJobStore>, String> {
+        self.require_supported(BackendCapability::ChronicleCompressor, operation)?;
+        self.json_compress_job_store.clone().ok_or_else(|| {
+            format!(
+                "{operation} cannot use the legacy CompressJobStore for {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    pub fn get_active_turn(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_active_turn(campaign_id)
+        } else {
+            Ok(self
+                .json_turn_store("get active turn")?
+                .get_active_turn(campaign_id))
+        }
+    }
+
+    pub fn get_turn_by_variant(
+        &self,
+        variant_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_turn_by_variant(variant_id)
+        } else {
+            Ok(self
+                .json_turn_store("get turn by variant")?
+                .get_turn_by_variant(variant_id))
+        }
+    }
+
+    pub fn get_turn(
+        &self,
+        turn_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_turn(turn_id)
+        } else {
+            Ok(self.json_turn_store("get turn")?.get_turn(turn_id))
+        }
+    }
+
+    pub fn save_turn(&self, turn: &storyforge_domain::turn::TurnRecord) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_turn(turn)
+        } else {
+            self.json_turn_store("save turn")?.create_turn(turn.clone())
+        }
+    }
+
+    pub fn update_turn_record<F>(&self, turn_id: &Id, mutate: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut storyforge_domain::turn::TurnRecord),
+    {
+        if self.is_sqlite() {
+            sqlite_runtime::update_turn_record(turn_id, mutate)
+        } else {
+            self.json_turn_store("update turn")?
+                .with_turn_mut(turn_id, mutate)
+        }
+    }
+
+    pub fn mutate_turn_if<P, M>(
+        &self,
+        turn_id: &Id,
+        predicate: P,
+        mutate: M,
+    ) -> Result<bool, String>
+    where
+        P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
+        M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
+    {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_turn_if(turn_id, predicate, mutate)
+        } else {
+            self.json_turn_store("mutate turn")?
+                .mutate_if(turn_id, predicate, mutate)
+        }
+    }
+
+    pub fn save_campaign(&self, campaign: &Campaign) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_campaign(campaign)
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "save campaign")?
+                .update_campaign(campaign.clone())
+        }
+    }
+
+    pub fn get_card_payload(&self, card_id: &Id) -> Result<Option<serde_json::Value>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_card_payload(card_id)
+        } else {
+            self.json_campaign_store(BackendCapability::CardCommands, "get card payload")?
+                .get_card(card_id)
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| format!("serialize card payload: {error}"))
+        }
+    }
+
+    pub fn list_card_payloads(&self) -> Result<Vec<serde_json::Value>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_card_payloads()
+        } else {
+            self.json_campaign_store(BackendCapability::CardCommands, "list card payloads")?
+                .list_cards()
+                .into_iter()
+                .map(|card| {
+                    serde_json::to_value(card)
+                        .map_err(|error| format!("serialize card payload: {error}"))
+                })
+                .collect()
+        }
+    }
+
+    pub fn save_mvu(
+        &self,
+        stored: &crate::campaign_store::StoredMvuTranslation,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_mvu(stored)
+        } else {
+            self.json_campaign_store(BackendCapability::MvuTranslation, "save MVU translation")?
+                .save_mvu(stored.clone())
+        }
+    }
+
+    pub fn get_mvu(
+        &self,
+        source_character_id: &Id,
+    ) -> Result<Option<crate::campaign_store::StoredMvuTranslation>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_mvu(source_character_id)
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::MvuTranslation, "get MVU translation")?
+                .get_mvu(source_character_id))
+        }
+    }
+
+    pub fn list_mvu(&self) -> Result<Vec<crate::campaign_store::StoredMvuTranslation>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_mvu()
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::MvuTranslation, "list MVU translations")?
+                .list_all_mvu())
+        }
+    }
+
+    /// Persist the active Campaign pointer. JSON writes `active_campaign.json`
+    /// (legacy bootstrap pointer); SQLite keeps the selection in-process
+    /// (`ActiveCampaignPersistence` is Degraded) and this is a no-op.
+    pub fn save_active_pointer(&self, campaign_id: Option<&Id>) -> Result<(), String> {
+        if !self.is_sqlite() {
+            save_active_campaign(&self.data_dir, campaign_id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the pipeline must defer conversation land to the pre-accept
+    /// UoW (SQLite) instead of landing drafts into the ConversationStore.
+    pub fn defer_pipeline_conversation_land(&self) -> bool {
+        self.is_sqlite()
+    }
+
+    pub fn list_campaigns(&self, card_id: Option<&Id>) -> Result<Vec<CampaignRecord>, String> {
+        let campaigns = if self.is_sqlite() {
+            sqlite_runtime::list_campaigns()?
+        } else if let Some(card_id) = card_id {
+            let json_store =
+                self.json_campaign_store(BackendCapability::CampaignRead, "list campaigns")?;
+            json_store.list_campaigns_of_card(card_id)
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignRead, "list campaigns")?
+                .list_campaigns()
+        };
+
+        campaigns
+            .into_iter()
+            .filter(|campaign| card_id.is_none_or(|card_id| campaign.card_id == *card_id))
+            .map(|campaign| {
+                let instance_count = if self.is_sqlite() {
+                    sqlite_runtime::list_instances(&campaign.id)?.len()
+                } else {
+                    let json_store = self.json_campaign_store(
+                        BackendCapability::CampaignRead,
+                        "count campaign instances",
+                    )?;
+                    json_store.list_instances(&campaign.id).len()
+                };
+                Ok(CampaignRecord {
+                    campaign,
+                    instance_count,
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_campaign(&self, campaign_id: &Id) -> Result<Option<CampaignRecord>, String> {
+        let campaign = if self.is_sqlite() {
+            sqlite_runtime::get_campaign(campaign_id)?
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignRead, "get campaign")?
+                .get_campaign(campaign_id)
+        };
+        let Some(campaign) = campaign else {
+            return Ok(None);
+        };
+        let instance_count = if self.is_sqlite() {
+            sqlite_runtime::list_instances(&campaign.id)?.len()
+        } else {
+            let json_store = self
+                .json_campaign_store(BackendCapability::CampaignRead, "count campaign instances")?;
+            json_store.list_instances(&campaign.id).len()
+        };
+        Ok(Some(CampaignRecord {
+            campaign,
+            instance_count,
+        }))
+    }
+
+    pub fn campaign_exists(&self, campaign_id: &Id) -> Result<bool, String> {
+        self.get_campaign(campaign_id)
+            .map(|record| record.is_some())
+    }
+
+    pub fn list_instances(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<Vec<storyforge_domain::campaign::CharacterInstance>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_instances(campaign_id)
+        } else {
+            Ok(self
+                .json_campaign_store(
+                    BackendCapability::CampaignInstanceRead,
+                    "list campaign instances",
+                )?
+                .list_instances(campaign_id))
+        }
+    }
+
+    pub fn get_instance(
+        &self,
+        campaign_id: &Id,
+        instance_id: &Id,
+    ) -> Result<Option<storyforge_domain::campaign::CharacterInstance>, String> {
+        Ok(self
+            .list_instances(campaign_id)?
+            .into_iter()
+            .find(|instance| instance.id == *instance_id))
+    }
+
+    pub fn list_knowledge(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_knowledge(campaign_id)
+        } else {
+            Ok(self
+                .json_campaign_store(
+                    BackendCapability::KnowledgeTaskRead,
+                    "list character knowledge",
+                )?
+                .list_knowledge(campaign_id))
+        }
+    }
+
+    pub fn list_tasks(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<Vec<storyforge_domain::story_task::StoryTask>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_tasks(campaign_id)
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::KnowledgeTaskRead, "list story tasks")?
+                .list_tasks(campaign_id))
+        }
+    }
+
+    pub fn list_summaries(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<Vec<storyforge_domain::agent::RoundSummary>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_summaries(campaign_id)
+        } else {
+            Ok(self
+                .json_campaign_store(
+                    BackendCapability::ChroniclePublication,
+                    "list round summaries",
+                )?
+                .list_summaries(campaign_id))
+        }
     }
 }
 
@@ -136,6 +724,15 @@ fn current_version_sqlite(db_path: &Path) -> Option<i64> {
     }
     let db = storyforge_infra_sqlite::Database::open(db_path).ok()?;
     current_version(&db).ok()
+}
+
+/// Persist the JSON active-campaign pointer file (legacy bootstrap sidecar).
+/// SQLite keeps the pointer in-process and never writes this file.
+fn save_active_campaign(data_dir: &Path, id: Option<&Id>) -> Result<(), String> {
+    let path = data_dir.join("active_campaign.json");
+    let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
+    storyforge_infra_util::atomic_write_json(&path, &v)
+        .map_err(|error| format!("保存活跃 Campaign 失败: {error}"))
 }
 
 /// Errors produced during backend wiring.
@@ -252,5 +849,182 @@ mod tests {
         // No marker, no database.
         assert!(!dir.path().join("storyforge.backend.json").exists());
         assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());
+    }
+
+    #[test]
+    fn facade_pins_backend_data_dir_and_sqlite_capabilities() {
+        let dir = TempDir::new().unwrap();
+        let facade = StorageFacade::new(
+            dir.path().to_path_buf(),
+            PinnedBackend::new(
+                StorageBackend::Sqlite,
+                storyforge_infra_sqlite::backend::BackendSource::Env,
+            ),
+        );
+
+        assert_eq!(facade.backend(), StorageBackend::Sqlite);
+        assert_eq!(facade.data_dir(), dir.path());
+        assert!(!facade.has_json_writers());
+        assert_eq!(
+            facade.capability(BackendCapability::CampaignRead),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::CampaignInstanceRead),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::KnowledgeTaskRead),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::VariableRead),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::CardCommands),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::CharacterCommands),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::ImportExport),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::CampaignHealth),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::VariableCommands),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::KnowledgeTaskCommands),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::WorldInfo),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::TypedMetaPatch),
+            CapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::ChronicleCompressor),
+            CapabilityStatus::Unsupported
+        );
+        let error = facade
+            .require_supported(
+                BackendCapability::ChronicleCompressor,
+                "chronicle compression",
+            )
+            .expect_err("unsupported SQLite capability must fail closed");
+        assert!(error.contains("ChronicleCompressor"));
+        assert!(error.contains("Unsupported"));
+        assert!(!error.contains(dir.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            facade.capability(BackendCapability::ActiveCampaignPersistence),
+            CapabilityStatus::Degraded
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::StoryClock),
+            CapabilityStatus::Degraded
+        );
+
+        let supported = [
+            BackendCapability::CampaignRead,
+            BackendCapability::CampaignInstanceRead,
+            BackendCapability::CampaignHealth,
+            BackendCapability::ConversationRead,
+            BackendCapability::TurnLifecycle,
+            BackendCapability::Postprocess,
+            BackendCapability::KnowledgeTaskRead,
+            BackendCapability::VariableRead,
+            BackendCapability::MvuTranslation,
+            BackendCapability::ChroniclePublication,
+        ];
+        let degraded = [
+            BackendCapability::ActiveCampaignPersistence,
+            BackendCapability::StoryClock,
+        ];
+        let unsupported = [
+            BackendCapability::CampaignLifecycle,
+            BackendCapability::CardCommands,
+            BackendCapability::CharacterCommands,
+            BackendCapability::ImportExport,
+            BackendCapability::KnowledgeTaskCommands,
+            BackendCapability::VariableCommands,
+            BackendCapability::WorldInfo,
+            BackendCapability::TypedMetaPatch,
+            BackendCapability::MvuSchemaApply,
+            BackendCapability::ChronicleCompressor,
+        ];
+        assert_eq!(
+            supported.len() + degraded.len() + unsupported.len(),
+            BackendCapability::ALL.len()
+        );
+        for capability in supported {
+            assert_eq!(facade.capability(capability), CapabilityStatus::Supported);
+        }
+        for capability in degraded {
+            assert_eq!(facade.capability(capability), CapabilityStatus::Degraded);
+        }
+        for capability in unsupported {
+            assert_eq!(facade.capability(capability), CapabilityStatus::Unsupported);
+        }
+
+        let character_error = match facade.json_character_store(
+            BackendCapability::CharacterCommands,
+            "read SQLite character",
+        ) {
+            Ok(_) => panic!("SQLite facade must not expose a legacy CharacterStore"),
+            Err(error) => error,
+        };
+        assert!(character_error.contains("CharacterCommands"));
+        assert!(!dir.path().join("characters.json").exists());
+    }
+
+    #[test]
+    fn json_facade_reports_current_capabilities_as_supported() {
+        let dir = TempDir::new().unwrap();
+        let facade = StorageFacade::new(
+            dir.path().to_path_buf(),
+            PinnedBackend::new(
+                StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        );
+
+        for capability in BackendCapability::ALL {
+            assert_eq!(
+                facade.capability(capability),
+                CapabilityStatus::Supported,
+                "JSON capability {capability:?} must remain available"
+            );
+        }
+        assert!(facade.has_json_writers());
+    }
+
+    #[test]
+    fn app_state_owns_the_explicitly_injected_facade() {
+        let dir = TempDir::new().unwrap();
+        let facade = std::sync::Arc::new(StorageFacade::new(
+            dir.path().to_path_buf(),
+            PinnedBackend::new(
+                StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        ));
+
+        let state = crate::AppState::new_with_backend(dir.path().to_path_buf(), facade.clone())
+            .expect("matching JSON facade constructs AppState");
+
+        assert!(std::sync::Arc::ptr_eq(state.storage(), &facade));
+        assert_eq!(state.storage().backend(), StorageBackend::Json);
+        assert_eq!(state.storage().data_dir(), dir.path());
     }
 }

@@ -14,9 +14,12 @@ use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
 use storyforge_domain::mvu_translation::{FallbackFragment, MvuTranslation};
+use storyforge_infra_sqlite::Database;
+use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 use storyforge_lib::sqlite_runtime;
 use storyforge_lib::{
     collect_mvu_fallback_fragments_for_backend, collect_mvu_update_rules_for_backend,
+    load_sqlite_campaign_context_snapshot, storage_backend::StorageFacade,
 };
 
 #[test]
@@ -25,6 +28,10 @@ fn sqlite_mvu_translation_authority_and_collectors() {
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate sqlite runtime");
     assert!(sqlite_runtime::is_sqlite_active());
+    let storage = StorageFacade::new(
+        temp.path().to_path_buf(),
+        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+    );
 
     // ── 卡 payload（StoredCard 形态）+ 两个 definition 供 def→source 反查 ──
     let card_id = Id::from_str("card-mvu");
@@ -109,6 +116,7 @@ fn sqlite_mvu_translation_authority_and_collectors() {
 
     // ── 收集链路：campaign runtime 两个实例同卡 → 规则去重、片段过滤 ──
     let campaign = Campaign::new(card_id.clone(), "MVU campaign".to_string());
+    sqlite_runtime::save_campaign(&campaign).expect("campaign persists for context compilation");
     let instance_a = CharacterInstance {
         id: Id::from_str("inst-a"),
         campaign_id: campaign.id.clone(),
@@ -130,7 +138,7 @@ fn sqlite_mvu_translation_authority_and_collectors() {
         is_temporary: false,
     };
     let runtime = CampaignRuntimeContext {
-        campaign,
+        campaign: campaign.clone(),
         instances: vec![instance_a, instance_b],
         definitions_by_id: Default::default(),
         knowledge: vec![],
@@ -141,17 +149,53 @@ fn sqlite_mvu_translation_authority_and_collectors() {
     ctx.campaign_runtime = Some(Arc::new(runtime));
 
     // 同卡两实例在场：规则只贡献一次（source 去重），空白规则被过滤
-    let rules =
-        collect_mvu_update_rules_for_backend(&ctx, &["Alice".to_string(), "Bob".to_string()]);
+    let rules = collect_mvu_update_rules_for_backend(
+        &storage,
+        &ctx,
+        &["Alice".to_string(), "Bob".to_string()],
+    )
+    .expect("SQLite MVU rule collection succeeds");
     assert_eq!(rules, vec!["受到伤害时降低 hp".to_string()]);
 
     // fallback 片段：空 js_snippet 被过滤（无去重语义，与 JSON 路径一致）
-    let fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &["Alice".to_string()]);
+    let fragments =
+        collect_mvu_fallback_fragments_for_backend(&storage, &ctx, &["Alice".to_string()])
+            .expect("SQLite MVU fragment collection succeeds");
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].js_snippet, "variables.probe = true;");
 
     // 未知角色 / 无 definition 命中 → 空集不报错
-    assert!(collect_mvu_update_rules_for_backend(&ctx, &["无名氏".to_string()]).is_empty());
+    assert!(
+        collect_mvu_update_rules_for_backend(&storage, &ctx, &["无名氏".to_string()])
+            .expect("an unknown character is a successful empty match")
+            .is_empty()
+    );
+
+    let card_corruptor = Database::open(&db_path).expect("open card corruption probe");
+    card_corruptor
+        .connection()
+        .execute(
+            "UPDATE character_cards SET payload_json = '{' WHERE card_id = ?1",
+            [card_id.as_str()],
+        )
+        .expect("corrupt the authoritative card payload");
+    drop(card_corruptor);
+    let context_error = match load_sqlite_campaign_context_snapshot(&storage, &campaign.id) {
+        Err(error) => error,
+        Ok(_) => panic!("SQLite card decode failures must not produce an empty Campaign context"),
+    };
+    assert!(
+        !context_error.trim().is_empty(),
+        "SQLite card corruption must produce a diagnostic"
+    );
+    sqlite_runtime::save_card_payload(
+        &card_id,
+        "MVU 测试卡",
+        Some(source_id.as_str()),
+        Some("2026-07-27T00:00:00Z"),
+        &stored_card,
+    )
+    .expect("restore card payload after the error propagation probe");
 
     // ── 删除级联往返 ──
     assert!(sqlite_runtime::delete_mvu(&source_id).expect("delete ok"));
@@ -161,5 +205,29 @@ fn sqlite_mvu_translation_authority_and_collectors() {
             .expect("get ok")
             .is_none()
     );
-    assert!(collect_mvu_update_rules_for_backend(&ctx, &["Alice".to_string()]).is_empty());
+    assert!(
+        collect_mvu_update_rules_for_backend(&storage, &ctx, &["Alice".to_string()])
+            .expect("a missing translation is a successful empty match")
+            .is_empty()
+    );
+
+    sqlite_runtime::save_mvu(&stored_mvu).expect("restore translation for error propagation");
+    let corruptor = Database::open(&db_path).expect("open an independent corruption probe");
+    corruptor
+        .connection()
+        .execute(
+            "UPDATE mvu_translations SET payload_json = '{' WHERE source_character_id = ?1",
+            [source_id.as_str()],
+        )
+        .expect("corrupt the authoritative MVU payload");
+    drop(corruptor);
+    let error = collect_mvu_update_rules_for_backend(&storage, &ctx, &["Alice".to_string()])
+        .expect_err("SQLite MVU decode failures must not be disguised as an empty rule set");
+    let normalized_error = error.to_ascii_lowercase();
+    assert!(
+        normalized_error.contains("mvu")
+            || normalized_error.contains("json")
+            || normalized_error.contains("deserialize"),
+        "unexpected SQLite MVU error: {error}"
+    );
 }

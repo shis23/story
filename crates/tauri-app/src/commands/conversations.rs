@@ -14,10 +14,10 @@ use storyforge_infra_regex::{
 
 use crate::AppState;
 use crate::error::TauriCommandError;
-use crate::sqlite_runtime;
+use crate::storage_backend::{BackendCapability, CapabilityStatus};
 use crate::{
-    collect_campaign_scoped_regex_scripts, collect_scoped_regex_scripts, get_campaign_store,
-    get_conn_store, get_global_regex_store, get_preset_store, merge_runtime_regex_scripts,
+    collect_scoped_regex_scripts, get_conn_store, get_global_regex_store, get_preset_store,
+    merge_runtime_regex_scripts,
 };
 use storyforge_app_conversation::ConversationStore;
 
@@ -318,50 +318,26 @@ pub(crate) struct ConversationSummaryDto {
 #[tauri::command]
 pub(crate) fn list_conversations(
     state: tauri::State<'_, Arc<AppState>>,
-) -> Vec<ConversationSummaryDto> {
-    // 联查角色卡名。
-    // conversation.character_id 存的是 CharacterCard.id（而非 domain Character 的
-    // source_character_id），所以必须用 campaign_store 的卡片表按 card.id 联查,
-    // 不能用 tool_ctx.characters（那是扁平 Character,id=source_character_id）。
-    // 兜底:character_id 联查不到时,走 campaign_id → campaign.card_id → card.name。
-    let store = get_campaign_store();
-    let cards = store.list_cards();
-    let card_by_id: std::collections::HashMap<&Id, &str> = cards
-        .iter()
-        .map(|sc| (&sc.card.id, sc.card.name.as_str()))
-        .collect();
-    state
-        .conv_store
-        .list()
+) -> Result<Vec<ConversationSummaryDto>, TauriCommandError> {
+    // 联查角色卡名由 backend adapter 统一处理（Gate 3）：
+    // JSON 一次 list_cards 快照建卡名表（character_id 直查 → campaign 兜底）；
+    // SQLite 无卡名来源，card_name 恒 None（文档化 Gate 4 缺口，不静默回退）。
+    let summaries = state.conv_store.list();
+    let card_names =
+        crate::backend_workflows::conversation_card_names_for_backend(state.storage(), &summaries)
+            .map_err(TauriCommandError::internal)?;
+    Ok(summaries
         .into_iter()
-        .map(|c| {
-            let card_name = c
-                .character_id
-                .as_ref()
-                .and_then(|cid| {
-                    // 首选:直接按 character_id(=CharacterCard.id)查卡名
-                    let cid_id = Id::from_str(cid);
-                    card_by_id.get(&cid_id).map(|n| (*n).to_string())
-                })
-                .or_else(|| {
-                    // 兜底:campaign_id → campaign.card_id → card.name
-                    c.campaign_id.as_ref().and_then(|camp_id| {
-                        store.get_campaign(camp_id).and_then(|campaign| {
-                            card_by_id.get(&campaign.card_id).map(|n| (*n).to_string())
-                        })
-                    })
-                });
-            ConversationSummaryDto {
-                id: c.id.to_string(),
-                character_id: c.character_id,
-                campaign_id: c.campaign_id.map(|id| id.to_string()),
-                card_name,
-                message_count: c.message_count,
-                created_at: c.created_at.to_rfc3339(),
-                updated_at: c.updated_at.to_rfc3339(),
-            }
+        .map(|c| ConversationSummaryDto {
+            id: c.id.to_string(),
+            character_id: c.character_id,
+            campaign_id: c.campaign_id.map(|id| id.to_string()),
+            card_name: card_names.get(c.id.as_str()).cloned(),
+            message_count: c.message_count,
+            created_at: c.created_at.to_rfc3339(),
+            updated_at: c.updated_at.to_rfc3339(),
         })
-        .collect()
+        .collect())
 }
 
 /// 删除整个会话。
@@ -373,14 +349,21 @@ pub(crate) fn delete_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
+    if state
+        .storage()
+        .capability(BackendCapability::CampaignLifecycle)
+        != CapabilityStatus::Supported
+    {
         return Err(TauriCommandError::validation(
             "conversation/campaign deletion is not available in the SQLite opt-in backend yet"
                 .to_string(),
         ));
     }
     let conv_id = Id::from_str(&conversation_id);
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::CampaignLifecycle,
+        "delete conversation campaign",
+    )?;
 
     // 优先：会话自己记录的 campaign_id
     let campaign_id = state
@@ -463,17 +446,44 @@ fn collect_conversation_regex_scripts(
     conversation: &Conversation,
     state: &AppState,
 ) -> Vec<RegexScript> {
-    let scoped_scripts = if let Some(campaign_id) = &conversation.campaign_id {
-        collect_campaign_scoped_regex_scripts(campaign_id, get_campaign_store())
-    } else {
-        let tool_snapshot = state.snapshot_tool_ctx();
-        collect_scoped_regex_scripts(
-            conversation.character_id.as_deref(),
-            &tool_snapshot.characters,
-        )
+    // campaign-scoped 正则按 backend 分发（Gate 3）：JSON 从 CampaignStore 读；
+    // SQLite 无 campaign-scoped 来源（Ok(None)），保持 character 维度降级。
+    let scoped_scripts = match conversation.campaign_id.as_ref() {
+        Some(campaign_id) => {
+            match crate::backend_workflows::campaign_scoped_regex_scripts_for_backend(
+                state.storage(),
+                campaign_id,
+            ) {
+                Ok(Some(scripts)) => scripts,
+                Ok(None) => collect_character_scoped_regex_scripts(conversation, state),
+                Err(error) => {
+                    tracing::warn!("conversation regex context unavailable: {error}");
+                    Vec::new()
+                }
+            }
+        }
+        None => collect_character_scoped_regex_scripts(conversation, state),
     };
 
     merge_runtime_regex_scripts(scoped_scripts, get_preset_store(), get_global_regex_store())
+}
+
+fn collect_character_scoped_regex_scripts(
+    conversation: &Conversation,
+    state: &AppState,
+) -> Vec<RegexScript> {
+    let tool_snapshot = state.snapshot_tool_ctx();
+    collect_scoped_regex_scripts(
+        conversation.character_id.as_deref(),
+        &tool_snapshot.characters,
+        state
+            .storage()
+            .json_character_store(
+                BackendCapability::CharacterCommands,
+                "conversation scoped regex context",
+            )
+            .ok(),
+    )
 }
 
 fn conversation_display_dto(

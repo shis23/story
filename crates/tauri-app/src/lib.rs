@@ -1,3 +1,4 @@
+mod backend_workflows;
 pub mod campaign_store;
 mod card_shell_cache;
 mod card_studio_api;
@@ -60,9 +61,11 @@ use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
 use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+use storyforge_domain::conversation::Provenance;
+#[cfg(test)]
+use storyforge_domain::conversation::Role as ConversationRole;
 #[cfg(test)]
 use storyforge_domain::conversation::VariantStatus;
-use storyforge_domain::conversation::{Provenance, Role as ConversationRole};
 use storyforge_domain::llm::{
     ChatMessage, LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
@@ -71,9 +74,6 @@ use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
-use storyforge_infra_sqlite::preaccept::{
-    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest,
-};
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
 };
@@ -119,15 +119,15 @@ impl Drop for PromptHookPendingGuard {
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
-static STORE: OnceLock<CharacterStore> = OnceLock::new();
+#[cfg(test)]
+static STORE: OnceLock<Arc<CharacterStore>> = OnceLock::new();
 const EMBED_SECRET_KIND: &str = "embedder";
 const EMBED_SECRET_ID: &str = "default";
 
+#[cfg(test)]
 pub(crate) fn get_store() -> &'static CharacterStore {
-    STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        CharacterStore::new(&data_dir)
-    })
+    let store = STORE.get_or_init(|| Arc::new(CharacterStore::new(&get_app_data_dir())));
+    store.as_ref()
 }
 
 static CONN_STORE: OnceLock<Arc<ConnectionStore>> = OnceLock::new();
@@ -168,8 +168,8 @@ fn get_global_regex_store() -> &'static global_regex_store::GlobalRegexStore {
     })
 }
 
-static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new();
-static COMPRESS_JOB_STORE: OnceLock<compress_job_store::CompressJobStore> = OnceLock::new();
+#[cfg(test)]
+static CAMPAIGN_STORE: OnceLock<Arc<campaign_store::CampaignStore>> = OnceLock::new();
 
 fn get_card_shell_cache() -> &'static card_shell_cache::CardShellCache {
     use std::sync::OnceLock;
@@ -177,60 +177,27 @@ fn get_card_shell_cache() -> &'static card_shell_cache::CardShellCache {
     CACHE.get_or_init(|| card_shell_cache::CardShellCache::new(&get_app_data_dir()))
 }
 
+#[cfg(test)]
 pub(crate) fn get_campaign_store() -> &'static campaign_store::CampaignStore {
-    let store = CAMPAIGN_STORE.get_or_init(|| {
-        if sqlite_runtime::is_sqlite_active() {
-            campaign_store::CampaignStore::disabled()
-        } else {
-            let data_dir = get_app_data_dir();
-            campaign_store::CampaignStore::new(&data_dir)
-        }
-    });
-    if sqlite_runtime::is_sqlite_active() {
-        // Backend resolution normally happens before this lazy store is ever
-        // initialized. Keep this guard for accidental early initialization so
-        // SQLite mode can never use JSON as a fallback or second write target.
-        store.disable_json_access();
-    }
-    store
-}
-
-fn get_compress_job_store() -> &'static compress_job_store::CompressJobStore {
-    COMPRESS_JOB_STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        compress_job_store::CompressJobStore::new(&data_dir)
-    })
-}
-
-static TURN_STORE: OnceLock<turn_store::TurnStore> = OnceLock::new();
-
-fn get_turn_store() -> &'static turn_store::TurnStore {
-    TURN_STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        turn_store::TurnStore::new(&data_dir)
-    })
+    let store = CAMPAIGN_STORE
+        .get_or_init(|| Arc::new(campaign_store::CampaignStore::new(&get_app_data_dir())));
+    store.as_ref()
 }
 
 /// Read Turn state from the process-selected authority. SQLite mode never
 /// consults the legacy JSON `TurnStore`, including on error paths.
 fn get_active_turn_for_backend(
+    storage: &storage_backend::StorageFacade,
     campaign_id: &Id,
 ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
-    if sqlite_runtime::is_sqlite_active() {
-        sqlite_runtime::get_active_turn(campaign_id)
-    } else {
-        Ok(get_turn_store().get_active_turn(campaign_id))
-    }
+    storage.get_active_turn(campaign_id)
 }
 
 fn get_turn_by_variant_for_backend(
+    storage: &storage_backend::StorageFacade,
     variant_id: &Id,
 ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
-    if sqlite_runtime::is_sqlite_active() {
-        sqlite_runtime::get_turn_by_variant(variant_id)
-    } else {
-        Ok(get_turn_store().get_turn_by_variant(variant_id))
-    }
+    storage.get_turn_by_variant(variant_id)
 }
 
 /// Phase A 启动恢复：幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn 为 Failed。
@@ -248,7 +215,7 @@ fn get_turn_by_variant_for_backend(
 fn recover_turns_on_startup(app_state: &AppState) {
     // SQLite accept is atomic: recover by failing incomplete pipeline turns.
     // Never fall back to JSON stores when SQLite is authoritative.
-    if sqlite_runtime::is_sqlite_active() {
+    if app_state.storage.is_sqlite() {
         match sqlite_runtime::recover_turns_on_startup() {
             Ok(n) if n > 0 => {
                 tracing::warn!(count = n, "sqlite recovery failed incomplete turns")
@@ -258,9 +225,20 @@ fn recover_turns_on_startup(app_state: &AppState) {
         }
         return;
     }
+    let campaign_store = app_state
+        .storage()
+        .json_campaign_store(
+            storage_backend::BackendCapability::TurnLifecycle,
+            "recover JSON turns",
+        )
+        .expect("JSON recovery requires the facade-owned CampaignStore");
+    let turn_store = app_state
+        .storage()
+        .json_turn_store("recover JSON turns")
+        .expect("JSON recovery requires the facade-owned TurnStore");
     let service = turn_lifecycle::TurnLifecycleService::new(
-        get_campaign_store(),
-        get_turn_store(),
+        campaign_store,
+        turn_store,
         &app_state.conv_store,
     );
     service.recover_turns_on_startup(|batch| {
@@ -273,10 +251,21 @@ fn recover_turns_on_startup(app_state: &AppState) {
 /// 如果存在非 terminal Turn，返回错误，阻止新一轮启动。
 /// 非 Campaign 模式（无活跃 Campaign）直接放行。
 fn check_turn_barrier(state: &Arc<AppState>) -> Result<(), TauriCommandError> {
-    check_turn_barrier_with(state, get_turn_store())
+    let active_campaign_id = {
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+    let Some(campaign_id) = active_campaign_id else {
+        return Ok(());
+    };
+    reject_if_active_turn(state.storage(), &campaign_id)
 }
 
 /// 可注入 TurnStore 的屏障检查（测试 hermetic 化用）。
+#[cfg(test)]
 fn check_turn_barrier_with(
     state: &Arc<AppState>,
     turn_store: &turn_store::TurnStore,
@@ -295,30 +284,27 @@ fn check_turn_barrier_with(
 }
 
 /// 直接写 Campaign 入口的屏障：指定 campaign 有活动 Turn 时拒绝。
-fn reject_if_active_turn(campaign_id: &Id) -> Result<(), TauriCommandError> {
-    reject_if_active_turn_in(get_turn_store(), campaign_id)
+fn reject_if_active_turn(
+    storage: &storage_backend::StorageFacade,
+    campaign_id: &Id,
+) -> Result<(), TauriCommandError> {
+    match storage.get_active_turn(campaign_id) {
+        Ok(Some(turn)) => Err(TauriCommandError::validation(format!(
+            "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
+            turn.turn_id, turn.status
+        ))),
+        Ok(None) => Ok(()),
+        Err(error) => Err(TauriCommandError::internal(format!(
+            "active turn lookup failed: {error}"
+        ))),
+    }
 }
 
+#[cfg(test)]
 fn reject_if_active_turn_in(
     turn_store: &turn_store::TurnStore,
     campaign_id: &Id,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        match sqlite_runtime::get_active_turn(campaign_id) {
-            Ok(Some(turn)) => {
-                return Err(TauriCommandError::validation(format!(
-                    "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
-                    turn.turn_id, turn.status
-                )));
-            }
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                return Err(TauriCommandError::internal(format!(
-                    "sqlite active turn lookup failed: {e}"
-                )));
-            }
-        }
-    }
     if let Some(turn) = turn_store.get_active_turn(campaign_id) {
         return Err(TauriCommandError::validation(format!(
             "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
@@ -601,19 +587,21 @@ fn should_load_legacy_active_campaign_pointer(sqlite_active: bool) -> bool {
 fn resolve_active_campaign_with_legacy_fallback(
     memory_active_id: Option<Id>,
     data_dir: &Path,
-    sqlite_active: bool,
+    storage: &storage_backend::StorageFacade,
 ) -> Option<Id> {
-    if should_load_legacy_active_campaign_pointer(sqlite_active) {
+    if should_load_legacy_active_campaign_pointer(storage.is_sqlite()) {
         memory_active_id.or_else(|| load_active_campaign(data_dir))
     } else {
         memory_active_id
     }
 }
 
-fn load_active_campaign_for_backend(data_dir: &Path) -> Option<Id> {
-    let sqlite_active = sqlite_runtime::is_sqlite_active();
-    let active_id = resolve_active_campaign_with_legacy_fallback(None, data_dir, sqlite_active);
-    if sqlite_active {
+fn load_active_campaign_for_backend(
+    data_dir: &Path,
+    storage: &storage_backend::StorageFacade,
+) -> Option<Id> {
+    let active_id = resolve_active_campaign_with_legacy_fallback(None, data_dir, storage);
+    if storage.is_sqlite() {
         return active_id;
     }
     let active_id = active_id?;
@@ -638,13 +626,6 @@ fn campaign_exists_on_disk(data_dir: &Path, id: &Id) -> bool {
         return false;
     };
     campaigns.iter().any(|campaign| campaign.id == *id)
-}
-
-fn save_active_campaign(data_dir: &Path, id: Option<&Id>) -> Result<(), String> {
-    let path = data_dir.join("active_campaign.json");
-    let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
-    storyforge_infra_util::atomic_write_json(&path, &v)
-        .map_err(|error| format!("保存活跃 Campaign 失败: {error}"))
 }
 
 // ─── AppState（M1 新增，注入到 Tauri managed state）─────────────────────────
@@ -693,6 +674,8 @@ fn clear_current_cancel_if(app: &AppState, operation_id: &Id) {
 pub struct AppState {
     /// App data directory used by stateful stores owned by this process.
     data_dir: PathBuf,
+    /// Process-pinned storage authority and capability contract.
+    storage: Arc<storage_backend::StorageFacade>,
     pub conv_store: Arc<ConversationStore>,
     pub log_store: Arc<LogStore>,
     /// 工具上下文（导入角色卡时同步更新，RwLock 支持运行时写入）
@@ -722,6 +705,9 @@ pub struct AppState {
     pub active_campaign: Mutex<Option<Id>>,
     /// Serialize active Campaign switching with deletion and pointer persistence.
     pub(crate) active_campaign_update: Mutex<()>,
+    /// Turn/Attempt/Accept/Postprocess workflow adapters selected once at
+    /// construction from the startup-pinned storage backend (Gate 3).
+    pub turn_workflow: Arc<backend_workflows::TurnWorkflow>,
     /// 插件注册表（持久化到 data/plugins.json）
     pub plugin_registry: Arc<PluginRegistry>,
     /// 模块存储（内置 + 自定义模块 + 启用/禁用状态）
@@ -737,25 +723,32 @@ pub struct AppState {
         Mutex<std::collections::HashMap<String, storyforge_app_meta::MetaConversation>>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AppState {
-    pub fn new() -> Self {
-        Self::new_with_data_dir(get_app_data_dir())
-    }
-
-    fn new_with_data_dir(data_dir: PathBuf) -> Self {
+    pub(crate) fn new_with_backend(
+        data_dir: PathBuf,
+        storage: Arc<storage_backend::StorageFacade>,
+    ) -> Result<Self, String> {
+        if storage.data_dir() != data_dir.as_path() {
+            return Err(
+                "AppState and StorageFacade must share one canonical data directory".to_string(),
+            );
+        }
+        storage.validate_runtime_authority()?;
+        let character_store = if storage.is_json() {
+            Some(storage.json_character_store_owned(
+                storage_backend::BackendCapability::CharacterCommands,
+                "hydrate JSON character runtime",
+            )?)
+        } else {
+            None
+        };
         std::fs::create_dir_all(&data_dir).ok();
         // AND-3：storage_meta 版本记录（升级检测基础；best-effort 不 panic）
         touch_storage_meta(&data_dir);
         let conv_dir = data_dir.join("conversations");
         let log_dir = data_dir.join("logs");
 
-        let conv_store = if sqlite_runtime::is_sqlite_active() {
+        let conv_store = if storage.is_sqlite() {
             let persistence = sqlite_runtime::conversation_persistence()
                 .expect("sqlite backend was activated before AppState construction");
             Arc::new(ConversationStore::with_persistence(persistence))
@@ -781,8 +774,7 @@ impl AppState {
         // 启动恢复：从 CharacterStore 把已导入的角色卡 + 世界书同步进 tool_ctx
         // （否则每次重启 dev，tool_ctx 都是空的，写作时报"没有可用角色卡"）
         // 世界书：最后一张卡的条目 + 所有其他卡的 is_global 条目（全局共享）
-        {
-            let store = CharacterStore::new(&data_dir);
+        if let Some(store) = character_store.as_deref() {
             let stored_chars = store.list();
             if !stored_chars.is_empty() {
                 let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -851,9 +843,18 @@ impl AppState {
             conv_store: conv_store.clone(),
         }));
 
-        Self {
+        // Gate 3: the Turn/Attempt/Accept workflow adapter is selected exactly
+        // once here; commands never branch on the storage backend.
+        let turn_workflow = Arc::new(backend_workflows::TurnWorkflow::new(
+            storage.clone(),
+            conv_store.clone(),
+        ));
+
+        Ok(Self {
             data_dir: data_dir.clone(),
+            storage: storage.clone(),
             conv_store,
+            turn_workflow,
             log_store,
             tool_ctx,
             current_cancel: Mutex::new(None),
@@ -869,7 +870,7 @@ impl AppState {
             // SQLite mode must not let a legacy JSON UI preference select an
             // authority record after cutover. SQLite-native preference storage
             // is intentionally deferred; selection remains in-process.
-            active_campaign: Mutex::new(load_active_campaign_for_backend(&data_dir)),
+            active_campaign: Mutex::new(load_active_campaign_for_backend(&data_dir, &storage)),
             active_campaign_update: Mutex::new(()),
             plugin_registry,
             module_store,
@@ -877,7 +878,7 @@ impl AppState {
             agent_profile_config_store,
             meta_session: Arc::new(meta_session),
             meta_conversations: Mutex::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -887,7 +888,14 @@ impl AppState {
             "storyforge-app-state-test-{}",
             uuid::Uuid::new_v4()
         ));
-        Self::new_with_data_dir(data_dir)
+        let storage = Arc::new(storage_backend::StorageFacade::new(
+            data_dir.clone(),
+            storyforge_infra_sqlite::backend::PinnedBackend::new(
+                storyforge_infra_sqlite::backend::StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        ));
+        Self::new_with_backend(data_dir, storage).expect("test JSON facade must be self-consistent")
     }
 
     /// 惰性清扫历史测试残留（>24h 的 storyforge-app-state-test-*）。
@@ -931,6 +939,30 @@ impl AppState {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         Arc::new(ctx)
+    }
+
+    pub(crate) fn storage(&self) -> &Arc<storage_backend::StorageFacade> {
+        &self.storage
+    }
+
+    pub(crate) fn json_campaign_store(
+        &self,
+        capability: storage_backend::BackendCapability,
+        operation: &str,
+    ) -> Result<&campaign_store::CampaignStore, TauriCommandError> {
+        self.storage
+            .json_campaign_store(capability, operation)
+            .map_err(TauriCommandError::validation)
+    }
+
+    pub(crate) fn json_character_store(
+        &self,
+        capability: storage_backend::BackendCapability,
+        operation: &str,
+    ) -> Result<&CharacterStore, TauriCommandError> {
+        self.storage
+            .json_character_store(capability, operation)
+            .map_err(TauriCommandError::validation)
     }
 
     /// 当前活跃的 LLM client。无连接时返回 None，禁止生产态回退开发 Mock。
@@ -1040,13 +1072,14 @@ impl AppState {
         );
         // SQLite pre-accept UoW owns the atomic conversation+attempt land point.
         // Pipeline generation returns text/provenance without durable ConversationStore writes.
-        if sqlite_runtime::is_sqlite_active() {
+        if self.storage.defer_pipeline_conversation_land() {
             pipeline.set_defer_conversation_land(true);
         }
         Ok(pipeline)
     }
 }
 
+pub use backend_workflows::*;
 pub use runtime_support::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1097,14 +1130,20 @@ pub fn run() {
                 cutover = resolution.cutover_performed,
                 "storage backend resolved"
             );
-            if let Some(db_path) = resolution.db_path {
-                sqlite_runtime::activate(&db_path)
+            let storage = Arc::new(storage_backend::StorageFacade::new(
+                data_dir.clone(),
+                resolution.pinned.clone(),
+            ));
+            if let Some(db_path) = resolution.db_path.as_deref() {
+                sqlite_runtime::activate(db_path)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
             }
 
             // AppState and every process-owned store now share the setup-resolved
             // directory. Only after construction can tracing write into LogStore.
-            let app_state = Arc::new(AppState::new_with_data_dir(data_dir));
+            let app_state = Arc::new(
+                AppState::new_with_backend(data_dir, storage).map_err(std::io::Error::other)?,
+            );
             storyforge_app_logging::init_tracing(app_state.log_store.clone());
             app.manage(app_state.clone());
 

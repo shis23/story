@@ -27,6 +27,7 @@ use storyforge_infra_sqlite::{current_version, migrate};
 /// Process-owned SQLite handle. Opened once when SQLite is selected.
 static SQLITE_DB: OnceLock<Arc<Mutex<Database>>> = OnceLock::new();
 static SQLITE_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SQLITE_ACTIVATION: Mutex<()> = Mutex::new(());
 
 /// SQLite-backed durable authority injected into `ConversationStore` when the
 /// opt-in backend is active. It makes the existing pipeline's user/draft/
@@ -76,10 +77,20 @@ pub fn is_sqlite_active() -> bool {
 /// Open and pin the SQLite database for this process. Fail closed if the path
 /// cannot be opened or migrated.
 pub fn activate(db_path: impl AsRef<Path>) -> Result<(), String> {
-    if SQLITE_DB.get().is_some() {
-        return Ok(());
-    }
+    let _activation = SQLITE_ACTIVATION
+        .lock()
+        .map_err(|_| "sqlite activation lock poisoned".to_string())?;
     let path = db_path.as_ref().to_path_buf();
+    if let Some(active_path) = SQLITE_PATH.get() {
+        return if authority_paths_match(active_path, &path) {
+            Ok(())
+        } else {
+            Err("sqlite backend already active at a different path".to_string())
+        };
+    }
+    if SQLITE_DB.get().is_some() {
+        return Err("sqlite database is active without a pinned path".to_string());
+    }
     let mut db = Database::open(&path).map_err(|e| format!("open sqlite: {e}"))?;
     migrate(&mut db).map_err(|e| format!("migrate sqlite: {e}"))?;
     let _ = current_version(&db).map_err(|e| format!("schema version: {e}"))?;
@@ -90,6 +101,24 @@ pub fn activate(db_path: impl AsRef<Path>) -> Result<(), String> {
         .set(Arc::new(Mutex::new(db)))
         .map_err(|_| "sqlite database already set".to_string())?;
     Ok(())
+}
+
+fn authority_paths_match(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+/// Validate that SQLite is active at the expected process authority path.
+pub fn validate_active_path(expected: &Path) -> Result<(), String> {
+    let active = SQLITE_PATH
+        .get()
+        .ok_or_else(|| "SQLite facade requires an active SQLite runtime".to_string())?;
+    if authority_paths_match(active, expected) {
+        Ok(())
+    } else {
+        Err("SQLite facade/runtime path mismatch".to_string())
+    }
 }
 
 /// Build the sole durable conversation authority for an SQLite process.
@@ -515,11 +544,11 @@ pub fn accept_by_variant(
                 other => AcceptError::Commit(other.to_string()),
             })?;
 
-            let campaign_revision_after = get_campaign(&turn.campaign_id)
-                .ok()
-                .flatten()
-                .map(|c| c.revision)
-                .unwrap_or(campaign_revision_before + 1);
+            // UoW 内写入的真值：`campaign.revision = batch.target_revision`
+            // （UoW 校验 target == expected + 1 后才提交）。直接从已验证的
+            // batch 取，避免提交后的二次读取——提交成功却因读失败误报错误，
+            // 会让调用方跳过 conversation invalidate 与后续动作。
+            let campaign_revision_after = batch.target_revision;
 
             let _ = outcome; // Applied | AlreadyCommitted — both OK for the caller.
             let _ = matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted);
@@ -552,12 +581,34 @@ pub fn recover_turns_on_startup() -> Result<usize, String> {
 
 // ─── Pre-accept lifecycle gateway (shared by Tauri + harness) ──────────────
 
+/// Test-only fault injection: make the first-draft preaccept UoW fail after
+/// its mutations (rollback path) so callers exercise the real failure
+/// write-back semantics. Exposed to integration tests via thread-local flag.
+#[doc(hidden)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fail_draft_uow_for_test(fail: bool) {
+    FAIL_DRAFT_UOW.with(|flag| flag.set(fail));
+}
+
+thread_local! {
+    static FAIL_DRAFT_UOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Atomic first-draft land: conversation AI node + Turn/Attempt DraftReady + outbox.
 pub fn create_draft_attempt(
     request: DraftAttemptRequest<'_>,
 ) -> Result<DraftAttemptOutcome, String> {
     with_db_mut(|db| {
-        SqlitePreacceptRepository::create_draft_attempt(db, request).map_err(|e| e.to_string())
+        if FAIL_DRAFT_UOW.with(|flag| flag.get()) {
+            SqlitePreacceptRepository::create_draft_attempt_with_fault(
+                db,
+                request,
+                storyforge_infra_sqlite::preaccept::PreacceptFault::BeforeCommit,
+            )
+            .map_err(|e| e.to_string())
+        } else {
+            SqlitePreacceptRepository::create_draft_attempt(db, request).map_err(|e| e.to_string())
+        }
     })
 }
 

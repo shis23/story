@@ -18,22 +18,17 @@ use crate::commands::writing_regenerate::{
 use crate::error::TauriCommandError;
 use crate::last_user_intent_before;
 use crate::production_postprocess;
-use crate::sqlite_runtime;
 use crate::turn_lifecycle;
-use crate::turn_store;
 use crate::{
-    AppState, AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest,
-    PromptHookPendingGuard, PromptHookPendingMap, append_missing_campaign_scoped_regex_scripts,
-    begin_writing_operation, check_turn_barrier, clear_current_cancel_if,
-    collect_mvu_fallback_fragments_for_backend, collect_mvu_update_rules_for_backend,
-    collect_scoped_regex_scripts, fill_agent_profile_context, fill_campaign_context_async,
-    fill_far_memory_hits, fill_profile_context, fill_regex_context, get_active_turn_for_backend,
-    get_campaign_store, get_global_regex_store, get_preset_store, get_turn_store,
-    is_current_attempt_ready_for_postprocess, postprocess_variable_keys,
-    prepare_start_conversation_async, run_shared_postprocess_background, service_fail_turn,
-    update_turn_record,
+    AppState, BackendTurnAttemptSink, PromptHookPendingGuard, PromptHookPendingMap,
+    append_missing_campaign_scoped_regex_scripts, begin_writing_operation, check_turn_barrier,
+    clear_current_cancel_if, collect_mvu_fallback_fragments_for_backend,
+    collect_mvu_update_rules_for_backend, collect_scoped_regex_scripts, fill_agent_profile_context,
+    fill_campaign_context_async, fill_far_memory_hits, fill_profile_context, fill_regex_context,
+    get_active_turn_for_backend, get_global_regex_store, get_preset_store,
+    postprocess_variable_keys, prepare_start_conversation_async, run_shared_postprocess_background,
+    service_fail_turn, update_turn_record,
 };
-use storyforge_infra_sqlite::preaccept::RegenerateAttemptRequest;
 
 // ─── M1 写作命令 ───────────────────────────────────────────────────────────
 
@@ -81,7 +76,7 @@ pub(crate) async fn regenerate_impl(
         .clone();
     let active_turn = active_campaign
         .as_ref()
-        .map(get_active_turn_for_backend)
+        .map(|campaign_id| get_active_turn_for_backend(app.storage(), campaign_id))
         .transpose()
         .map_err(TauriCommandError::internal)?
         .flatten();
@@ -125,6 +120,12 @@ pub(crate) async fn regenerate_impl(
         regex_scripts: collect_scoped_regex_scripts(
             regex_character_id.as_deref(),
             &tool_snapshot.characters,
+            app.storage()
+                .json_character_store(
+                    crate::storage_backend::BackendCapability::CharacterCommands,
+                    "regenerate scoped regex context",
+                )
+                .ok(),
         ),
         campaign_runtime: None,
         agent_profile_config: None,
@@ -185,12 +186,12 @@ pub(crate) async fn regenerate_impl(
         // 新 variant 在同一 node 上,用 req 的 node_id 作为 variant_id
         // SQLite: atomic preaccept UoW owns conversation + attempt land.
         let regen_attempt_id = if let Some(campaign_id) = &ctx.campaign_id {
-            if let Some(turn) =
-                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
+            if let Some(turn) = get_active_turn_for_backend(app.storage(), campaign_id)
+                .map_err(TauriCommandError::internal)?
             {
                 let new_attempt_id = Id::new();
-                if sqlite_runtime::is_sqlite_active() {
-                    match sqlite_runtime::append_regenerate_attempt(RegenerateAttemptRequest {
+                match app.turn_workflow.append_regenerate_attempt(
+                    crate::backend_workflows::RegenerateAttemptRequest {
                         campaign_id,
                         conversation_id: &conversation_id,
                         turn_id: &turn.turn_id,
@@ -201,58 +202,13 @@ pub(crate) async fn regenerate_impl(
                             .pending_temporary_instances()
                             .to_vec(),
                         provenance: Some(provenance.clone()),
-                    }) {
-                        Ok(outcome) => {
-                            app.conv_store.invalidate();
-                            Some(outcome.attempt_id)
-                        }
-                        Err(e) => {
-                            let _ = update_turn_record(&turn.turn_id, |record| {
-                                record.status = storyforge_domain::turn::TurnStatus::Failed;
-                                record.failure_reason =
-                                    Some(format!("sqlite preaccept regenerate 失败: {e}"));
-                                record.touch();
-                            });
-                            clear_current_cancel_if(&app, &operation_id);
-                            return Err(TauriCommandError::internal(format!(
-                                "sqlite preaccept regenerate 失败: {e}"
-                            )));
-                        }
-                    }
-                } else {
-                    let new_attempt = turn_lifecycle::new_draft_attempt(
-                        new_attempt_id,
-                        node_id.clone(),
-                        text,
-                        pipeline.pending_temporary_instances().to_vec(),
-                    );
-                    let new_attempt_id = new_attempt.attempt_id.clone();
-                    // P0-4：regenerate Attempt 落盘失败不能吞掉，否则后处理会把 Turn
-                    // 推到 AwaitingAcceptance 却找不到 Attempt，形成无法 accept 的死锁。
-                    if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                        turn_lifecycle::append_regenerate_attempt(record, new_attempt);
-                    }) {
-                        if let Err(comp_e) = app
-                            .conv_store
-                            .soft_delete_variant(&conversation_id, &node_id)
-                        {
-                            tracing::error!(
-                                "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
-                                node_id
-                            );
-                        }
-                        let _ = update_turn_record(&turn.turn_id, |record| {
-                            record.status = storyforge_domain::turn::TurnStatus::Failed;
-                            record.failure_reason =
-                                Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
-                            record.touch();
-                        });
+                    },
+                ) {
+                    Ok(outcome) => Some(outcome.attempt_id),
+                    Err(e) => {
                         clear_current_cancel_if(&app, &operation_id);
-                        return Err(TauriCommandError::internal(format!(
-                            "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
-                        )));
+                        return Err(TauriCommandError::internal(e));
                     }
-                    Some(new_attempt_id)
                 }
             } else {
                 None
@@ -278,8 +234,11 @@ pub(crate) async fn regenerate_impl(
         // Operation-owned cancel clones only (no global re-subscribe / no false fallback).
         let pp_rx = cancel_rx.clone();
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）+ 变量更新规则（注入后处理提示词）
-        let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
-        let mvu_rules = collect_mvu_update_rules_for_backend(&ctx, &present_chars);
+        let mvu_fragments =
+            collect_mvu_fallback_fragments_for_backend(app.storage(), &ctx, &present_chars)
+                .map_err(TauriCommandError::internal)?;
+        let mvu_rules = collect_mvu_update_rules_for_backend(app.storage(), &ctx, &present_chars)
+            .map_err(TauriCommandError::internal)?;
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // regenerate 返回的 node 即当前 node_id（variant 更新）
         let draft_node_for_fix = pipeline_req.node_id.clone();
@@ -306,9 +265,8 @@ pub(crate) async fn regenerate_impl(
         // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）。
         // 关键同步失败必须传播，不能 best-effort 返回修复稿却留下原稿 hash。
         let active_turn_after_regenerate = match &ctx.campaign_id {
-            Some(campaign_id) => {
-                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
-            }
+            Some(campaign_id) => get_active_turn_for_backend(app.storage(), campaign_id)
+                .map_err(TauriCommandError::internal)?,
             None => None,
         };
         let pp_identity = match (
@@ -328,12 +286,9 @@ pub(crate) async fn regenerate_impl(
             _ => None,
         };
         if let Some(identity) = &pp_identity {
-            let sink = BackendTurnAttemptSink::production();
-            let service = production_postprocess::ProductionPostprocessService::new_json(
-                get_campaign_store(),
+            let sink = BackendTurnAttemptSink::production(app.storage().clone());
+            if let Err(e) = production_postprocess::TurnAttemptSink::sync_autofix_with_provenance(
                 &sink,
-            );
-            if let Err(e) = service.sync_autofix_attempt_with_provenance(
                 identity,
                 &final_text,
                 quality_report.clone(),
@@ -345,14 +300,15 @@ pub(crate) async fn regenerate_impl(
                     "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
-            if sqlite_runtime::is_sqlite_active() {
-                app.conv_store.invalidate();
-            }
+            // SQLite UoW mutated the conversation; JSON cache refresh is a
+            // harmless no-op reload. (Gate 3: no backend flag in commands.)
+            app.conv_store.invalidate();
         }
 
         // regenerate 保持同步语义：await 共享后处理；关键失败向上返回。
         let pp_runtime = ctx.campaign_runtime.clone();
         if let Err(e) = run_shared_postprocess_background(
+            app.storage().clone(),
             pipeline,
             ctx,
             final_text,
@@ -987,7 +943,7 @@ pub(crate) async fn start_writing(
     let legacy_opening_character = tool_snapshot.characters.first().cloned();
     let start_target = prepare_start_conversation_async(
         app.clone(),
-        get_campaign_store(),
+        None,
         conversation_id,
         character_id.clone(),
         legacy_opening_character,
@@ -999,8 +955,16 @@ pub(crate) async fn start_writing(
     let regex_character_id = start_target.regex_character_id;
     ctx.conversation_id = conversation_id.clone();
     let campaign_regex_scripts = std::mem::take(&mut ctx.regex_scripts);
-    ctx.regex_scripts =
-        collect_scoped_regex_scripts(regex_character_id.as_deref(), &tool_snapshot.characters);
+    ctx.regex_scripts = collect_scoped_regex_scripts(
+        regex_character_id.as_deref(),
+        &tool_snapshot.characters,
+        app.storage()
+            .json_character_store(
+                crate::storage_backend::BackendCapability::CharacterCommands,
+                "writing scoped regex context",
+            )
+            .ok(),
+    );
     append_missing_campaign_scoped_regex_scripts(&mut ctx, campaign_regex_scripts);
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
@@ -1013,19 +977,12 @@ pub(crate) async fn start_writing(
     // Phase A: Campaign 模式下创建 TurnRecord
     let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
         // 获取当前 Campaign revision 作为 base
-        let base_revision = if sqlite_runtime::is_sqlite_active() {
-            sqlite_runtime::get_campaign(campaign_id)
-                .map_err(TauriCommandError::internal)?
-                .ok_or_else(|| {
-                    TauriCommandError::internal(format!("sqlite campaign {} missing", campaign_id))
-                })?
-                .revision
-        } else {
-            get_campaign_store()
-                .get_campaign(campaign_id)
-                .map(|c| c.revision)
-                .unwrap_or(0)
-        };
+        let base_revision = app
+            .storage()
+            .get_campaign(campaign_id)
+            .map_err(TauriCommandError::internal)?
+            .map(|record| record.campaign.revision)
+            .unwrap_or(0);
         let input_node = start_target.input_node_id.unwrap_or_else(|| {
             tracing::warn!(
                 "Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder"
@@ -1038,11 +995,7 @@ pub(crate) async fn start_writing(
             input_node,
             base_revision,
         );
-        let create_turn = if sqlite_runtime::is_sqlite_active() {
-            sqlite_runtime::save_turn(&record)
-        } else {
-            get_turn_store().create_turn(record.clone())
-        };
+        let create_turn = app.storage().save_turn(&record);
         if let Err(e) = create_turn {
             tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
             return Err(TauriCommandError::internal(format!(
@@ -1089,73 +1042,31 @@ pub(crate) async fn start_writing(
         let created_attempt_id = if let Some(ref turn) = turn_record {
             let attempt_id = Id::new();
             let temps = pipeline.pending_temporary_instances().to_vec();
-            if sqlite_runtime::is_sqlite_active() {
-                let campaign_id = ctx.campaign_id.as_ref().ok_or_else(|| {
-                    TauriCommandError::internal(
-                        "sqlite preaccept draft requires campaign_id".to_string(),
-                    )
-                })?;
-                match sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+            let campaign_id = ctx.campaign_id.as_ref().ok_or_else(|| {
+                TauriCommandError::internal(
+                    "sqlite preaccept draft requires campaign_id".to_string(),
+                )
+            })?;
+            match app.turn_workflow.create_draft_attempt(
+                crate::backend_workflows::DraftAttemptRequest {
                     campaign_id,
                     conversation_id: &conversation_id,
                     turn_id: &turn.turn_id,
                     attempt_id: &attempt_id,
+                    provisional_variant_id: Some(draft_node_id),
                     draft_text: final_text,
                     pending_temporary_instances: temps,
                     provenance: provenance.clone(),
-                }) {
-                    Ok(outcome) => {
-                        landed_draft_node_id = outcome.variant_id;
-                        app.conv_store.invalidate();
-                        Some(outcome.attempt_id)
-                    }
-                    Err(e) => {
-                        let _ = update_turn_record(&turn.turn_id, |record| {
-                            record.status = storyforge_domain::turn::TurnStatus::Failed;
-                            record.failure_reason =
-                                Some(format!("sqlite preaccept draft 失败: {e}"));
-                            record.touch();
-                        });
-                        clear_current_cancel_if(&app, &operation_id);
-                        return Err(TauriCommandError::internal(format!(
-                            "sqlite preaccept draft 失败: {e}"
-                        )));
-                    }
+                },
+            ) {
+                Ok(outcome) => {
+                    landed_draft_node_id = outcome.variant_id;
+                    Some(outcome.attempt_id)
                 }
-            } else {
-                let attempt = turn_lifecycle::new_draft_attempt(
-                    attempt_id.clone(),
-                    draft_node_id.clone(),
-                    final_text,
-                    temps,
-                );
-                // A.1/P0-4：Attempt 创建失败必须传播，并补偿软删无主 Draft
-                if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                    record.attempts.push(attempt);
-                    record.status = storyforge_domain::turn::TurnStatus::DraftReady;
-                    record.touch();
-                }) {
-                    if let Err(comp_e) = app
-                        .conv_store
-                        .soft_delete_variant(&conversation_id, draft_node_id)
-                    {
-                        tracing::error!(
-                            "P0-4 补偿失败: soft_delete 无主 Draft {} 失败: {comp_e}（原错误: {e}）",
-                            draft_node_id
-                        );
-                    }
-                    // Turn 标 Failed，避免屏障卡死后续写作
-                    let _ = update_turn_record(&turn.turn_id, |record| {
-                        record.status = storyforge_domain::turn::TurnStatus::Failed;
-                        record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
-                        record.touch();
-                    });
+                Err(e) => {
                     clear_current_cancel_if(&app, &operation_id);
-                    return Err(TauriCommandError::internal(format!(
-                        "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
-                    )));
+                    return Err(TauriCommandError::internal(e));
                 }
-                Some(attempt_id)
             }
         } else {
             None
@@ -1177,8 +1088,11 @@ pub(crate) async fn start_writing(
         let var_keys = postprocess_variable_keys(&ctx);
         // Reuse the operation-owned cancel receiver (no global re-subscribe / no fallback).
         let pp_cancel_rx = cancel_rx.clone();
-        let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
-        let mvu_rules = collect_mvu_update_rules_for_backend(&ctx, &present_chars);
+        let mvu_fragments =
+            collect_mvu_fallback_fragments_for_backend(app.storage(), &ctx, &present_chars)
+                .map_err(TauriCommandError::internal)?;
+        let mvu_rules = collect_mvu_update_rules_for_backend(app.storage(), &ctx, &present_chars)
+            .map_err(TauriCommandError::internal)?;
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // SQLite: use the authoritative landed variant id (not the provisional pipeline id).
@@ -1217,13 +1131,9 @@ pub(crate) async fn start_writing(
             _ => None,
         };
         if let Some(identity) = &pp_identity {
-            let sink = BackendTurnAttemptSink::production();
-            // new_json is fine for autofix: it only uses sink, not batch_source.
-            let service = production_postprocess::ProductionPostprocessService::new_json(
-                get_campaign_store(),
+            let sink = BackendTurnAttemptSink::production(app.storage().clone());
+            if let Err(e) = production_postprocess::TurnAttemptSink::sync_autofix_with_provenance(
                 &sink,
-            );
-            if let Err(e) = service.sync_autofix_attempt_with_provenance(
                 identity,
                 &final_text,
                 quality_report.clone(),
@@ -1235,9 +1145,9 @@ pub(crate) async fn start_writing(
                     "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
-            if sqlite_runtime::is_sqlite_active() {
-                app.conv_store.invalidate();
-            }
+            // SQLite UoW mutated the conversation; JSON cache refresh is a
+            // harmless no-op reload. (Gate 3: no backend flag in commands.)
+            app.conv_store.invalidate();
         }
 
         // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
@@ -1249,6 +1159,7 @@ pub(crate) async fn start_writing(
         let operation_id_for_pp = operation_id.clone();
         tokio::spawn(async move {
             let result = run_shared_postprocess_background(
+                app_for_pp.storage().clone(),
                 pipeline,
                 ctx,
                 final_text,
@@ -1283,7 +1194,7 @@ pub(crate) async fn start_writing(
             }
             Err(e) => {
                 if let Some(ref turn) = turn_record {
-                    let _ = update_turn_record(&turn.turn_id, |record| {
+                    let _ = update_turn_record(app.storage(), &turn.turn_id, |record| {
                         record.status = storyforge_domain::turn::TurnStatus::Failed;
                         record.failure_reason = Some(format!("写作失败: {e}"));
                         record.touch();
@@ -1312,7 +1223,7 @@ pub(crate) async fn start_writing(
         Err(e) => {
             // Phase A: 写作失败 → TurnRecord 标 Failed（无副作用，安全失败）
             if let Some(ref turn) = turn_record {
-                let _ = update_turn_record(&turn.turn_id, |record| {
+                let _ = update_turn_record(app.storage(), &turn.turn_id, |record| {
                     record.status = storyforge_domain::turn::TurnStatus::Failed;
                     record.failure_reason = Some(format!("写作失败: {e}"));
                     record.touch();
@@ -1320,261 +1231,6 @@ pub(crate) async fn start_writing(
             }
             Err(TauriCommandError::from(format!("写作失败: {e}")))
         }
-    }
-}
-
-/// Routes Attempt/Turn persistence through the active backend (JSON or SQLite).
-pub(crate) struct BackendTurnAttemptSink<'a> {
-    /// Production uses the process-wide store; tests can inject an isolated store so
-    /// backend adapter coverage never writes to the user's real AppData directory.
-    json_turn_store: Option<&'a turn_store::TurnStore>,
-}
-
-impl<'a> BackendTurnAttemptSink<'a> {
-    pub(crate) fn production() -> Self {
-        Self {
-            json_turn_store: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_json_store(json_turn_store: &'a turn_store::TurnStore) -> Self {
-        Self {
-            json_turn_store: Some(json_turn_store),
-        }
-    }
-
-    fn json_store(&self) -> &'a turn_store::TurnStore {
-        match self.json_turn_store {
-            Some(store) => store,
-            None => get_turn_store(),
-        }
-    }
-
-    fn mutate_json_if<P, M>(&self, turn_id: &Id, predicate: P, mutate: M) -> Result<bool, String>
-    where
-        P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
-        M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
-    {
-        self.json_store()
-            .mutate_if(turn_id, predicate, mutate)
-            .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
-    }
-}
-
-impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink<'_> {
-    fn load_turn(
-        &self,
-        turn_id: &Id,
-    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
-        if sqlite_runtime::is_sqlite_active() {
-            sqlite_runtime::get_turn(turn_id)
-        } else {
-            Ok(self.json_store().get_turn(turn_id))
-        }
-    }
-
-    fn sync_autofix(
-        &self,
-        identity: &production_postprocess::PostprocessIdentity,
-        final_text: &str,
-        report: storyforge_domain::turn::QualityReport,
-    ) -> Result<(), production_postprocess::ProductionPostprocessError> {
-        self.sync_autofix_with_provenance(identity, final_text, report, None)
-    }
-
-    fn sync_autofix_with_provenance(
-        &self,
-        identity: &production_postprocess::PostprocessIdentity,
-        final_text: &str,
-        report: storyforge_domain::turn::QualityReport,
-        provenance: Option<Provenance>,
-    ) -> Result<(), production_postprocess::ProductionPostprocessError> {
-        use production_postprocess::ProductionPostprocessError;
-        use storyforge_domain::turn::{AttemptStatus, TurnStatus};
-
-        if sqlite_runtime::is_sqlite_active() {
-            // Typed pre-validation against the authoritative SQLite turn before UoW.
-            let turn = sqlite_runtime::get_turn(&identity.turn_id)
-                .map_err(ProductionPostprocessError::AutofixSync)?
-                .ok_or_else(|| ProductionPostprocessError::AttemptMissing {
-                    turn_id: identity.turn_id.to_string(),
-                    attempt_id: identity.attempt_id.to_string(),
-                })?;
-            if turn.campaign_id != identity.campaign_id {
-                return Err(ProductionPostprocessError::ScopeMismatch {
-                    field: "campaign_id",
-                    expected: identity.campaign_id.to_string(),
-                    actual: turn.campaign_id.to_string(),
-                });
-            }
-            if turn.conversation_id != identity.conversation_id {
-                return Err(ProductionPostprocessError::ScopeMismatch {
-                    field: "conversation_id",
-                    expected: identity.conversation_id.to_string(),
-                    actual: turn.conversation_id.to_string(),
-                });
-            }
-            if turn.find_attempt(&identity.attempt_id).is_none() {
-                return Err(ProductionPostprocessError::AttemptMissing {
-                    turn_id: identity.turn_id.to_string(),
-                    attempt_id: identity.attempt_id.to_string(),
-                });
-            }
-            let writable = matches!(
-                turn.status,
-                TurnStatus::DraftReady | TurnStatus::DerivingState
-            ) && turn
-                .find_attempt(&identity.attempt_id)
-                .is_some_and(|attempt| {
-                    matches!(
-                        attempt.status,
-                        AttemptStatus::DraftReady | AttemptStatus::DerivingState
-                    )
-                });
-            if !writable {
-                // Concurrent supersede / late status: durable zero-write, non-fatal.
-                return Ok(());
-            }
-            return sqlite_runtime::sync_autofix(AutofixSyncRequest {
-                campaign_id: &identity.campaign_id,
-                conversation_id: &identity.conversation_id,
-                turn_id: &identity.turn_id,
-                attempt_id: &identity.attempt_id,
-                final_text,
-                quality_report: report,
-                provenance: provenance.clone(),
-            })
-            .map_err(ProductionPostprocessError::AutofixSync);
-        }
-
-        // Capture typed validation under the same conditional durable mutation.
-        let mut precondition: Option<ProductionPostprocessError> = None;
-        let mut not_writable = false;
-        let applied = self
-            .mutate_json_if(
-                &identity.turn_id,
-                |record| {
-                    if record.campaign_id != identity.campaign_id {
-                        precondition = Some(ProductionPostprocessError::ScopeMismatch {
-                            field: "campaign_id",
-                            expected: identity.campaign_id.to_string(),
-                            actual: record.campaign_id.to_string(),
-                        });
-                        return false;
-                    }
-                    if record.conversation_id != identity.conversation_id {
-                        precondition = Some(ProductionPostprocessError::ScopeMismatch {
-                            field: "conversation_id",
-                            expected: identity.conversation_id.to_string(),
-                            actual: record.conversation_id.to_string(),
-                        });
-                        return false;
-                    }
-                    if record.find_attempt(&identity.attempt_id).is_none() {
-                        precondition = Some(ProductionPostprocessError::AttemptMissing {
-                            turn_id: identity.turn_id.to_string(),
-                            attempt_id: identity.attempt_id.to_string(),
-                        });
-                        return false;
-                    }
-                    let writable = matches!(
-                        record.status,
-                        TurnStatus::DraftReady | TurnStatus::DerivingState
-                    ) && record.find_attempt(&identity.attempt_id).is_some_and(
-                        |attempt| {
-                            matches!(
-                                attempt.status,
-                                AttemptStatus::DraftReady | AttemptStatus::DerivingState
-                            )
-                        },
-                    );
-                    if !writable {
-                        not_writable = true;
-                        return false;
-                    }
-                    true
-                },
-                |record| {
-                    if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
-                        turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
-                        if let Some(provenance) = provenance {
-                            att.provenance = Some(provenance);
-                        }
-                    }
-                    record.touch();
-                },
-            )
-            .map_err(ProductionPostprocessError::AutofixSync)?;
-        if applied {
-            Ok(())
-        } else if let Some(err) = precondition {
-            Err(err)
-        } else if not_writable {
-            // Concurrent supersede / late status: durable zero-write, non-fatal.
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn attach_postprocess(
-        &self,
-        identity: &production_postprocess::PostprocessIdentity,
-        batch: Option<storyforge_domain::turn::MutationBatch>,
-        derivation: storyforge_domain::turn::DerivationComponents,
-    ) -> Result<bool, String> {
-        if sqlite_runtime::is_sqlite_active() {
-            use storyforge_infra_sqlite::preaccept::PostprocessApplyOutcome;
-            return match sqlite_runtime::apply_postprocess(PostprocessApplyRequest {
-                campaign_id: &identity.campaign_id,
-                conversation_id: &identity.conversation_id,
-                turn_id: &identity.turn_id,
-                attempt_id: &identity.attempt_id,
-                batch,
-                derivation,
-            })? {
-                PostprocessApplyOutcome::Applied | PostprocessApplyOutcome::AlreadyApplied => {
-                    Ok(true)
-                }
-                PostprocessApplyOutcome::SkippedLate => Ok(false),
-            };
-        }
-        self.mutate_json_if(
-            &identity.turn_id,
-            |record| {
-                record.campaign_id == identity.campaign_id
-                    && record.conversation_id == identity.conversation_id
-                    && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
-            },
-            |record| {
-                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
-                    turn_lifecycle::apply_postprocess_to_attempt(att, batch, derivation);
-                }
-                record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
-                record.touch();
-            },
-        )
-    }
-
-    fn mark_failed_if_current(
-        &self,
-        identity: &production_postprocess::PostprocessIdentity,
-        reason: String,
-    ) -> Result<bool, String> {
-        self.mutate_json_if(
-            &identity.turn_id,
-            |record| {
-                record.campaign_id == identity.campaign_id
-                    && record.conversation_id == identity.conversation_id
-                    && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
-            },
-            |record| {
-                record.status = storyforge_domain::turn::TurnStatus::Failed;
-                record.failure_reason = Some(reason);
-                record.touch();
-            },
-        )
     }
 }
 

@@ -1,5 +1,58 @@
 use super::*;
 
+#[test]
+fn gate3_character_commands_do_not_probe_the_sqlite_runtime() {
+    let source = include_str!("commands/characters.rs");
+    assert!(
+        !source.contains("sqlite_runtime::is_sqlite_active()"),
+        "character commands must select storage through AppState::storage()"
+    );
+}
+
+#[test]
+fn character_delete_checks_campaign_lifecycle_before_any_legacy_mutation() {
+    let source = include_str!("commands/characters.rs");
+    let delete_start = source
+        .find("pub(crate) fn delete_character(")
+        .expect("delete_character command must exist");
+    let delete_body = source[delete_start..].replace("\r\n", "\n");
+    let next_command_marker = ["\n#", "[tauri::command]"].concat();
+    let next_command = delete_body
+        .find(&next_command_marker)
+        .unwrap_or(delete_body.len());
+    let delete_body = &delete_body[..next_command];
+
+    let capability_guard = delete_body
+        .find("BackendCapability::CampaignLifecycle")
+        .expect("delete_character must fail closed on unsupported campaign lifecycle");
+    let first_character_mutation = delete_body
+        .find("character_store\n        .delete")
+        .expect("delete_character must still delete the JSON character after the guard");
+    assert!(
+        capability_guard < first_character_mutation,
+        "capability check must run before CharacterStore mutation"
+    );
+}
+
+#[test]
+fn sqlite_character_delete_cascade_is_explicitly_unsupported() {
+    use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
+
+    let storage = storage_backend::StorageFacade::new(
+        std::env::temp_dir().join("storyforge-gate3-character-delete-capability"),
+        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+    );
+    let error = storage
+        .require_supported(
+            storage_backend::BackendCapability::CampaignLifecycle,
+            "character delete cascade",
+        )
+        .expect_err("SQLite character deletion must stop before its first mutation");
+    assert!(error.contains("character delete cascade"));
+    assert!(error.contains("Unsupported"));
+    assert!(!storage.has_json_writers());
+}
+
 fn make_test_character(name: &str) -> Character {
     use storyforge_domain::Source;
     Character {
@@ -744,8 +797,7 @@ async fn test_save_character_card_async_persists_and_replaces_source() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let store: &'static campaign_store::CampaignStore =
-        Box::leak(Box::new(campaign_store::CampaignStore::new(&dir)));
+    let store = Arc::new(campaign_store::CampaignStore::new(&dir));
 
     let character = make_test_character("Async Card Source");
     let mut first = storyforge_domain::character::CharacterCard::from_character(&character);
@@ -766,8 +818,12 @@ async fn test_save_character_card_async_persists_and_replaces_source() {
             "Second",
         ));
 
-    save_character_card_async(store, first).await.unwrap();
-    let stored = save_character_card_async(store, second).await.unwrap();
+    save_character_card_async(store.clone(), first)
+        .await
+        .unwrap();
+    let stored = save_character_card_async(store.clone(), second)
+        .await
+        .unwrap();
 
     assert_eq!(stored.card.name, "Async Card Updated");
     assert_eq!(stored.card.character_definitions.len(), 1);
@@ -809,6 +865,7 @@ fn test_create_campaign_in_store_cleans_conversation_on_store_failure() {
 
     let err = create_campaign_in_store(
         &store,
+        get_store(),
         &conv_store,
         card_id,
         "cleanup blocked".into(),
@@ -858,8 +915,15 @@ fn test_create_campaign_in_store_initializes_card_global_variables() {
     let card_id = card.id.as_str().to_string();
     store.save_card(card).unwrap();
 
-    let dto =
-        create_campaign_in_store(&store, &conv_store, card_id, "globals".into(), None).unwrap();
+    let dto = create_campaign_in_store(
+        &store,
+        get_store(),
+        &conv_store,
+        card_id,
+        "globals".into(),
+        None,
+    )
+    .unwrap();
     let campaign = store.get_campaign(&Id::from_str(&dto.id)).unwrap();
     let field = campaign
         .variable_schema
@@ -969,8 +1033,15 @@ fn test_apply_campaign_opening_rewrites_first_assistant_message() {
     let card_id = card.id.as_str().to_string();
     store.save_card(card).unwrap();
 
-    let dto =
-        create_campaign_in_store(&store, &conv_store, card_id, "opening".into(), None).unwrap();
+    let dto = create_campaign_in_store(
+        &store,
+        get_store(),
+        &conv_store,
+        card_id,
+        "opening".into(),
+        None,
+    )
+    .unwrap();
     let campaign_id = Id::from_str(&dto.id);
     let conv_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
     // \u{6d4b}\u{8bd5}\u{73af}\u{5883}\u{65e0}\u{5168}\u{5c40} CharacterStore\u{ff1a}\u{624b}\u{52a8}\u{64ad}\u{79cd}\u{5f00}\u{573a}\u{767d}\u{ff08}\u{751f}\u{4ea7}\u{8def}\u{5f84}\u{7531} create_campaign \u{5199}\u{5165}\u{ff09}
@@ -1013,7 +1084,15 @@ fn test_apply_campaign_opening_rejects_after_conversation_grows() {
     let card_id = card.id.as_str().to_string();
     store.save_card(card).unwrap();
 
-    let dto = create_campaign_in_store(&store, &conv_store, card_id, "grown".into(), None).unwrap();
+    let dto = create_campaign_in_store(
+        &store,
+        get_store(),
+        &conv_store,
+        card_id,
+        "grown".into(),
+        None,
+    )
+    .unwrap();
     let campaign_id = Id::from_str(&dto.id);
     let conv_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
     conv_store
@@ -1072,6 +1151,7 @@ fn test_delete_campaign_playthrough_cascades_conversation_and_summaries() {
 
     let dto = create_campaign_in_store(
         &store,
+        get_store(),
         &conv_store,
         card_id,
         "playthrough-to-delete".into(),
@@ -1134,7 +1214,9 @@ fn test_delete_conversation_path_resolves_bound_campaign_and_cascades() {
     let card_id = card.id.as_str().to_string();
     store.save_card(card).unwrap();
 
-    let dto = create_campaign_in_store(&store, &conv_store, card_id, "c2".into(), None).unwrap();
+    let dto =
+        create_campaign_in_store(&store, get_store(), &conv_store, card_id, "c2".into(), None)
+            .unwrap();
     let campaign_id = Id::from_str(&dto.id);
     let conversation_id = Id::from_str(dto.conversation_id.as_deref().unwrap());
     let state = AppState::new_for_test();
@@ -1168,7 +1250,7 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
 
     let created = prepare_start_conversation_async(
         state.clone(),
-        campaign_store,
+        Some(campaign_store),
         None,
         Some("char-legacy".into()),
         Some(legacy_character),
@@ -1208,7 +1290,7 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
     ignored_character.first_mes = "ignored opening".into();
     let reused = prepare_start_conversation_async(
         state.clone(),
-        campaign_store,
+        Some(campaign_store),
         Some(existing.id.as_str().to_string()),
         None,
         Some(Arc::new(ignored_character)),
@@ -1253,7 +1335,7 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
     ignored_campaign_character.first_mes = "campaign ignored opening".into();
     let campaign_target = prepare_start_conversation_async(
         state.clone(),
-        campaign_store,
+        Some(campaign_store),
         Some(requested_conv.id.as_str().to_string()),
         None,
         Some(Arc::new(ignored_campaign_character)),
@@ -1279,6 +1361,15 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
     assert!(requested_conv.nodes.is_empty());
 
     let _ = std::fs::remove_dir_all(&campaign_dir);
+}
+
+#[test]
+fn runtime_support_routes_backend_selection_through_the_injected_facade() {
+    let source = include_str!("runtime_support.rs");
+    assert!(
+        !source.contains("is_sqlite_active("),
+        "runtime_support must not read the process-global SQLite flag"
+    );
 }
 
 #[test]
@@ -1343,6 +1434,7 @@ fn test_fork_campaign_in_store_records_source_and_clones_snapshot() {
 
     let dto = fork_campaign_in_store(
         &store,
+        get_store(),
         &conv_store,
         source_campaign.id.clone(),
         fork_node.clone(),

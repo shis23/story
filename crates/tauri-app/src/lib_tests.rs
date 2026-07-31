@@ -1,3 +1,5 @@
+#[path = "lib_tests_backend.rs"]
+mod backend;
 #[path = "lib_tests_campaigns.rs"]
 mod campaigns;
 #[path = "lib_tests_connections.rs"]

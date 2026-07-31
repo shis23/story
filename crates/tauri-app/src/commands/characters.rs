@@ -1,4 +1,12 @@
 use super::super::*;
+use crate::storage_backend::{BackendCapability, CapabilityStatus};
+
+fn require_character_commands(state: &AppState, operation: &str) -> Result<(), TauriCommandError> {
+    state
+        .storage()
+        .require_supported(BackendCapability::CharacterCommands, operation)
+        .map_err(TauriCommandError::validation)
+}
 
 // ─── 角色卡 DTO（保留 M0）───────────────────────────────────────────────────
 
@@ -153,10 +161,13 @@ pub(crate) fn import_character(
     data: Vec<u8>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterSummary, TauriCommandError> {
+    require_character_commands(state.inner().as_ref(), "import character")?;
+    let character_store =
+        state.json_character_store(BackendCapability::CharacterCommands, "import character")?;
     let character =
         storyforge_infra_import::import_character(&data).map_err(TauriCommandError::from)?;
     let info = CharacterInfo::from(&character);
-    let stored = get_store()
+    let stored = character_store
         .save(info)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
@@ -215,17 +226,27 @@ pub(crate) fn import_character(
 }
 
 #[tauri::command]
-pub(crate) fn list_characters() -> Vec<CharacterSummary> {
-    get_store()
+pub(crate) fn list_characters(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<CharacterSummary>, TauriCommandError> {
+    require_character_commands(state.inner().as_ref(), "list characters")?;
+    Ok(state
+        .json_character_store(BackendCapability::CharacterCommands, "list characters")?
         .list()
         .into_iter()
         .map(CharacterSummary::from)
-        .collect()
+        .collect())
 }
 
 #[tauri::command]
-pub(crate) fn get_character(id: String) -> Result<CharacterInfo, TauriCommandError> {
-    stored_character_for_id_or_source_in_store(get_store(), &Id::from_str(&id))
+pub(crate) fn get_character(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CharacterInfo, TauriCommandError> {
+    require_character_commands(state.inner().as_ref(), "get character")?;
+    let character_store =
+        state.json_character_store(BackendCapability::CharacterCommands, "get character")?;
+    stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&id))
         .map(|stored| stored.info)
         .ok_or_else(|| TauriCommandError::from(format!("角色卡不存在: {id}")))
 }
@@ -257,8 +278,23 @@ pub(crate) fn delete_character(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::CharacterCommands,
+            "character delete cascade",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let campaign_store = state.json_campaign_store(
+        BackendCapability::CampaignLifecycle,
+        "character delete cascade",
+    )?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "character delete cascade",
+    )?;
     // 先取出 name（用于同步 tool_ctx）
-    let stored = get_store().get(&id);
+    let stored = character_store.get(&id);
     let name = stored.as_ref().map(|s| s.info.name.clone());
     let stored_source_character_id = stored
         .as_ref()
@@ -272,7 +308,7 @@ pub(crate) fn delete_character(
             &ctx.characters,
         )
     };
-    if !get_store()
+    if !character_store
         .delete(&id)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
     {
@@ -295,18 +331,11 @@ pub(crate) fn delete_character(
     // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
     // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
     for source_id in &source_ids {
-        // #22：MVU 翻译级联删除按后端分流（SQLite → mvu_translations 表）
-        if sqlite_runtime::is_sqlite_active() {
-            if let Err(e) = sqlite_runtime::delete_mvu(source_id) {
-                tracing::warn!("SQLite MVU 翻译级联删除失败（{source_id}）: {e}");
-            }
-        } else {
-            let _ = get_campaign_store().delete_mvu(source_id);
-        }
+        let _ = campaign_store.delete_mvu(source_id);
         // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
-        if let Some(stored_card) = get_campaign_store().get_card_by_source(source_id) {
+        if let Some(stored_card) = campaign_store.get_card_by_source(source_id) {
             // 桥接：通过角色名找到 Character.id，再查 card
-            let _ = get_campaign_store().delete_card(&stored_card.card.id);
+            let _ = campaign_store.delete_card(&stored_card.card.id);
         }
     }
     // 级联删除：清理向量库中该角色相关的记录（M-2）
@@ -326,6 +355,7 @@ pub(crate) fn update_world_info_route(
     route: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    require_character_commands(state.inner().as_ref(), "update character world info route")?;
     // 验证路由值合法
     match route.as_str() {
         "Constant" | "Selective" | "Both" | "Disabled" => {}
@@ -336,10 +366,14 @@ pub(crate) fn update_world_info_route(
         }
     }
 
-    get_store().update_world_info_route(&character_id, entry_index, &route)?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "update character world info route",
+    )?;
+    character_store.update_world_info_route(&character_id, entry_index, &route)?;
 
     // 同步更新 tool_ctx 中的世界书路由
-    if let Some(stored) = get_store().get(&character_id)
+    if let Some(stored) = character_store.get(&character_id)
         && stored.info.world_info_entries.get(entry_index).is_some()
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -375,16 +409,22 @@ pub(crate) fn update_world_info_entry(
     order: i32,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    get_store().update_world_info_entry(
-        &character_id,
-        entry_index,
-        keys.clone(),
-        content.clone(),
-        constant,
-        is_global,
-        depth,
-        order,
-    )?;
+    require_character_commands(state.inner().as_ref(), "update character world info entry")?;
+    state
+        .json_character_store(
+            BackendCapability::CharacterCommands,
+            "update character world info entry",
+        )?
+        .update_world_info_entry(
+            &character_id,
+            entry_index,
+            keys.clone(),
+            content.clone(),
+            constant,
+            is_global,
+            depth,
+            order,
+        )?;
 
     // 同步 tool_ctx 的世界书（含全局条目 merge）
     rebuild_world_info_in_tool_ctx(&state);
@@ -401,13 +441,19 @@ pub(crate) fn add_world_info_entry(
     is_global: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
-    let new_index = get_store().add_world_info_entry(
-        &character_id,
-        keys.clone(),
-        content.clone(),
-        constant,
-        is_global.unwrap_or(false),
-    )?;
+    require_character_commands(state.inner().as_ref(), "add character world info entry")?;
+    let new_index = state
+        .json_character_store(
+            BackendCapability::CharacterCommands,
+            "add character world info entry",
+        )?
+        .add_world_info_entry(
+            &character_id,
+            keys.clone(),
+            content.clone(),
+            constant,
+            is_global.unwrap_or(false),
+        )?;
 
     // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目入向量库
     rebuild_world_info_in_tool_ctx(&state);
@@ -432,7 +478,13 @@ pub(crate) fn delete_world_info_entry(
     entry_index: usize,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    get_store().delete_world_info_entry(&character_id, entry_index)?;
+    require_character_commands(state.inner().as_ref(), "delete character world info entry")?;
+    state
+        .json_character_store(
+            BackendCapability::CharacterCommands,
+            "delete character world info entry",
+        )?
+        .delete_world_info_entry(&character_id, entry_index)?;
     rebuild_world_info_in_tool_ctx(&state);
     Ok(())
 }
@@ -446,17 +498,23 @@ pub(crate) fn delete_world_info_entry(
 /// - 蓝灯（Constant/Both）条目进导演常驻上下文
 /// - 绿灯（Selective/Both）条目进向量检索池
 pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
+    if require_character_commands(state.inner().as_ref(), "rebuild character world info").is_err() {
+        return;
+    }
     use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
     // 有活跃活动时以本局世界书为唯一注入源（卡库写路径 rebuild 不应覆盖）
-    if !sqlite_runtime::is_sqlite_active() {
+    if state.storage().capability(BackendCapability::WorldInfo) == CapabilityStatus::Supported {
         let active = state
             .active_campaign
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(campaign_id) = active
-            && let Ok(book) = get_campaign_store().get_world_info(&campaign_id)
+            && let Ok(store) = state
+                .storage()
+                .json_campaign_store(BackendCapability::WorldInfo, "rebuild campaign world info")
+            && let Ok(book) = store.get_world_info(&campaign_id)
             && !book.entries.is_empty()
         {
             apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
@@ -464,7 +522,13 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
         }
     }
 
-    let all_chars = get_store().list();
+    let Ok(character_store) = state.storage().json_character_store(
+        BackendCapability::CharacterCommands,
+        "rebuild character world info runtime",
+    ) else {
+        return;
+    };
+    let all_chars = character_store.list();
 
     // 找当前活跃角色名（tool_ctx.characters 里的）
     let active_names: Vec<String> = state

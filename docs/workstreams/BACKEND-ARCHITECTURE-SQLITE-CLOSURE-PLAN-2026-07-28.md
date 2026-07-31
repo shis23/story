@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**进行中（Gate 1、Gate 2 已通过；Gate 3–8 backend facade、SQLite 迁移与平台验收仍未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> code-under-test：`main@b6cad53` 加当前 Gate 2 verifier-repair 工作树（尚未提交）。
+> 状态：**进行中（Gate 1、Gate 2、Gate 3 已通过；Gate 4–8 尚未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
@@ -283,6 +283,10 @@ facade 必须能显式报告：
 - backend flag 只存在于 bootstrap/facade 构造和专用测试。
 - SQLite 活跃时 JSON 写入者没有构造机会。
 - 新增命令无需自行添加 JSON/SQLite 分支。
+
+### 8.5 Gate 3 完成（2026-07-31）
+
+四项标准全部达成（逐项证据与统计见 RESULT §15）：命令/应用服务层 `.is_sqlite()`/`.is_json()` 30 → 0；六个 SQLite-only facade API 移除并由注入的 `TurnWorkflow`（`backend_workflows.rs`）以 backend-neutral DTO 取代；静态门禁（Rust 测试 + baseline 字段）钉住白名单 = {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs}；SQLite 活跃时四个 JSON writer 无构造机会不变。Gate 4 起不再有任何应用层 JSON/SQLite 分支需要迁移。
 
 ## 9. Gate 4：SQLite 缺口补齐
 
@@ -703,3 +707,12 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - `SubagentCancelled` 区分真取消与失败仍需新增事件变体或字段，属于明确排除在本 Gate 硬约束之外的 IPC/事件词汇迁移；不再把它计作 §7.5 阻塞项。SQLite typed patch 完整落地属于 Gate 4，也不计作 Gate 2 未完成。
 - 最终确定性证据：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`cargo test -p storyforge --no-default-features`（361 passed、3 ignored）、`cargo test -p harness-real-llm --no-run`、前端 `npm.cmd test`（476/476）、`npm.cmd run build`、architecture baseline（175/175 commands、162 invokes、0 missing、sqlite flag 68）全部通过。
 - 最终结论：**Gate 2 PASS**。下一阶段为 Gate 3（单一 backend facade）；当前工作树应在提交后把 code-under-test 更新为对应提交 SHA。
+
+## 29. Gate 3 Batch 3.1 进入检查点（显式 facade 与 Campaign 读取切片，2026-07-29）
+
+- 新增进程级 `StorageFacade`，显式持有启动时固定的 `PinnedBackend` 与规范数据目录；`AppState` 通过构造参数接收同一个 `Arc<StorageFacade>`，不再通过 SQLite handle 是否存在来推断自身 backend。
+- 新增 `BackendCapability` / `CapabilityStatus` 能力矩阵。JSON 当前能力保持 supported；SQLite 只把 Campaign 读取、Conversation 读取、Turn/Postprocess、MVU translation、Chronicle publication 等已接通应用路径标为 supported；Campaign instance 读取/lifecycle、变量命令、知识/任务命令、WorldInfo、typed Meta patch、MVU schema apply、Chronicle compressor 均诚实标为 unsupported，active Campaign 持久化标为 degraded。`migration_required` 与 `read_only_recovery` 状态已进入类型系统，后续迁移/恢复切片使用。
+- 首个垂直切片：Campaign list/get/get-active 统一委托 facade，并保留 SQLite `card_id` 过滤；create/fork/delete 与 Conversation 级联删除通过 facade 能力声明 fail closed；active Campaign 选择从显式 facade 读取 backend。Tauri 命令仅增加框架注入的 `State<Arc<AppState>>`，前端 invoke 参数和命令名未变。
+- AppState ConversationStore 选择、pipeline defer-land、启动 recovery、legacy active pointer 与 playthrough pointer 清理均改读注入 facade；默认/隐式 AppState backend 构造入口已删除。SQLite 重复激活只允许同一规范路径，AppState 构造会拒绝 facade/runtime backend 或路径不一致。
+- `is_sqlite_active()` 总引用基线从 Gate 2 的 **68** 降到 **55**，其中 2 处位于允许保留的 `sqlite_runtime`/facade 边界，应用层环境式引用为 **53**；剩余应用引用位于尚未迁移的 Turn/Writing/Meta/WorldInfo/Character/runtime-support 等切片。Gate 3 尚为 **IN PROGRESS**，不得标记 PASS。
+- 当前验证：RED 测试确认 facade/AppState 类型缺失与分支基线不符；GREEN 后 `cargo test -p storyforge --no-default-features`（364 passed、3 ignored）、目标 crate clippy、fmt、前端命令合同（8/8）和 `git diff --check` 通过。

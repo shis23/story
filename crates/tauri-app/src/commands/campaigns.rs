@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::storage_backend::{BackendCapability, CapabilityStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignSummaryDto {
@@ -89,6 +90,11 @@ pub(crate) async fn extract_characters(
         extract_campaign_variable_schema_from_extensions, extract_mvu_schema_from_extensions,
     };
 
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "extract characters from imported character card",
+    )?;
+
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
     let character = {
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
@@ -103,12 +109,14 @@ pub(crate) async fn extract_characters(
             None => {
                 // 2. 回退：前端可能传了存储 id（import_character 返回的 StoredCharacter.id，
                 //    与 Character.id 无关）。用存储 id 查 CharacterStore 拿到 name，再按 name 查 tool_ctx。
-                get_store().get(&source_character_id).and_then(|stored| {
-                    ctx.characters
-                        .iter()
-                        .find(|c| c.name == stored.info.name)
-                        .map(|c| (*c).clone())
-                })
+                character_store
+                    .get(&source_character_id)
+                    .and_then(|stored| {
+                        ctx.characters
+                            .iter()
+                            .find(|c| c.name == stored.info.name)
+                            .map(|c| (*c).clone())
+                    })
             }
         }
     }
@@ -119,9 +127,12 @@ pub(crate) async fn extract_characters(
     })?;
 
     // 已存在则直接返回
-    let store = get_campaign_store();
+    let store = state
+        .storage()
+        .json_campaign_store_owned(BackendCapability::CardCommands, "extract characters")
+        .map_err(TauriCommandError::validation)?;
     let force = force.unwrap_or(false);
-    let mut card = match prepare_character_extraction_card(store, &character, force)? {
+    let mut card = match prepare_character_extraction_card(store.as_ref(), &character, force)? {
         CharacterExtractionDecision::ReturnExisting(existing) => {
             return Ok(CardSummaryDto::from(&existing));
         }
@@ -186,10 +197,10 @@ pub(crate) async fn extract_characters(
 }
 
 pub(crate) async fn save_character_card_async(
-    store: &'static campaign_store::CampaignStore,
+    store: Arc<campaign_store::CampaignStore>,
     card: storyforge_domain::character::CharacterCard,
 ) -> Result<campaign_store::StoredCard, TauriCommandError> {
-    tokio::task::spawn_blocking(move || save_character_card_to_store(store, card))
+    tokio::task::spawn_blocking(move || save_character_card_to_store(store.as_ref(), card))
         .await
         .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
 }
@@ -204,12 +215,14 @@ pub(crate) fn save_character_card_to_store(
 }
 
 pub(crate) async fn save_character_card_force_rerun_async(
-    store: &'static campaign_store::CampaignStore,
+    store: Arc<campaign_store::CampaignStore>,
     card: storyforge_domain::character::CharacterCard,
 ) -> Result<campaign_store::StoredCard, TauriCommandError> {
-    tokio::task::spawn_blocking(move || save_character_card_force_rerun_to_store(store, card))
-        .await
-        .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        save_character_card_force_rerun_to_store(store.as_ref(), card)
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
 }
 
 pub(crate) fn save_character_card_force_rerun_to_store(
@@ -234,13 +247,24 @@ pub(crate) fn create_campaign(
     opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
+    if state
+        .storage()
+        .capability(BackendCapability::CampaignLifecycle)
+        != CapabilityStatus::Supported
+    {
         return Err(TauriCommandError::validation(
             "campaign creation is not available in the SQLite opt-in backend yet".to_string(),
         ));
     }
+    let store =
+        state.json_campaign_store(BackendCapability::CampaignLifecycle, "create campaign")?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "create campaign from character card",
+    )?;
     create_campaign_in_store(
-        get_campaign_store(),
+        store,
+        character_store,
         state.conv_store.as_ref(),
         card_id,
         name,
@@ -250,6 +274,7 @@ pub(crate) fn create_campaign(
 
 pub(crate) fn create_campaign_in_store(
     store: &campaign_store::CampaignStore,
+    character_store: &storage::CharacterStore,
     conv_store: &ConversationStore,
     card_id: String,
     name: String,
@@ -282,15 +307,17 @@ pub(crate) fn create_campaign_in_store(
     };
 
     // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character greeting）
-    if let Some(opening) =
-        resolve_campaign_opening_message(&stored.card.source_character_id, opening_message)
-        && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
+    if let Some(opening) = resolve_campaign_opening_message(
+        character_store,
+        &stored.card.source_character_id,
+        opening_message,
+    ) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         tracing::warn!("建 Campaign 时追加开场白失败: {e}");
     }
 
     // 本局世界书：从卡模板（+ 其它卡 is_global）拷贝，活动侧可写、卡侧只读
-    if let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &stored) {
+    if let Err(e) = seed_campaign_world_info_from_card(store, character_store, &campaign, &stored) {
         tracing::warn!("开档拷贝世界书失败 campaign={}: {e}", campaign.id);
     }
 
@@ -308,8 +335,12 @@ pub(crate) fn apply_campaign_opening(
     content: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    let store = state.json_campaign_store(
+        BackendCapability::CampaignLifecycle,
+        "apply campaign opening",
+    )?;
     apply_campaign_opening_in_store(
-        get_campaign_store(),
+        store,
         state.conv_store.as_ref(),
         &Id::from_str(&campaign_id),
         content,
@@ -364,24 +395,28 @@ pub(crate) fn apply_campaign_opening_in_store(
 /// 开档时将卡内嵌世界书（及其它卡 is_global 条目）写入 Campaign 旁路世界书文件。
 pub(crate) fn seed_campaign_world_info_from_card(
     store: &campaign_store::CampaignStore,
+    character_store: &storage::CharacterStore,
     campaign: &storyforge_domain::campaign::Campaign,
     stored_card: &campaign_store::StoredCard,
 ) -> Result<(), String> {
-    let template = resolve_template_world_info_for_card(stored_card);
+    let template = resolve_template_world_info_for_card(character_store, stored_card);
     store.ensure_world_info_from_book(&campaign.id, &template)?;
     Ok(())
 }
 
 pub(crate) fn resolve_template_world_info_for_card(
+    character_store: &storage::CharacterStore,
     stored_card: &campaign_store::StoredCard,
 ) -> storyforge_domain::world_info::WorldInfoBook {
     // 优先 CharacterStore 完整书；否则用 card 关联 source 上的 embedded 书
-    if let Some(sc) = stored_character_for_source_id(&stored_card.card.source_character_id) {
+    if let Some(sc) =
+        stored_character_for_source_id(character_store, &stored_card.card.source_character_id)
+    {
         if let Some(book) = sc.info.embedded_world_info.clone() {
-            return merge_global_entries_into_book(book, &sc.info.name);
+            return merge_global_entries_into_book(character_store, book, &sc.info.name);
         }
         if let Some(book) = world_info_book_from_entries(&sc.info.world_info_entries) {
-            return merge_global_entries_into_book(book, &sc.info.name);
+            return merge_global_entries_into_book(character_store, book, &sc.info.name);
         }
     }
     storyforge_domain::world_info::WorldInfoBook {
@@ -392,10 +427,11 @@ pub(crate) fn resolve_template_world_info_for_card(
 }
 
 pub(crate) fn merge_global_entries_into_book(
+    character_store: &storage::CharacterStore,
     mut book: storyforge_domain::world_info::WorldInfoBook,
     active_name: &str,
 ) -> storyforge_domain::world_info::WorldInfoBook {
-    let all = get_store().list();
+    let all = character_store.list();
     for stored in all {
         if stored.info.name == active_name {
             continue;
@@ -418,6 +454,7 @@ pub(crate) fn merge_global_entries_into_book(
 
 pub(crate) fn fork_campaign_in_store(
     store: &campaign_store::CampaignStore,
+    character_store: &storage::CharacterStore,
     conv_store: &ConversationStore,
     source_campaign_id: Id,
     fork_node_id: Id,
@@ -486,7 +523,8 @@ pub(crate) fn fork_campaign_in_store(
         }
         _ => {
             if let Some(card) = store.get_card(&campaign.card_id)
-                && let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &card)
+                && let Err(e) =
+                    seed_campaign_world_info_from_card(store, character_store, &campaign, &card)
             {
                 tracing::warn!("fork 惰性种子世界书失败: {e}");
             }
@@ -505,7 +543,11 @@ pub(crate) fn fork_campaign(
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
+    if state
+        .storage()
+        .capability(BackendCapability::CampaignLifecycle)
+        != CapabilityStatus::Supported
+    {
         return Err(TauriCommandError::validation(
             "SQLite opt-in currently rejects campaign fork rather than writing a JSON shadow copy"
                 .to_string(),
@@ -514,14 +556,25 @@ pub(crate) fn fork_campaign(
     let source_cid = Id::from_str(&source_campaign_id);
 
     // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
-    if get_turn_store().get_active_turn(&source_cid).is_some() {
+    if state
+        .storage()
+        .get_active_turn(&source_cid)
+        .map_err(TauriCommandError::storage)?
+        .is_some()
+    {
         return Err(TauriCommandError::validation(
             "源 Campaign 有未完成的 Turn，请先 Accept、Discard 或 Abandon 后再 fork（阶段 A 只支持从已提交 head fork）".to_string(),
         ));
     }
 
+    let store = state.json_campaign_store(BackendCapability::CampaignLifecycle, "fork campaign")?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "fork campaign character templates",
+    )?;
     fork_campaign_in_store(
-        get_campaign_store(),
+        store,
+        character_store,
         &state.conv_store,
         source_cid,
         Id::from_str(&fork_node_id),
@@ -532,62 +585,35 @@ pub(crate) fn fork_campaign(
 #[tauri::command]
 pub(crate) fn list_campaigns(
     card_id: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<CampaignSummaryDto>, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        let requested_card = card_id.as_ref().map(Id::from_str);
-        let campaigns = sqlite_runtime::list_campaigns().map_err(TauriCommandError::internal)?;
-        return campaigns
-            .into_iter()
-            .filter(|campaign| match &requested_card {
-                Some(id) => campaign.card_id == *id,
-                None => true,
-            })
-            .map(|campaign| {
-                let mut dto = CampaignSummaryDto::from(&campaign);
-                dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
-                    .map_err(TauriCommandError::internal)?
-                    .len();
-                Ok(dto)
-            })
-            .collect();
-    }
-    let store = get_campaign_store();
-    let campaigns = if let Some(cid) = card_id {
-        store.list_campaigns_of_card(&Id::from_str(&cid))
-    } else {
-        store.list_campaigns()
-    };
+    let requested_card = card_id.as_ref().map(Id::from_str);
+    let campaigns = state
+        .storage()
+        .list_campaigns(requested_card.as_ref())
+        .map_err(TauriCommandError::internal)?;
     Ok(campaigns
-        .iter()
-        .map(|c| {
-            let mut dto = CampaignSummaryDto::from(c);
-            dto.instance_count = store.list_instances(&c.id).len();
+        .into_iter()
+        .map(|record| {
+            let mut dto = CampaignSummaryDto::from(&record.campaign);
+            dto.instance_count = record.instance_count;
             dto
         })
         .collect())
 }
 
 #[tauri::command]
-pub(crate) fn get_campaign(id: String) -> Result<CampaignSummaryDto, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        let campaign_id = Id::from_str(&id);
-        let campaign = sqlite_runtime::get_campaign(&campaign_id)
-            .map_err(TauriCommandError::internal)?
-            .ok_or_else(|| {
-                TauriCommandError::not_found(format!("campaign id={id} was not found"))
-            })?;
-        let mut dto = CampaignSummaryDto::from(&campaign);
-        dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
-            .map_err(TauriCommandError::internal)?
-            .len();
-        return Ok(dto);
-    }
-    let store = get_campaign_store();
-    let c = store
+pub(crate) fn get_campaign(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    let record = state
+        .storage()
         .get_campaign(&Id::from_str(&id))
+        .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={id}")))?;
-    let mut dto = CampaignSummaryDto::from(&c);
-    dto.instance_count = store.list_instances(&c.id).len();
+    let mut dto = CampaignSummaryDto::from(&record.campaign);
+    dto.instance_count = record.instance_count;
     Ok(dto)
 }
 
@@ -597,14 +623,20 @@ pub(crate) fn delete_campaign(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
+    if state
+        .storage()
+        .capability(BackendCapability::CampaignLifecycle)
+        != CapabilityStatus::Supported
+    {
         return Err(TauriCommandError::validation(
             "campaign deletion is not available in the SQLite opt-in backend yet".to_string(),
         ));
     }
 
+    let store =
+        state.json_campaign_store(BackendCapability::CampaignLifecycle, "delete campaign")?;
     crate::playthrough_lifecycle::delete_campaign_playthrough_in_store(
-        get_campaign_store(),
+        store,
         state.conv_store.as_ref(),
         state.inner().as_ref(),
         &Id::from_str(&id),
@@ -617,38 +649,32 @@ pub(crate) fn set_active_campaign(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
-    let json_active = !sqlite_runtime::is_sqlite_active();
-    set_active_campaign_in_state(
-        state.inner().as_ref(),
-        campaign_id.clone(),
-        json_active,
-        || {
-            if sqlite_runtime::is_sqlite_active() {
-                if sqlite_runtime::get_campaign(&campaign_id)
-                    .map_err(TauriCommandError::internal)?
-                    .is_none()
-                {
-                    return Err(TauriCommandError::not_found(format!(
-                        "campaign id={id} was not found"
-                    )));
-                }
-            } else if get_campaign_store().get_campaign(&campaign_id).is_none() {
-                return Err(TauriCommandError::not_found(format!(
-                    "找不到 campaign id={id}"
-                )));
-            }
-            Ok(())
-        },
-    )?;
-    if json_active {
-        // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书
-        let store = get_campaign_store();
+    set_active_campaign_in_state(state.inner().as_ref(), campaign_id.clone(), || {
+        if !state
+            .storage()
+            .campaign_exists(&campaign_id)
+            .map_err(TauriCommandError::internal)?
+        {
+            return Err(TauriCommandError::not_found(format!(
+                "找不到 campaign id={id}"
+            )));
+        }
+        Ok(())
+    })?;
+    // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书（WorldInfo 能力声明式门控）
+    if state.storage().capability(BackendCapability::WorldInfo) == CapabilityStatus::Supported {
+        let store = state
+            .json_campaign_store(BackendCapability::WorldInfo, "activate campaign world info")?;
         if let Ok(mut book) = store.get_world_info(&campaign_id) {
             if book.entries.is_empty()
                 && let Some(camp) = store.get_campaign(&campaign_id)
                 && let Some(card) = store.get_card(&camp.card_id)
             {
-                let template = resolve_template_world_info_for_card(&card);
+                let character_store = state.json_character_store(
+                    BackendCapability::CharacterCommands,
+                    "activate campaign character world info template",
+                )?;
+                let template = resolve_template_world_info_for_card(character_store, &card);
                 if let Ok(seeded) = store.ensure_world_info_from_book(&campaign_id, &template) {
                     book = seeded;
                 }
@@ -665,7 +691,6 @@ pub(crate) fn set_active_campaign(
 pub(crate) fn set_active_campaign_in_state<F>(
     state: &AppState,
     campaign_id: Id,
-    json_active: bool,
     validate: F,
 ) -> Result<(), TauriCommandError>
 where
@@ -676,10 +701,10 @@ where
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     validate()?;
-    if json_active {
-        save_active_campaign(&state.data_dir, Some(&campaign_id))
-            .map_err(TauriCommandError::storage)?;
-    }
+    // 指针持久化由 backend adapter 处理：JSON 写 active_campaign.json，
+    // SQLite 仅内存（ActiveCampaignPersistence Degraded，显式不落盘）。
+    crate::backend_workflows::save_active_pointer(state.storage(), Some(&campaign_id))
+        .map_err(TauriCommandError::storage)?;
     *state
         .active_campaign
         .lock()
@@ -699,35 +724,41 @@ pub(crate) fn get_active_campaign(
     let Some(id) = id else {
         return Ok(None);
     };
-    if sqlite_runtime::is_sqlite_active() {
-        let Some(campaign) =
-            sqlite_runtime::get_campaign(&id).map_err(TauriCommandError::internal)?
-        else {
-            return Ok(None);
-        };
-        let mut dto = CampaignSummaryDto::from(&campaign);
-        dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
-            .map_err(TauriCommandError::internal)?
-            .len();
-        return Ok(Some(dto));
-    }
-    let store = get_campaign_store();
-    let Some(c) = store.get_campaign(&id) else {
+    let Some(record) = state
+        .storage()
+        .get_campaign(&id)
+        .map_err(TauriCommandError::internal)?
+    else {
         return Ok(None);
     };
-    let mut dto = CampaignSummaryDto::from(&c);
-    dto.instance_count = store.list_instances(&c.id).len();
+    let mut dto = CampaignSummaryDto::from(&record.campaign);
+    dto.instance_count = record.instance_count;
     Ok(Some(dto))
 }
 
 #[tauri::command]
-pub(crate) fn list_instances(campaign_id: String) -> Vec<CharacterInstanceDto> {
-    let store = get_campaign_store();
+pub(crate) fn list_instances(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<CharacterInstanceDto>, TauriCommandError> {
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::CampaignInstanceRead,
+            "list campaign instances",
+        )
+        .map_err(TauriCommandError::validation)?;
     let campaign_id = Id::from_str(&campaign_id);
-    store
+    let instances = state
+        .storage()
         .list_instances(&campaign_id)
+        .map_err(TauriCommandError::storage)?;
+    instances
         .iter()
-        .map(|instance| character_instance_dto_from_store(store, instance))
+        .map(|instance| {
+            crate::backend_workflows::character_instance_dto_for_backend(state.storage(), instance)
+                .map_err(TauriCommandError::storage)
+        })
         .collect()
 }
 
@@ -735,31 +766,22 @@ pub(crate) fn list_instances(campaign_id: String) -> Vec<CharacterInstanceDto> {
 pub(crate) fn get_instance(
     campaign_id: String,
     instance_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterInstanceDto, TauriCommandError> {
-    let store = get_campaign_store();
-    store
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::CampaignInstanceRead,
+            "get campaign instance",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let instance = state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .map(|instance| character_instance_dto_from_store(store, &instance))
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))
-}
-
-pub(crate) fn character_instance_dto_from_store(
-    store: &campaign_store::CampaignStore,
-    instance: &storyforge_domain::campaign::CharacterInstance,
-) -> CharacterInstanceDto {
-    let role_type = instance.definition_id.as_ref().and_then(|definition_id| {
-        let campaign = store.get_campaign(&instance.campaign_id)?;
-        let card = store.get_card(&campaign.card_id)?;
-        card.card
-            .character_definitions
-            .iter()
-            .find(|definition| definition.id == *definition_id)
-            .map(|definition| definition.role_type.clone())
-    });
-    match role_type.as_ref() {
-        Some(role_type) => CharacterInstanceDto::with_role_type(instance, role_type),
-        None => CharacterInstanceDto::from(instance),
-    }
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
+    crate::backend_workflows::character_instance_dto_for_backend(state.storage(), &instance)
+        .map_err(TauriCommandError::storage)
 }
 
 pub(crate) fn trimmed_optional(value: Option<String>) -> Option<String> {
@@ -851,15 +873,20 @@ pub(crate) fn add_campaign_instance(
     name: Option<String>,
     persona: Option<String>,
     behavior: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterInstanceDto, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    reject_if_active_turn(&campaign_id)?;
+    let store = state.json_campaign_store(
+        BackendCapability::CampaignLifecycle,
+        "add campaign instance",
+    )?;
+    reject_if_active_turn(state.storage(), &campaign_id)?;
     let definition_id = definition_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(Id::from_str);
     add_campaign_instance_to_store(
-        get_campaign_store(),
+        store,
         &campaign_id,
         definition_id.as_ref(),
         name,

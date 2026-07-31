@@ -24,6 +24,7 @@ use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger};
 use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
 use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
 use storyforge_infra_llm::LlmClient;
+use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 use storyforge_infra_sqlite::preaccept::{
     AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyOutcome, PostprocessApplyRequest,
     PreacceptOutboxKind, RegenerateAttemptRequest,
@@ -36,6 +37,7 @@ use storyforge_tauri_app::production_postprocess::{
     QualityAutofixRequest, TurnAttemptSink, run_quality_gate_with_optional_editor_autofix,
 };
 use storyforge_tauri_app::sqlite_runtime;
+use storyforge_tauri_app::storage_backend::StorageFacade;
 use storyforge_tauri_app::turn_lifecycle;
 
 use crate::coverage_ledger::{ObservationKey, ObservedCoverage, SqlitePostcondition};
@@ -463,7 +465,11 @@ impl SqliteHarnessEnv {
         let Some(active_id) = self.active_campaign_id() else {
             return Ok(ctx);
         };
-        fill_campaign_runtime_from_sqlite(&mut ctx, &self.tool_ctx, &active_id)?;
+        let storage = StorageFacade::new(
+            self.data_dir.clone(),
+            PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+        );
+        fill_campaign_runtime_from_sqlite(&storage, &mut ctx, &self.tool_ctx, &active_id)?;
         // Production-faithful: feed RoundSummary catalog into director remote-memory tools.
         // Without this, get_recent_summary / search_chronicle see empty stores and never
         // produce a complete tool-call evidence timeline.

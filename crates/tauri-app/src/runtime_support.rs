@@ -10,6 +10,7 @@ use super::*;
 /// surface (regenerate) / fail-closed (background start_writing).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_shared_postprocess_background(
+    storage: Arc<storage_backend::StorageFacade>,
     pipeline: PipelineOrchestrator,
     writing_ctx: WritingContext,
     final_text: String,
@@ -22,7 +23,7 @@ pub(crate) async fn run_shared_postprocess_background(
     identity: Option<production_postprocess::PostprocessIdentity>,
     runtime: Option<std::sync::Arc<CampaignRuntimeContext>>,
 ) -> Result<bool, production_postprocess::ProductionPostprocessError> {
-    use production_postprocess::{ProductionPostprocessError, ProductionPostprocessService};
+    use production_postprocess::ProductionPostprocessError;
 
     if *cancel.borrow() {
         tracing::warn!("Phase A: postprocess 写回跳过——cancelled");
@@ -48,33 +49,31 @@ pub(crate) async fn run_shared_postprocess_background(
         return Ok(false);
     }
 
-    let sink = BackendTurnAttemptSink::production();
+    let sink = crate::backend_workflows::BackendTurnAttemptSink::production(storage.clone());
     let Some(identity) = identity else {
         // 非 Campaign 路径：保持旧行为（直接写 store）
         if let Some(outcome) = outcome {
-            persist_postprocess_outcome_async(&writing_ctx, outcome, present_chars).await;
+            crate::backend_workflows::persist_postprocess_outcome_async(
+                storage.clone(),
+                &writing_ctx,
+                outcome,
+                present_chars,
+            )
+            .await
+            .map_err(ProductionPostprocessError::BatchConstruction)?;
         }
         return Ok(false);
     };
 
-    let result = if sqlite_runtime::is_sqlite_active() {
-        match runtime.as_ref() {
-            Some(runtime) => {
-                let service = ProductionPostprocessService::new_runtime(runtime.as_ref(), &sink);
-                service.apply_outcome(&identity, outcome, &present_chars, &cancel)
-            }
-            None => {
-                // Same unified PostProcessFailed path as apply_outcome errors.
-                Err(ProductionPostprocessError::BatchConstruction(
-                    "sqlite postprocess has no CampaignRuntimeContext; refusing JSON fallback"
-                        .into(),
-                ))
-            }
-        }
-    } else {
-        let service = ProductionPostprocessService::new_json(get_campaign_store(), &sink);
-        service.apply_outcome(&identity, outcome, &present_chars, &cancel)
-    };
+    // Batch source / adapter selection happens in the named backend adapter
+    // (Gate 3): SQLite requires the CampaignRuntimeContext snapshot and never
+    // falls back to the JSON store.
+    let service = crate::backend_workflows::build_postprocess_service(
+        storage.as_ref(),
+        runtime.as_deref(),
+        &sink,
+    )?;
+    let result = service.apply_outcome(&identity, outcome, &present_chars, &cancel);
 
     match result {
         Ok(result) if result.applied => {
@@ -146,20 +145,20 @@ pub(crate) fn service_fail_turn(
 }
 
 /// 读取-修改-写回 TurnRecord 的便捷辅助。
-pub(crate) fn update_turn_record<F>(turn_id: &Id, f: F) -> Result<(), String>
+pub(crate) fn update_turn_record<F>(
+    storage: &storage_backend::StorageFacade,
+    turn_id: &Id,
+    f: F,
+) -> Result<(), String>
 where
     F: FnOnce(&mut storyforge_domain::turn::TurnRecord),
 {
-    if sqlite_runtime::is_sqlite_active() {
-        return sqlite_runtime::update_turn_record(turn_id, f);
-    }
-    get_turn_store()
-        .with_turn_mut(turn_id, f)
-        .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
+    storage.update_turn_record(turn_id, f)
 }
 
 /// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
 pub(crate) fn update_turn_record_if<P, M>(
+    storage: &storage_backend::StorageFacade,
     turn_id: &Id,
     predicate: P,
     mutate: M,
@@ -168,12 +167,7 @@ where
     P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
     M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
 {
-    if sqlite_runtime::is_sqlite_active() {
-        return sqlite_runtime::mutate_turn_if(turn_id, predicate, mutate);
-    }
-    get_turn_store()
-        .mutate_if(turn_id, predicate, mutate)
-        .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
+    storage.mutate_turn_if(turn_id, predicate, mutate)
 }
 
 /// 后处理结果只能写回仍属于当前草稿的 Attempt。
@@ -182,147 +176,6 @@ pub(crate) fn is_current_attempt_ready_for_postprocess(
     attempt_id: &Id,
 ) -> bool {
     turn_lifecycle::is_current_attempt_ready_for_postprocess(record, attempt_id)
-}
-
-pub(crate) struct StartConversationTarget {
-    pub(crate) conversation_id: Id,
-    pub(crate) regex_character_id: Option<String>,
-    /// Phase A: 追加的 user 消息节点 ID（TurnRecord.input_node_id 用）
-    pub(crate) input_node_id: Option<Id>,
-}
-
-pub(crate) async fn prepare_start_conversation_async(
-    state: Arc<AppState>,
-    campaign_store: &'static campaign_store::CampaignStore,
-    requested_conversation_id: Option<String>,
-    character_id: Option<String>,
-    legacy_opening_character: Option<Arc<storyforge_domain::character::Character>>,
-    opening_message: Option<String>,
-    intent: String,
-) -> Result<StartConversationTarget, TauriCommandError> {
-    tokio::task::spawn_blocking(move || {
-        prepare_start_conversation(
-            state,
-            campaign_store,
-            requested_conversation_id,
-            character_id,
-            legacy_opening_character,
-            opening_message,
-            intent,
-        )
-    })
-    .await
-    .map_err(|e| TauriCommandError::internal(format!("准备写作对话任务失败: {e}")))?
-}
-
-pub(crate) fn prepare_start_conversation(
-    state: Arc<AppState>,
-    campaign_store: &campaign_store::CampaignStore,
-    requested_conversation_id: Option<String>,
-    character_id: Option<String>,
-    legacy_opening_character: Option<Arc<storyforge_domain::character::Character>>,
-    opening_message: Option<String>,
-    intent: String,
-) -> Result<StartConversationTarget, TauriCommandError> {
-    let campaign_conv_id: Option<Id> = {
-        let active = state
-            .active_campaign
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if sqlite_runtime::is_sqlite_active() {
-            match active.as_ref() {
-                Some(campaign_id) => {
-                    sqlite_runtime::get_campaign(campaign_id)
-                        .map_err(TauriCommandError::internal)?
-                        .ok_or_else(|| {
-                            TauriCommandError::internal(format!(
-                                "sqlite campaign {} missing while preparing writing",
-                                campaign_id
-                            ))
-                        })?
-                        .conversation_id
-                }
-                None => None,
-            }
-        } else {
-            active
-                .as_ref()
-                .and_then(|cid| campaign_store.get_campaign(cid))
-                .and_then(|campaign| campaign.conversation_id.clone())
-        }
-    };
-    let conversation_id = campaign_conv_id
-        .map(|cid| cid.as_str().to_string())
-        .or(requested_conversation_id);
-
-    let (conversation_id, input_node_id) = if let Some(id_str) = conversation_id {
-        let id = Id::from_str(&id_str);
-        match state.conv_store.append_user_message(&id, intent.clone()) {
-            Ok(node_id) => (id, Some(node_id)),
-            Err(e) => {
-                if sqlite_runtime::is_sqlite_active() {
-                    return Err(TauriCommandError::internal(format!(
-                        "sqlite user message persistence failed: {e}"
-                    )));
-                }
-                tracing::warn!("追加 user 消息失败: {e}");
-                (id, None)
-            }
-        }
-    } else {
-        let conv = if sqlite_runtime::is_sqlite_active() {
-            state
-                .conv_store
-                .create_persisted(character_id.clone(), None)
-                .map_err(|e| {
-                    TauriCommandError::internal(format!("sqlite conversation creation failed: {e}"))
-                })?
-        } else {
-            state.conv_store.create(character_id.clone(), None)
-        };
-        let id = conv.id.clone();
-        let legacy_opening =
-            resolve_legacy_opening_message(legacy_opening_character.as_ref(), opening_message);
-        if let Some(opening) = legacy_opening
-            && let Err(e) =
-                state
-                    .conv_store
-                    .append_final_message(&id, ConversationRole::Assistant, opening)
-        {
-            if sqlite_runtime::is_sqlite_active() {
-                return Err(TauriCommandError::internal(format!(
-                    "sqlite opening message persistence failed: {e}"
-                )));
-            }
-            tracing::warn!("追加开场白失败: {e}");
-        }
-        let node_id = match state.conv_store.append_user_message(&id, intent.clone()) {
-            Ok(node_id) => Some(node_id),
-            Err(e) if sqlite_runtime::is_sqlite_active() => {
-                return Err(TauriCommandError::internal(format!(
-                    "sqlite user message persistence failed: {e}"
-                )));
-            }
-            Err(e) => {
-                tracing::warn!("追加 user 消息失败: {e}");
-                None
-            }
-        };
-        (id, node_id)
-    };
-
-    let regex_character_id = character_id.or_else(|| {
-        state
-            .conv_store
-            .get(&conversation_id)
-            .and_then(|c| c.character_id)
-    });
-
-    Ok(StartConversationTarget {
-        conversation_id,
-        regex_character_id,
-        input_node_id,
-    })
 }
 
 pub(crate) fn resolve_legacy_opening_message(
@@ -339,10 +192,11 @@ pub(crate) fn resolve_legacy_opening_message(
 }
 
 pub(crate) fn resolve_campaign_opening_message(
+    store: &storage::CharacterStore,
     source_character_id: &Id,
     requested: Option<String>,
 ) -> Option<String> {
-    let stored = stored_character_for_source_id(source_character_id)?;
+    let stored = stored_character_for_source_id(store, source_character_id)?;
     resolve_opening_message_from_parts(
         &stored.info.first_mes,
         &stored.info.alternate_greetings,
@@ -365,9 +219,10 @@ pub(crate) fn stored_character_for_id_or_source_in_store(
 }
 
 pub(crate) fn stored_character_for_source_id(
+    store: &storage::CharacterStore,
     source_character_id: &Id,
 ) -> Option<storage::StoredCharacter> {
-    stored_character_for_id_or_source_in_store(get_store(), source_character_id)
+    stored_character_for_id_or_source_in_store(store, source_character_id)
 }
 
 pub(crate) fn resolve_opening_message_from_parts(
@@ -406,12 +261,13 @@ pub(crate) fn resolve_opening_message_from_parts(
 pub(crate) fn collect_scoped_regex_scripts(
     character_id: Option<&str>,
     characters: &[Arc<storyforge_domain::character::Character>],
+    character_store: Option<&storage::CharacterStore>,
 ) -> Vec<RegexScript> {
     let Some(character_id) = character_id else {
         return Vec::new();
     };
 
-    let stored = get_store().get(character_id);
+    let stored = character_store.and_then(|store| store.get(character_id));
     let source_id = stored
         .as_ref()
         .and_then(|stored| stored.info.source_character_id.as_deref())
@@ -508,15 +364,20 @@ pub(crate) fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) 
         resolve_active_campaign_with_legacy_fallback(
             guard.clone(),
             &state.data_dir,
-            sqlite_runtime::is_sqlite_active(),
+            state.storage(),
         )
     };
-    let active_id = match active_id {
-        Some(id) => id,
-        None => return,
+    let Some(active_id) = active_id else {
+        return;
     };
-    let store = get_campaign_store();
-    fill_campaign_runtime_from_store(ctx, &state.tool_ctx, store, &active_id);
+    match crate::backend_workflows::load_campaign_context_snapshot_for_backend(
+        state.storage(),
+        &active_id,
+    ) {
+        Ok(Some(snapshot)) => apply_campaign_context_snapshot(ctx, &state.tool_ctx, snapshot),
+        Ok(None) => {}
+        Err(error) => tracing::warn!("test Campaign context load failed: {error}"),
+    }
 }
 
 pub(crate) async fn fill_campaign_context_async(
@@ -533,24 +394,17 @@ pub(crate) async fn fill_campaign_context_async(
         guard.clone()
     };
     let data_dir = state.data_dir.clone();
-    let sqlite_active = sqlite_runtime::is_sqlite_active();
+    let storage = state.storage().clone();
     let snapshot = tokio::task::spawn_blocking(move || {
-        let active_id = resolve_active_campaign_with_legacy_fallback(
-            memory_active_id,
-            &data_dir,
-            sqlite_active,
-        );
+        let active_id =
+            resolve_active_campaign_with_legacy_fallback(memory_active_id, &data_dir, &storage);
         let Some(active_id) = active_id else {
             return Ok(None);
         };
-        if sqlite_runtime::is_sqlite_active() {
-            load_sqlite_campaign_context_snapshot(&active_id)
-        } else {
-            Ok(load_campaign_context_snapshot(
-                get_campaign_store(),
-                &active_id,
-            ))
-        }
+        crate::backend_workflows::load_campaign_context_snapshot_for_backend(
+            storage.as_ref(),
+            &active_id,
+        )
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("加载 Campaign 快照任务失败: {e}")))?
@@ -1033,9 +887,13 @@ pub(crate) fn load_campaign_context_snapshot(
 /// refresh write uses the process-owned SQLite authority.
 /// Public for harness SQLite endurance: same snapshot path as production opt-in.
 pub fn load_sqlite_campaign_context_snapshot(
+    storage: &storage_backend::StorageFacade,
     active_id: &Id,
 ) -> Result<Option<CampaignContextSnapshot>, String> {
-    let Some(mut camp) = sqlite_runtime::get_campaign(active_id)? else {
+    let Some(mut camp) = storage
+        .get_campaign(active_id)?
+        .map(|record| record.campaign)
+    else {
         return Ok(None);
     };
 
@@ -1044,7 +902,7 @@ pub fn load_sqlite_campaign_context_snapshot(
         camp.ensure_lineage_id();
         campaign_changed = true;
     }
-    let all_summaries = sqlite_runtime::list_summaries(active_id)?;
+    let all_summaries = storage.list_summaries(active_id)?;
     let (epoch_snap, _membership, should_persist_epoch, bumped_revision) =
         compute_context_epoch_refresh_parts(&camp, &all_summaries);
     if should_persist_epoch {
@@ -1053,31 +911,46 @@ pub fn load_sqlite_campaign_context_snapshot(
         campaign_changed = true;
     }
     if campaign_changed {
-        sqlite_runtime::save_campaign(&camp)?;
+        storage.save_campaign(&camp)?;
     }
 
-    let all_summaries = sqlite_runtime::list_summaries(active_id)?;
+    let all_summaries = storage.list_summaries(active_id)?;
     let turn = next_writing_turn(&all_summaries);
     let chronicle_prompt_catalog =
         build_chronicle_prompt_catalog(&all_summaries, camp.context_epoch.as_ref());
     let recent_summaries =
         take_recent_summaries_for_context(all_summaries.clone(), RECENT_SUMMARIES_LOAD_LIMIT);
-    let tasks = sqlite_runtime::list_tasks(active_id)?;
-    let instances = sqlite_runtime::list_instances(active_id)?;
-    let knowledge = sqlite_runtime::list_knowledge(active_id)?;
+    let tasks = storage.list_tasks(active_id)?;
+    let instances = storage.list_instances(active_id)?;
+    let knowledge = storage.list_knowledge(active_id)?;
 
-    let stored_card = sqlite_runtime::get_card_payload(&camp.card_id)?.and_then(|payload| {
-        serde_json::from_value::<campaign_store::StoredCard>(payload.clone())
-            .ok()
-            .or_else(|| {
-                serde_json::from_value::<storyforge_domain::character::CharacterCard>(payload)
-                    .ok()
-                    .map(|card| campaign_store::StoredCard {
+    let stored_card = match storage.get_card_payload(&camp.card_id)? {
+        Some(payload) => {
+            match serde_json::from_value::<campaign_store::StoredCard>(payload.clone()) {
+                Ok(stored) => Some(stored),
+                Err(stored_error) => {
+                    let card = serde_json::from_value::<
+                        storyforge_domain::character::CharacterCard,
+                    >(payload)
+                    .map_err(|card_error| {
+                        format!(
+                            "SQLite Campaign card payload decode failed: stored={stored_error}; card={card_error}"
+                        )
+                    })?;
+                    Some(campaign_store::StoredCard {
                         card,
                         imported_at: String::new(),
                     })
-            })
-    });
+                }
+            }
+        }
+        None => {
+            return Err(format!(
+                "SQLite Campaign {} references missing card {}",
+                camp.id, camp.card_id
+            ));
+        }
+    };
     let scoped_regex_scripts = stored_card
         .as_ref()
         .map(|stored| stored.card.scoped_regex_scripts())
@@ -1290,24 +1163,6 @@ pub(crate) fn compute_context_epoch_refresh_parts(
 ///
 /// 调用前应已清空 `ctx.campaign_runtime` 与 `tool_ctx.campaign_runtime`（防 stale）。
 /// 若 store 中找不到该 campaign，直接返回（无 campaign 模式）。
-/// Fill WritingContext from the process-owned SQLite authority (opt-in only).
-pub fn fill_campaign_runtime_from_sqlite(
-    ctx: &mut WritingContext,
-    tool_ctx: &Arc<RwLock<ToolContext>>,
-    active_id: &Id,
-) -> Result<(), String> {
-    if !sqlite_runtime::is_sqlite_active() {
-        return Err("fill_campaign_runtime_from_sqlite requires SQLite backend".into());
-    }
-    match load_sqlite_campaign_context_snapshot(active_id)? {
-        Some(snapshot) => {
-            apply_campaign_context_snapshot(ctx, tool_ctx, snapshot);
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
 pub fn fill_campaign_runtime_from_store(
     ctx: &mut WritingContext,
     tool_ctx: &Arc<RwLock<ToolContext>>,
@@ -1525,10 +1380,12 @@ pub(crate) fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct TemporaryInstancesPersistContext {
     campaign_id: Id,
 }
 
+#[cfg(test)]
 impl TemporaryInstancesPersistContext {
     pub(crate) fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
         Some(Self {
@@ -1536,31 +1393,6 @@ impl TemporaryInstancesPersistContext {
         })
     }
 }
-
-/// 测试/兼容：直接把临时 instance 落盘到 CampaignStore。
-///
-/// 生产路径 A.1 改为 accept 时 `Mutation::UpsertInstance`；本函数保留给单测。
-#[allow(dead_code)]
-pub(crate) async fn persist_temporary_instances_async(
-    ctx: &WritingContext,
-    temporaries: Vec<storyforge_domain::campaign::CharacterInstance>,
-) {
-    if temporaries.is_empty() {
-        return;
-    }
-    let Some(persist_ctx) = TemporaryInstancesPersistContext::from_writing_context(ctx) else {
-        return;
-    };
-
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        persist_temporary_instances_to_store(get_campaign_store(), &persist_ctx, &temporaries);
-    })
-    .await
-    {
-        tracing::warn!("落盘临时 instance 的阻塞任务失败: {e}");
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn persist_temporary_instances_to(
     store: &campaign_store::CampaignStore,
@@ -1573,6 +1405,7 @@ pub(crate) fn persist_temporary_instances_to(
     persist_temporary_instances_to_store(store, &persist_ctx, temporaries);
 }
 
+#[cfg(test)]
 pub(crate) fn persist_temporary_instances_to_store(
     store: &campaign_store::CampaignStore,
     persist_ctx: &TemporaryInstancesPersistContext,
@@ -1688,108 +1521,6 @@ pub(crate) fn collect_mvu_fallback_fragments(
     fragments
 }
 
-/// SQLite does not yet migrate the optional MVU translation cache. Do not
-/// read its JSON file as a hidden second authority; run postprocess without
-/// those optional snippets until MVU has a typed SQLite table.
-pub fn collect_mvu_fallback_fragments_for_backend(
-    ctx: &WritingContext,
-    present_chars: &[String],
-) -> Vec<storyforge_domain::mvu_translation::FallbackFragment> {
-    if sqlite_runtime::is_sqlite_active() {
-        // #22：SQLite 已是 MVU 翻译权威（V005 表 + importer 迁移），直接读它。
-        collect_mvu_from_sqlite(ctx, present_chars, false, |stored| {
-            stored
-                .translation
-                .fallback_fragments
-                .into_iter()
-                .filter(|f| !f.js_snippet.is_empty())
-                .collect()
-        })
-    } else {
-        collect_mvu_fallback_fragments(ctx, get_campaign_store(), present_chars)
-    }
-}
-
-/// #22：SQLite 后端的 MVU 收集骨架——与 JSON 版同语义：
-/// present instance → definition_id → source 卡（def→source 反查表来自
-/// character_cards payload）→ mvu_translations 表取翻译，`extract` 挑字段。
-/// `dedup_sources=true` 时同一 source 卡只贡献一次（规则收集用）。
-pub(crate) fn collect_mvu_from_sqlite<T>(
-    ctx: &WritingContext,
-    present_chars: &[String],
-    dedup_sources: bool,
-    mut extract: impl FnMut(campaign_store::StoredMvuTranslation) -> Vec<T>,
-) -> Vec<T> {
-    let runtime = match &ctx.campaign_runtime {
-        Some(rt) => rt,
-        None => return vec![],
-    };
-    let payloads = match sqlite_runtime::list_card_payloads() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("[MVU] SQLite 卡 payload 读取失败，本轮不注入: {e}");
-            return vec![];
-        }
-    };
-    // payload 兼容两种形态：StoredCard 包装（生产写入）/ 裸 CharacterCard（旧 cutover 源）
-    let def_to_source: std::collections::HashMap<Id, Id> = payloads
-        .iter()
-        .filter_map(|value| {
-            let inner = value.get("card").unwrap_or(value);
-            serde_json::from_value::<storyforge_domain::character::CharacterCard>(inner.clone())
-                .ok()
-        })
-        .flat_map(|card| {
-            let src = card.source_character_id.clone();
-            card.character_definitions
-                .into_iter()
-                .map(move |d| (d.id, src.clone()))
-        })
-        .collect();
-
-    let mut visited_sources = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for char_id_str in present_chars {
-        let char_id = Id::from_str(char_id_str);
-        let inst = runtime
-            .instances
-            .iter()
-            .find(|i| i.id == char_id || i.name == *char_id_str);
-        let inst = match inst {
-            Some(i) => i,
-            None => continue,
-        };
-        let def_id = match &inst.definition_id {
-            Some(d) => d,
-            None => continue,
-        };
-        let source_id = match def_to_source.get(def_id) {
-            Some(s) => s,
-            None => continue,
-        };
-        if dedup_sources && !visited_sources.insert(source_id.clone()) {
-            continue;
-        }
-        match sqlite_runtime::get_mvu(source_id) {
-            Ok(Some(stored)) => {
-                let items = extract(stored);
-                if !items.is_empty() {
-                    tracing::info!(
-                        target: "tauri-app",
-                        "[MVU] 角色 '{}' 所属卡贡献 {} 条 MVU 产物（SQLite）",
-                        inst.name,
-                        items.len()
-                    );
-                    out.extend(items);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("[MVU] SQLite 翻译读取失败（{}）: {e}", inst.name),
-        }
-    }
-    out
-}
-
 /// CampaignStore.cards → source_character_id → MvuTranslation.update_rules
 ///
 /// 与 `collect_mvu_fallback_fragments` 同型的查找链，但按 source 卡去重：
@@ -1860,27 +1591,6 @@ pub(crate) fn collect_mvu_update_rules(
     rules
 }
 
-/// 后端分流：SQLite 活跃时读 mvu_translations 表（V005 起为权威），
-/// 否则读 JSON CampaignStore——两条路径同语义（按 source 卡去重）。
-pub fn collect_mvu_update_rules_for_backend(
-    ctx: &WritingContext,
-    present_chars: &[String],
-) -> Vec<String> {
-    if sqlite_runtime::is_sqlite_active() {
-        // #22：SQLite 已是 MVU 翻译权威，规则收集不再空转（按 source 卡去重）。
-        collect_mvu_from_sqlite(ctx, present_chars, true, |stored| {
-            stored
-                .translation
-                .update_rules
-                .into_iter()
-                .filter(|r| !r.trim().is_empty())
-                .collect()
-        })
-    } else {
-        collect_mvu_update_rules(ctx, get_campaign_store(), present_chars)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PostprocessPersistContext {
     pub(crate) campaign_id: Id,
@@ -1889,7 +1599,7 @@ pub(crate) struct PostprocessPersistContext {
 }
 
 impl PostprocessPersistContext {
-    fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
+    pub(crate) fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
         Some(Self {
             campaign_id: ctx.campaign_id.clone()?,
             conversation_id: ctx.conversation_id.clone(),
@@ -1898,32 +1608,6 @@ impl PostprocessPersistContext {
     }
 }
 
-pub(crate) async fn persist_postprocess_outcome_async(
-    ctx: &WritingContext,
-    outcome: storyforge_app_agent::PostProcessOutcome,
-    present_chars: Vec<String>,
-) {
-    let Some(persist_ctx) = PostprocessPersistContext::from_writing_context(ctx) else {
-        return;
-    };
-
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        persist_postprocess_outcome_to_store(
-            get_campaign_store(),
-            &persist_ctx,
-            &outcome,
-            &present_chars,
-        );
-    })
-    .await
-    {
-        tracing::warn!("保存后处理结果的阻塞任务失败: {e}");
-    }
-}
-
-/// Phase A: 把后处理产出转换为 MutationBatch（不直接写 CampaignStore）。
-///
-/// 委托共享 `production_postprocess` 实现，保留局部 wrapper 兼容既有测试。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_mutation_batch(
     store: &campaign_store::CampaignStore,

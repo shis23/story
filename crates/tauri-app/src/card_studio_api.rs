@@ -140,7 +140,11 @@ pub fn cardstudio_create_from_character(
     brief: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let stored = resolve_stored_character(&character_id)?;
+    let character_store = state.json_character_store(
+        crate::storage_backend::BackendCapability::CharacterCommands,
+        "create Card Studio project from character",
+    )?;
+    let stored = resolve_stored_character(character_store, &character_id)?;
     let character = crate::stored_info_to_character(&stored);
 
     // Ensure tool_ctx has it (best effort) so later extract/import paths stay consistent.
@@ -166,9 +170,9 @@ pub fn cardstudio_create_from_character(
 }
 
 fn resolve_stored_character(
+    store: &crate::storage::CharacterStore,
     character_id: &str,
 ) -> Result<crate::storage::StoredCharacter, TauriCommandError> {
-    let store = crate::get_store();
     if let Some(s) = store.get(character_id) {
         return Ok(s);
     }
@@ -717,6 +721,17 @@ pub fn cardstudio_import_compiled(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<ImportCompiledResultDto, TauriCommandError> {
+    state
+        .storage()
+        .require_supported(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "import compiled Card Studio character",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let campaign_store = state.json_campaign_store(
+        crate::storage_backend::BackendCapability::CardCommands,
+        "import compiled Card Studio card",
+    )?;
     let store = get_card_studio_store();
     let mut project = store
         .get(&id)
@@ -732,7 +747,11 @@ pub fn cardstudio_import_compiled(
         storyforge_domain::card_studio::CardProjectMode::FromExistingCard
     );
     let info = CharacterInfo::from(&character);
-    let stored = crate::get_store()
+    let stored = state
+        .json_character_store(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "import compiled Card Studio character",
+        )?
         .save(info)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
@@ -762,7 +781,7 @@ pub fn cardstudio_import_compiled(
     } else {
         "Card Studio 从零导入，已生成单主角定义，可稍后重新识别。".into()
     });
-    let stored_card = crate::get_campaign_store()
+    let stored_card = campaign_store
         .save_card(card)
         .map_err(|e| TauriCommandError::storage(format!("保存 CharacterCard 失败: {e}")))?;
 

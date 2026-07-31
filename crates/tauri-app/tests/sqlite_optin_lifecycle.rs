@@ -16,9 +16,11 @@ use storyforge_domain::turn::{
     TurnStatus,
 };
 use storyforge_infra_sqlite::Database;
+use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 use storyforge_infra_sqlite::cutover::{CutoverPlan, CutoverRequest, recover_or_verify};
 use storyforge_infra_sqlite::production::SqliteProductionRepository;
 use storyforge_lib::sqlite_runtime;
+use storyforge_lib::storage_backend::StorageFacade;
 use storyforge_lib::turn_lifecycle::{AcceptError, append_regenerate_attempt, new_draft_attempt};
 
 fn write_json(path: &Path, value: serde_json::Value) {
@@ -93,6 +95,46 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
         .expect("campaign picker reads the SQLite authority after JSON removal");
     assert_eq!(picker_campaigns.len(), 1);
     assert_eq!(picker_campaigns[0].id, campaign_id);
+
+    let facade = StorageFacade::new(
+        source_dir.to_path_buf(),
+        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+    );
+    facade
+        .validate_runtime_authority()
+        .expect("facade and SQLite runtime must name the same authority");
+    assert!(
+        !facade.has_json_writers(),
+        "SQLite facade must not construct legacy Campaign/Turn writers"
+    );
+    assert_eq!(
+        facade
+            .list_campaigns(Some(&Id::from_str("other-card")))
+            .expect("SQLite facade applies card filtering")
+            .len(),
+        0,
+        "SQLite facade must not drop the requested card filter"
+    );
+    assert_eq!(
+        facade
+            .list_campaigns(Some(&Id::from_str("card-1")))
+            .expect("matching SQLite campaign remains visible")
+            .len(),
+        1
+    );
+
+    let mismatched_json = StorageFacade::new(
+        source_dir.to_path_buf(),
+        PinnedBackend::new(StorageBackend::Json, BackendSource::Default),
+    );
+    assert!(
+        mismatched_json.validate_runtime_authority().is_err(),
+        "a JSON facade must reject an already-active SQLite runtime"
+    );
+    assert!(
+        sqlite_runtime::activate(source_dir.join("different.sqlite3")).is_err(),
+        "SQLite activation must reject a different second database path"
+    );
 
     // write -> Draft: the normal ConversationStore API is what pipeline uses.
     let user_node = conversations
@@ -222,6 +264,10 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
             .expect("force accept uses the regenerated SQLite Attempt");
     assert!(outcome.commit_as_degraded);
     assert_eq!(outcome.turn_status, TurnStatus::Degraded);
+    assert_eq!(
+        outcome.campaign_revision_after, 1,
+        "first commit must report the UoW-validated target revision"
+    );
 
     let replay =
         sqlite_runtime::accept_by_variant(&campaign_id, &conversation_id, &draft_node, false)
@@ -252,6 +298,123 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
             .unwrap()
             .status,
         AttemptStatus::Committed
+    );
+
+    // The committed revision is taken from the UoW-validated batch
+    // (target = expected + 1), never from a post-commit read-back: a commit
+    // that succeeded must report success with the true revision so callers
+    // run invalidate / indexing / chronicle enqueue. A second turn proves the
+    // returned revision matches the durable authority for a fresh commit.
+    let second_user = conversations
+        .append_user_message(&conversation_id, "second-turn revision".into())
+        .expect("second turn user message persists in SQLite");
+    let second_turn = TurnRecord::new(campaign_id.clone(), conversation_id.clone(), second_user, 1);
+    let second_turn_id = second_turn.turn_id.clone();
+    sqlite_runtime::save_turn(&second_turn).expect("second Turn persists in SQLite");
+    let second_draft = conversations
+        .append_ai_draft(&conversation_id, "second-turn draft".into(), None)
+        .expect("second draft persists in SQLite");
+    let second_attempt =
+        new_draft_attempt(Id::new(), second_draft.clone(), "second-turn draft", vec![]);
+    sqlite_runtime::update_turn_record(&second_turn_id, |record| {
+        record.attempts.push(second_attempt);
+        record.status = TurnStatus::AwaitingAcceptance;
+        record.attempts[0].status = AttemptStatus::AwaitingAcceptance;
+        record.touch();
+    })
+    .expect("second Attempt persists in SQLite");
+    let second_outcome =
+        sqlite_runtime::accept_by_variant(&campaign_id, &conversation_id, &second_draft, false)
+            .expect("second accept commits successfully");
+    assert_eq!(
+        second_outcome.campaign_revision_after, 2,
+        "UoW-validated batch target revision must be reported"
+    );
+    let second_committed = sqlite_runtime::get_turn(&second_turn_id)
+        .unwrap()
+        .expect("second accepted Turn persists in SQLite");
+    assert_eq!(second_committed.status, TurnStatus::Committed);
+    let campaign_after_second = sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .expect("campaign remains readable after second accept");
+    assert_eq!(
+        campaign_after_second.revision, second_outcome.campaign_revision_after,
+        "reported revision must match the durable authority"
+    );
+
+    // TurnWorkflow 级：SQLite 首稿 UoW 失败必须把仍为 Generating 的 Turn
+    // 标 Failed（failure_reason 写盘），否则它会永远占用 active-turn barrier。
+    // 用 fault 注入走真实回滚路径（BeforeCommit）。
+    let workflow =
+        storyforge_lib::TurnWorkflow::new(Arc::new(facade.clone()), conversations.clone());
+    let draft_fault_turn =
+        TurnRecord::new(campaign_id.clone(), conversation_id.clone(), Id::new(), 2);
+    let draft_fault_turn_id = draft_fault_turn.turn_id.clone();
+    sqlite_runtime::save_turn(&draft_fault_turn).expect("fault Turn persists in SQLite");
+    sqlite_runtime::fail_draft_uow_for_test(true);
+    let draft_fault_err = workflow
+        .create_draft_attempt(storyforge_lib::DraftAttemptRequest {
+            campaign_id: &campaign_id,
+            conversation_id: &conversation_id,
+            turn_id: &draft_fault_turn_id,
+            attempt_id: &Id::new(),
+            provisional_variant_id: Some(&Id::new()),
+            draft_text: "fault draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        })
+        .expect_err("injected UoW fault must fail the draft");
+    sqlite_runtime::fail_draft_uow_for_test(false);
+    assert!(!draft_fault_err.is_empty());
+    let failed_turn = sqlite_runtime::get_turn(&draft_fault_turn_id)
+        .unwrap()
+        .expect("failed Turn persists in SQLite");
+    assert_eq!(
+        failed_turn.status,
+        TurnStatus::Failed,
+        "SQLite draft failure must mark a Generating Turn Failed to release the active-turn barrier"
+    );
+    assert!(
+        failed_turn
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("sqlite preaccept draft 失败")),
+        "unexpected failure_reason: {:?}",
+        failed_turn.failure_reason
+    );
+
+    // 已成功推进的状态绝不被失败写回降级：Committed Turn 被 preaccept
+    // 校验拒绝（expected Generating）时保持原状态，不写 failure_reason。
+    let mut settled_turn =
+        TurnRecord::new(campaign_id.clone(), conversation_id.clone(), Id::new(), 2);
+    settled_turn.status = TurnStatus::Committed;
+    let settled_turn_id = settled_turn.turn_id.clone();
+    sqlite_runtime::save_turn(&settled_turn).expect("settled Turn persists in SQLite");
+    let settled_err = workflow
+        .create_draft_attempt(storyforge_lib::DraftAttemptRequest {
+            campaign_id: &campaign_id,
+            conversation_id: &conversation_id,
+            turn_id: &settled_turn_id,
+            attempt_id: &Id::new(),
+            provisional_variant_id: Some(&Id::new()),
+            draft_text: "settled draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        })
+        .expect_err("non-Generating turn must fail the draft UoW");
+    assert!(!settled_err.is_empty());
+    let preserved = sqlite_runtime::get_turn(&settled_turn_id)
+        .unwrap()
+        .expect("settled Turn persists in SQLite");
+    assert_eq!(
+        preserved.status,
+        TurnStatus::Committed,
+        "a settled Turn must never be downgraded by a failed draft write-back"
+    );
+    assert!(
+        preserved.failure_reason.is_none(),
+        "no failure_reason may be written onto a settled Turn: {:?}",
+        preserved.failure_reason
     );
 
     // restart/recovery: an incomplete later Turn is failed from the same DB,

@@ -7,8 +7,9 @@ use super::conversations::auto_archive_if_needed;
 pub(crate) fn get_active_turn_receipt(
     campaign_id: String,
     node_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Option<ActiveTurnReceiptDto>, TauriCommandError> {
-    get_active_turn_receipt_impl(campaign_id, node_id)
+    get_active_turn_receipt_impl(state.storage(), campaign_id, node_id)
 }
 
 #[tauri::command]
@@ -21,8 +22,11 @@ pub(crate) async fn retry_active_turn_postprocess(
 }
 
 #[tauri::command]
-pub(crate) fn get_active_turn_quality(campaign_id: String) -> Option<ActiveTurnQualityDto> {
-    get_active_turn_quality_impl(campaign_id)
+pub(crate) fn get_active_turn_quality(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Option<ActiveTurnQualityDto>, TauriCommandError> {
+    get_active_turn_quality_impl(state.storage(), campaign_id)
 }
 
 fn mutation_is_receipt_reviewable(mutation: &storyforge_domain::turn::Mutation) -> bool {
@@ -169,13 +173,14 @@ fn active_turn_receipt_from_record(
 
 /// 读取活动 Attempt 的 Accept-before 小票，不修改任何状态。
 pub(crate) fn get_active_turn_receipt_impl(
+    storage: &crate::storage_backend::StorageFacade,
     campaign_id: String,
     node_id: String,
 ) -> Result<Option<ActiveTurnReceiptDto>, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
     let variant_id = Id::from_str(&node_id);
     let Some(turn) =
-        get_active_turn_for_backend(&campaign_id).map_err(TauriCommandError::internal)?
+        get_active_turn_for_backend(storage, &campaign_id).map_err(TauriCommandError::internal)?
     else {
         return Ok(None);
     };
@@ -183,13 +188,14 @@ pub(crate) fn get_active_turn_receipt_impl(
 }
 
 fn apply_turn_receipt_selection(
+    storage: &crate::storage_backend::StorageFacade,
     campaign_id: &Id,
     variant_id: &Id,
     selected_mutation_indices: &[usize],
 ) -> Result<(), String> {
     use storyforge_domain::turn::{AttemptStatus, MutationBatchStatus, TurnStatus};
 
-    let turn = get_active_turn_for_backend(campaign_id)?
+    let turn = get_active_turn_for_backend(storage, campaign_id)?
         .ok_or_else(|| "当前 Campaign 没有待采纳 Turn".to_string())?;
     let turn_id = turn.turn_id.clone();
     let attempt_id = turn
@@ -199,6 +205,7 @@ fn apply_turn_receipt_selection(
         .clone();
     let mut selection_error: Option<String> = None;
     let applied = update_turn_record_if(
+        storage,
         &turn_id,
         |record| {
             record.campaign_id == *campaign_id
@@ -291,7 +298,7 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
         ));
     }
 
-    let turn = get_active_turn_for_backend(&campaign_id)
+    let turn = get_active_turn_for_backend(state.storage(), &campaign_id)
         .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::validation("当前 Campaign 没有待采纳 Turn"))?;
     let attempt = turn
@@ -339,6 +346,13 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
         regex_scripts: collect_scoped_regex_scripts(
             regex_character_id.as_deref(),
             &snapshot.characters,
+            state
+                .storage()
+                .json_character_store(
+                    crate::storage_backend::BackendCapability::CharacterCommands,
+                    "turn retry scoped regex context",
+                )
+                .ok(),
         ),
         campaign_runtime: None,
         agent_profile_config: None,
@@ -365,9 +379,15 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
 
     let present_characters = postprocess_present_characters(attempt.provenance.as_ref());
     let variable_keys = postprocess_variable_keys(&writing_ctx);
-    let fallback_fragments =
-        collect_mvu_fallback_fragments_for_backend(&writing_ctx, &present_characters);
-    let mvu_update_rules = collect_mvu_update_rules_for_backend(&writing_ctx, &present_characters);
+    let fallback_fragments = collect_mvu_fallback_fragments_for_backend(
+        state.storage(),
+        &writing_ctx,
+        &present_characters,
+    )
+    .map_err(TauriCommandError::internal)?;
+    let mvu_update_rules =
+        collect_mvu_update_rules_for_backend(state.storage(), &writing_ctx, &present_characters)
+            .map_err(TauriCommandError::internal)?;
     let pipeline = state.new_pipeline_with_regex(&writing_ctx.regex_scripts)?;
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -385,6 +405,7 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
     // before the shared postprocess service starts, so a missing conversation,
     // invalid Campaign context, or config load error cannot strand the Turn.
     let transitioned = update_turn_record_if(
+        state.storage(),
         &turn_id,
         |record| {
             record.status == TurnStatus::AwaitingAcceptance
@@ -410,6 +431,7 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
     }
 
     run_shared_postprocess_background(
+        state.storage().clone(),
         pipeline,
         writing_ctx,
         final_text,
@@ -425,7 +447,7 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
     .await
     .map_err(|error| TauriCommandError::internal(format!("重试记账失败: {error}")))?;
 
-    let refreshed = get_active_turn_for_backend(&campaign_id)
+    let refreshed = get_active_turn_for_backend(state.storage(), &campaign_id)
         .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::internal("重试后找不到活动 Turn"))?;
     active_turn_receipt_from_record(&refreshed, &variant_id)
@@ -453,10 +475,13 @@ pub(crate) fn active_turn_quality_from_record(
 /// 读取当前 Campaign 活动 Turn 上 active Attempt 的 QualityReport。
 ///
 /// 无活动 Turn / 无质量报告 → None。不创建状态。
-pub(crate) fn get_active_turn_quality_impl(campaign_id: String) -> Option<ActiveTurnQualityDto> {
+pub(crate) fn get_active_turn_quality_impl(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: String,
+) -> Result<Option<ActiveTurnQualityDto>, TauriCommandError> {
     let camp = Id::from_str(&campaign_id);
-    let turn = get_active_turn_for_backend(&camp).ok()??;
-    active_turn_quality_from_record(&turn)
+    let turn = get_active_turn_for_backend(storage, &camp).map_err(TauriCommandError::internal)?;
+    Ok(turn.as_ref().and_then(active_turn_quality_from_record))
 }
 
 /// 编辑当前变体内容
@@ -470,53 +495,13 @@ pub(crate) fn edit_variant(
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
 
-    // SQLite opt-in: atomic edit + Stale via preaccept UoW when a live Attempt is linked.
-    if sqlite_runtime::is_sqlite_active() {
-        if let Some(turn) =
-            get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
-            && let Some(att) = turn.find_attempt_by_variant(&nid)
-        {
-            sqlite_runtime::mark_stale_after_edit(
-                &turn.campaign_id,
-                &turn.conversation_id,
-                &turn.turn_id,
-                &att.attempt_id,
-                &new_content,
-            )
-            .map_err(TauriCommandError::internal)?;
-            state.conv_store.invalidate();
-            return Ok(());
-        }
-        // No linked Attempt: plain conversation edit only (still SQLite-backed store).
-        state
-            .conv_store
-            .edit_variant(&conv_id, &nid, new_content)
-            .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-        return Ok(());
-    }
-
+    // Turn/Attempt edit + Stale mark is a backend-owned workflow (Gate 3):
+    // SQLite uses the atomic mark-stale preaccept UoW when an Attempt is
+    // linked; JSON edits first and marks Stale best-effort (P0-3).
     state
-        .conv_store
-        .edit_variant(&conv_id, &nid, new_content)
-        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-
-    // P0-3：编辑后 draft_hash 不再匹配 → 标记关联 Attempt 为 Stale
-    // commit_turn_attempt 会因 hash 不匹配拒绝 accept，Stale 是显式信号
-    if let Some(turn) =
-        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
-    {
-        let turn_id = turn.turn_id.clone();
-        if let Some(att) = turn.find_attempt_by_variant(&nid) {
-            let attempt_id = att.attempt_id.clone();
-            let _ = update_turn_record(&turn_id, |record| {
-                if let Some(a) = record.find_attempt_mut(&attempt_id) {
-                    a.status = storyforge_domain::turn::AttemptStatus::Stale;
-                }
-                record.touch();
-            });
-        }
-    }
-
+        .turn_workflow
+        .edit_variant_with_stale_mark(&conv_id, &nid, &new_content)
+        .map_err(TauriCommandError::internal)?;
     Ok(())
 }
 
@@ -569,11 +554,11 @@ pub(crate) async fn accept_variant_async(
             // A committed replay has no active Turn left. In that case skip the
             // already-applied receipt selection and let commit_turn_attempt
             // return its existing idempotent result.
-            if get_active_turn_for_backend(&campaign_id)
+            if get_active_turn_for_backend(state.storage(), &campaign_id)
                 .map_err(TauriCommandError::internal)?
                 .is_some()
             {
-                apply_turn_receipt_selection(&campaign_id, &node_id, selected)
+                apply_turn_receipt_selection(state.storage(), &campaign_id, &node_id, selected)
                     .map_err(TauriCommandError::validation)?;
             }
         }
@@ -595,278 +580,6 @@ pub(crate) async fn accept_variant_async(
     Ok(())
 }
 
-/// 统计 campaign 未覆盖 A/B 数量。
-pub(crate) fn count_uncovered_chronicle_levels(
-    store: &campaign_store::CampaignStore,
-    campaign_id: &Id,
-) -> (usize, usize) {
-    let entries = store.list_summaries(campaign_id);
-    let uncovered_a = entries
-        .iter()
-        .filter(|s| s.covered_by.is_none() && s.is_leaf_a())
-        .count();
-    let uncovered_b = entries
-        .iter()
-        .filter(|s| {
-            s.covered_by.is_none()
-                && s.chronicle_level() == storyforge_domain::chronicle::ChronicleLevel::B
-        })
-        .count();
-    (uncovered_a, uncovered_b)
-}
-
-/// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
-pub(crate) fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
-    if sqlite_runtime::is_sqlite_active() {
-        // Chronicle publication jobs are already typed in infra-sqlite, but
-        // the background worker still depends on the JSON job store. Refuse
-        // that secondary authority rather than silently reading/writing it.
-        tracing::debug!(
-            campaign_id = %campaign_id,
-            "sqlite backend skips JSON-only chronicle compressor worker"
-        );
-        return;
-    }
-    let store = get_campaign_store();
-    let job_store = get_compress_job_store();
-    let (uncovered_a, uncovered_b) = count_uncovered_chronicle_levels(store, &campaign_id);
-    let need_a = storyforge_domain::chronicle::should_enqueue_compress(
-        uncovered_a,
-        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
-    );
-    let need_b = storyforge_domain::chronicle::should_enqueue_compress(
-        uncovered_b,
-        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
-    );
-    if !need_a && !need_b {
-        return;
-    }
-    let camp = store.get_campaign(&campaign_id);
-    let conversation_id = camp.as_ref().and_then(|c| c.conversation_id.clone());
-    let lineage_id = camp.as_ref().and_then(|c| c.lineage_id.clone());
-    match job_store.enqueue_or_get_open(
-        &campaign_id,
-        conversation_id,
-        lineage_id,
-        uncovered_a as u32,
-        uncovered_b as u32,
-    ) {
-        Ok((job, created)) => {
-            tracing::info!(
-                target: "chronicle_compressor",
-                campaign_id = %campaign_id,
-                job_id = %job.id,
-                created,
-                uncovered_a,
-                uncovered_b,
-                "compress job enqueued"
-            );
-            // Pending（含失败回队）允许再次 spawn；Running 不重复 spawn。
-            // 实际互斥靠 try_claim_pending。
-            if created || job.status == compress_job_store::CompressJobStatus::Pending {
-                spawn_compress_job_worker(state, job.id);
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "chronicle_compressor",
-                "enqueue compress job failed: {e}"
-            );
-        }
-    }
-}
-
-pub(crate) fn should_recover_json_compress_jobs(sqlite_active: bool) -> bool {
-    !sqlite_active
-}
-
-/// 启动恢复：Running→Pending，然后为所有 open job spawn worker。
-pub(crate) fn recover_compress_jobs_on_startup(app_state: Arc<AppState>) {
-    // Chronicle compression still has a JSON job-store implementation only.
-    // An opt-in SQLite process must neither resume nor mutate that secondary
-    // store until the SQLite-native job path exists.
-    if !should_recover_json_compress_jobs(sqlite_runtime::is_sqlite_active()) {
-        tracing::info!(
-            target: "chronicle_compressor",
-            "startup: skipping JSON chronicle-job recovery in SQLite mode"
-        );
-        return;
-    }
-    let job_store = get_compress_job_store();
-    let reset = job_store.reset_running_to_pending();
-    if reset > 0 {
-        tracing::info!(
-            target: "chronicle_compressor",
-            reset,
-            "startup: reset Running compress jobs to Pending"
-        );
-    }
-    let open = job_store.list_open();
-    if open.is_empty() {
-        return;
-    }
-    tracing::info!(
-        target: "chronicle_compressor",
-        count = open.len(),
-        "startup: replaying open compress jobs"
-    );
-    for job in open {
-        spawn_compress_job_worker(app_state.clone(), job.id);
-    }
-}
-
-/// 消费单个 compress job（可崩溃重试：失败回到 Pending 或 Failed）。
-pub(crate) fn spawn_compress_job_worker(state: Arc<AppState>, job_id: Id) {
-    tokio::spawn(async move {
-        let job_store = get_compress_job_store();
-        let store = get_campaign_store();
-        let job = match job_store.list_all().into_iter().find(|j| j.id == job_id) {
-            Some(j) if j.status == compress_job_store::CompressJobStatus::Pending => j,
-            _ => return,
-        };
-        match job_store.try_claim_pending(&job_id) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(
-                    target: "chronicle_compressor",
-                    job_id = %job_id,
-                    "compress job already claimed; worker exit"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: "chronicle_compressor", "try_claim_pending {job_id}: {e}");
-                return;
-            }
-        }
-
-        let campaign_id = job.campaign_id.clone();
-        let camp = match store.get_campaign(&campaign_id) {
-            Some(c) => c,
-            None => {
-                let _ = job_store.mark_failed_or_retry(&job_id, "campaign missing");
-                return;
-            }
-        };
-        let lineage = job
-            .lineage_id
-            .clone()
-            .or(camp.lineage_id.clone())
-            .unwrap_or_else(Id::new);
-        let conversation_id = job
-            .conversation_id
-            .clone()
-            .or(camp.conversation_id.clone())
-            .unwrap_or_else(|| Id::from_str("unknown-conv"));
-        let entries = store.list_summaries(&campaign_id);
-
-        let llm = match state.require_active_llm() {
-            Ok(llm) => llm,
-            Err(error) => {
-                let _ = job_store.mark_failed_or_retry(&job_id, error.to_string());
-                return;
-            }
-        };
-        let tool_snapshot = state.snapshot_tool_ctx();
-        let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
-        let (_tx, cancel) = tokio::sync::watch::channel(false);
-
-        match storyforge_app_agent::run_compress_if_needed(
-            &runtime,
-            &campaign_id,
-            &lineage,
-            &conversation_id,
-            entries,
-            cancel,
-            None,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(outcomes) => {
-                let mut publish_err: Option<String> = None;
-                for out in outcomes {
-                    if let Err(e) = store.publish_compress_result(
-                        &campaign_id,
-                        &out.parent_summaries,
-                        &out.publish.child_covered_by,
-                    ) {
-                        publish_err = Some(e);
-                        break;
-                    }
-                    tracing::info!(
-                        target: "chronicle_compressor",
-                        job_id = %job_id,
-                        level = ?out.output_level,
-                        parents = out.parent_summaries.len(),
-                        children = out.publish.child_covered_by.len(),
-                        "compress batch published"
-                    );
-                }
-                if let Some(e) = publish_err {
-                    // 仅当 marker 仍在且 summaries 校验可通过时 heal 才能完成；
-                    // 校验失败会保留 marker，并让 job 回 Pending 下次 Accept/启动再试。
-                    if store.needs_compress_metadata_heal(&campaign_id) {
-                        match store.heal_compress_publication_metadata(&campaign_id) {
-                            Ok(()) => {}
-                            Err(he) => tracing::warn!(
-                                target: "chronicle_compressor",
-                                "heal after publish err (marker kept if incomplete): {he}"
-                            ),
-                        }
-                    }
-                    if let Err(me) = job_store.mark_failed_or_retry(&job_id, e) {
-                        tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
-                    }
-                } else if let Err(e) = job_store.mark_succeeded(&job_id) {
-                    tracing::error!(target: "chronicle_compressor", "mark_succeeded: {e}");
-                }
-            }
-            Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress) => {
-                // 可能是：并发已压缩完，或 summaries 已写但 metadata 未 heal
-                if store.needs_compress_metadata_heal(&campaign_id) {
-                    if let Err(e) = store.heal_compress_publication_metadata(&campaign_id) {
-                        tracing::warn!(
-                            target: "chronicle_compressor",
-                            job_id = %job_id,
-                            "heal metadata on NothingToCompress failed: {e}"
-                        );
-                        if let Err(me) = job_store.mark_failed_or_retry(&job_id, e) {
-                            tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
-                        }
-                        return;
-                    }
-                    tracing::info!(
-                        target: "chronicle_compressor",
-                        job_id = %job_id,
-                        "healed compress metadata after NothingToCompress"
-                    );
-                }
-                if let Err(e) = job_store.mark_succeeded(&job_id) {
-                    tracing::error!(target: "chronicle_compressor", "mark_succeeded: {e}");
-                } else {
-                    tracing::info!(
-                        target: "chronicle_compressor",
-                        job_id = %job_id,
-                        "compress job nothing to do → succeeded"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "chronicle_compressor",
-                    job_id = %job_id,
-                    "compress run failed: {e}"
-                );
-                if let Err(me) = job_store.mark_failed_or_retry(&job_id, e.to_string()) {
-                    tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
-                }
-            }
-        }
-    });
-}
-
 /// Phase A: Campaign 模式下的 TurnCommit（accept → 正文 Final + 状态变更 + revision bump）。
 ///
 /// 生产实现委托共享 `turn_lifecycle::TurnLifecycleService`，保证 Tauri 与 harness 同路径。
@@ -882,23 +595,13 @@ pub(crate) async fn commit_turn_attempt(
     let conv_id = conv_id.clone();
     let node_id = node_id.clone();
 
-    let state_for_accept = state.clone();
+    // Turn/Attempt/Accept dispatch lives in the injected TurnWorkflow adapter
+    // (Gate 3): JSON uses the shared TurnLifecycleService, SQLite the atomic
+    // production UoW (which also invalidates the conversation cache).
+    let workflow = state.turn_workflow.clone();
     let campaign_id_for_accept = campaign_id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        if sqlite_runtime::is_sqlite_active() {
-            return sqlite_runtime::accept_by_variant(
-                &campaign_id_for_accept,
-                &conv_id,
-                &node_id,
-                force_accept,
-            );
-        }
-        let service = turn_lifecycle::TurnLifecycleService::new(
-            get_campaign_store(),
-            get_turn_store(),
-            &state_for_accept.conv_store,
-        );
-        service.accept_by_variant(&campaign_id_for_accept, &conv_id, &node_id, force_accept)
+        workflow.accept_by_variant(&campaign_id_for_accept, &conv_id, &node_id, force_accept)
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("TurnCommit 任务失败: {e}")))?
@@ -909,13 +612,6 @@ pub(crate) async fn commit_turn_attempt(
         turn_lifecycle::AcceptError::CampaignMissing => TauriCommandError::internal(e.to_string()),
         other => TauriCommandError::validation(other.to_string()),
     })?;
-
-    // SQLite Accept mutates the conversation graph in its atomic UoW. Drop
-    // the in-process projection so subsequent context reads reload the Final
-    // variant from SQLite instead of retaining a stale Draft cache entry.
-    if sqlite_runtime::is_sqlite_active() {
-        state.conv_store.invalidate();
-    }
 
     // ContextCompiler：已接受的 RoundSummary 进入远记忆向量池（best-effort）
     {
@@ -951,14 +647,14 @@ pub(crate) fn soft_delete_variant(
     let nid = Id::from_str(&node_id);
 
     // Phase A: Campaign 模式下标记 Attempt Discarded
-    if let Some(turn) =
-        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+    if let Some(turn) = get_turn_by_variant_for_backend(state.storage(), &nid)
+        .map_err(TauriCommandError::internal)?
     {
         let attempt_id = turn
             .find_attempt_by_variant(&nid)
             .map(|a| a.attempt_id.clone());
         if let Some(att_id) = attempt_id {
-            let _ = update_turn_record(&turn.turn_id, |record| {
+            let _ = update_turn_record(state.storage(), &turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&att_id) {
                     att.status = storyforge_domain::turn::AttemptStatus::Discarded;
                 }
@@ -999,7 +695,7 @@ pub(crate) async fn abandon_turn(
         ));
     };
 
-    let turn = get_active_turn_for_backend(&campaign_id)
+    let turn = get_active_turn_for_backend(state.storage(), &campaign_id)
         .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::validation("没有活动 Turn 可以放弃".to_string()))?;
 
@@ -1026,7 +722,7 @@ pub(crate) async fn abandon_turn(
     .map_err(TauriCommandError::internal)?;
 
     // 标记 Turn Abandoned
-    update_turn_record(&turn.turn_id, |record| {
+    update_turn_record(state.storage(), &turn.turn_id, |record| {
         record.status = storyforge_domain::turn::TurnStatus::Abandoned;
         for att in &mut record.attempts {
             if att.status.is_active() {
@@ -1087,13 +783,13 @@ pub(crate) fn switch_variant(
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
     // P0-3：切换变体后，当前 active variant 变了 → 旧 Attempt 标 Stale
-    if let Some(turn) =
-        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+    if let Some(turn) = get_turn_by_variant_for_backend(state.storage(), &nid)
+        .map_err(TauriCommandError::internal)?
     {
         let turn_id = turn.turn_id.clone();
         if let Some(att) = turn.find_attempt_by_variant(&nid) {
             let attempt_id = att.attempt_id.clone();
-            let _ = update_turn_record(&turn_id, |record| {
+            let _ = update_turn_record(state.storage(), &turn_id, |record| {
                 if let Some(a) = record.find_attempt_mut(&attempt_id) {
                     a.status = storyforge_domain::turn::AttemptStatus::Stale;
                 }

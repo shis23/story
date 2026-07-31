@@ -5,9 +5,19 @@ use super::super::*;
 pub(crate) fn get_character_variables(
     campaign_id: String,
     instance_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
-    get_campaign_store()
+    state
+        .storage()
+        .require_supported(
+            storage_backend::BackendCapability::VariableRead,
+            "get character variables",
+        )
+        .map_err(TauriCommandError::validation)?;
+    state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map_err(TauriCommandError::storage)?
         .map(|i| i.variables)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))
 }
@@ -20,10 +30,14 @@ pub(crate) fn set_character_variable(
     key: String,
     value: serde_json::Value,
     turn: Option<u32>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接写变量
-    reject_if_active_turn(&Id::from_str(&campaign_id))?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "set character variable",
+    )?;
+    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
@@ -38,10 +52,20 @@ pub(crate) fn set_character_variable(
 #[tauri::command]
 pub(crate) fn get_campaign_variables(
     campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
-    get_campaign_store()
+    state
+        .storage()
+        .require_supported(
+            storage_backend::BackendCapability::VariableRead,
+            "get campaign variables",
+        )
+        .map_err(TauriCommandError::validation)?;
+    state
+        .storage()
         .get_campaign(&Id::from_str(&campaign_id))
-        .map(|c| c.variables)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign.variables)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))
 }
 
@@ -49,10 +73,20 @@ pub(crate) fn get_campaign_variables(
 #[tauri::command]
 pub(crate) fn get_campaign_variable_schema(
     campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<storyforge_domain::variables::VariableField>, TauriCommandError> {
-    get_campaign_store()
+    state
+        .storage()
+        .require_supported(
+            storage_backend::BackendCapability::VariableRead,
+            "get campaign variable schema",
+        )
+        .map_err(TauriCommandError::validation)?;
+    state
+        .storage()
         .get_campaign(&Id::from_str(&campaign_id))
-        .map(|campaign| campaign.variable_schema)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign.variable_schema)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))
 }
 
@@ -134,9 +168,14 @@ pub(crate) fn add_campaign_variable(
     value_type: String,
     default_value: serde_json::Value,
     description: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    reject_if_active_turn(&campaign_id)?;
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "add campaign variable",
+    )?;
+    reject_if_active_turn(state.storage(), &campaign_id)?;
     let key = storyforge_domain::variables::normalize_mvu_key(&key);
     let label = label.trim();
     let description = description
@@ -158,7 +197,6 @@ pub(crate) fn add_campaign_variable(
         group: Some("全局".into()),
     };
 
-    let store = get_campaign_store();
     let mut campaign = store
         .get_campaign(&campaign_id)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
@@ -179,10 +217,15 @@ pub(crate) struct CampaignVariableSchemaSyncDto {
 #[tauri::command]
 pub(crate) fn sync_campaign_variable_schema(
     campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    reject_if_active_turn(&campaign_id)?;
-    sync_campaign_variable_schema_in_store(get_campaign_store(), &campaign_id)
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "sync campaign variable schema",
+    )?;
+    reject_if_active_turn(state.storage(), &campaign_id)?;
+    sync_campaign_variable_schema_in_store(store, &campaign_id)
 }
 
 pub(crate) fn sync_campaign_variable_schema_in_store(
@@ -209,10 +252,14 @@ pub(crate) fn set_campaign_variable(
     key: String,
     value: serde_json::Value,
     turn: Option<u32>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接写变量
-    reject_if_active_turn(&Id::from_str(&campaign_id))?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "set campaign variable",
+    )?;
+    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let mut camp = store
         .get_campaign(&Id::from_str(&campaign_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
@@ -228,10 +275,14 @@ pub(crate) fn set_campaign_variable(
 pub(crate) fn promote_temporary_instance(
     campaign_id: String,
     instance_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接改实例
-    reject_if_active_turn(&Id::from_str(&campaign_id))?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "promote temporary instance",
+    )?;
+    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;

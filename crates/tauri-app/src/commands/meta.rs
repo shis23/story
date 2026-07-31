@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::storage_backend::BackendCapability;
 
 // ─── Meta Agent 命令 ──────────────────────────────────────────────────────
 
@@ -28,11 +29,13 @@ pub(crate) fn meta_accept_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
-        "legacy Meta patch accept",
-    )
-    .map_err(TauriCommandError::validation)?;
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::TypedMetaPatch,
+            "legacy Meta patch accept",
+        )
+        .map_err(TauriCommandError::validation)?;
     // P0-7 residual：legacy 世界书 patch 与 typed Meta 一样，活动 Turn 期间禁止直接写
     check_turn_barrier(state.inner())?;
 
@@ -90,23 +93,23 @@ pub(crate) fn meta_accept_patch(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     if let Some(campaign_id) = active_campaign_id {
-        if !sqlite_runtime::is_sqlite_active() {
-            let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(ref world_info) = ctx.world_info {
-                if let Err(e) =
-                    get_campaign_store().set_world_info(&campaign_id, (**world_info).clone())
-                {
-                    tracing::warn!(
-                        "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
-                        campaign_id
-                    );
-                } else {
-                    tracing::info!(
-                        "meta_accept_patch 已写回本局世界书 campaign={} entries={}",
-                        campaign_id,
-                        world_info.entries.len()
-                    );
-                }
+        let store = state.json_campaign_store(
+            BackendCapability::TypedMetaPatch,
+            "persist legacy Meta world info patch",
+        )?;
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref world_info) = ctx.world_info {
+            if let Err(e) = store.set_world_info(&campaign_id, (**world_info).clone()) {
+                tracing::warn!(
+                    "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
+                    campaign_id
+                );
+            } else {
+                tracing::info!(
+                    "meta_accept_patch 已写回本局世界书 campaign={} entries={}",
+                    campaign_id,
+                    world_info.entries.len()
+                );
             }
         }
     } else {
@@ -142,7 +145,11 @@ pub(crate) fn meta_accept_patch(
             let global_keys_set: std::collections::HashSet<String> =
                 global_entries.iter().map(|e| e.keys.join(",")).collect();
 
-            let all_stored = get_store().list();
+            let character_store = state.json_character_store(
+                BackendCapability::TypedMetaPatch,
+                "persist legacy Meta character world info patch",
+            )?;
+            let all_stored = character_store.list();
             for stored in &all_stored {
                 let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
                     .info
@@ -153,7 +160,7 @@ pub(crate) fn meta_accept_patch(
                     .collect();
                 let mut new_entries = preserved_private;
                 new_entries.extend(global_entries.clone());
-                let _ = get_store().update_world_info_entries_bulk(&stored.id, new_entries);
+                let _ = character_store.update_world_info_entries_bulk(&stored.id, new_entries);
             }
         }
     }
@@ -396,47 +403,18 @@ pub(crate) fn meta_dismiss_patch(
 #[tauri::command]
 pub(crate) fn meta_health_check(
     campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    state
+        .storage()
+        .require_supported(BackendCapability::CampaignHealth, "campaign health check")
+        .map_err(TauriCommandError::validation)?;
     let cid = Id::from_str(&campaign_id);
 
-    if sqlite_runtime::is_sqlite_active() {
-        return meta_backend::sqlite_campaign_health_issues(&cid)
-            .map_err(TauriCommandError::storage)?
-            .into_iter()
-            .map(|issue| to_json_value(&issue, "campaign health issue"))
-            .collect();
-    }
-
-    let store = get_campaign_store();
-
-    // 确认 campaign 存在
-    let campaign = store
-        .get_campaign(&cid)
-        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
-
-    // 获取关联的 card → definitions
-    let definitions = store
-        .get_card(&campaign.card_id)
-        .map(|c| c.card.character_definitions)
-        .unwrap_or_default();
-
-    let instances = store.list_instances(&cid);
-    let knowledge = store.list_knowledge(&cid);
-    let tasks = store.list_tasks(&cid);
-
-    let snapshot = storyforge_app_meta::CampaignHealthSnapshot {
-        instances: &instances,
-        definitions: &definitions,
-        knowledge: &knowledge,
-        tasks: &tasks,
-    };
-
-    let issues = storyforge_app_meta::check_campaign_health(&snapshot);
-
-    issues
-        .into_iter()
-        .map(|i| to_json_value(&i, "campaign health issue"))
-        .collect()
+    // 后端分发在 named adapter（Gate 3）：SQLite 走 fail-closed typed 读取，
+    // JSON 走共享 check_campaign_health 快照算法。
+    crate::backend_workflows::campaign_health_issues_for_backend(state.storage(), &cid)
+        .map_err(TauriCommandError::storage)
 }
 
 /// Tauri command: 解释某条消息的生成溯源（确定性，零 LLM）

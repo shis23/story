@@ -102,7 +102,11 @@ pub(crate) fn plugin_list_characters(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-    Ok(get_store()
+    Ok(state
+        .json_character_store(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "plugin list characters",
+        )?
         .list()
         .into_iter()
         .map(CharacterSummary::from)
@@ -120,7 +124,11 @@ pub(crate) fn plugin_read_character(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-    get_store()
+    state
+        .json_character_store(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "plugin read character",
+        )?
         .get(&character_id)
         .map(|s| s.info)
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
@@ -137,7 +145,11 @@ pub(crate) fn plugin_read_world_info(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadWorldInfo)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-    get_store()
+    state
+        .json_character_store(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "plugin read character world info",
+        )?
         .get(&character_id)
         .map(|s| s.info)
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
@@ -176,9 +188,17 @@ pub(crate) fn plugin_get_variable(
         &plugin_id,
         &[Permission::ReadVariables, Permission::WriteVariables],
     )?;
-    let store = get_campaign_store();
-    store
+    state
+        .storage()
+        .require_supported(
+            storage_backend::BackendCapability::VariableRead,
+            "plugin get variable",
+        )
+        .map_err(TauriCommandError::validation)?;
+    state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map_err(TauriCommandError::storage)?
         .map(|i| i.variables)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))
 }
@@ -198,8 +218,11 @@ pub(crate) fn plugin_set_variable(
         .ensure_permission(&plugin_id, &Permission::WriteVariables)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     // P0-7：活动 Turn 期间拒绝直接写变量，避免绕过 Coordinator
-    reject_if_active_turn(&Id::from_str(&campaign_id))?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::VariableCommands,
+        "plugin set variable",
+    )?;
+    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))?;

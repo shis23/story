@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn gate3_meta_and_world_info_commands_do_not_probe_the_sqlite_runtime() {
+    for (name, source) in [
+        ("meta", include_str!("commands/meta.rs")),
+        ("meta_typed", include_str!("commands/meta_typed.rs")),
+        ("world_info", include_str!("commands/world_info.rs")),
+    ] {
+        assert!(
+            !source.contains("sqlite_runtime::is_sqlite_active()"),
+            "{name} commands must select storage through AppState::storage()"
+        );
+    }
+}
+
+#[test]
+fn sqlite_meta_and_world_info_capabilities_fail_with_explicit_operation_errors() {
+    use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
+
+    let storage = storage_backend::StorageFacade::new(
+        std::env::temp_dir().join("storyforge-gate3-meta-capability"),
+        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+    );
+    for (capability, operation) in [
+        (
+            storage_backend::BackendCapability::TypedMetaPatch,
+            "typed Meta patch accept",
+        ),
+        (
+            storage_backend::BackendCapability::MvuSchemaApply,
+            "MVU schema apply",
+        ),
+        (
+            storage_backend::BackendCapability::WorldInfo,
+            "list campaign world info",
+        ),
+    ] {
+        let error = storage
+            .require_supported(capability, operation)
+            .expect_err("SQLite capability must fail closed before a JSON store is consulted");
+        assert!(error.contains(operation));
+        assert!(error.contains("Unsupported"));
+    }
+    storage
+        .require_supported(
+            storage_backend::BackendCapability::MvuTranslation,
+            "list MVU translations",
+        )
+        .expect("SQLite MVU translation is a supported facade capability");
+}
+
+#[test]
 fn test_meta_apply_mvu_schema_backfills_all_campaign_instances_without_overwriting_values() {
     use storyforge_domain::campaign::Campaign;
 
@@ -193,17 +243,16 @@ async fn test_save_mvu_translation_async_persists_and_replaces_existing() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let store: &'static campaign_store::CampaignStore =
-        Box::leak(Box::new(campaign_store::CampaignStore::new(&dir)));
+    let store = Arc::new(campaign_store::CampaignStore::new(&dir));
 
     save_mvu_translation_async(
-        store,
+        store.clone(),
         make_test_mvu_translation("src-mvu", "MVU 初版", "2026-07-07T00:00:00Z"),
     )
     .await
     .unwrap();
     save_mvu_translation_async(
-        store,
+        store.clone(),
         make_test_mvu_translation("src-mvu", "MVU 更新", "2026-07-07T00:00:01Z"),
     )
     .await

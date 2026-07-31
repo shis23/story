@@ -141,6 +141,7 @@ fn test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle() {
     let stored = save_character_card_to_store(&store, card).unwrap();
     let campaign = create_campaign_in_store(
         &store,
+        get_store(),
         &conv_store,
         stored.card.id.as_str().to_string(),
         "Complex Fixture Campaign".into(),
@@ -1661,6 +1662,7 @@ async fn test_real_complex_card_offline_mvu_plumbing_smoke() {
     let stored = save_character_card_to_store(&store, card).unwrap();
     let campaign = create_campaign_in_store(
         &store,
+        get_store(),
         &conv_store,
         stored.card.id.as_str().to_string(),
         "Complex Fixture MVU Fallback Campaign".into(),

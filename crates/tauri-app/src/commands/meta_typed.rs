@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::storage_backend::BackendCapability;
 
 // ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
 
@@ -26,12 +27,17 @@ pub(crate) fn meta_propose_campaign_repairs(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::TypedMetaPatch,
+            "campaign repair proposals",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let store = state.json_campaign_store(
+        BackendCapability::TypedMetaPatch,
         "campaign repair proposals",
-    )
-    .map_err(TauriCommandError::validation)?;
-    let store = get_campaign_store();
+    )?;
     meta_propose_campaign_repairs_in_store(store, &campaign_id, state.inner().as_ref())
 }
 
@@ -166,9 +172,17 @@ pub(crate) fn meta_preview_typed_patch(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, TauriCommandError> {
-    meta_backend::ensure_typed_patch_backend_supported(sqlite_runtime::is_sqlite_active())
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::TypedMetaPatch,
+            "typed Meta patch preview",
+        )
         .map_err(TauriCommandError::validation)?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::TypedMetaPatch,
+        "typed Meta patch preview",
+    )?;
     meta_preview_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
 }
 
@@ -237,12 +251,15 @@ pub(crate) fn meta_accept_typed_patch(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    meta_backend::ensure_typed_patch_backend_supported(sqlite_runtime::is_sqlite_active())
+    state
+        .storage()
+        .require_supported(BackendCapability::TypedMetaPatch, "typed Meta patch accept")
         .map_err(TauriCommandError::validation)?;
     // Phase A 屏障：活动 Turn 存在时拒绝 Meta patch accept（防并发写竞争）
     let cid = Id::from_str(&campaign_id);
-    reject_if_active_turn(&cid)?;
-    let store = get_campaign_store();
+    reject_if_active_turn(state.storage(), &cid)?;
+    let store =
+        state.json_campaign_store(BackendCapability::TypedMetaPatch, "typed Meta patch accept")?;
     meta_accept_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
 }
 
@@ -648,6 +665,11 @@ pub(crate) async fn meta_analyze_mvu_card(
 ) -> Result<MvuTranslationDetailDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
+    state
+        .storage()
+        .require_supported(BackendCapability::MvuTranslation, "analyze MVU card")
+        .map_err(TauriCommandError::validation)?;
+
     // #22：分析与持久化两个后端都支持——SQLite 活跃时写 mvu_translations 表。
 
     // 取原 Character
@@ -687,15 +709,11 @@ pub(crate) async fn meta_analyze_mvu_card(
         translation: translation.clone(),
         analyzed_at: analyzed_at.clone(),
     };
-    if sqlite_runtime::is_sqlite_active() {
-        let stored_for_sqlite = stored.clone();
-        tokio::task::spawn_blocking(move || sqlite_runtime::save_mvu(&stored_for_sqlite))
-            .await
-            .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
-            .map_err(TauriCommandError::storage)?;
-    } else {
-        save_mvu_translation_async(get_campaign_store(), stored).await?;
-    }
+    let storage = state.storage().clone();
+    tokio::task::spawn_blocking(move || storage.save_mvu(&stored))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
+        .map_err(TauriCommandError::storage)?;
 
     Ok(MvuTranslationDetailDto {
         source_character_id: character.id.as_str().to_string(),
@@ -706,15 +724,17 @@ pub(crate) async fn meta_analyze_mvu_card(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn save_mvu_translation_async(
-    store: &'static campaign_store::CampaignStore,
+    store: Arc<campaign_store::CampaignStore>,
     stored: campaign_store::StoredMvuTranslation,
 ) -> Result<(), TauriCommandError> {
-    tokio::task::spawn_blocking(move || save_mvu_translation_to_store(store, stored))
+    tokio::task::spawn_blocking(move || save_mvu_translation_to_store(store.as_ref(), stored))
         .await
         .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
 }
 
+#[cfg(test)]
 pub(crate) fn save_mvu_translation_to_store(
     store: &campaign_store::CampaignStore,
     stored: campaign_store::StoredMvuTranslation,
@@ -728,13 +748,17 @@ pub(crate) fn save_mvu_translation_to_store(
 ///
 /// #22：SQLite 活跃时读 mvu_translations 表（V005 起为权威），不再拒绝。
 #[tauri::command]
-pub(crate) fn meta_list_mvu_translations()
--> Result<Vec<MvuTranslationSummaryDto>, TauriCommandError> {
-    let list = if sqlite_runtime::is_sqlite_active() {
-        sqlite_runtime::list_mvu().map_err(TauriCommandError::storage)?
-    } else {
-        get_campaign_store().list_all_mvu()
-    };
+pub(crate) fn meta_list_mvu_translations(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<MvuTranslationSummaryDto>, TauriCommandError> {
+    state
+        .storage()
+        .require_supported(BackendCapability::MvuTranslation, "list MVU translations")
+        .map_err(TauriCommandError::validation)?;
+    let list = state
+        .storage()
+        .list_mvu()
+        .map_err(TauriCommandError::storage)?;
     Ok(list
         .iter()
         .map(|m| MvuTranslationSummaryDto {
@@ -755,13 +779,17 @@ pub(crate) fn meta_list_mvu_translations()
 #[tauri::command]
 pub(crate) fn meta_get_mvu_translation(
     source_character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Option<MvuTranslationDetailDto>, TauriCommandError> {
+    state
+        .storage()
+        .require_supported(BackendCapability::MvuTranslation, "get MVU translation")
+        .map_err(TauriCommandError::validation)?;
     let id = Id::from_str(source_character_id);
-    let found = if sqlite_runtime::is_sqlite_active() {
-        sqlite_runtime::get_mvu(&id).map_err(TauriCommandError::storage)?
-    } else {
-        get_campaign_store().get_mvu(&id)
-    };
+    let found = state
+        .storage()
+        .get_mvu(&id)
+        .map_err(TauriCommandError::storage)?;
     Ok(found.map(|m| MvuTranslationDetailDto {
         source_character_id: m.source_character_id.as_str().to_string(),
         character_name: m.character_name.clone(),
@@ -775,13 +803,19 @@ pub(crate) fn meta_get_mvu_translation(
 #[tauri::command]
 pub(crate) fn meta_preview_mvu_apply(
     source_character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<MvuApplyPreview>, TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::MvuSchemaApply,
+            "MVU schema apply preview",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let store = state.json_campaign_store(
+        BackendCapability::MvuSchemaApply,
         "MVU schema apply preview",
-    )
-    .map_err(TauriCommandError::validation)?;
-    let store = get_campaign_store();
+    )?;
     let id = Id::from_str(&source_character_id);
     let mvu = store.get_mvu(&id).ok_or_else(|| {
         TauriCommandError::not_found(
@@ -821,13 +855,13 @@ pub(crate) fn meta_preview_mvu_apply(
 pub(crate) fn meta_apply_mvu_schema(
     source_character_id: String,
     definition_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
-        "MVU schema apply",
-    )
-    .map_err(TauriCommandError::validation)?;
-    let store = get_campaign_store();
+    state
+        .storage()
+        .require_supported(BackendCapability::MvuSchemaApply, "MVU schema apply")
+        .map_err(TauriCommandError::validation)?;
+    let store = state.json_campaign_store(BackendCapability::MvuSchemaApply, "MVU schema apply")?;
     meta_apply_mvu_schema_in_store(store, source_character_id, definition_id)
 }
 

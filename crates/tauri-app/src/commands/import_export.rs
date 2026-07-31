@@ -387,8 +387,15 @@ pub struct CampaignImportResult {
 /// 从 CharacterStore 取原始 Character（含 raw_card_json），
 /// 用 to_st_data 构建 StCharacterData，再写入 PNG。
 #[tauri::command]
-pub(crate) fn export_st_card_png(character_id: String) -> Result<Vec<u8>, TauriCommandError> {
-    let stored = get_store()
+pub(crate) fn export_st_card_png(
+    character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<u8>, TauriCommandError> {
+    let stored = state
+        .json_character_store(
+            storage_backend::BackendCapability::ImportExport,
+            "export ST character card",
+        )?
         .get(&character_id)
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
 
@@ -414,8 +421,12 @@ pub(crate) fn export_st_card_png(character_id: String) -> Result<Vec<u8>, TauriC
 #[tauri::command]
 pub(crate) fn export_campaign_st_cards(
     campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignExportResult, TauriCommandError> {
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::ImportExport,
+        "export campaign ST cards",
+    )?;
     let camp_id = Id::from_str(&campaign_id);
 
     let campaign = store
@@ -438,7 +449,11 @@ pub(crate) fn export_campaign_st_cards(
         serde_json::to_string_pretty(&shared_lorebook).unwrap_or_else(|_| "{}".into());
 
     // 尝试从 CharacterStore 获取原始 Character（用于 raw_card_json）
-    let original_character = get_store()
+    let original_character = state
+        .json_character_store(
+            storage_backend::BackendCapability::ImportExport,
+            "export campaign ST cards",
+        )?
         .get(stored_card.card.source_character_id.as_str())
         .map(|s| stored_info_to_character(&s));
 
@@ -497,9 +512,16 @@ pub(crate) fn export_campaign_st_cards(
 ///
 /// 包含 Campaign 元数据 + Instances + Definitions + Knowledge + Tasks + Summaries。
 #[tauri::command]
-pub(crate) fn export_campaign_bundle(campaign_id: String) -> Result<String, TauriCommandError> {
+pub(crate) fn export_campaign_bundle(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<String, TauriCommandError> {
     let camp_id = Id::from_str(&campaign_id);
-    export_campaign_bundle_from_store(get_campaign_store(), camp_id)
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::ImportExport,
+        "export campaign bundle",
+    )?;
+    export_campaign_bundle_from_store(store, camp_id)
 }
 
 pub(crate) fn export_campaign_bundle_from_store(
@@ -546,7 +568,11 @@ pub(crate) fn import_campaign_bundle(
 ) -> Result<CampaignImportResult, TauriCommandError> {
     let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
         .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
-    import_campaign_bundle_into_store(get_campaign_store(), state.conv_store.as_ref(), bundle)
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::ImportExport,
+        "import campaign bundle",
+    )?;
+    import_campaign_bundle_into_store(store, state.conv_store.as_ref(), bundle)
 }
 
 pub(crate) fn import_campaign_bundle_into_store(

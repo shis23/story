@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use storyforge_app_conversation::ConversationStore;
 use storyforge_domain::Id;
 
+use crate::AppState;
 use crate::campaign_store::CampaignStore;
 use crate::error::TauriCommandError;
-use crate::{AppState, save_active_campaign, sqlite_runtime};
 
 trait ConversationDeleter {
     fn delete(&self, id: &Id) -> Result<(), String>;
@@ -79,9 +79,11 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         active_campaign.as_ref() == Some(campaign_id)
     };
-    let pointer_cleared = active_pointer_needs_clear && !sqlite_runtime::is_sqlite_active();
+    // 指针持久化由 backend adapter 处理：JSON 清 active_campaign.json，
+    // SQLite 仅内存指针（ActiveCampaignPersistence Degraded，不落盘）。
+    let pointer_cleared = active_pointer_needs_clear;
     if pointer_cleared {
-        save_active_campaign(&state.data_dir, None).map_err(|error| {
+        crate::backend_workflows::save_active_pointer(state.storage(), None).map_err(|error| {
             TauriCommandError::storage(format!("清除活跃活动指针失败: {error}"))
         })?;
     }
@@ -91,7 +93,8 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
     for conversation_id in conversation_ids {
         if let Err(error) = deleter.delete(conversation_id) {
             let restore_error = if pointer_cleared {
-                save_active_campaign(&state.data_dir, Some(campaign_id)).err()
+                crate::backend_workflows::save_active_pointer(state.storage(), Some(campaign_id))
+                    .err()
             } else {
                 None
             };
@@ -114,7 +117,11 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
             Ok(deleted) => deleted,
             Err(error) => {
                 let restore_error = if pointer_cleared {
-                    save_active_campaign(&state.data_dir, Some(campaign_id)).err()
+                    crate::backend_workflows::save_active_pointer(
+                        state.storage(),
+                        Some(campaign_id),
+                    )
+                    .err()
                 } else {
                     None
                 };
@@ -128,7 +135,8 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         };
         if !deleted {
             let restore_error = if pointer_cleared {
-                save_active_campaign(&state.data_dir, Some(campaign_id)).err()
+                crate::backend_workflows::save_active_pointer(state.storage(), Some(campaign_id))
+                    .err()
             } else {
                 None
             };
@@ -285,7 +293,8 @@ mod tests {
                 .active_campaign
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
-            save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
+            crate::backend_workflows::save_active_pointer(state.storage(), Some(&campaign_a.id))
+                .unwrap();
 
             let switch_entered = Arc::new(Barrier::new(2));
             let release_switch = Arc::new(Barrier::new(2));
@@ -296,7 +305,7 @@ mod tests {
             let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
                 let id_for_validation = switch_id.clone();
-                set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                set_active_campaign_in_state(&switch_state, switch_id, move || {
                     switch_entered_for_thread.wait();
                     release_switch_for_thread.wait();
                     if switch_store.get_campaign(&id_for_validation).is_some() {
@@ -390,7 +399,8 @@ mod tests {
                 .active_campaign
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(campaign_a.id.clone());
-            save_active_campaign(&state.data_dir, Some(&campaign_a.id)).unwrap();
+            crate::backend_workflows::save_active_pointer(state.storage(), Some(&campaign_a.id))
+                .unwrap();
 
             let switch_entered = Arc::new(Barrier::new(2));
             let release_switch = Arc::new(Barrier::new(2));
@@ -401,7 +411,7 @@ mod tests {
             let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
                 let id_for_validation = switch_id.clone();
-                set_active_campaign_in_state(&switch_state, switch_id, true, move || {
+                set_active_campaign_in_state(&switch_state, switch_id, move || {
                     switch_entered_for_thread.wait();
                     release_switch_for_thread.wait();
                     if switch_store.get_campaign(&id_for_validation).is_some() {

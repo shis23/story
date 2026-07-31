@@ -1,7 +1,7 @@
 use super::*;
 use crate::commands::turns::{
-    active_turn_quality_from_record, postprocess_present_characters, receipt_items_from_batch,
-    retain_selected_receipt_mutations,
+    active_turn_quality_from_record, get_active_turn_quality_impl, postprocess_present_characters,
+    receipt_items_from_batch, retain_selected_receipt_mutations,
 };
 
 #[test]
@@ -44,6 +44,29 @@ fn test_active_turn_quality_from_record() {
     assert_eq!(
         dto.warnings,
         vec!["\u{5b57}\u{6570}\u{8fc7}\u{77ed}".to_string()]
+    );
+}
+
+#[test]
+fn sqlite_active_turn_quality_propagates_backend_lookup_failure() {
+    let dir = std::env::temp_dir().join(format!(
+        "storyforge-quality-facade-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let storage = storage_backend::StorageFacade::new(
+        dir,
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Sqlite,
+            storyforge_infra_sqlite::backend::BackendSource::Env,
+        ),
+    );
+
+    let error = get_active_turn_quality_impl(&storage, "camp-quality-error".into())
+        .expect_err("an unavailable SQLite authority must not be reported as no active Turn");
+
+    assert!(
+        error.to_string().contains("sqlite backend is not active"),
+        "unexpected error: {error}"
     );
 }
 
@@ -702,8 +725,26 @@ fn postprocess_rejects_superseded_attempt_after_regenerate() {
 
 #[test]
 fn sqlite_mode_never_recovers_the_legacy_json_compress_job_store() {
-    assert!(!should_recover_json_compress_jobs(true));
-    assert!(should_recover_json_compress_jobs(false));
+    let dir = std::env::temp_dir().join(format!(
+        "storyforge-gate3-compress-recovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sqlite_facade = crate::storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Sqlite,
+            storyforge_infra_sqlite::backend::BackendSource::Env,
+        ),
+    );
+    let json_facade = crate::storage_backend::StorageFacade::new(
+        dir,
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Json,
+            storyforge_infra_sqlite::backend::BackendSource::Default,
+        ),
+    );
+    assert!(!should_recover_json_compress_jobs(&sqlite_facade));
+    assert!(should_recover_json_compress_jobs(&json_facade));
 }
 
 #[test]
@@ -722,8 +763,23 @@ fn sqlite_mode_never_uses_the_legacy_active_campaign_pointer() {
     )
     .unwrap();
 
+    let sqlite_facade = crate::storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Sqlite,
+            storyforge_infra_sqlite::backend::BackendSource::Env,
+        ),
+    );
+    let json_facade = crate::storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Json,
+            storyforge_infra_sqlite::backend::BackendSource::Default,
+        ),
+    );
+
     assert_eq!(
-        resolve_active_campaign_with_legacy_fallback(None, &dir, true),
+        resolve_active_campaign_with_legacy_fallback(None, &dir, &sqlite_facade),
         None,
         "a restarted SQLite process must ignore a stale JSON selector"
     );
@@ -731,13 +787,13 @@ fn sqlite_mode_never_uses_the_legacy_active_campaign_pointer() {
         resolve_active_campaign_with_legacy_fallback(
             Some(Id::from_str("selected-in-memory")),
             &dir,
-            true,
+            &sqlite_facade,
         ),
         Some(Id::from_str("selected-in-memory")),
         "SQLite may use only the explicit in-process selection"
     );
     assert_eq!(
-        resolve_active_campaign_with_legacy_fallback(None, &dir, false),
+        resolve_active_campaign_with_legacy_fallback(None, &dir, &json_facade),
         Some(Id::from_str("stale-json-campaign")),
         "JSON mode preserves its legacy restart behavior"
     );
@@ -758,7 +814,14 @@ fn startup_discards_active_pointer_for_missing_campaign() {
     .unwrap();
     std::fs::write(dir.join("campaigns.json"), "[]").unwrap();
 
-    assert_eq!(load_active_campaign_for_backend(&dir), None);
+    let json_facade = crate::storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Json,
+            storyforge_infra_sqlite::backend::BackendSource::Default,
+        ),
+    );
+    assert_eq!(load_active_campaign_for_backend(&dir, &json_facade), None);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -771,7 +834,15 @@ fn save_active_campaign_reports_persistence_failure() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::create_dir(dir.join("active_campaign.json")).unwrap();
 
-    let error = save_active_campaign(&dir, Some(&Id::from_str("campaign")))
+    let facade = crate::storage_backend::StorageFacade::new(
+        dir.clone(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Json,
+            storyforge_infra_sqlite::backend::BackendSource::Default,
+        ),
+    );
+    let error = facade
+        .save_active_pointer(Some(&Id::from_str("campaign")))
         .expect_err("directory collision must not be silently ignored");
     assert!(!error.is_empty());
     std::fs::remove_dir_all(&dir).ok();

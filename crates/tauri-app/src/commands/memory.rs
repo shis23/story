@@ -171,10 +171,13 @@ pub(crate) fn knowledge_entry_to_dto(
 pub(crate) fn list_character_knowledge(
     campaign_id: String,
     character_id: Option<String>,
-) -> Vec<KnowledgeEntryDto> {
-    let store = get_campaign_store();
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<KnowledgeEntryDto>, TauriCommandError> {
     let camp = Id::from_str(&campaign_id);
-    let all_entries = store.list_knowledge(&camp);
+    let all_entries = state
+        .storage()
+        .list_knowledge(&camp)
+        .map_err(TauriCommandError::storage)?;
     let entries: Vec<_> = if let Some(cid) = character_id {
         let cid = Id::from_str(&cid);
         all_entries
@@ -184,8 +187,10 @@ pub(crate) fn list_character_knowledge(
     } else {
         all_entries.iter().collect()
     };
-    let instance_names: std::collections::HashMap<Id, String> = store
+    let instance_names: std::collections::HashMap<Id, String> = state
+        .storage()
         .list_instances(&camp)
+        .map_err(TauriCommandError::storage)?
         .into_iter()
         .map(|inst| (inst.id, inst.name))
         .collect();
@@ -193,10 +198,10 @@ pub(crate) fn list_character_knowledge(
         .iter()
         .map(|entry| (entry.id.clone(), entry))
         .collect();
-    entries
+    Ok(entries
         .into_iter()
         .map(|entry| knowledge_entry_to_dto(entry, &instance_names, &knowledge_by_id))
-        .collect()
+        .collect())
 }
 
 /// 任务 DTO（前端展示用）
@@ -238,10 +243,16 @@ impl From<&storyforge_domain::story_task::StoryTask> for StoryTaskDto {
 
 /// 列出某 campaign 的所有任务（可按状态筛：pending/active/likely_completed/completed/abandoned）
 #[tauri::command]
-pub(crate) fn list_tasks(campaign_id: String, status_filter: Option<String>) -> Vec<StoryTaskDto> {
-    let store = get_campaign_store();
+pub(crate) fn list_tasks(
+    campaign_id: String,
+    status_filter: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<StoryTaskDto>, TauriCommandError> {
     let camp = Id::from_str(&campaign_id);
-    let mut tasks = store.list_tasks(&camp);
+    let mut tasks = state
+        .storage()
+        .list_tasks(&camp)
+        .map_err(TauriCommandError::storage)?;
     if let Some(filter) = status_filter {
         tasks.retain(|t| {
             let s = serde_json::to_string(&t.status).unwrap_or_default();
@@ -250,7 +261,7 @@ pub(crate) fn list_tasks(campaign_id: String, status_filter: Option<String>) -> 
                 || s.starts_with('{') && filter == "likely_completed"
         });
     }
-    tasks.iter().map(StoryTaskDto::from).collect()
+    Ok(tasks.iter().map(StoryTaskDto::from).collect())
 }
 
 /// 创建任务（前端 UI：用户手动规划伏笔/目标）
@@ -261,13 +272,17 @@ pub(crate) fn create_task(
     description: String,
     triggers: Vec<storyforge_domain::story_task::TaskTrigger>,
     created_turn: Option<u32>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<String, TauriCommandError> {
     if title.trim().is_empty() {
         return Err("任务标题不能为空".into());
     }
     // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(&Id::from_str(&campaign_id))?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::KnowledgeTaskCommands,
+        "create story task",
+    )?;
+    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let task = storyforge_domain::story_task::StoryTask::user_planned(
         Id::from_str(&campaign_id),
         title,
@@ -284,13 +299,19 @@ pub(crate) fn create_task(
 
 /// 标记任务完成（用户确认）
 #[tauri::command]
-pub(crate) fn complete_task(task_id: String) -> Result<(), TauriCommandError> {
-    let store = get_campaign_store();
+pub(crate) fn complete_task(
+    task_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::KnowledgeTaskCommands,
+        "complete story task",
+    )?;
     let mut task = store
         .get_task(&Id::from_str(&task_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(&task.campaign_id)?;
+    reject_if_active_turn(state.storage(), &task.campaign_id)?;
     task.complete();
     store
         .update_task(task)
@@ -300,13 +321,19 @@ pub(crate) fn complete_task(task_id: String) -> Result<(), TauriCommandError> {
 
 /// 放弃任务
 #[tauri::command]
-pub(crate) fn abandon_task(task_id: String) -> Result<(), TauriCommandError> {
-    let store = get_campaign_store();
+pub(crate) fn abandon_task(
+    task_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let store = state.json_campaign_store(
+        storage_backend::BackendCapability::KnowledgeTaskCommands,
+        "abandon story task",
+    )?;
     let mut task = store
         .get_task(&Id::from_str(&task_id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(&task.campaign_id)?;
+    reject_if_active_turn(state.storage(), &task.campaign_id)?;
     task.abandon();
     store
         .update_task(task)
@@ -352,12 +379,16 @@ impl From<&storyforge_domain::agent::RoundSummary> for RoundSummaryDto {
 
 /// 列出某 campaign 的所有本轮剧情摘要（按 turn 升序）
 #[tauri::command]
-pub(crate) fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
-    let store = get_campaign_store();
+pub(crate) fn list_round_summaries(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<RoundSummaryDto>, TauriCommandError> {
     let camp = Id::from_str(&campaign_id);
-    store
+    Ok(state
+        .storage()
         .list_summaries(&camp)
+        .map_err(TauriCommandError::storage)?
         .iter()
         .map(RoundSummaryDto::from)
-        .collect()
+        .collect())
 }

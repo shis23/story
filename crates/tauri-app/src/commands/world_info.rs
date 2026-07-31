@@ -1,4 +1,15 @@
 use super::super::*;
+use crate::storage_backend::BackendCapability;
+
+fn require_world_info_supported(
+    state: &AppState,
+    operation: &str,
+) -> Result<(), TauriCommandError> {
+    state
+        .storage()
+        .require_supported(BackendCapability::WorldInfo, operation)
+        .map_err(TauriCommandError::validation)
+}
 
 // ─── Campaign 本局世界书（卡只读模板 / 活动可写真相源）──────────────────────
 
@@ -185,12 +196,9 @@ pub(crate) fn list_campaign_world_info(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignWorldInfoDto, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
-    let store = get_campaign_store();
+    require_world_info_supported(state.inner().as_ref(), "list campaign world info")?;
+    let store =
+        state.json_campaign_store(BackendCapability::WorldInfo, "list campaign world info")?;
     let id = Id::from_str(&campaign_id);
     let camp = store
         .get_campaign(&id)
@@ -201,7 +209,11 @@ pub(crate) fn list_campaign_world_info(
     if book.entries.is_empty()
         && let Some(card) = store.get_card(&camp.card_id)
     {
-        let template = resolve_template_world_info_for_card(&card);
+        let character_store = state.json_character_store(
+            BackendCapability::CharacterCommands,
+            "seed campaign world info from character template",
+        )?;
+        let template = resolve_template_world_info_for_card(character_store, &card);
         book = store
             .ensure_world_info_from_book(&id, &template)
             .map_err(TauriCommandError::storage)?;
@@ -227,11 +239,11 @@ pub(crate) fn add_campaign_world_info_entry(
     req: AddCampaignWorldInfoDto,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "add campaign world info entry")?;
+    let store = state.json_campaign_store(
+        BackendCapability::WorldInfo,
+        "add campaign world info entry",
+    )?;
     let id = Id::from_str(&req.campaign_id);
     let route = if req.constant {
         storyforge_domain::world_info::LoreRoute::Constant
@@ -254,7 +266,6 @@ pub(crate) fn add_campaign_world_info_entry(
         extensions: serde_json::json!({ "sf_source": "user" }),
         extra: Default::default(),
     };
-    let store = get_campaign_store();
     let idx = store
         .add_world_info_entry(&id, entry)
         .map_err(TauriCommandError::storage)?;
@@ -282,13 +293,12 @@ pub(crate) fn update_campaign_world_info_entry(
     req: UpdateCampaignWorldInfoDto,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "update campaign world info entry")?;
     let id = Id::from_str(&req.campaign_id);
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::WorldInfo,
+        "update campaign world info entry",
+    )?;
     let book = store
         .get_world_info(&id)
         .map_err(TauriCommandError::storage)?;
@@ -324,13 +334,12 @@ pub(crate) fn set_campaign_world_info_enabled(
     enabled: bool,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "set campaign world info enabled")?;
     let id = Id::from_str(&campaign_id);
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::WorldInfo,
+        "set campaign world info enabled",
+    )?;
     let book = store
         .set_world_info_entry_enabled(&id, entry_index, enabled)
         .map_err(TauriCommandError::storage)?;
@@ -344,13 +353,12 @@ pub(crate) fn delete_campaign_world_info_entry(
     entry_index: usize,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "delete campaign world info entry")?;
     let id = Id::from_str(&campaign_id);
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::WorldInfo,
+        "delete campaign world info entry",
+    )?;
     store
         .delete_world_info_entry(&id, entry_index)
         .map_err(TauriCommandError::storage)?;
@@ -367,14 +375,13 @@ pub(crate) fn set_campaign_world_info_route(
     route: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "set campaign world info route")?;
     let id = Id::from_str(&campaign_id);
     let lore = parse_lore_route(&route)?;
-    let store = get_campaign_store();
+    let store = state.json_campaign_store(
+        BackendCapability::WorldInfo,
+        "set campaign world info route",
+    )?;
     store
         .set_world_info_route(&id, entry_index, lore)
         .map_err(TauriCommandError::storage)?;
@@ -389,11 +396,22 @@ pub(crate) fn set_campaign_world_info_route(
 #[tauri::command]
 pub(crate) fn get_character_world_info(
     character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignWorldInfoDto, TauriCommandError> {
-    let stored = get_store()
-        .get(&character_id)
-        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
-        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::CharacterCommands,
+            "get character world info",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "get character world info",
+    )?;
+    let stored =
+        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
+            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let book = stored
         .info
         .embedded_world_info
@@ -414,11 +432,22 @@ pub(crate) fn get_character_world_info(
 pub(crate) fn get_character_world_info_entry(
     character_id: String,
     entry_index: usize,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignWorldInfoEntryDto, TauriCommandError> {
-    let stored = get_store()
-        .get(&character_id)
-        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
-        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    state
+        .storage()
+        .require_supported(
+            BackendCapability::CharacterCommands,
+            "get character world info entry",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let character_store = state.json_character_store(
+        BackendCapability::CharacterCommands,
+        "get character world info entry",
+    )?;
+    let stored =
+        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
+            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let book = stored
         .info
         .embedded_world_info
@@ -440,14 +469,15 @@ pub(crate) fn get_character_world_info_entry(
 pub(crate) fn get_campaign_world_info_entry(
     campaign_id: String,
     entry_index: usize,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignWorldInfoEntryDto, TauriCommandError> {
-    if sqlite_runtime::is_sqlite_active() {
-        return Err(TauriCommandError::validation(
-            "campaign world info is not available in the SQLite opt-in backend yet",
-        ));
-    }
+    require_world_info_supported(state.inner().as_ref(), "get campaign world info entry")?;
     let id = Id::from_str(&campaign_id);
-    let book = get_campaign_store()
+    let book = state
+        .json_campaign_store(
+            BackendCapability::WorldInfo,
+            "get campaign world info entry",
+        )?
         .get_world_info(&id)
         .map_err(TauriCommandError::storage)?;
     let entry = book.entries.get(entry_index).ok_or_else(|| {

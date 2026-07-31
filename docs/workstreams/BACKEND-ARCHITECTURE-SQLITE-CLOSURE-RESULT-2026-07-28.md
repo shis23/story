@@ -1,8 +1,8 @@
 # 后端架构拆分与 SQLite 收口：执行结果（2026-07-28 起）
 
-> 状态：**Gate 1 PASS；Gate 2 PASS（verifier 返修已完成）**；Gate 3–8（backend facade、SQLite 迁移、平台验收和发布封存）尚未完成。
+> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS（2026-07-31）**；Gate 4–8 尚未完成。
 >
-> code-under-test：`main@b6cad53` 加当前 Gate 2 verifier-repair 工作树（尚未提交）。
+> code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 >
 > document HEAD：本文件所在文档提交；不把文档提交当作被测代码。
 
@@ -504,3 +504,98 @@ Gate 2 PARTIAL 后进入 **Gate 3（单一 backend facade）**。Gate 3 目标�
 ### 13.5 下一阶段
 
 进入 **Gate 3（单一 backend facade）**。Gate 3 的目标保持不变：启动时一次性解析 backend，构造显式 facade/port 集合，并逐步消除命令层对 `is_sqlite_active()` 的 68 处直接读取。
+
+## 14. Gate 3 Batch 3.1：显式 facade 与首个垂直切片（2026-07-29）
+
+### 14.1 已完成
+
+- `StorageFacade` 持有 `PinnedBackend` 和规范 `data_dir`；生产 setup 把 backend resolution 直接注入 `AppState`，测试构造显式使用 JSON facade。
+- `AppState` 与 facade 必须共享同一目录，构造时 fail-fast；ConversationStore authority、pipeline defer-land、启动 recovery 和 active pointer 逻辑改读注入 facade。
+- 能力矩阵显式区分 supported、degraded、unsupported、migration required、read-only recovery；SQLite Campaign instance、变量命令、知识/任务命令、WorldInfo 与 Gate 4 能力均保持显式 unsupported，没有被聚合能力名伪装成 supported。
+- Campaign list/get/get-active 通过 facade 统一 JSON/SQLite 分派并保留 `card_id` 过滤；Campaign lifecycle 与 Conversation 级联删除通过能力声明保持显式 unsupported；active Campaign 选择保留 JSON 指针落盘和 SQLite 仅进程内选择的既有差异。
+- 删除 AppState 默认/隐式 backend 构造入口；SQLite runtime 重复激活仅允许同一规范路径，AppState 构造校验 facade backend、数据目录与实际 SQLite authority 一致，发现分叉即 fail closed。
+- 前端 IPC 命令名与显式参数未变；新增的 Tauri `State` 参数由框架注入。
+
+### 14.2 TDD 与验证
+
+- RED：facade/能力类型不存在时目标 Rust 测试按预期编译失败；AppState 未提供显式 backend 构造时第二个目标测试按预期失败；分支合同在实际 63、目标 55 时按预期失败。
+- GREEN：`storage_backend::tests` 7/7；`cargo test -p storyforge --no-default-features` 364 passed、3 ignored、0 failed；`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings` 通过；前端命令合同 8/8；fmt 与 `git diff --check` 通过。
+- 架构基线：commands 175/175、frontend invokes 162、missing 0、crates 16；`activeFlagReferences` **68 → 55**，其中 facade/runtime 允许 2 处，`applicationFlagReferences=53`。
+
+### 14.3 当前结论与下一切片
+
+Gate 3 为 **IN PROGRESS**，不是 PASS。下一批应迁移 Turn/Attempt/Accept 与 Writing/runtime-support，让应用服务不再读取 ambient flag；随后迁移 Meta、WorldInfo、Character 和 Chronicle compressor，直至命令/应用服务内 `is_sqlite_active()` 为 0，并验证 SQLite 活跃时没有 JSON 写入者构造机会。
+
+## 15. Gate 3 完成：单一 backend facade（2026-07-31）
+
+### 15.1 交付内容
+
+- 新建 `crates/tauri-app/src/backend_workflows.rs`（命名 backend adapter，~1,200 行）：
+  - **Backend-neutral workflow DTO**：`DraftAttemptRequest` / `RegenerateAttemptRequest` / `DraftAttemptOutcome`——只用 domain 类型（`Id`、`Provenance`、`CharacterInstance`），应用层不再暴露 `storyforge_infra_sqlite::preaccept::*` 请求/结果类型。
+  - **`TurnWorkflow`**：`AppState::new_with_backend` 构造一次注入（`AppState::turn_workflow`），命令层调用 `create_draft_attempt` / `append_regenerate_attempt` / `accept_by_variant` / `edit_variant_with_stale_mark`——JSON/SQLite 分派（含 SQLite UoW 后 conversation cache invalidate、JSON 软删补偿与 Failed 标记）全部内聚在 adapter。
+  - **`BackendTurnAttemptSink`**（从 `commands/writing.rs` 移入）：`sync_autofix_with_provenance` / `attach_postprocess` 的 SQLite typed 预校验与 JSON 条件 mutate 保留原语义。
+  - **`build_postprocess_service` 工厂**：Postprocess batch source（`Runtime` vs `JsonStore`）在 adapter 边界按 backend 选择一次；SQLite 无 CampaignRuntimeContext 时保持显式 fail-closed，不悄悄回退 JSON。
+  - 迁移吸收：`prepare_start_conversation(_async)`、MVU 两个 `*_for_backend` 收集器 + `collect_mvu_from_sqlite`、`persist_postprocess_outcome_async`、`fill_campaign_runtime_from_sqlite`（crate root 保留 re-export，harness 兼容）、`load_campaign_context_snapshot_for_backend`、Chronicle compressor 全家（`maybe_spawn_chronicle_compress` / `recover_compress_jobs_on_startup` / `spawn_compress_job_worker` 等）、`campaign_health_issues_for_backend`、`conversation_card_name_for_backend`、`campaign_scoped_regex_scripts_for_backend`、`character_instance_dto_for_backend`。
+- `StorageFacade`：删除六个 SQLite-only API（`create_draft_attempt` / `append_regenerate_attempt` / `sync_autofix` / `apply_postprocess` / `mark_stale_after_edit` / `accept_by_variant`），不再向调用方暴露 infra-sqlite 类型；新增 `save_active_pointer`（JSON 写指针文件 / SQLite no-op，吸收 campaigns 与 playthrough 指针逻辑）与 `defer_pipeline_conversation_land`。
+- `runtime_support.rs` 不再读取 backend flag；`persist_temporary_instances_async`（dead_code）删除，单测保留 `persist_temporary_instances_to*`。
+- 静态门禁双保险：
+  - 新增 Rust 测试 `lib_tests_backend.rs`：遍历 `src/` + `src/commands/`，白名单 = {`lib.rs`（bootstrap）、`storage_backend.rs`、`sqlite_runtime.rs`、`backend_workflows.rs`}，白名单外的 `.is_sqlite()`/`.is_json()` 一律报错；并钉住 commands 不得使用 ambient `get_store()`。
+  - `scripts/architecture/backend-baseline.mjs` 新增 `applicationMethodFlagReferences` / `facadeMethodFlagReferences` / `methodFlagReferencesByFile` 字段。
+- 修复陈旧测试 `character_delete_checks_campaign_lifecycle_before_any_legacy_mutation`（断言字面量 `get_store()` → `character_store`）。
+- **评审修复（2026-07-31，两处 P1 行为回归 + 二次评审修正）**：
+  - `TurnWorkflow::create_draft_attempt`/`append_regenerate_attempt` 的 SQLite 失败写回改为**条件化**（`mutate_turn_if`，predicate = scope 匹配 && 状态仍为 `Generating`）——首稿/重生成 UoW 失败时，仅对仍占用 barrier 的 Generating Turn 标 `Failed` + `failure_reason`；已推进到 `DraftReady`/`Committed` 的 Turn（重复或竞态请求被 UoW 拒绝）**绝不降级**。写回错误经 `tracing::error` 报告，不吞掉。回归段两条：fault 注入（`PreacceptFault::BeforeCommit` 真实回滚路径）下 Generating Turn → `Failed`；Committed Turn 被拒绝后状态与 `failure_reason` 原样保持。
+  - Accept 的 `campaign_revision_after` 改为直接取 UoW 校验过的 `batch.target_revision`（UoW 内 `campaign.revision = target` 且校验 `target == expected + 1`；replay 路径本就使用持久化 batch 的 target_revision），**删除提交后二次读取**——提交成功却因读失败误报 `AcceptError::Commit` 会让调用方跳过 conversation invalidate、summary 索引与 Chronicle enqueue。回归段断言：首轮 accept 返回 `campaign_revision_after == 1`、第二轮 accept 返回值与盘上权威 revision 一致。
+- **评审修复（中等项）**：`list_conversations` 从每会话一次 `list_cards()` 退化为单次快照（新批量 adapter `conversation_card_names_for_backend`，一次 `list_cards()` 建映射）；`lib_tests_backend` 静态门禁改为递归扫描且白名单按 **src/ 相对路径**精确匹配（嵌套同名文件如 `commands/storage_backend.rs` 无法绕过）；frontend 合同测试新增 `applicationMethodFlagReferences == 0` 断言。
+
+### 15.2 修改前后后端分支统计
+
+| 指标 | Batch 3.1 结束时 | Gate 3 完成后 |
+|---|---|---|
+| commands / runtime_support / playthrough 内 `.is_sqlite()` / `.is_json()` | 30 处 | **0** |
+| 六个 SQLite-only facade API（暴露 infra-sqlite 类型） | 6 | **0** |
+| `applicationMethodFlagReferences`（baseline） | —（新增字段） | **0** |
+| `facadeMethodFlagReferences`（baseline） | —（新增字段） | 59（backend_workflows 22 / lib.rs 5 / storage_backend 32） |
+| `activeFlagReferences`（`is_sqlite_active(`） | 2 | 2（facade 内） |
+| `applicationFlagReferences` | 0 | 0 |
+| `ambientCharacterStoreReferences` | 0 | 0 |
+| `facadeSelectedWriterConstructors` | 4 | 4 |
+| `applicationSelectedWriterConstructors` | 0 | 0 |
+
+### 15.3 Gate 3 四项通过标准逐项核对
+
+- [x] **Tauri command 和应用服务内 `is_sqlite_active()` 为 0**：commands/、`runtime_support.rs`、`playthrough_lifecycle.rs` 的 `.is_sqlite()` / `.is_json()` 全部归零（30 → 0），`is_sqlite_active(` 自 Batch 3.1 起仅剩 facade 内部 2 处。
+- [x] **backend flag 只存在于 bootstrap/facade 构造和专用测试**：静态门禁测试按文件白名单钉住；`baseline.mjs` 同口径统计 `applicationMethodFlagReferences=0`。
+- [x] **SQLite 活跃时 JSON 写入者没有构造机会**：`StorageFacade::new` 在 SQLite 分支不构造四个 JSON store（`has_json_writers()=false`），既有 `sqlite_*_capability` 测试与 `facadeSelectedWriterConstructors=4`（仅 facade）不变。
+- [x] **新增命令无需自行添加 JSON/SQLite 分支**：Turn/Attempt/Accept/Postprocess 经注入的 `TurnWorkflow`/sink/工厂；campaign 指针、health、card-name、regex、MVU 收集经命名 adapter 函数；命令层只剩 capability 声明式门控与 `*_for_backend` 调用。
+
+### 15.4 关键行为保持
+
+- 六个 SQLite-only API 的语义原样迁入 adapter：JSON 软删补偿、Turn Failed 标记、错误消息文案（前端依赖展示）不变；SQLite UoW 后 conversation invalidate 保留。
+- SQLite 下既有能力缺口**不静默回退**：role_type 富化（SQLite 保持 `None`）、conversation card_name（`None`）、campaign-scoped regex（走 character 维度）均为文档化 Gate 4 数据完整性事项；chronicle compressor 在 SQLite 下继续显式跳过。
+- `meta_health_check` 的 JSON missing-campaign 错误从 `not_found` 分类变为 `storage` 分类（消息文本不变）；已确认前端不按 `TauriCommandError.type` 分支，无行为影响。
+- `edit_variant` 等 IPC 命令签名不变；`set_active_campaign_in_state` 签名去掉 `json_active` 参数（测试同步更新）。
+
+### 15.5 验证证据（全部通过，含评审修复后的复验）
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo check --workspace`：通过，零警告。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：全部通过（tauri-app 374 passed / 3 ignored；含新增 `gate3_backend_flag_whitelist_is_exactly_bootstrap_facade_and_adapter`、`gate3_commands_never_use_the_ambient_character_store`、optin lifecycle 的 revision 一致性回归段与 TurnWorkflow 首稿失败标 Failed 回归段）。说明：首次全量运行时 `infra-sqlite importer::tests::concurrent_same_manifest_converges_to_one_completed_run` 出现一次并发窗口失败，孤立重跑两次与全量复跑均通过——既有并发 flake，与本次改动无关（该测试与 importer 代码均未触碰）。
+- `node scripts/architecture/backend-baseline.mjs`：`applicationMethodFlagReferences=0`、`applicationFlagReferences=0`、`applicationSelectedWriterConstructors=0`。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8/8 通过（含新增 `applicationMethodFlagReferences == 0` 断言）。
+- `npm test`（frontend）：476 passed、0 failed。
+- `npm run build`（frontend）：通过（仅既有 chunk-size 警告）。
+- `git diff --check`：通过。
+
+### 15.5.1 关于「一次性 port 选择」的口径说明
+
+Gate 3 计划 §8.1 允许「trait 或启动时选择的 **enum-dispatched struct**」。`TurnWorkflow`/`BackendTurnAttemptSink`/`build_postprocess_service` 采用后者：`AppState::new_with_backend` 构造时注入，其持有的 `StorageFacade.pinned` 是进程级 `OnceLock` 的一次性不可变选择；每次方法调用读 `is_sqlite()` 读取的是该不可变选择（分派），不是运行时探测/重新选择。评审按「严格 trait 实现选择」口径指出未达到「构造时选 JsonTurnWorkflow/SqliteTurnWorkflow 具体实现」——这是实现风格差异，不属于行为缺口；若后续 Gate 需要 trait 化（如为 harness 注入 fake workflow），可在 facade 稳定后无损演进。四条通过条件与「命令不分支」口径下结论不变。
+
+### 15.6 提交
+
+- Gate 3 完成提交：未 push；提交 SHA 以 `git log` 为准（本段不引用自身提交，避免 amend 自指失效）。
+
+### 15.7 下一阶段（Gate 4）与安全后续项（不属本 Gate）
+
+- Gate 4 起补齐 SQLite 缺口：Meta UoW（typed patch preview/accept/dismiss、active-turn barrier、故障注入回滚）、MVU schema apply/definition 更新/backfill、WorldInfo、CharacterCommands/ImportExport、Chronicle compressor 的 SQLite-native 实现，以及 card_name/role_type/campaign-scoped regex 数据完整性收口。
+- 记录为后续任务（本次**不处理**）：CardShell 路径泄露审查、Import/Export 导出脱敏等无关安全待办。

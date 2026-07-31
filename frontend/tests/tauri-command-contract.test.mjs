@@ -25,9 +25,19 @@ test('Gate 0 command registration matches the complete ordered snapshot', () => 
   assert.deepEqual(baseline.backend.registeredCommands, commandSnapshot)
 })
 
-test('Gate 0 records the expected SQLite branch surface', () => {
+test('Gate 3 records the shrinking ambient SQLite branch surface', () => {
   assert.equal(baseline.workspace.crateCount, 16)
-  assert.equal(baseline.sqlite.activeFlagReferences, 68)
+  assert.equal(baseline.sqlite.activeFlagReferences, 2)
+  assert.equal(baseline.sqlite.facadeFlagReferences, 2)
+  assert.equal(baseline.sqlite.applicationFlagReferences, 0)
+  assert.equal(baseline.sqlite.ambientCharacterStoreReferences, 0)
+  assert.equal(baseline.sqlite.facadeSelectedWriterConstructors, 4)
+  assert.equal(baseline.sqlite.applicationSelectedWriterConstructors, 0)
+  // Gate 3: `.is_sqlite()` / `.is_json()` are confined to bootstrap, the
+  // facade, the SQLite runtime and the named backend adapter — zero anywhere
+  // else (mirrors the Rust static whitelist test).
+  assert.equal(baseline.sqlite.applicationMethodFlagReferences, 0)
+  assert.ok(baseline.sqlite.facadeMethodFlagReferences > 0)
   assert.ok(baseline.sqlite.unsupported.length > 0)
 })
 
