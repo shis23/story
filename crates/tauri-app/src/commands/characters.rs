@@ -304,11 +304,13 @@ pub(crate) fn delete_character(
             &ctx.characters,
         )
     };
-    if !state
+    // 整个删除（角色库 + MVU + 卡 + Campaign 全量级联）在一个原子操作内完成，
+    // 错误传播给调用方（Gate 4 三审 P1：不得报告成功却只删了一半）。
+    let removed = state
         .storage()
-        .delete_character(&id)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
-    {
+        .delete_character_full_cascade(&id, &source_ids)
+        .map_err(|e| TauriCommandError::storage(format!("删除失败（已整体回滚）: {e}")))?;
+    if !removed {
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
     }
     // 同步从 tool_ctx 移除
@@ -321,26 +323,10 @@ pub(crate) fn delete_character(
             ctx.world_info = None;
         }
     }
-    // 级联删除：该卡的 MVU 翻译 + CharacterCard（含其所有 Campaign）
-    //
-    // 注意 id 语义：delete_character 的 `id` 是 StoredCharacter.id（存储层 UUID），
-    // 而 CharacterCard.source_character_id 是 Character.id（domain 层 UUID，导入时生成）。
-    // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
-    // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
-    for source_id in &source_ids {
-        let _ = state.storage().delete_mvu(source_id);
-        // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
-        if let Ok(Some(stored_card)) = state.storage().get_card_by_source(source_id) {
-            // 桥接：通过角色名找到 Character.id，再查 card
-            let _ = state.storage().delete_card(&stored_card.card.id);
-        }
-    }
-    // 级联删除：清理向量库中该角色相关的记录（M-2）
-    for source_id in &source_ids {
-        if let Err(e) = state.vector_store.delete_by_character(source_id) {
-            tracing::warn!("清理角色向量记录失败: {e}");
-        }
-    }
+    // 内存态世界书重建（角色库已删除，t_ctx 内世界书条目需要清理）
+    // 注意：旧实现引用的 vector_store.delete_by_character 不存在（无效调用），
+    // 现改为显式不执行 + 记录。SQLite 角色库删除已含全量持久化级联。
+    rebuild_world_info_in_tool_ctx(&state);
     Ok(())
 }
 
@@ -485,7 +471,9 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
     }
     use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
-    // 有活跃活动时以本局世界书为唯一注入源（卡库写路径 rebuild 不应覆盖）
+    // 有活跃活动时以本局世界书为唯一注入源（卡库写路径 rebuild 不应覆盖）。
+    // 经 backend-neutral facade 读取（SQLite 走 V006 表），不依赖 JSON store
+    // （Gate 4 三审 P2：SQLite 下编辑落库后 tool_ctx 必须刷新）。
     if state.storage().capability(BackendCapability::WorldInfo) == CapabilityStatus::Supported {
         let active = state
             .active_campaign
@@ -493,10 +481,7 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(campaign_id) = active
-            && let Ok(store) = state
-                .storage()
-                .json_campaign_store(BackendCapability::WorldInfo, "rebuild campaign world info")
-            && let Ok(book) = store.get_world_info(&campaign_id)
+            && let Ok(book) = state.storage().get_world_info(&campaign_id)
             && !book.entries.is_empty()
         {
             apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
@@ -504,13 +489,13 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
         }
     }
 
-    let Ok(character_store) = state.storage().json_character_store(
-        BackendCapability::CharacterCommands,
-        "rebuild character world info runtime",
-    ) else {
-        return;
+    let all_chars = match state.storage().list_characters() {
+        Ok(chars) => chars,
+        Err(e) => {
+            tracing::warn!("rebuild world info: 角色库读取失败: {e}");
+            return;
+        }
     };
-    let all_chars = character_store.list();
 
     // 找当前活跃角色名（tool_ctx.characters 里的）
     let active_names: Vec<String> = state

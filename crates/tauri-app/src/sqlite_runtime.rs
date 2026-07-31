@@ -158,6 +158,15 @@ fn with_db<T>(f: impl FnOnce(&Database) -> Result<T, String>) -> Result<T, Strin
     f(&db)
 }
 
+/// Integration-test access to the process DB connection (dependent-row
+/// assertions / fixture seeding). Not for production use.
+#[doc(hidden)]
+pub fn with_db_raw<T>(f: impl FnOnce(&Database) -> T) -> T {
+    let mutex = SQLITE_DB.get().expect("sqlite backend active");
+    let db = mutex.lock().map_err(|_| "poisoned").unwrap();
+    f(&db)
+}
+
 pub fn get_campaign(campaign_id: &Id) -> Result<Option<Campaign>, String> {
     with_db(|db| {
         SqliteProductionRepository::get_campaign(db, campaign_id).map_err(|e| e.to_string())
@@ -1171,86 +1180,202 @@ pub fn mutate_character<T>(
 /// Delete one card payload row (character delete cascade). Mirrors the JSON
 /// `CampaignStore::delete_card` scope: the card's campaigns cascade into
 /// instances / knowledge / tasks / summaries / world info / MVU rows.
+/// Delete a card payload with its **full** campaign cascade in one transaction
+/// (character delete). Dependency order respects `foreign_keys=ON`:
+/// mutation_commits → chronicle jobs → preaccept_outbox → attempts → turns →
+/// conversations → summaries/covers → tasks/knowledge/instances/world_info →
+/// campaigns → mvu → character_cards. Any FK failure rolls everything back.
 pub fn delete_card_payload(card_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| delete_card_payload_inner(db, card_id))
+}
+
+fn delete_card_payload_inner(db: &mut Database, card_id: &Id) -> Result<bool, String> {
+    let tx = db
+        .connection_mut()
+        .transaction()
+        .map_err(|e| e.to_string())?;
+    let source_ids: Vec<Option<String>> = {
+        let mut stmt = tx
+            .prepare("SELECT source_character_id FROM character_cards WHERE card_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([card_id.as_str()], |row| row.get::<_, Option<String>>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    delete_card_cascade_tx(&tx, card_id.as_str())?;
+    for source_id in source_ids.iter().flatten() {
+        tx.execute(
+            "DELETE FROM mvu_translations WHERE source_character_id = ?1",
+            [source_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let removed = tx
+        .execute(
+            "DELETE FROM character_cards WHERE card_id = ?1",
+            [card_id.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(removed > 0)
+}
+
+/// Delete one character (by stored id **or** source id) with its entire
+/// cascade (MVU translations + card/campaign + all dependent rows) in a
+/// **single** SQLite transaction (Gate 4 三审 P1：真实玩过的 Campaign 的
+/// FK 依赖全部清理，失败整体回滚，绝不报告成功却留下不一致数据）。
+pub fn delete_character_full_cascade(id: &str, extra_source_ids: &[Id]) -> Result<bool, String> {
     with_db_mut(|db| {
         let tx = db
             .connection_mut()
             .transaction()
             .map_err(|e| e.to_string())?;
-        let source_ids: Vec<Option<String>> = {
-            let mut stmt = tx
-                .prepare("SELECT source_character_id FROM character_cards WHERE card_id = ?1")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([card_id.as_str()], |row| row.get::<_, Option<String>>(0))
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT character_id, source_character_id FROM characters \
+                 WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((character_id, source_from_row)) = row else {
+            return Ok(false);
         };
-        let campaign_ids: Vec<String> = {
-            let mut stmt = tx
-                .prepare("SELECT campaign_id FROM campaigns WHERE card_id = ?1")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([card_id.as_str()], |row| row.get::<_, String>(0))
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+        // 候选 source id：库行自带 + 调用方（tool_ctx 域 id）提供。
+        let mut candidates: Vec<String> = Vec::new();
+        let mut push_source = |s: &str| {
+            if !candidates.iter().any(|c| c == s) {
+                candidates.push(s.to_string());
+            }
         };
-        for campaign_id in &campaign_ids {
-            tx.execute(
-                "DELETE FROM round_summary_covers WHERE parent_id IN \
-                 (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1)",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM round_summaries WHERE campaign_id = ?1",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM story_tasks WHERE campaign_id = ?1",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM character_knowledge WHERE campaign_id = ?1",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM character_instances WHERE campaign_id = ?1",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
-                [campaign_id],
-            )
-            .map_err(|e| e.to_string())?;
+        if let Some(s) = source_from_row.as_deref() {
+            push_source(s);
         }
-        tx.execute(
-            "DELETE FROM campaigns WHERE card_id = ?1",
-            [card_id.as_str()],
-        )
-        .map_err(|e| e.to_string())?;
-        for source_id in source_ids.iter().flatten() {
+        for id in extra_source_ids {
+            push_source(id.as_str());
+        }
+        for source in &candidates {
             tx.execute(
                 "DELETE FROM mvu_translations WHERE source_character_id = ?1",
-                [source_id],
+                [source],
             )
             .map_err(|e| e.to_string())?;
+            let card_id: Option<String> = tx
+                .query_row(
+                    "SELECT card_id FROM character_cards WHERE source_character_id = ?1 LIMIT 1",
+                    [source],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(card_id) = card_id {
+                delete_card_cascade_tx(&tx, &card_id)?;
+                tx.execute("DELETE FROM character_cards WHERE card_id = ?1", [&card_id])
+                    .map_err(|e| e.to_string())?;
+            }
         }
-        let removed = tx
-            .execute(
-                "DELETE FROM character_cards WHERE card_id = ?1",
-                [card_id.as_str()],
-            )
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM characters WHERE character_id = ?1",
+            [&character_id],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(removed > 0)
+        Ok(true)
     })
+}
+
+/// Full dependency-ordered campaign cascade inside an open transaction.
+/// `foreign_keys=ON` makes order mandatory: children before their parents.
+fn delete_card_cascade_tx(tx: &rusqlite::Transaction<'_>, card_id: &str) -> Result<(), String> {
+    let campaign_ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT campaign_id FROM campaigns WHERE card_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([card_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for campaign_id in &campaign_ids {
+        // mutation_commits → publication/compress jobs → preaccept_outbox
+        tx.execute(
+            "DELETE FROM mutation_commits WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM chronicle_publication_jobs WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM chronicle_compress_jobs WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM preaccept_outbox WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // turn_attempts → turns → conversations
+        tx.execute(
+            "DELETE FROM turn_attempts WHERE turn_id IN \
+             (SELECT turn_id FROM turns WHERE campaign_id = ?1)",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM turns WHERE campaign_id = ?1", [campaign_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM conversations WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // chronicle summaries / covers / tasks / knowledge / instances / world info
+        tx.execute(
+            "DELETE FROM round_summary_covers WHERE parent_id IN \
+             (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1) \
+             OR child_id IN (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1)",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM round_summaries WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM story_tasks WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM character_knowledge WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM character_instances WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM campaigns WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // ─── Gate 4 P1-4: atomic Campaign Bundle import (single transaction) ────────

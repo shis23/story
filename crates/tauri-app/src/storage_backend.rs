@@ -856,6 +856,42 @@ impl StorageFacade {
         }
     }
 
+    /// Delete one character with its **entire** cascade (MVU + card + all
+    /// campaign dependent rows) in a single atomic operation. SQLite: one
+    /// transaction; JSON: existing `delete_character` cascade semantics.
+    pub fn delete_character_full_cascade(
+        &self,
+        id: &str,
+        extra_source_ids: &[Id],
+    ) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_character_full_cascade(id, extra_source_ids)
+        } else {
+            // JSON 路径：沿用 CharacterStore + CampaignStore 既有级联。
+            let character_store = self
+                .json_character_store(BackendCapability::CharacterCommands, "delete character")?;
+            let removed = character_store.delete(id)?;
+            let campaign_store =
+                self.json_campaign_store(BackendCapability::CampaignLifecycle, "delete character")?;
+            for source_id in extra_source_ids {
+                let _ = campaign_store.delete_mvu(source_id);
+                if let Some(stored_card) = campaign_store.get_card_by_source(source_id) {
+                    let _ = campaign_store.delete_card(&stored_card.card.id);
+                }
+            }
+            if let Some(stored) = character_store.get(id)
+                && let Some(source_id) = stored.info.source_character_id.as_ref()
+            {
+                let source_id = Id::from_str(source_id);
+                let _ = campaign_store.delete_mvu(&source_id);
+                if let Some(stored_card) = campaign_store.get_card_by_source(&source_id) {
+                    let _ = campaign_store.delete_card(&stored_card.card.id);
+                }
+            }
+            Ok(removed)
+        }
+    }
+
     // ─── Gate 4 P1-4: ImportExport (backend-neutral facade) ───────────────
 
     /// Get one card wrapper payload as a `StoredCard`.

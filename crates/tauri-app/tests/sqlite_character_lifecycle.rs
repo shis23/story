@@ -662,6 +662,160 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
         "bound card must be gone after cascade"
     );
 
+    // ─── 8b. 真实 `delete_character_full_cascade`：带全量依赖（turns/outbox/
+    //         mutation_commits/chronicle jobs/summaries/covers）的角色删除
+    //         必须在一个事务内清理干净，绝不报告成功却留下半套数据（三审 P1）。
+    let (_full_card_id, full_camp_id, full_conv_id, full_turn_id) = {
+        let cid = Id::new();
+        let camp_id = Id::new();
+        let conv_id = Id::new();
+        let turn_id = Id::new();
+        sqlite_runtime::save_card_payload(
+            &cid,
+            "Full Cascade Card",
+            Some("full-source-1"),
+            Some("2026-07-31T00:00:00Z"),
+            &serde_json::json!({"card": {"id": cid.as_str(), "name": "Full Cascade Card"}}),
+        )
+        .expect("save full card");
+        let mut camp = Campaign::new(cid.clone(), "Full Cascade Camp");
+        camp.id = camp_id.clone();
+        camp.conversation_id = Some(conv_id.clone());
+        sqlite_runtime::save_campaign(&camp).expect("save full campaign");
+        let mut conv = Conversation::new(None, Some(camp_id.clone()));
+        conv.id = conv_id.clone();
+        sqlite_runtime::save_conversation(&conv).expect("save full conversation");
+        let turn = storyforge_domain::turn::TurnRecord::new(
+            camp_id.clone(),
+            conv_id.clone(),
+            Id::new(),
+            0,
+        );
+        let turn = {
+            let mut t = turn;
+            t.turn_id = turn_id.clone();
+            t
+        };
+        sqlite_runtime::save_turn(&turn).expect("save full turn");
+        sqlite_runtime::save_mvu(&storyforge_lib::campaign_store::StoredMvuTranslation {
+            source_character_id: Id::from_str("full-source-1"),
+            character_name: "Full Cascade".into(),
+            translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(
+                vec![],
+            ),
+            analyzed_at: "2026-07-31T00:00:00Z".into(),
+        })
+        .expect("save full mvu");
+        // 直接依赖行：mutation_commit + compress job + preaccept outbox
+        // （FK 顺序：turn_attempts → mutation_commits / preaccept_outbox）。
+        sqlite_runtime::with_db_raw(|db| {
+            let conn = db.connection();
+            conn.execute(
+                "INSERT INTO turn_attempts (attempt_id, turn_id, variant_id, draft_hash, status, created_at, payload_json) VALUES ('attempt-full-1', ?1, 'variant-full', 'h', 'committed', 'now', '{}')",
+                rusqlite::params![turn_id.as_str()],
+            )
+            .expect("insert attempt");
+            conn.execute(
+                "INSERT INTO mutation_commits (commit_id, campaign_id, turn_id, attempt_id, expected_revision, target_revision, terminal_status, payload_hash, committed_at) VALUES ('mc-full-1', ?1, ?2, 'attempt-full-1', 0, 1, 'committed', 'ph', 'now')",
+                rusqlite::params![camp_id.as_str(), turn_id.as_str()],
+            )
+            .expect("insert mutation commit");
+            conn.execute(
+                "INSERT INTO chronicle_compress_jobs (job_id, campaign_id, status, attempts, max_attempts, created_at, updated_at) VALUES ('cj-full-1', ?1, 'pending', 0, 5, 'now', 'now')",
+                rusqlite::params![camp_id.as_str()],
+            )
+            .expect("insert compress job");
+            conn.execute(
+                "INSERT INTO preaccept_outbox (outbox_id, campaign_id, conversation_id, turn_id, attempt_id, kind, draft_hash, payload_hash, status, payload_json, created_at, updated_at) VALUES ('ob-full-1', ?1, ?2, ?3, 'attempt-full-1', 'postprocess', 'h', 'ph', 'pending', '{}', 'now', 'now')",
+                rusqlite::params![camp_id.as_str(), conv_id.as_str(), turn_id.as_str()],
+            )
+            .expect("insert outbox");
+        });
+        (cid, camp_id, conv_id, turn_id)
+    };
+    let full_char = facade
+        .save_character(sample_character_info(
+            "Full Cascade Hero",
+            Some("full-source-1".to_string()),
+        ))
+        .expect("save full character");
+    assert!(
+        facade
+            .delete_character_full_cascade(&full_char.id, &[Id::from_str("full-source-1")])
+            .expect("atomic full cascade delete"),
+        "full cascade must report deletion"
+    );
+    // 全部依赖行清理干净：卡、campaign、conversation、turn、MVU、jobs、outbox、commits。
+    assert!(
+        sqlite_runtime::get_card_payload_by_source(&Id::from_str("full-source-1"))
+            .unwrap()
+            .is_none(),
+        "card must be gone after full cascade"
+    );
+    assert!(
+        sqlite_runtime::get_campaign(&full_camp_id)
+            .unwrap()
+            .is_none(),
+        "campaign must be gone after full cascade"
+    );
+    assert!(
+        sqlite_runtime::get_conversation(&full_conv_id)
+            .unwrap()
+            .is_none(),
+        "conversation must be gone after full cascade"
+    );
+    assert!(
+        sqlite_runtime::get_turn(&full_turn_id).unwrap().is_none(),
+        "turn must be gone after full cascade"
+    );
+    assert!(
+        sqlite_runtime::get_mvu(&Id::from_str("full-source-1"))
+            .unwrap()
+            .is_none(),
+        "MVU must be gone after full cascade"
+    );
+    sqlite_runtime::with_db_raw(|db| {
+        let conn = db.connection();
+        let compress_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chronicle_compress_jobs WHERE campaign_id = ?1",
+                [full_camp_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            compress_jobs, 0,
+            "compress jobs must be gone after full cascade"
+        );
+        let outbox: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM preaccept_outbox WHERE campaign_id = ?1",
+                [full_camp_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox, 0, "outbox must be empty after full cascade");
+        let commits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_commits WHERE campaign_id = ?1",
+                [full_camp_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            commits, 0,
+            "mutation_commits must be empty after full cascade"
+        );
+        let turns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE campaign_id = ?1",
+                [full_camp_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(turns, 0, "turns must be gone after full cascade");
+    });
+
     // ─── 9. ST PNG 导出链可执行（SQLite 数据源）───────────────────────────
     let png_stored = facade
         .save_character(sample_character_info(

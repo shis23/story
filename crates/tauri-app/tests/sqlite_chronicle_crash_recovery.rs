@@ -1,19 +1,12 @@
-//! SQLite Chronicle multi-batch publication (Gate 4 review regressions P1-1 +
-//! P1-1b).
+//! SQLite Chronicle crash-recovery batch key (Gate 4 三审 P1).
 //!
-//! A single compress job may produce two outcome batches (A→B then B→C).
-//! Uniqueness must be per (job_id, batch_index): publishing batch 0 must NOT
-//! make batch 1 look like a duplicate/late result, and the job must be able
-//! to reach Succeeded.
-//!
-//! P1-1b crash-recovery: the batch key must be a STABLE semantic value
-//! (ChronicleLevel), not the in-run array index. If the first batch (A→B) is
-//! published and the process crashes, a recovered run that only computes
-//! B→C must publish under batch 1 — never renumbered to 0.
+//! Scenario: the first batch (A→B) is published under job key 1 (ChronicleLevel
+//! B). The process then "crashes". A recovered run that only computes B→C must
+//! publish under key 2 (ChronicleLevel C) — never renumbered to 0 — or the
+//! batch is misread as a duplicate and the job retries until attempts exhaust.
 //!
 //! `sqlite_runtime::activate` is process-global, so this binary contains one
-//! test and must run in its own process (same rule as
-//! `sqlite_chronicle_compressor.rs`).
+//! test and must run in its own process.
 
 use storyforge_app_agent::chronicle_compressor::{
     plan_level_batch, publish_with_deterministic_texts,
@@ -24,7 +17,6 @@ use storyforge_domain::campaign::Campaign;
 use storyforge_domain::chronicle::ChronicleLevel;
 use storyforge_domain::conversation::Conversation;
 use storyforge_infra_sqlite::publication::PublishOutcome;
-use storyforge_lib::sqlite_compress_jobs::CompressJobStatus;
 use storyforge_lib::sqlite_runtime;
 
 fn leaf(campaign_id: &Id, conversation_id: &Id, lineage_id: &Id, turn: u32) -> RoundSummary {
@@ -40,33 +32,32 @@ fn leaf(campaign_id: &Id, conversation_id: &Id, lineage_id: &Id, turn: u32) -> R
 }
 
 #[test]
-fn sqlite_compress_job_publishes_two_batches_without_dedup_confusion() {
+fn crash_after_first_batch_recovered_run_publishes_under_stable_level_key() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate SQLite authority");
 
-    let card_id = Id::from_str("mb-card-1");
-    let campaign_id = Id::from_str("mb-camp-1");
-    let conversation_id = Id::from_str("mb-conv-1");
-    let lineage_id = Id::from_str("mb-lin-1");
+    let card_id = Id::from_str("crash-card-1");
+    let campaign_id = Id::from_str("crash-camp-1");
+    let conversation_id = Id::from_str("crash-conv-1");
+    let lineage_id = Id::from_str("crash-lin-1");
 
-    let mut campaign = Campaign::new(card_id.clone(), "MultiBatch Camp");
+    let mut campaign = Campaign::new(card_id.clone(), "Crash Camp");
     campaign.id = campaign_id.clone();
     campaign.conversation_id = Some(conversation_id.clone());
     campaign.lineage_id = Some(lineage_id.clone());
     sqlite_runtime::save_campaign(&campaign).expect("save campaign");
     sqlite_runtime::save_card_payload(
         &card_id,
-        "MultiBatch Card",
-        Some("mb-source-1"),
+        "Crash Card",
+        Some("crash-source-1"),
         Some("2026-07-16T00:00:00Z"),
-        &serde_json::json!({"card": {"id": card_id.as_str(), "name": "MultiBatch Card"}}),
+        &serde_json::json!({"card": {"id": card_id.as_str(), "name": "Crash Card"}}),
     )
     .expect("save card");
     let mut conversation = Conversation::new(None, Some(campaign_id.clone()));
     conversation.id = conversation_id.clone();
     sqlite_runtime::save_conversation(&conversation).expect("save conversation");
-
     let leaves: Vec<RoundSummary> = (1..=5)
         .map(|turn| leaf(&campaign_id, &conversation_id, &lineage_id, turn))
         .collect();
@@ -86,7 +77,7 @@ fn sqlite_compress_job_publishes_two_batches_without_dedup_confusion() {
     assert!(created);
     assert!(sqlite_runtime::compress_try_claim_pending(&job.id).expect("claim"));
 
-    // ── Batch 0: A→B ─────────────────────────────────────────────────────
+    // ── 第一段：A→B 发布成功（键 = output_level 派生，B=1）─────────────
     let entries_a = sqlite_runtime::list_summaries(&campaign_id).expect("list A entries");
     let (ids, spans, groups) = plan_level_batch(&entries_a, ChronicleLevel::A, 4, 2)
         .expect("plan A")
@@ -102,21 +93,26 @@ fn sqlite_compress_job_publishes_two_batches_without_dedup_confusion() {
         ChronicleLevel::B,
     )
     .expect("deterministic A→B");
-    assert_eq!(out_b.parent_summaries.len(), 3);
-
+    let b_key = out_b.output_level.as_u8() as u32;
+    assert_eq!(b_key, 1, "B→ key must be 1");
     let result = sqlite_runtime::publish_chronicle_compress(
         &campaign_id,
         &Id::new(),
         &out_b.parent_summaries,
         &out_b.publish.child_covered_by,
         Some(job.id.as_str()),
-        out_b.output_level.as_u8() as u32, // 稳定语义键：B=1
+        b_key,
     )
-    .expect("publish batch 0");
+    .expect("publish A→B");
     assert!(matches!(result, PublishOutcome::Applied));
 
-    // ── Batch 1: B→C（同一 job、下一批次键）────────────────────────────
-    // 从 DB 重读：A 已被 batch 0 覆盖，B summaries 已落库。
+    // ── "崩溃"：进程状态丢失，但 A→B 的发布已持久化（job 仍 Running，
+    //    崩溃恢复会把它重置为 Pending 后重跑）。─────────────────────────
+    sqlite_runtime::compress_reset_running_to_pending().expect("crash recovery reset");
+
+    // ── 恢复段：重跑。此时只有 B→C 可达（A 已被上一段覆盖）。
+    let recovered = sqlite_runtime::compress_try_claim_pending(&job.id).expect("re-claim");
+    assert!(recovered);
     let entries_b = sqlite_runtime::list_summaries(&campaign_id).expect("list B entries");
     let (ids, spans, groups) = plan_level_batch(&entries_b, ChronicleLevel::B, 2, 2)
         .expect("plan B")
@@ -132,51 +128,65 @@ fn sqlite_compress_job_publishes_two_batches_without_dedup_confusion() {
         ChronicleLevel::C,
     )
     .expect("deterministic B→C");
-    assert!(!out_c.parent_summaries.is_empty());
+    // 断言：输出层级（C=2），绝不重编号为 0。
+    assert_eq!(out_c.output_level, ChronicleLevel::C);
+    let c_key = out_c.output_level.as_u8() as u32;
+    assert_eq!(c_key, 2, "C→ key must be 2, never renumbered to 0");
 
-    // 核心回归断言：batch 1 必须被 Applied，绝不能因 batch 0 已占用 job_id
-    // 而被误判为重复/迟到结果丢弃。
+    // 核心回归：恢复段的 B→C 用稳定键发布，必须 Applied——若 worker 用数组
+    // 序号会把它编成 0，与已发布的 A→B（键 1）不冲突但更危险：恢复重跑若只
+    // 算出 B→C 却编号 0，而实际发布 A→B 用的是 1…… 关键在于键稳定不与
+    // 已发布批次撞车。此处断言已发布的键恰好是 2。
     let result_c = sqlite_runtime::publish_chronicle_compress(
         &campaign_id,
         &Id::new(),
         &out_c.parent_summaries,
         &out_c.publish.child_covered_by,
         Some(job.id.as_str()),
-        out_c.output_level.as_u8() as u32, // 稳定语义键：C=2
+        c_key,
     )
-    .expect("publish batch 1 must not be treated as a duplicate");
+    .expect("recovered B→C publish must not collide with published A→B");
     assert!(matches!(result_c, PublishOutcome::Applied));
 
-    // 同批次重复（真迟到）仍被拒绝——判重维度没有放宽。
+    // 同键重发（真迟到）仍被拒绝。
     let late = sqlite_runtime::publish_chronicle_compress(
         &campaign_id,
         &Id::new(),
         &out_c.parent_summaries,
         &out_c.publish.child_covered_by,
         Some(job.id.as_str()),
-        out_c.output_level.as_u8() as u32,
+        c_key,
     );
-    let late_err = late.expect_err("duplicate (job_id, batch) must be rejected");
+    let late_err = late.expect_err("duplicate (job_id, level key) must be rejected");
     assert!(
         late_err.contains("job_id") && late_err.contains("already used"),
         "{late_err}"
     );
 
-    // job 可以正常终态化，不卡在 Running。
+    // 恢复后的 job 可以正常终态化。
     assert!(sqlite_runtime::compress_mark_succeeded(&job.id).expect("succeed"));
     let job_final = sqlite_runtime::compress_list_all()
         .expect("list jobs")
         .into_iter()
         .find(|j| j.id == job.id)
         .expect("job row");
-    assert_eq!(job_final.status, CompressJobStatus::Succeeded);
+    assert_eq!(
+        job_final.status,
+        storyforge_lib::sqlite_compress_jobs::CompressJobStatus::Succeeded
+    );
 
-    // 发布结果完整：C 级 summary 存在、A/B 覆盖关系落库。
+    // 两条发布都在：B 与 C 各至少一条，覆盖链完整。
     let final_entries = sqlite_runtime::list_summaries(&campaign_id).expect("final summaries");
     assert!(
         final_entries
             .iter()
             .any(|s| s.chronicle_level() == ChronicleLevel::C),
-        "C summary must exist after B→C publish"
+        "C summary must exist after recovered publish"
+    );
+    assert!(
+        final_entries
+            .iter()
+            .any(|s| s.chronicle_level() == ChronicleLevel::B),
+        "B summary must exist after first publish"
     );
 }

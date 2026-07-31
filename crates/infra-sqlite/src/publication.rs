@@ -40,8 +40,12 @@ pub struct PublishRequest<'a> {
     pub parents: &'a [RoundSummary],
     pub child_covered_by: &'a [(Id, Id)],
     pub job_id: Option<&'a str>,
-    /// 同一 compress job 内的批次序号（A→B 为 0，B→C 为 1…）。唯一性按
+    /// 同一 compress job 内的稳定批次标识（A→B 为 0，B→C 为 1…）。唯一性按
     /// (job_id, batch_index) 判定：一个 job 可发布多批结果，互不误判为重复。
+    ///
+    /// 必须是**语义稳定**值（来源的 ChronicleLevel，见 worker 调用点），而非
+    /// 本次运行中的数组序号：第一批 A→B 成功后进程崩溃，恢复后重算只有 B→C，
+    /// 若用数组序号它会重新编号 0，与已发布的批次 0 冲突并反复重试直到耗尽。
     pub batch_index: u32,
 }
 

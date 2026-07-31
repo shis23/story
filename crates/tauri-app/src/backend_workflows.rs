@@ -1880,7 +1880,11 @@ pub fn spawn_compress_job_worker_with(
         {
             Ok(outcomes) => {
                 let mut publish_err: Option<String> = None;
-                for (batch_index, out) in outcomes.into_iter().enumerate() {
+                for out in outcomes {
+                    // 批次键用稳定语义值：output_level（A→B=0、B→C=1）。若用数组
+                    // 序号，第一批发布后崩溃、恢复只剩 B→C 时会重新编号 0，与已
+                    // 发布批次冲突并反复重试（三轮评审 P1-1b）。
+                    let batch_index = out.output_level.as_u8() as u32;
                     let result = if storage.is_sqlite() {
                         let publication_id = Id::new();
                         crate::sqlite_runtime::publish_chronicle_compress_with_fault_flag(
@@ -1889,7 +1893,7 @@ pub fn spawn_compress_job_worker_with(
                             &out.parent_summaries,
                             &out.publish.child_covered_by,
                             Some(job_id.as_str()),
-                            batch_index as u32,
+                            batch_index,
                         )
                     } else {
                         match campaign_store.as_ref() {

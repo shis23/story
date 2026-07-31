@@ -832,5 +832,60 @@ meta、mvu、chronicle_compressor、chronicle_multibatch、character_lifecycle�
 （migrations / audit_snapshot / migration_concurrency / migration_readiness /
 preaccept_lifecycle）。
 
+### 30.10 Gate 4 三审修复（2026-07-31）
+
+> 二审判定 INCOMPLETE（2 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 Chronicle 崩溃恢复批次键不稳定（属实）**：worker 曾用本次运行的数组序号
+作批次号——第一批 A→B 发布后崩溃，恢复运行只剩 B→C，会重新编号为 0，与已发布
+批次冲突并反复重试直到耗尽。
+- 修复：批次键改为**稳定语义值** `out.output_level.as_u8()`（B=1、C=2），与
+  已发布批次绝不撞车；`PublishRequest.batch_index` 文档钉死「必须语义稳定，非
+  数组序号」；崩溃恢复（Running→Pending 重置后重跑）天然幂等。
+- 回归测试：新增
+  `crates/tauri-app/tests/sqlite_chronicle_crash_recovery.rs`——A→B 发布后
+  `compress_reset_running_to_pending` 模拟崩溃，恢复段 B→C 用稳定键发布成功、
+  同键迟到拒绝、job 正常终态化；`sqlite_chronicle_multibatch.rs` 改为用
+  `output_level.as_u8()` 派生键。
+
+**P1 角色删除报告成功但只删一半（属实）**：`delete_character` 先删角色库记录，
+随后级联（MVU / card / campaign）错误全被 `let _ =` 吞掉；SQLite
+`delete_card_payload` 只清理 summaries/tasks/knowledge/instances/world_info，
+未清理 turns/attempts/preaccept_outbox/mutation_commits/chronicle jobs，真实玩过
+的 Campaign 会因外键删除失败却返回成功。
+- 修复：
+  - `sqlite_runtime::delete_character_full_cascade(id, extra_source_ids)` 单事务：
+    角色库行 + 候选 source 级联 MVU + 卡 + `delete_card_cascade_tx`
+    （依赖序完整清理 mutation_commits → chronicle publication/compress jobs →
+    preaccept_outbox → turn_attempts → turns → conversations → summaries/covers →
+    tasks/knowledge/instances/world_info → campaigns）。
+  - `delete_card_payload` 复用同一 cascade，删除改为**依赖序全量**清理。
+  - `commands/characters.rs::delete_character` 改经 facade
+    `delete_character_full_cascade`，错误传播给调用方（`删除失败（已整体回滚）`）；
+    顺带移除了不存在的 `vector_store.delete_by_character` 无效调用。
+  - `storage_backend` 新增 `delete_character_full_cascade` facade 方法
+    （JSON 分支保持既有级联语义）。
+- 回归测试：`sqlite_character_lifecycle.rs` 新增 8b 段——真实带依赖
+  （turn_attempts/mutation_commits/compress_jobs/preaccept_outbox）的 Campaign，
+  `delete_character_full_cascade` 后所有依赖表归零。
+
+**P2 SQLite 世界书编辑后 tool_ctx 不刷新（属实）**：
+`rebuild_world_info_in_tool_ctx` 仍走 `json_character_store` 重建，SQLite 下失败
+静默 return，编辑落库但写作上下文用旧世界书。
+- 修复：改造为纯 backend-neutral facade 读取——活跃 Campaign 世界书走
+  `storage.get_world_info`（SQLite 走 V006 表），角色库走
+  `storage.list_characters`；失败路径改为告警日志（不再静默 return）。characters.rs
+  全文件零 JSON store 直连（静态守卫测试钉住）。
+- 测试：`lib_tests_campaigns.rs` 更新能力矩阵断言（CharacterCommands /
+  ImportExport → Supported，SQLite facade 无 JSON writer）；既有 `character_delete_
+  fails_closed` 静态守卫保持。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings` / `cargo test --workspace`（全绿）/
+8 个 sqlite 集成测试（含新增 crash_recovery）全过 / `backend-baseline.mjs`
+（`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
+`npm test` 476/476 / `npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

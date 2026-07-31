@@ -43,22 +43,29 @@ fn character_delete_fails_closed_before_any_storage_mutation() {
 }
 
 #[test]
-fn sqlite_character_delete_cascade_is_explicitly_unsupported() {
+fn sqlite_character_commands_and_import_export_are_supported_no_json_writers() {
+    // Gate 4 三审 P1-4 后的能力矩阵：CharacterCommands / ImportExport 已
+    // SQLite 化，必须 Supported；SQLite facade 仍不得构造任何 JSON writer。
     use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 
     let storage = storage_backend::StorageFacade::new(
         std::env::temp_dir().join("storyforge-gate3-character-delete-capability"),
         PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
     );
-    let error = storage
-        .require_supported(
-            storage_backend::BackendCapability::CampaignLifecycle,
-            "character delete cascade",
-        )
-        .expect_err("SQLite character deletion must stop before its first mutation");
-    assert!(error.contains("character delete cascade"));
-    assert!(error.contains("Unsupported"));
-    assert!(!storage.has_json_writers());
+    assert_eq!(
+        storage.capability(storage_backend::BackendCapability::CharacterCommands),
+        storage_backend::CapabilityStatus::Supported,
+        "CharacterCommands must be SQLite-native after Gate 4 P1-4"
+    );
+    assert_eq!(
+        storage.capability(storage_backend::BackendCapability::ImportExport),
+        storage_backend::CapabilityStatus::Supported,
+        "ImportExport must be SQLite-native after Gate 4 P1-4"
+    );
+    assert!(
+        !storage.has_json_writers(),
+        "SQLite facade must not own JSON writers"
+    );
 }
 
 fn make_test_character(name: &str) -> Character {
