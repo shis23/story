@@ -134,17 +134,28 @@ pub fn cardstudio_create_from_novel(
 /// C path: open an existing imported character as a revise CardProject.
 ///
 /// `character_id` may be CharacterStore id or domain source_character_id.
+///
+/// 走 facade（双后端等价）：`storage().get_character` 对 JSON 直查 CharacterStore、
+/// 对 SQLite 走 `characters` 表，行为与 `list_characters`/`get_character` 命令一致；
+/// 不得在 SQLite 激活时直连 JSON-only 的 `json_character_store`，否则命令会失败。
 #[tauri::command]
 pub fn cardstudio_create_from_character(
     character_id: String,
     brief: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let character_store = state.json_character_store(
-        crate::storage_backend::BackendCapability::CharacterCommands,
-        "create Card Studio project from character",
-    )?;
-    let stored = resolve_stored_character(character_store, &character_id)?;
+    state
+        .storage()
+        .require_supported(
+            crate::storage_backend::BackendCapability::CharacterCommands,
+            "create Card Studio project from character",
+        )
+        .map_err(TauriCommandError::validation)?;
+    let stored = state
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let character = crate::stored_info_to_character(&stored);
 
     // Ensure tool_ctx has it (best effort) so later extract/import paths stay consistent.
@@ -167,21 +178,6 @@ pub fn cardstudio_create_from_character(
     get_card_studio_store()
         .insert(project)
         .map_err(TauriCommandError::storage)
-}
-
-fn resolve_stored_character(
-    store: &crate::storage::CharacterStore,
-    character_id: &str,
-) -> Result<crate::storage::StoredCharacter, TauriCommandError> {
-    if let Some(s) = store.get(character_id) {
-        return Ok(s);
-    }
-    // fallback: match source_character_id
-    store
-        .list()
-        .into_iter()
-        .find(|s| s.info.source_character_id.as_deref() == Some(character_id))
-        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
 }
 
 #[tauri::command]

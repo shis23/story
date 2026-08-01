@@ -198,13 +198,24 @@ impl TurnStore {
     /// JSON 路径 campaign 删除级联用：turns.json 与 CampaignStore 分开持久化，
     /// SQLite 由 `delete_campaign_cascade` 单事务级联删除，本方法仅 JSON 使用。
     /// 无 Turn 时不写盘（幂等 no-op）。
+    ///
+    /// 写盘失败时回滚内存快照（与 `mutate_if` 同款），避免内存已删 / 文件未删的
+    /// 分裂态——否则调用方拿到 `Err` 后重试会漏删，或误判 campaign 已清空
+    /// （审查跟进 P2）。
     pub fn delete_turns_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
         let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
         let before = turns.len();
+        // 先快照删除前的内存状态——persist 失败时用它回滚，保持内存与磁盘一致
+        // （磁盘因 atomic_write 未残留任何内容，故仍是删除前的内容）。
+        let snapshot = turns.clone();
         turns.retain(|t| &t.campaign_id != campaign_id);
         let deleted = before - turns.len();
-        if deleted > 0 {
-            persist_turns(&self.turns_path, &turns)?;
+        if deleted > 0
+            && let Err(error) = persist_turns(&self.turns_path, &turns)
+        {
+            // 回滚内存：恢复删除前快照，避免内存已删 / 文件未删的分裂态。
+            *turns = snapshot;
+            return Err(error);
         }
         Ok(deleted)
     }
@@ -551,5 +562,53 @@ mod tests {
         // Reopen from same dir
         let store2 = TurnStore::new(&dir);
         assert!(store2.get_active_turn(&Id::from_str("camp-1")).is_some());
+    }
+
+    /// 审查跟进 P2：写盘失败时内存必须回滚，避免「内存已删 / 文件未删」分裂态。
+    /// 用 write_fence 冻结 turns.json 路径注入 persist 失败（atomic_write 对冻结路径
+    /// 返回 PermissionDenied），断言返回 Err 且内存仍保留删除前的 Turn、磁盘也未变。
+    #[test]
+    fn delete_turns_for_campaign_rolls_back_in_memory_when_persist_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-turn-store-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = TurnStore::new(&dir);
+        let campaign_id = Id::from_str("camp-fail");
+        let mut record = make_record("camp-fail");
+        // Committed 让 get_active_turn 不冲突，且仍会被 delete 按 campaign 删除。
+        record.status = TurnStatus::Committed;
+        let turn_id = record.turn_id.clone();
+        store.create_turn(record).unwrap();
+        assert!(store.get_turn(&turn_id).is_some());
+        let turns_path = dir.join("turns.json");
+        drop(store);
+
+        // 冻结 turns.json：persist_turns → atomic_write 返回 PermissionDenied。
+        storyforge_infra_util::write_fence::freeze(&turns_path);
+
+        let frozen_store = TurnStore::new(&dir);
+        let result = frozen_store.delete_turns_for_campaign(&campaign_id);
+        assert!(
+            result.is_err(),
+            "delete should fail when persist is fenced, got {result:?}"
+        );
+
+        // 内存回滚：Turn 仍在内存中（未被删除）。
+        assert!(
+            frozen_store.get_turn(&turn_id).is_some(),
+            "in-memory turn must be restored after persist failure"
+        );
+        // 磁盘也未被改动（删除未生效）。
+        let reopened = TurnStore::new(&dir);
+        assert!(
+            reopened.get_turn(&turn_id).is_some(),
+            "on-disk turn must be unchanged after persist failure"
+        );
+
+        // 解冻并清理。
+        storyforge_infra_util::write_fence::unfreeze(&turns_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

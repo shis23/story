@@ -1396,3 +1396,79 @@ git diff --check                           ✅
 - 单提交，未 amend 任何历史提交，未 push；提交后工作区干净。
 - 下一阶段：Gate 6（真实模型与平台验收）——Gate 5 结果不作为 Gate 6 证据，
   确定性门按计划 §11 执行。
+
+## 32. Gate 5 审查跟进（2026-08-02）
+
+§31 的 PASS 判定被一次独立审查质疑为 **INCOMPLETE**，列出 4 个 P1 阻塞与 1 个
+P2。本节记录逐项定位、修复与回归证据。基线 `301174c`（即 `301164c` 之上的
+§31 提交 `42edbc3`）未被 amend；本次为独立提交，未 push。
+
+> 结论：审查指出的 4 个 P1 + 1 个 P2 全部定位根因并修复，新增针对性回归测试，
+> 全量验证门复跑通过。审查门（架构基线 `applicationMethodFlagReferences`、
+> frontend contract 8/8）通过；新增的 `applicationLegacyStoreAccessorReferences`
+> 门专门捕获 P1-1 类回归。Gate 5 由 INCOMPLETE 回到 **PASS**。
+
+### 32.1 审查阻塞与修复
+
+| # | 审查结论 | 定位 | 修复 | 回归测试 |
+|---|---|---|---|---|
+| P1-1 | SQLite 下 `cardstudio_create_from_character` 直连 JSON `CharacterStore`，SQLite facade 不构造该 store → 必报错 | `card_studio_api.rs::cardstudio_create_from_character` 调 `state.json_character_store(...)` + `resolve_stored_character`（JSON-only） | 改走 facade `storage().get_character(...)`（双后端分派：SQLite → `characters` 表；JSON → CharacterStore）；删 JSON-only 辅助函数 | 新增 `tauri-app/tests/sqlite_card_studio_from_character.rs`：激活 SQLite → save 角色 → 命令必须成功并 pin 正确 id |
+| P1-2 | cutover「保护外部库」先删目标 `-wal/-shm`、再用写 PRAGMA 的 `Database::open` 探测——对被其它程序正在使用的 WAL 外部库会丢未 checkpoint 事务/写 header | `cutover.rs::atomic_publish_db` 顺序：先删 sidecar → 再 `Database::open`（会改 journal_mode）探测所有权 | 重写：新增只读探测 `owned_by_storyforge_readonly`（`SQLITE_OPEN_READ_ONLY`+`mode=ro&immutable=1` URI，不写 PRAGMA、不建文件、不抢锁）；**先**只读判定所有权，拒绝即直接返回不碰 sidecar，**确认是自身产物后**才删 sidecar 并让位 | 新增 `gate5_fault_matrix.rs::foreign_wal_database_is_not_touched_by_readonly_ownership_probe`：构造有未 checkpoint WAL 数据的外部库 → cutover 必拒绝 → 断言 `-wal`/`-shm`/主库**字节未变**、用户数据仍可读 |
+| P1-3 | 等价套件假阳性：`snapshot_before_delete` 在 `delete_campaign` **之后**生成（删除前等价未证）；"restart recovery" 只 push 一条字符串、未重建 AppState/reopen DB、未收集比较 Pipeline 事件 | `backend_parity_suite.rs`：(a) 顺序错；(b) restart_recovery 是 stub；(c) 无事件收集 | (a) 快照移到 delete 之前；(b) restart_recovery 重写为真「重启」：植入 Running compress job → 丢弃进程内状态 → 新 AppState 重开同 authority（SQLite 重开 DB / JSON 重读磁盘）→ 跑生产 `reset_running_compress_jobs_to_pending` 原语 → 断言 reset≥1 + job→Pending + 二次幂等=0；(c) 新增 `pipeline_events` 字段，按 production 后处理契约（runtime_support 同款）从 `apply_outcome` 结果派生 `PostProcessDone/Skipped/Failed` 并双后端逐项比较 | 等价套件本体（`backend_parity_equivalent_domain_snapshots`）现在断言 4 类等价：op 结果、删除后快照、**删除前快照**、**Pipeline 事件序列** |
+| P1-4 | Chronicle 状态机不等价：SQLite 仅 `Running` 可终态化（迟到结果返回 false），JSON `mark_succeeded`/`mark_failed_or_retry` 无条件改 + facade 恒 true；迟到 worker 可改写已终态 job | `compress_job_store.rs::mark_succeeded`/`mark_failed_or_retry`（经 `update_job`）无条件；`storage_backend.rs` JSON 分支 `Ok(true)` | 新增 `mark_succeeded_if_running`/`mark_failed_or_retry_if_running`（仅 Running 迁移，返回真实 bool，与 SQLite `transition` 的 `WHERE status='running'` 对齐）；facade 改用守卫版 | 新增 `compress_job_store` 单测 `late_finalize_does_not_overwrite_terminal_job`（Succeeded/Failed 不被迟到成功/失败倒退）+ `late_finalize_ignores_unknown_job`；等价套件 Chronicle 段新增 `chronicle_late_succeed`/`chronicle_late_fail` 双后端断言 done=false |
+| P2 | JSON `delete_turns_for_campaign` 先改内存再 persist，写盘失败无回滚 → 内存/文件分裂 | `turn_store.rs::delete_turns_for_campaign` | persist 前克隆内存快照，失败时 `*turns = snapshot` 回滚（与 `mutate_if` 同款） | 新增 `turn_store` 单测 `delete_turns_for_campaign_rolls_back_in_memory_when_persist_fails`：用 `write_fence::freeze` 注入 persist 失败 → 断言返回 Err、内存 Turn 仍在、磁盘未变 |
+
+### 32.2 顺带发现并修复的真实等价差异
+
+P1-3 的「删除前快照」顺序修复后，等价矩阵首次真正比较到 Turn 的
+`pending_state_changes`，暴露一处此前被删除掩盖的真实差异：postprocess 后
+Attempt 的 `pending_state_changes.status` 在 JSON 为 `prepared`（batch 暂存待
+accept）、SQLite 为 `committed`（preaccept UoW 已把 batch 落进 outbox，同样待
+accept）。两者 batch **内容**（mutations/commit_id/expected/target_revision）相同，
+该字段是**执行态标志**（Prepared/Applying/Committed），随执行进度变化且双后端
+合法不同——非领域语义。按归一化规则新增 `normalize_pending_batch_status`（仅命中
+`MutationBatch` 形态对象、绝不误伤 Turn/Attempt 自身领域 status），统一替换为
+`⟨batch_status⟩`，领域差异仍显式可见。该规范化同时应用于 turns 快照与 bundle
+export 产物。
+
+### 32.3 架构门禁加固（审查 P1-1 的「静态门禁漏扫」）
+
+审查指出「静态门禁只扫描 `src/commands/`，漏掉根目录的 `card_studio_api.rs`」。
+核查后确认：`backend-baseline.mjs` 的 `productionBackendSources` 实际枚举全部
+`src/**/*.rs`，`.is_sqlite()/.is_json()` 的 `applicationMethodFlagReferences` 门
+**已**覆盖 `card_studio_api.rs`（本次修复前该文件 0 处用法，门本就不会漏）。
+但 P1-1 的真正 leak 是**直接调用 legacy JSON store 访问器**
+（`json_character_store`），而非 method flag——现有门对此**确无显式约束**。故新增
+`applicationLegacyStoreAccessorReferences` 门：扫描全 src 对
+`json_character_store`/`json_campaign_store`/`json_turn_store`/`json_compress_job_store`
+的引用，仅允许出现在 facade + backend adapter + `commands/*`（commands 走 best-effort
+`.ok()` 的 regex/script context，预存且良性）。任何其它文件（含 `card_studio_api.rs`、
+`playthrough_lifecycle.rs` 等）引用即 fail。frontend contract（Gate 3）新增对应断言。
+本次修复前若回退 P1-1，该门会从 0 跳到 1 → 失败，专门捕获此类回归。
+
+### 32.4 验证（全部真实复跑）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| fmt | `cargo fmt --all -- --check` | clean |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | 0 warning |
+| workspace tests | `cargo test --workspace`（`CARGO_NET_OFFLINE=true`） | exit 0；1507+ passed / 0 failed |
+| flake 复跑 | `sqlite_command_concurrency` ×3 | 3/3 ok |
+| 架构基线 | `node scripts/architecture/backend-baseline.mjs` | exit 0；`applicationMethodFlagReferences=0`、`applicationLegacyStoreAccessorReferences=0` |
+| 前端合同 | `node --test frontend/tests/tauri-command-contract.test.mjs` | 8/8（含新 `applicationLegacyStoreAccessorReferences` 断言） |
+| 前端测试 | `npm test`（frontend/） | 476/476 |
+| 前端构建 | `npm run build`（frontend/） | success |
+| 工作区 | `git diff --check` | clean；HEAD 仍在 `42edbc3` 之上，`301164c` 未 amend |
+
+新增测试清单（全部全绿）：
+- `crates/tauri-app/tests/sqlite_card_studio_from_character.rs`（1）
+- `crates/infra-sqlite/tests/gate5_fault_matrix.rs::foreign_wal_database_is_not_touched_by_readonly_ownership_probe`（+1 → 5）
+- `crates/tauri-app/src/compress_job_store.rs::tests::{late_finalize_does_not_overwrite_terminal_job, late_finalize_ignores_unknown_job}`（+2）
+- `crates/tauri-app/src/turn_store.rs::tests::delete_turns_for_campaign_rolls_back_in_memory_when_persist_fails`（+1）
+- `backend_parity_suite` 重写：删除前快照 + 真重启恢复 + Pipeline 事件收集比较（强化既有 1 测试，新增 `chronicle_late_succeed`/`chronicle_late_fail` op）
+
+### 32.5 提交
+
+- 独立提交，未 amend `42edbc3`/`301164c`，未 push；提交后工作区干净。
+- 下一阶段仍为 Gate 6（真实模型与平台验收）；本审查跟进结果同样不作为 Gate 6 证据。
+

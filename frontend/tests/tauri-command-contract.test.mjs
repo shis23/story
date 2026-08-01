@@ -38,6 +38,12 @@ test('Gate 3 records the shrinking ambient SQLite branch surface', () => {
   // else (mirrors the Rust static whitelist test).
   assert.equal(baseline.sqlite.applicationMethodFlagReferences, 0)
   assert.ok(baseline.sqlite.facadeMethodFlagReferences > 0)
+  // Gate 5 review-followup: direct legacy JSON store accessors
+  // (json_character_store / json_campaign_store / json_turn_store /
+  // json_compress_job_store) are confined to the facade + backend adapter.
+  // Anywhere else (commands, card_studio_api, playthrough, …) is a backend-
+  // policy leak that silently breaks the command under SQLite authority.
+  assert.equal(baseline.sqlite.applicationLegacyStoreAccessorReferences, 0)
   // Gate 4: the four SQLite-unsupported marker families
   // (ensure_json_meta_backend_supported / ensure_typed_patch_backend_supported /
   // "sqlite backend skips" / "unsupported until an atomic SQLite Meta UoW")

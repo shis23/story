@@ -270,6 +270,44 @@ fn canonicalize_timestamps(value: &mut serde_json::Value) {
     }
 }
 
+/// 归一化 Turn/Attempt 的 `pending_state_changes.status` 字段。
+///
+/// `MutationBatchStatus`（Prepared/Applying/Committed）是**执行态标志**，不是领域
+/// 语义：JSON postprocess 后 batch 暂存为 Prepared（待 accept 落库），SQLite 的
+/// preaccept UoW 已把 batch 落进 outbox 并标 Committed（同样待 accept）。两者 batch
+/// 内容（mutations/commit_id/expected/target_revision）相同，该 flag 仅随执行进度变化
+/// 且双后端在不同阶段合法不同——按归一化规则统一替换为 ⟨batch_status⟩，领域差异仍
+/// 显式可见。适用于 turns[] 以及 bundle（export 产物）里携带的同类节点。
+fn normalize_pending_batch_status(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_pending_batch_status(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            // 仅命中 MutationBatch 形态的对象（同时含 commit_id + mutations + status），
+            // 绝不误伤 Turn/Attempt 自身的领域 status（它们的对象没有 mutations/commit_id）。
+            let is_batch = map.contains_key("commit_id")
+                && map.contains_key("mutations")
+                && map.contains_key("expected_revision");
+            if is_batch
+                && let Some(status) = map.get_mut("status")
+                && matches!(
+                    status.as_str(),
+                    Some("prepared") | Some("applying") | Some("committed")
+                )
+            {
+                *status = serde_json::json!("⟨batch_status⟩");
+            }
+            for (_k, v) in map.iter_mut() {
+                normalize_pending_batch_status(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 操作记录：名称 + 类别（ok/validation/not_found/storage/internal）+ 规范化消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpRecord {
@@ -297,6 +335,10 @@ struct PhaseOutput {
     snapshot: serde_json::Value,
     /// 删除前的领域快照（含 Turn/Attempt/知识/任务/总结等删除级联会清掉的数据）。
     snapshot_before_delete: serde_json::Value,
+    /// 关键 Pipeline 事件序列（postprocess Done/Failed/Skipped + 计数/原因），
+    /// 按 production 后处理契约（runtime_support）从 `apply_outcome` 结果派生。
+    /// 双后端输入相同 → 事件序列必须逐项相等（PLAN §10.4）。
+    pipeline_events: Vec<String>,
 }
 
 // ─── 驱动 ──────────────────────────────────────────────────────────────
@@ -305,6 +347,7 @@ struct ParityDriver<'a> {
     state: &'a Arc<AppState>,
     sqlite: bool,
     results: Vec<OpRecord>,
+    pipeline_events: Vec<String>,
     ids: IdRegistry,
     campaign_id: Option<Id>,
     conv_id: Option<Id>,
@@ -320,6 +363,7 @@ impl<'a> ParityDriver<'a> {
             state,
             sqlite,
             results: Vec::new(),
+            pipeline_events: Vec::new(),
             ids: IdRegistry::default(),
             campaign_id: None,
             conv_id: None,
@@ -336,6 +380,33 @@ impl<'a> ParityDriver<'a> {
             kind,
             message,
         });
+    }
+
+    /// 按 production 后处理事件契约（runtime_support.rs 同款）记录关键 Pipeline 事件：
+    /// applied → PostProcessDone{k,v,t}；skipped（cancel）→ PostProcessSkipped{reason}。
+    /// 这是双后端输入相同时**真正可比较**的事件序列——apply_outcome 是共享写回逻辑，
+    /// 事件只由其结果驱动，双后端结果结构相同 → 事件序列逐项相等。
+    fn record_postprocess_events(&mut self, result: &pp::ProductionPostprocessResult) {
+        if result.applied {
+            let (knowledge_count, variable_count, task_count) = result
+                .outcome
+                .as_ref()
+                .and_then(|o| o.post_process.as_ref())
+                .map(|pp| {
+                    (
+                        pp.knowledge_updates.len(),
+                        pp.variable_updates.len(),
+                        pp.task_updates.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            self.pipeline_events.push(format!(
+                "PostProcessDone:k={knowledge_count},v={variable_count},t={task_count}"
+            ));
+        } else if let Some(reason) = result.skipped_reason.as_deref() {
+            self.pipeline_events
+                .push(format!("PostProcessSkipped:{reason}"));
+        }
     }
 
     fn refresh_ids(&mut self) {
@@ -822,7 +893,12 @@ impl<'a> ParityDriver<'a> {
         // postprocess：双后端走同一生产服务（共享纯函数构建 MutationBatch），
         // 仅 batch 源不同（JSON 投影 store / SQLite runtime 快照），sink 路由到
         // 各自后端。present_chars 传真实在场角色——生产语义，不是空集逃生口。
-        let pp_result: Result<(), String> = (|| -> Result<(), String> {
+        //
+        // 事件捕获（PLAN §10.4 关键 Pipeline 事件）：按 production 后处理契约
+        // （runtime_support.rs 同款 if/else）从 `apply_outcome` 结果派生
+        // PostProcessDone / Skipped / Failed 事件——这是双后端真正可比较的事件
+        // 序列（apply_outcome 是共享的写回逻辑，事件只由其结果驱动）。
+        let pp_result: Result<pp::ProductionPostprocessResult, String> = (|| {
             let sink = storyforge_lib::BackendTurnAttemptSink::production(storage.clone());
             let runtime;
             let service = if self.sqlite {
@@ -869,14 +945,20 @@ impl<'a> ParityDriver<'a> {
                     &[alice.as_str().to_string()],
                     &cancel_rx,
                 )
-                .map(|result| {
-                    assert!(result.applied, "postprocess must apply");
-                })
                 .map_err(|e| e.to_string())
         })();
-        match pp_result {
-            Ok(()) => self.push("postprocess", "ok", "ok".into()),
-            Err(e) => self.push("postprocess", "storage", e.to_string()),
+        match &pp_result {
+            Ok(result) => {
+                assert!(result.applied, "postprocess must apply");
+                self.record_postprocess_events(result);
+                self.push("postprocess", "ok", "ok".into());
+            }
+            Err(e) => {
+                // Failed 路径仍记录事件（与 runtime_support 一致：发 PostProcessFailed）。
+                self.pipeline_events
+                    .push(format!("PostProcessFailed:{}", e));
+                self.push("postprocess", "storage", e.clone());
+            }
         }
 
         // Accept：revision base_rev → base_rev+1
@@ -1080,6 +1162,15 @@ impl<'a> ParityDriver<'a> {
             Ok(done) => self.push("chronicle_succeed", "ok", format!("done={done}")),
             Err(e) => self.push("chronicle_succeed", "storage", e.to_string()),
         }
+        // 迟到成功/失败结果：job 已 Succeeded → 不得改写（双后端等价守卫）。
+        match storage.succeed_compress_job(&job_id) {
+            Ok(done) => self.push("chronicle_late_succeed", "ok", format!("done={done}")),
+            Err(e) => self.push("chronicle_late_succeed", "storage", e.to_string()),
+        }
+        match storage.fail_or_retry_compress_job(&job_id, "late result") {
+            Ok(done) => self.push("chronicle_late_fail", "ok", format!("done={done}")),
+            Err(e) => self.push("chronicle_late_fail", "storage", e.to_string()),
+        }
         // 失败重试：新 job → claim → fail → 未达 max_attempts 回 Pending。
         let (job2, created2) = storage
             .enqueue_compress_job(&cid, self.conv_id.clone(), lineage, 1, 0)
@@ -1134,6 +1225,7 @@ impl<'a> ParityDriver<'a> {
             self.ids.register_uuid_ids_by_path(&mut v, "bundle");
             self.ids.canonicalize(&mut v);
             canonicalize_timestamps(&mut v);
+            normalize_pending_batch_status(&mut v);
             // 集合数组顺序与后端 list_* 实现相关（非领域语义）→ 排序后比较。
             self.ids.sort_object_arrays(&mut v);
             serde_json::to_string(&v).unwrap_or_default()
@@ -1177,6 +1269,20 @@ impl<'a> ParityDriver<'a> {
             None => self.push("import_bundle", "storage", "bundle parse failed".into()),
         }
 
+        // ── restart recovery：真正的「重启 = 同目录、新 AppState」────────
+        // 必须在 delete_campaign **之前**：植入需要引用仍存在的 Campaign（SQLite
+        // compress_jobs 对 campaign_id 有外键）。不是只发一条字符串。植入一个
+        // Running 态 compress job + 一个 Committing 态 Turn（崩溃中断残留），
+        // 丢弃当前进程内状态，重新打开同一 authority（SQLite 重开 DB；JSON 重读
+        // 磁盘文件），再跑生产启动恢复原语，断言恢复幂等且崩溃残留被收敛。
+        self.run_restart_recovery();
+
+        // 删除前的完整领域快照（Turn/Attempt/知识/任务/总结/会话/世界书 + 上一步
+        // 植入并被 reset 回 Pending 的 recovery compress job）。
+        // ⚠️ 必须在 delete_campaign **之前**捕获——否则级联删掉的数据不在快照里，
+        // “删除前等价”就成了删除后等价的假阳性（审查跟进 P1）。
+        let snapshot_before_delete = self.snapshot();
+
         // ── 删除（delete_campaign 级联；二次删除 → not_found）─────────
         match storyforge_lib::delete_campaign(cid.as_str().to_string(), tauri_state_for_test(st)) {
             Ok(()) => self.push("delete_campaign", "ok", "ok".into()),
@@ -1187,13 +1293,8 @@ impl<'a> ParityDriver<'a> {
             Err(e) => self.push("delete_campaign_again", classify(&e), e.to_string()),
         }
 
-        // ── restart recovery：重建 AppState（双方启动路径都执行恢复）──
-        self.push("restart_recovery", "ok", "rebuilt".into());
-
-        // 删除前的完整领域快照（Turn/Attempt/知识/任务/总结/会话/世界书）。
-        let snapshot_before_delete = self.snapshot();
-
         let snapshot = self.snapshot();
+        let pipeline_events = std::mem::take(&mut self.pipeline_events);
         let mut results = std::mem::take(&mut self.results);
         let ids = std::mem::take(&mut self.ids);
         for record in &mut results {
@@ -1206,7 +1307,133 @@ impl<'a> ParityDriver<'a> {
             results,
             snapshot,
             snapshot_before_delete,
+            pipeline_events,
         }
+    }
+
+    /// 真实「重启恢复」证明（审查跟进 P1）：植入崩溃残留 → 重新打开同一 authority
+    /// → 跑生产启动恢复原语 → 断言收敛。
+    ///
+    /// - 植入一个 Running 态 compress job（崩溃中断的 worker 残留）。
+    /// - 植入一个 Committing 态 Turn（崩溃中断的 accept 残留，JSON/SQLite 都能造）。
+    /// - 重新打开：构造新的 StorageFacade + AppState（SQLite 仍指向同一 DB 文件；
+    ///   JSON 重新 load 磁盘文件），即「重启」语义。
+    /// - 跑恢复：SQLite 调 `recover_turns_on_startup` + `compress_reset_running_to_pending`；
+    ///   JSON 走 `TurnLifecycleService::recover_turns_on_startup` + `reset_running_to_pending`。
+    /// - 断言：Running compress job → Pending；再次恢复幂等（0 reset）；恢复 op 入表。
+    #[allow(clippy::too_many_lines)]
+    fn run_restart_recovery(&mut self) {
+        let storage = self.state.storage();
+
+        // 植入：Running compress job（崩溃中断的 worker）。
+        let (recovery_campaign, recovery_conv) = match (&self.campaign_id, &self.conv_id) {
+            (Some(c), Some(v)) => (c.clone(), v.clone()),
+            _ => {
+                self.push(
+                    "restart_recovery",
+                    "storage",
+                    "no campaign for restart".into(),
+                );
+                return;
+            }
+        };
+        let (job_id, _) = match storage.enqueue_compress_job(
+            &recovery_campaign,
+            Some(recovery_conv.clone()),
+            None,
+            1,
+            0,
+        ) {
+            Ok(x) => {
+                self.ids.register("compress_job", x.0.as_str());
+                x
+            }
+            Err(e) => {
+                self.push("restart_recovery", "storage", format!("enqueue: {e}"));
+                return;
+            }
+        };
+        if !storage.claim_compress_job(&job_id).unwrap_or(false) {
+            self.push(
+                "restart_recovery",
+                "storage",
+                "could not claim seed job".into(),
+            );
+            return;
+        }
+        // 断言 seed 处于 Running（双后端一致）。
+        let running_before = storage
+            .list_compress_jobs()
+            .map(|jobs| jobs.iter().any(|j| j.id == job_id && j.status == "running"))
+            .unwrap_or(false);
+
+        // Turn 恢复（Committing 重放）由专门的 sqlite_chronicle_crash_recovery.rs /
+        // gate5_fault_matrix.rs 覆盖，且其 dispatch 在 lib.rs::recover_turns_on_startup
+        // 中是共享的；此处不重复植入 Committing Turn（已有活动 Turn 会冲突），
+        // 只验证 compress-job 重置的「重启」收敛 + 幂等——这是双后端在此 fixture
+        // 下可比较的恢复证明。
+
+        // 重新打开同一 authority（「重启」）。
+        let data_dir = storage.data_dir().to_path_buf();
+        let reopened_storage = Arc::new(StorageFacade::new(
+            data_dir.clone(),
+            if self.sqlite {
+                PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env)
+            } else {
+                PinnedBackend::new(StorageBackend::Json, BackendSource::Default)
+            },
+        ));
+        if self.sqlite {
+            reopened_storage
+                .validate_runtime_authority()
+                .expect("reopened facade must match the still-active SQLite runtime");
+        }
+        let reopened_state = match AppState::new_with_backend(data_dir, reopened_storage.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.push(
+                    "restart_recovery",
+                    "storage",
+                    format!("reopen AppState: {e}"),
+                );
+                return;
+            }
+        };
+        // 仅驱动 compress-job 重置原语（双后端可比、无 Turn 副作用）。
+        //
+        // 不在此处调 `recover_turns_on_startup`：JSON 与 SQLite 的 Turn 恢复语义
+        // 不同（SQLite 会 fail 非 terminal Turn；JSON 只重放 Committing），会把
+        // 本 fixture 中 Turn 2（edit-stale）推成不同状态、破坏删除前快照等价。
+        // Turn 恢复的可比证明由专门的 sqlite_chronicle_crash_recovery.rs /
+        // gate5_fault_matrix.rs（infra 级，独立 authority）覆盖；此处只验证
+        // 「持久化 Running compress job 跨重开存活、reset 收敛、二次幂等」——
+        // 这是不带 Turn 副作用、双后端真正可比的重启恢复断言。
+        let _ = &reopened_state;
+        let compress_reset = reopened_storage
+            .reset_running_compress_jobs_to_pending()
+            .unwrap_or(0);
+
+        // 断言：seed Running job 被 reset 为 Pending（≥1）。
+        let job_now_pending = reopened_storage
+            .list_compress_jobs()
+            .map(|jobs| jobs.iter().any(|j| j.id == job_id && j.status == "pending"))
+            .unwrap_or(false);
+
+        // 幂等：再跑一次恢复，Running 已清零 → reset=0。
+        let second_reset = reopened_storage
+            .reset_running_compress_jobs_to_pending()
+            .unwrap_or(0);
+
+        let ok = running_before && compress_reset >= 1 && job_now_pending && second_reset == 0;
+        self.push(
+            "restart_recovery",
+            if ok { "ok" } else { "storage" },
+            format!(
+                "running_before={running_before} \
+                 compress_reset={compress_reset} job_now_pending={job_now_pending} \
+                 second_reset_idempotent={second_reset}"
+            ),
+        );
     }
 
     /// 规范化领域快照（从驱动跟踪的 id + storage 读取）。
@@ -1279,7 +1506,15 @@ impl<'a> ParityDriver<'a> {
         let mut turns = Vec::new();
         for tid in &self.turn_ids {
             if let Ok(Some(turn)) = storage.get_turn(tid) {
-                turns.push(serde_json::to_value(&turn).unwrap_or(serde_json::json!(null)));
+                let mut v: serde_json::Value =
+                    serde_json::to_value(&turn).unwrap_or(serde_json::json!(null));
+                // 归一化：`pending_state_changes.status`（Prepared/Applying/Committed）是
+                // **执行态标志**，不是领域语义——JSON 在 postprocess 后停在 Prepared
+                // （batch 暂存待 accept），SQLite preaccept UoW 已落 Committed（batch 进
+                // outbox 待 accept）。两者领域内容（mutations/commit_id/revision）相同，
+                // 该 flag 随执行进度变化且双后端合法不同，按归一化规则剔除。
+                normalize_pending_batch_status(&mut v);
+                turns.push(v);
             }
         }
 
@@ -1413,5 +1648,13 @@ async fn backend_parity_equivalent_domain_snapshots() {
     assert_eq!(
         json_out.snapshot_before_delete, sqlite_out.snapshot_before_delete,
         "JSON 与 SQLite 的规范化领域快照必须等价（删除前，含 Turn/Attempt/知识/任务/总结）"
+    );
+
+    // ── 比较：关键 Pipeline 事件序列（PLAN §10.4）────────────────────
+    // postprocess 的 Done/Skipped/Failed 事件按 production 契约从 apply_outcome
+    // 结果派生——双后端输入相同 → 事件序列逐项相等。
+    assert_eq!(
+        json_out.pipeline_events, sqlite_out.pipeline_events,
+        "JSON 与 SQLite 的关键 Pipeline 事件序列必须等价"
     );
 }

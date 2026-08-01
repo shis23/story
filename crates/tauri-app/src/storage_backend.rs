@@ -403,24 +403,26 @@ impl StorageFacade {
     }
 
     /// 成功完成：Running → Succeeded。返回是否发生了转换。
+    ///
+    /// 双后端等价（Gate 5）：仅 Running 可终态化，迟到/并发 worker 不得改写已
+    /// 终态化的 job。SQLite `transition` 用 `WHERE status='running'` 守卫；JSON
+    /// 走 `mark_succeeded_if_running`（同守卫）。两者返回真实布尔，不再恒 true。
     pub fn succeed_compress_job(&self, job_id: &Id) -> Result<bool, String> {
         if self.is_sqlite() {
             sqlite_runtime::compress_mark_succeeded(job_id)
         } else {
             let store = self.json_compress_job_store("succeed chronicle compression")?;
-            store.mark_succeeded(job_id)?;
-            Ok(true)
+            store.mark_succeeded_if_running(job_id)
         }
     }
 
-    /// 失败：未达 max_attempts 回 Pending（可重试），否则 Failed。
+    /// 失败：未达 max_attempts 回 Pending（可重试），否则 Failed。仅 Running 可迁移。
     pub fn fail_or_retry_compress_job(&self, job_id: &Id, err: &str) -> Result<bool, String> {
         if self.is_sqlite() {
             sqlite_runtime::compress_mark_failed_or_retry(job_id, err)
         } else {
             let store = self.json_compress_job_store("fail chronicle compression")?;
-            store.mark_failed_or_retry(job_id, err)?;
-            Ok(true)
+            store.mark_failed_or_retry_if_running(job_id, err)
         }
     }
 
@@ -450,6 +452,22 @@ impl StorageFacade {
         };
         jobs.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         Ok(jobs)
+    }
+
+    /// 启动恢复原语（双后端公开入口）：把崩溃中断残留的 Running compress job
+    /// reset 回 Pending，便于 worker 重放。SQLite 走 V006 表的单事务 UPDATE；
+    /// JSON 走 CompressJobStore::reset_running_to_pending。返回被重置的数量。
+    ///
+    /// Gate 5 重启恢复证明（审查跟进）：测试可经此公开入口驱动「重启」恢复，
+    /// 不必触达 `pub(crate)` 的 legacy store 句柄。
+    pub fn reset_running_compress_jobs_to_pending(&self) -> Result<usize, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::compress_reset_running_to_pending()
+        } else {
+            Ok(self
+                .json_compress_job_store("reset running compress jobs")?
+                .reset_running_to_pending())
+        }
     }
 
     pub fn get_active_turn(

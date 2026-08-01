@@ -245,6 +245,80 @@ fn empty_file_at_cutover_target_is_refused_not_silently_replaced() {
     }
 }
 
+// ─── 3b. 外部 WAL 数据库：所有权探测必须只读、不改 sidecar ───────────────
+//
+// 审查跟进 P1：原实现先用写 PRAGMA 的 Database::open 探测、且在探测之前删
+// -wal/-shm，对「被其它程序正在使用、有未 checkpoint 事务的外部 WAL 库」会
+// 丢数据/写 header。修复后必须满足：拒绝覆盖；-wal sidecar 与用户数据原样保留。
+
+#[test]
+fn foreign_wal_database_is_not_touched_by_readonly_ownership_probe() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+
+    // 构造一个**有未 checkpoint WAL 数据**的外部数据库（无 schema_migrations
+    // 表，因此不是 StoryForge）。用 rusqlite 直接建表并写一行——WAL 模式下，
+    // 关闭连接前未 checkpoint 的事务会落在 -wal sidecar 里。
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE user_data (id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO user_data (note) VALUES ('precious wal row');",
+        )
+        .unwrap();
+        // 故意不 checkpoint：让 -wal 携带事务。
+        let wal = db_path.with_extension("sqlite3-wal");
+        assert!(wal.exists(), "WAL sidecar must exist after writes");
+        let _ = wal; // borrow only
+    }
+    let wal_path = db_path.with_extension("sqlite3-wal");
+    let shm_path = db_path.with_extension("sqlite3-shm");
+    let wal_before = fs::read(&wal_path).unwrap_or_default();
+    let shm_before = fs::read(&shm_path).unwrap_or_default();
+    let db_before = fs::read(&db_path).unwrap();
+
+    // run_cutover 必须拒绝（无关数据库，非 StoryForge）。
+    let err = run_cutover(&request(dir.path()))
+        .expect_err("cutover must refuse to overwrite a foreign WAL database");
+    assert!(
+        err.to_string().contains("non-StoryForge"),
+        "error must explain the refusal, got: {err}"
+    );
+
+    // 关键断言：-wal / -shm / 主库字节未变——只读探测 + 不删 sidecar。
+    assert_eq!(
+        fs::read(&wal_path).unwrap_or_default(),
+        wal_before,
+        "-wal sidecar must be untouched"
+    );
+    assert_eq!(
+        fs::read(&shm_path).unwrap_or_default(),
+        shm_before,
+        "-shm sidecar must be untouched"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        db_before,
+        "main db bytes must be untouched"
+    );
+
+    // 用户数据仍可读（WAL + 主库未被破坏）。
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let note: String = conn
+        .query_row("SELECT note FROM user_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(note, "precious wal row");
+    drop(conn);
+
+    // 无 marker；JSON 仍权威。
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert!(dir.path().join("campaigns.json").exists());
+}
+
 // ─── 4. pre-accept outbox 日志跨重启存活 + 恢复再次 fail 未完成 Turn ─────
 
 #[test]

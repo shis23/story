@@ -138,6 +138,32 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
     .filter(([name]) => methodFlagWhitelist.includes(name))
     .reduce((sum, [, count]) => sum + count, 0)
   sqlite.methodFlagReferencesByFile = Object.fromEntries(methodFlagFiles)
+  // Direct legacy JSON store accessors (json_character_store / json_campaign_store /
+  // json_turn_store / json_compress_job_store) must be confined to:
+  //   - the facade + named backend adapter (methodFlagWhitelist), and
+  //   - commands/* (which only use them via best-effort `.ok()` for regex/script
+  //     context that degrades gracefully under SQLite — pre-existing, benign).
+  // Anywhere else (card_studio_api, playthrough_lifecycle, runtime_support, …)
+  // is a backend-policy leak: it makes the path JSON-only and silently breaks
+  // under SQLite authority (Gate 5 review-followup: cardstudio_create_from_character
+  // previously called json_character_store directly and failed under SQLite).
+  const legacyStoreAccessorPattern =
+    /\.json_(?:character|campaign|turn|compress_job)_store\b/g
+  const legacyAccessorFiles = new Map()
+  for (const { filePath, source } of productionBackendSources) {
+    const count = (source.match(legacyStoreAccessorPattern) ?? []).length
+    if (count > 0)
+      legacyAccessorFiles.set(
+        path.relative(backendSourceRoot, filePath).replaceAll('\\', '/'),
+        count,
+      )
+  }
+  const legacyAccessorAllowed = (name) =>
+    methodFlagWhitelist.includes(name) || name.startsWith('commands/')
+  sqlite.applicationLegacyStoreAccessorReferences = [...legacyAccessorFiles.entries()]
+    .filter(([name]) => !legacyAccessorAllowed(name))
+    .reduce((sum, [, count]) => sum + count, 0)
+  sqlite.legacyStoreAccessorReferencesByFile = Object.fromEntries(legacyAccessorFiles)
   const crates = [...cargoSource.matchAll(/^\s*"(crates\/[^"\r\n]+)"\s*,?\s*$/gm)].map(
     (match) => match[1],
   )

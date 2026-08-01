@@ -827,29 +827,29 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
         ));
     }
 
-    // Remove stale WAL/SHM sidecar files before publish.
-    for sidecar in ["-wal", "-shm"] {
-        let path = format!("{}{sidecar}", final_path.display());
-        let _ = fs::remove_file(&path);
-    }
-
     // If a final DB already exists (re-publish after partial failure),
     // move it aside. JSON is still authoritative at this point.
     if final_path.exists() {
         // 只允许让位「上次中断发布的自身产物」（带 storyforge schema 迁移）；
         // 无关/损坏的既有数据库必须 fail closed——绝不静默让新 authority 顶替
         // 用户数据（无 marker 不意味着目标文件可以被覆盖）。
-        let ours = Database::open(final_path)
-            .ok()
-            .and_then(|db| crate::migrations::current_version(&db).ok())
-            .unwrap_or(0)
-            >= 1;
-        if !ours {
+        //
+        // ⚠️ 顺序很关键：必须**先**用**只读、不修改 PRAGMA** 的方式判定所有权，
+        // 任何失败直接返回；确认是自身产物后再删除 -wal/-shm sidecar 并改名让位。
+        // 否则若目标是被其它程序**正在使用**的 WAL 数据库，先删 sidecar 会丢
+        // 未 checkpoint 的事务，而用会改 journal_mode 的 open 去探测外部库会写
+        // 入它的 header（破坏数据）。审查跟进 P1。
+        if !owned_by_storyforge_readonly(final_path)? {
             return Err(SqliteError::Other(format!(
                 "refusing to overwrite existing non-StoryForge database at {}; \
                  move or delete it to proceed",
                 final_path.display()
             )));
+        }
+        // 所有权确认（自身上次中断发布的产物）：现在可以安全清理 sidecar。
+        for sidecar in ["-wal", "-shm"] {
+            let path = format!("{}{sidecar}", final_path.display());
+            let _ = fs::remove_file(&path);
         }
         let backup_name = format!(
             "{}.pre-publish-{}.sqlite3",
@@ -864,12 +864,66 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
             .unwrap_or_else(|| Path::new("."))
             .join(&backup_name);
         fs::rename(final_path, &aside)?;
+    } else {
+        // No existing final DB: stale sidecars from a long-gone DB are safe to
+        // clear now that we know there is no live database holding them.
+        for sidecar in ["-wal", "-shm"] {
+            let path = format!("{}{sidecar}", final_path.display());
+            let _ = fs::remove_file(&path);
+        }
     }
 
     // Atomic rename: temp → final.
     fs::rename(temp, final_path)?;
 
     Ok(())
+}
+
+/// Read-only ownership probe: open the file with `SQLITE_OPEN_READONLY` (no
+/// `READ_WRITE`, no `CREATE`, **no PRAGMA writes**) and check for a
+/// StoryForge `schema_migrations` table whose version is >= 1.
+///
+/// This never mutates the target database: it cannot flip WAL mode, cannot
+/// create the file, and cannot truncate `-wal`/`-shm`. Any error (unreadable,
+/// not a database, locked) is treated as "not ours" so the caller fails
+/// closed rather than risking a foreign DB.
+fn owned_by_storyforge_readonly(path: &Path) -> Result<bool> {
+    use rusqlite::OpenFlags;
+    // SQLITE_OPEN_READ_WRITE must NOT be set: opening a WAL-mode DB read/write
+    // can checkpoint/rotate the -wal sidecar; opening foreign DBs read/write
+    // lets rusqlite's PRAGMA setup touch their header. Read-only is a pure
+    // probe. URI mode lets us pass `?mode=ro` and `nolock=1` so we do not
+    // contend on a live DB's locks either.
+    let uri = path
+        .to_str()
+        .ok_or_else(|| SqliteError::Other(format!("non-utf8 db path: {}", path.display())))?;
+    let uri = format!("file:{uri}?mode=ro&immutable=1");
+    let conn = match rusqlite::Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        // Cannot open read-only (locked / not a DB / foreign schema) → not ours.
+        Err(_) => return Ok(false),
+    };
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_table != 1 {
+        return Ok(false);
+    }
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    Ok(version >= 1)
 }
 
 /// Write the marker atomically (write to temp file, then rename).

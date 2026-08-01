@@ -1,7 +1,7 @@
 pub mod backend_workflows;
 pub mod campaign_store;
 mod card_shell_cache;
-mod card_studio_api;
+pub mod card_studio_api;
 mod card_studio_store;
 mod commands;
 mod compress_job_store;

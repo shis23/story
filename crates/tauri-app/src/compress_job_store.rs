@@ -233,6 +233,53 @@ impl CompressJobStore {
         })
     }
 
+    /// 终态化**仅当 job 仍处于 Running**：迟到/并发 worker 不得改写已被其它
+    /// worker 终态化的 job。与 SQLite `SqliteCompressJobRepository::transition`
+    /// （`WHERE status='running'`）状态机对齐——Gate 5 等价矩阵。
+    ///
+    /// 返回 `Ok(true)` 表示发生了转换；`Ok(false)` 表示 job 不在 Running
+    /// （已被终态化或不存在/状态不匹配），调用方不得再改。
+    pub fn mark_succeeded_if_running(&self, job_id: &Id) -> Result<bool, String> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+            return Ok(false);
+        };
+        if j.status != CompressJobStatus::Running {
+            return Ok(false);
+        }
+        j.status = CompressJobStatus::Succeeded;
+        j.last_error = None;
+        j.updated_at = now_iso();
+        persist(&self.path, &jobs)?;
+        Ok(true)
+    }
+
+    /// 失败回队，**仅当 job 仍处于 Running**（与 SQLite 一致）。迟到结果不得
+    /// 把已 Succeeded/Failed 的 job 倒退回 Pending。返回是否发生转换。
+    pub fn mark_failed_or_retry_if_running(
+        &self,
+        job_id: &Id,
+        err: impl Into<String>,
+    ) -> Result<bool, String> {
+        let err = err.into();
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+            return Ok(false);
+        };
+        if j.status != CompressJobStatus::Running {
+            return Ok(false);
+        }
+        j.last_error = Some(err);
+        if j.attempts >= j.max_attempts {
+            j.status = CompressJobStatus::Failed;
+        } else {
+            j.status = CompressJobStatus::Pending;
+        }
+        j.updated_at = now_iso();
+        persist(&self.path, &jobs)?;
+        Ok(true)
+    }
+
     fn update_job(&self, job_id: &Id, f: impl FnOnce(&mut CompressJob)) -> Result<(), String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
         let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
@@ -348,6 +395,84 @@ mod tests {
             .unwrap();
         store.mark_succeeded(&job.id).unwrap();
         assert!(!store.try_claim_pending(&job.id).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Gate 5 等价（审查跟进 P1）：迟到 worker 不得改写已被其它 worker 终态化的
+    // job——与 SQLite `transition`/`mark_failed_or_retry` 的 `WHERE status='running'`
+    // 守卫对齐。`mark_succeeded_if_running` / `mark_failed_or_retry_if_running`
+    // 必须对非 Running 返回 false 且不改状态。
+    #[test]
+    fn late_finalize_does_not_overwrite_terminal_job() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store
+            .enqueue_or_get_open(&camp, None, None, 200, 0)
+            .unwrap();
+        // 正常路径：claim → succeed。
+        assert!(store.try_claim_pending(&job.id).unwrap());
+        assert!(store.mark_succeeded_if_running(&job.id).unwrap());
+        // 迟到成功结果：job 已 Succeeded → 不再迁移，状态不变。
+        assert!(!store.mark_succeeded_if_running(&job.id).unwrap());
+        assert_eq!(
+            store
+                .list_all()
+                .into_iter()
+                .find(|j| j.id == job.id)
+                .unwrap()
+                .status,
+            CompressJobStatus::Succeeded
+        );
+        // 迟到失败结果也不能把 Succeeded 倒退回 Pending/Failed。
+        assert!(
+            !store
+                .mark_failed_or_retry_if_running(&job.id, "late boom")
+                .unwrap()
+        );
+
+        // 另一 job：claim → fail(retry) → 再 claim → fail(retry) … → failed 终态。
+        let (job2, _) = store.enqueue_or_get_open(&camp, None, None, 1, 0).unwrap();
+        for _ in 0..DEFAULT_COMPRESS_JOB_MAX_ATTEMPTS {
+            assert!(store.try_claim_pending(&job2.id).unwrap());
+            assert!(
+                store
+                    .mark_failed_or_retry_if_running(&job2.id, "boom")
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            store
+                .list_all()
+                .into_iter()
+                .find(|j| j.id == job2.id)
+                .unwrap()
+                .status,
+            CompressJobStatus::Failed
+        );
+        // 迟到成功结果不能复活已 Failed 的 job。
+        assert!(!store.mark_succeeded_if_running(&job2.id).unwrap());
+        assert_eq!(
+            store
+                .list_all()
+                .into_iter()
+                .find(|j| j.id == job2.id)
+                .unwrap()
+                .status,
+            CompressJobStatus::Failed
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn late_finalize_ignores_unknown_job() {
+        let (dir, store) = temp_store();
+        let unknown = Id::from_str("nope");
+        assert!(!store.mark_succeeded_if_running(&unknown).unwrap());
+        assert!(
+            !store
+                .mark_failed_or_retry_if_running(&unknown, "x")
+                .unwrap()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
