@@ -1138,5 +1138,55 @@ character` 收集受影响 Campaign/会话时用 `if let Ok` / `.ok()` 忽略错
 `unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
 `npm test` 476/476 / `npm run build` / `git diff --check`。
 
+### 30.16 Gate 4 九审修复（2026-08-01）
+
+> 八审判定 INCOMPLETE（1 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 JSON 多角色落盘失败后内存未回滚（属实）**：`CharacterStore::
+update_world_info_entries_bulk_multi` 直接锁内修改 `self.inner` 的 `Vec`，
+再 `persist`；写盘失败（磁盘/权限）返回错误，但内存角色已被改写——"命令报告
+失败、当前进程看到新值、重启后回退旧值"的分裂状态。
+- 修复：改为**候选副本**模式——克隆 `chars` 为 `candidate`，在候选副本上校验
+  存在性、统一修改、`persist(&candidate)`；`persist` 成功后才用 `*chars = candidate`
+  替换 `self.inner`。写盘失败时内存与文件都保持原值。
+- 测试：`bulk_multi_world_info_json_persist_failure_keeps_memory_and_file_unchanged`
+  ——用 `write_fence::freeze` 冻结 `characters.json` 路径使 `atomic_write` 返回
+  PermissionDenied（确定性故障，与"磁盘不可写"同类），断言：错误返回、`list()`
+  内存两角色均保持旧条目、文件字节不变；解冻后成功路径两角色都收到新条目。
+  **已验红**（stash 还原旧实现 → 内存显示 `["patched content"]`、断言失败），
+  判别力成立。
+
+**P2 门禁守卫识别仍较宽松（属实）**：旧 `enclosing_command_fn` 用 `\nfn ` /
+`\n    fn ` 文本回溯，识别不了 `pub(crate) async fn` 等完整签名（可能框到错误
+函数）；`has_guard` 又把**任意** `json_campaign_store` 出现视为守卫——若命令只
+调用了 Supported 能力的 `json_campaign_store`（如 CampaignRead）会误放行。
+- 修复：
+  - `is_fn_signature_line`：完整签名识别（`pub(crate)/pub(super)/pub` +
+    `async` + `fn name(`），`enclosing_command_fn` 改为行级定位函数起止。
+  - `has_unsupported_capability_guard`：**去空白后**匹配，具体 capability 必须是
+    Unsupported 集合（`CampaignLifecycle` / `CardCommands` /
+    `KnowledgeTaskCommands` / `VariableCommands`）之一，或显式
+    `!= CapabilityStatus::Supported` + return Err——多行调用
+    （`json_campaign_store_owned(\n BackendCapability::CardCommands,`）也能识别。
+  - `scan_character_store_direct_connections`：把扫描逻辑抽成纯函数，violation
+    带函数名 + 行号 + capability，便于定位。
+- 测试：`gate_guard_recognizes_unsupported_capability_guards` 判别力——构造三个
+  命令片段：`unguarded_async`（`pub(crate) async fn` 下 Supported 能力直连无守卫，
+  **必须抓出**）、`guarded_explicit`（`capability(...) != Supported` + return Err
+  守卫，**放行**）、`guarded_via_campaign` / `guarded_via_require`
+  （`json_campaign_store_owned(CardCommands)` / `require_supported(CardCommands)`
+  守卫，**放行**）。**已验红**（旧逻辑脚本模拟 → 找不到 `pub(crate) async fn`
+  签名直接漏检 `NO_FUNCTION_FOUND`；新逻辑正确抓出）。
+  - 递归门禁 `character_commands_supported_must_never_touch_json_character_store`
+    改用 `scan_character_store_direct_connections`，命令层真实调用点全通过。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings`（0 警告）/ `cargo test --workspace`
+（全绿，408 lib）/ **12 个 sqlite 集成测试**全过 / `backend-baseline.mjs`
+（`commandAttributes=175`、`registered=175`、`unsupported: []`、
+`applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
+`npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

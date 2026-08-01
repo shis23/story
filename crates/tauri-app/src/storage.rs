@@ -225,19 +225,25 @@ impl CharacterStore {
     /// 与 `update_world_info_entries_bulk` 不同，本方法在**一次持久化**内修改
     /// 全部目标角色——任一步失败（角色不存在）不改任何角色、不写盘，杜绝
     /// “前几个角色已更新、后一个失败”的部分提交。
+    ///
+    /// Gate 4 八审 P1：在**候选副本**上修改并持久化，`persist` 成功后才用候选
+    /// 副本替换 `self.inner`——若 `persist` 因磁盘/权限失败返回错误，内存与文件
+    /// 都保持原值，不会出现“命令报告失败、当前进程看到新值、重启后回退旧值”
+    /// 的分裂状态。
     pub fn update_world_info_entries_bulk_multi(
         &self,
         entries: &[(String, Vec<crate::WorldInfoEntryInfo>)],
     ) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        // 先校验全部角色存在（失败则整体不改），再统一修改。
+        // 先校验全部角色存在（失败则整体不改），再在候选副本上统一修改。
         for (id, _) in entries.iter() {
             if !chars.iter().any(|c| c.id == *id) {
                 return Err(format!("角色卡不存在: {id}"));
             }
         }
+        let mut candidate = chars.clone();
         for (id, new_entries) in entries.iter() {
-            let char = chars
+            let char = candidate
                 .iter_mut()
                 .find(|c| c.id == *id)
                 .expect("existence pre-checked");
@@ -245,7 +251,9 @@ impl CharacterStore {
             char.info.world_info_count = char.info.world_info_entries.len();
             char.info.has_world_info = !char.info.world_info_entries.is_empty();
         }
-        self.persist(&chars)?;
+        self.persist(&candidate)?;
+        // 持久化成功后才替换内存态。
+        *chars = candidate;
         Ok(())
     }
 

@@ -118,6 +118,140 @@ fn character_detail_resolves_the_card_source_character_id() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Gate 4 八审 P1：JSON 多角色批量更新在 `persist` 失败时，**内存与文件都必须
+/// 保持原值**。
+///
+/// 旧缺陷：`update_world_info_entries_bulk_multi` 直接锁内修改 `self.inner`，
+/// 再 `persist`；写盘失败（磁盘/权限）返回错误，但内存角色已被改写——"命令报告
+/// 失败、当前进程看到新值、重启后回退旧值"的分裂状态。修复后改为候选副本上
+/// 修改并持久化，成功后才替换 `self.inner`。
+///
+/// 故障注入：`write_fence` 冻结 `characters.json` 路径使 `atomic_write` 返回
+/// PermissionDenied——与"磁盘不可写"同类的确定性故障。断言错误返回、`list()`
+/// 内存与原文件都保持旧条目；解冻后成功路径两角色都收到新条目。
+#[test]
+fn bulk_multi_world_info_json_persist_failure_keeps_memory_and_file_unchanged() {
+    let dir = std::env::temp_dir().join(format!(
+        "storyforge_test_bulk_multi_rollback_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = storage::CharacterStore::new(&dir);
+    let path = dir.join("characters.json");
+
+    let mut alpha = CharacterInfo::from(&make_test_character("Alpha"));
+    alpha.world_info_entries = vec![WorldInfoEntryInfo {
+        keys: vec!["alpha_old".into()],
+        content: "alpha old content".into(),
+        constant: false,
+        route: "Selective".into(),
+        is_global: false,
+        depth: 2,
+        order: 100,
+    }];
+    let mut beta = CharacterInfo::from(&make_test_character("Beta"));
+    beta.world_info_entries = vec![WorldInfoEntryInfo {
+        keys: vec!["beta_old".into()],
+        content: "beta old content".into(),
+        constant: false,
+        route: "Selective".into(),
+        is_global: false,
+        depth: 2,
+        order: 100,
+    }];
+    let alpha_stored = store.save(alpha).unwrap();
+    let beta_stored = store.save(beta).unwrap();
+    let file_before = std::fs::read_to_string(&path).unwrap();
+
+    // ─── 故障注入：冻结 characters.json 使 persist 返回 PermissionDenied ───
+    storyforge_infra_util::write_fence::freeze(&path);
+    let new_entries = vec![WorldInfoEntryInfo {
+        keys: vec!["patched".into()],
+        content: "patched content".into(),
+        constant: true,
+        route: "Constant".into(),
+        is_global: true,
+        depth: 2,
+        order: 100,
+    }];
+    let err = store
+        .update_world_info_entries_bulk_multi(&[
+            (alpha_stored.id.clone(), new_entries.clone()),
+            (beta_stored.id.clone(), new_entries.clone()),
+        ])
+        .expect_err("persist failure must propagate");
+    assert!(
+        !err.is_empty(),
+        "error must carry the persist failure reason, got: {err}"
+    );
+    assert!(
+        err.contains("写栅栏") || err.contains("write fence") || err.contains("冻结"),
+        "error must reference the frozen-path write refusal, got: {err}"
+    );
+
+    // ─── 内存保持原值 ───
+    let in_memory = store.list();
+    for stored in &in_memory {
+        assert_eq!(
+            stored.info.world_info_entries.len(),
+            1,
+            "in-memory world info entries must be unchanged after failed persist: {}",
+            stored.info.name
+        );
+        assert!(
+            stored
+                .info
+                .world_info_entries
+                .iter()
+                .any(|e| e.content
+                    == format!("{} old content", stored.info.name.to_ascii_lowercase())),
+            "in-memory {} must keep its OLD entry after failed persist, got {:?}",
+            stored.info.name,
+            stored.info.world_info_entries
+        );
+        assert!(
+            !stored
+                .info
+                .world_info_entries
+                .iter()
+                .any(|e| e.content == "patched content"),
+            "in-memory {} must NOT see the patched entry after failed persist",
+            stored.info.name
+        );
+    }
+    // ─── 文件保持原值（未被 .tmp 或目标改写）───
+    let file_after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        file_after, file_before,
+        "JSON file must be byte-identical after failed persist (no partial write)"
+    );
+
+    // ─── 解冻后成功路径：两角色都收到新条目 ───
+    assert!(
+        storyforge_infra_util::write_fence::unfreeze(&path),
+        "fence must have been active"
+    );
+    store
+        .update_world_info_entries_bulk_multi(&[
+            (alpha_stored.id.clone(), new_entries.clone()),
+            (beta_stored.id.clone(), new_entries.clone()),
+        ])
+        .expect("success path after unfreeze");
+    for stored in &store.list() {
+        assert!(
+            stored
+                .info
+                .world_info_entries
+                .iter()
+                .any(|e| e.content == "patched content"),
+            "{} must receive the patched entry on success, got {:?}",
+            stored.info.name,
+            stored.info.world_info_entries
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn stored_world_info_both_route_restores_constant_and_selective_semantics() {
     let mut info = CharacterInfo::from(&make_test_character("Active Card"));
@@ -1719,87 +1853,267 @@ fn collect_command_rust_files() -> Vec<(String, String)> {
     files
 }
 
-/// 定位 `json_character_store` 调用行所在函数体（向上回溯到最近的函数/命令
-/// 起点），返回函数体文本（用于守卫检查）。
-fn enclosing_command_fn(source: &str, call_line_start: usize) -> Option<&str> {
-    // 向上找最近的 `fn ` 起始行或 tauri command 属性起始行。
-    let before = &source[..call_line_start];
-    let last_fn = before
-        .rfind("\nfn ")
-        .or_else(|| before.rfind("\n    fn "))?;
-    let fn_start = before[..last_fn].rfind("\n").map(|i| i + 1).unwrap_or(0);
-    let fn_line_start = fn_start;
-    // 函数体从 fn 行到下一个顶层 fn / 下一个 tauri command 属性 / 测试 mod。
+/// Unsupported 能力集合：SQLite 下 `require_supported` 对这些能力 fail-closed，
+/// 命令整体不可用。命令层若需直连 JSON CharacterStore，函数体必须被其中任一
+/// 能力的守卫 fail-closed——否则是“声称 Supported 却静默读 JSON”的漏网。
+const GATE_UNSUPPORTED_CAPABILITIES: &[&str] = &[
+    "CampaignLifecycle",
+    "CardCommands",
+    "KnowledgeTaskCommands",
+    "VariableCommands",
+];
+
+/// 判断一行是否为 Rust 函数签名（支持 `pub(crate) async fn` / `async fn` /
+/// `pub fn` / impl 方法等完整签名）。这是 Gate 4 八审 P2 的修复核心：旧实现只
+/// 匹配 `\nfn `/`\n    fn `，无法识别 `pub(crate) async fn` 等签名，导致向上
+/// 回溯框到错误函数。
+fn is_fn_signature_line(line: &str) -> bool {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix("pub(crate) ")
+        .or_else(|| t.strip_prefix("pub(super) "))
+        .or_else(|| t.strip_prefix("pub "))
+        .unwrap_or(t);
+    let t = t.strip_prefix("async ").unwrap_or(t);
+    t.starts_with("fn ") && t.contains('(')
+}
+
+/// 提取包含 `call_start` 的命令/函数体（完整 Rust 签名定位）。
+///
+/// 行级扫描：向上找最近一条函数签名行作为函数起点，向下到下一个函数签名 /
+/// 下一个 tauri command 属性 / `#[cfg(test)]` 作为函数终点。定位失败返回 None。
+fn enclosing_command_fn(source: &str, call_start: usize) -> Option<&str> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut line_offsets = Vec::with_capacity(lines.len());
+    let mut off = 0;
+    for l in &lines {
+        line_offsets.push(off);
+        off += l.len();
+    }
+    let call_line = line_offsets.iter().rposition(|&o| o <= call_start)?;
+    let sig_line = (0..=call_line)
+        .rev()
+        .find(|&i| is_fn_signature_line(lines[i]))?;
     // 注：`tauri` 与 `command` 分开拼接，避免本文件出现会被架构基线
     // （backend-baseline.mjs 的 extractCommandAttributes）计数的字面属性文本。
     let command_attr = format!("#[{}]", "tauri::command");
-    let rest = &source[call_line_start..];
-    let next_fn = rest.find("\nfn ").or_else(|| rest.find("\n    fn "));
-    let next_command = rest.find(&command_attr);
-    let end = match (next_fn, next_command) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => rest.len(),
+    let mut end_line = lines.len();
+    for (i, l) in lines.iter().enumerate().skip(sig_line + 1) {
+        if is_fn_signature_line(l) || l.contains(&command_attr) || l.contains("#[cfg(test)]") {
+            end_line = i;
+            break;
+        }
+    }
+    let body_start = line_offsets[sig_line];
+    let body_end = if end_line < lines.len() {
+        line_offsets[end_line]
+    } else {
+        source.len()
     };
-    Some(&source[fn_line_start..call_line_start + end])
+    Some(&source[body_start..body_end])
+}
+
+/// 去除全部空白（换行/空格/制表）——多行调用 `json_campaign_store_owned(\n
+/// BackendCapability::CardCommands,` 归一成连续文本，便于守卫前缀匹配。
+fn strip_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 函数体是否被 Unsupported 能力守卫 fail-closed（SQLite 下命令整体不可用）。
+///
+/// Gate 4 八审 P2：旧 `has_guard` 把**任意** `json_campaign_store` 出现都视为
+/// 守卫——若命令只调用了 Supported 能力的 `json_campaign_store`（如 CampaignRead），
+/// 会误放行。这里校验具体 capability 必须是 Unsupported 集合之一，或显式
+/// `!= CapabilityStatus::Supported` + return Err。去空白后再匹配，因此真实代码里
+/// 的多行调用（campaigns.rs 的 `json_campaign_store_owned(\n
+/// BackendCapability::CardCommands,`）也能被识别为守卫。
+fn has_unsupported_capability_guard(body: &str) -> bool {
+    let b = strip_ws(body);
+    for cap in GATE_UNSUPPORTED_CAPABILITIES {
+        for prefix in [
+            "json_campaign_store_owned(BackendCapability::",
+            "json_campaign_store_owned(storage_backend::BackendCapability::",
+            "json_campaign_store_owned(crate::storage_backend::BackendCapability::",
+            "json_campaign_store(BackendCapability::",
+            "json_campaign_store(storage_backend::BackendCapability::",
+            "json_campaign_store(crate::storage_backend::BackendCapability::",
+            "require_supported(BackendCapability::",
+            "require_supported(storage_backend::BackendCapability::",
+            "require_supported(crate::storage_backend::BackendCapability::",
+            "capability(BackendCapability::",
+            "capability(storage_backend::BackendCapability::",
+        ] {
+            if b.contains(&format!("{prefix}{cap}")) {
+                return true;
+            }
+        }
+    }
+    // 显式 capability(X) != Supported + return Err 形态（如 campaigns.rs 的
+    // create/fork/delete campaign 前置守卫）。
+    if b.contains("!=CapabilityStatus::Supported")
+        && b.contains("returnErr(TauriCommandError::validation")
+    {
+        return true;
+    }
+    false
+}
+
+/// 从函数签名行提取函数名（用于 violation 报告定位）。输入 `is_fn_signature_line`
+/// 已确保该行是函数签名；从最后一个 `fn ` 后到第一个 `(` 取标识符。
+fn function_name_from_signature(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let after_fn = t.rfind("fn ")? + 3;
+    let rest = &t[after_fn..];
+    let name = rest.split(['(', ' ']).next()?;
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// 提取 `json_character_store` 调用点的 capability 变体名（如 `CharacterCommands`）。
+fn capability_of_json_character_store_call(source: &str, call_start: usize) -> Option<String> {
+    let after = &source[call_start + "json_character_store".len()..];
+    let open = after.find('(')? + 1;
+    let comma = after[open..].find(',')?;
+    let arg = after[open..open + comma].trim();
+    let ident = arg.rsplit("::").next()?.trim();
+    Some(ident.to_string())
+}
+
+/// 单文件门禁扫描：返回违规描述列表（空 = 该文件无直连违规）。
+fn scan_character_store_direct_connections(source: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = source[search_from..].find("json_character_store") {
+        let abs = search_from + rel;
+        search_from = abs + 1;
+        if source[abs..].starts_with("json_character_store_owned") {
+            continue; // 构造 writer 的 facade 方法，非命令层直连。
+        }
+        // 向后扫到语句结束：若在 `;` 前遇到 `.ok()`（跨行容错），放行。
+        let stmt_end = source[abs..]
+            .find(';')
+            .map(|i| abs + i)
+            .unwrap_or(source.len());
+        let stmt = &source[abs..stmt_end];
+        if stmt.contains(".ok()") || stmt.contains(".expect(") {
+            continue; // 容错/测试形态，SQLite 下取 None 走降级或显式处理。
+        }
+        let cap = capability_of_json_character_store_call(source, abs).unwrap_or_default();
+        // Unsupported 能力调用点自身 `require_supported` fail-closed → 放行。
+        if GATE_UNSUPPORTED_CAPABILITIES.contains(&cap.as_str()) {
+            continue;
+        }
+        // Supported 能力调用点：命令函数体必须被 Unsupported 能力守卫整体
+        // fail-closed（SQLite 下命令不可用），否则是"声称 Supported 却静默读 JSON"。
+        let body = enclosing_command_fn(source, abs);
+        let has_guard = body.map(has_unsupported_capability_guard).unwrap_or(false);
+        if !has_guard {
+            let line_no = source[..abs].matches('\n').count() + 1;
+            let line = source[abs..]
+                .find('\n')
+                .map(|i| source[abs..abs + i].to_string())
+                .unwrap_or_else(|| source[abs..].to_string());
+            let fn_name = body
+                .and_then(|b| {
+                    b.split_inclusive('\n')
+                        .find(|l| is_fn_signature_line(l))
+                        .and_then(|l| function_name_from_signature(l))
+                })
+                .unwrap_or("?");
+            violations.push(format!(
+                "fn {fn_name} line {line_no}: json_character_store({cap}) 直连无 \
+                 Unsupported 能力守卫——SQLite 下 Supported 能力或未 fail-closed 的路径\
+                 直连 JSON store 必失败: {line}"
+            ));
+        }
+    }
+    violations
 }
 
 #[test]
 fn character_commands_supported_must_never_touch_json_character_store() {
-    let mut violations: Vec<String> = Vec::new();
+    let mut all_violations: Vec<String> = Vec::new();
     for (name, source) in collect_command_rust_files() {
-        // 找每个 json_character_store 调用起点。
-        let mut call_starts: Vec<usize> = Vec::new();
-        let mut search_from = 0;
-        while let Some(rel) = source[search_from..].find("json_character_store") {
-            let abs = search_from + rel;
-            search_from = abs + 1;
-            if source[abs..].starts_with("json_character_store_owned") {
-                continue; // 构造 writer 的 facade 方法，非命令层直连。
-            }
-            call_starts.push(abs);
-        }
-        for call_start in call_starts {
-            // 向后扫到语句结束：若在 `;` 前遇到 `.ok()`（跨行容错），放行。
-            let stmt_end = source[call_start..]
-                .find(';')
-                .map(|i| call_start + i)
-                .unwrap_or(source.len());
-            let stmt = &source[call_start..stmt_end];
-            if stmt.contains(".ok()") || stmt.contains(".expect(") {
-                continue; // 容错/测试形态，SQLite 下取 None 走降级或显式处理。
-            }
-            // 所在函数体必须有能力 fail-closed 守卫。判定（Gate 4 七审 P2）：
-            // `require_supported(CharacterCommands)` **不算**守卫——CharacterCommands
-            // 在 SQLite 下 Supported，require_supported 通过后仍会落到 json_
-            // character_store 直连。真正的守卫是函数体含 `json_campaign_store`
-            // 调用（内部对 CardCommands/CampaignLifecycle 等 Unsupported 能力
-            // fail-closed，SQLite 下命令整体不可用、不会静默读 JSON），或显式
-            // `!= CapabilityStatus::Supported` + return Err。
-            let has_guard = enclosing_command_fn(&source, call_start)
-                .map(|body| {
-                    body.contains("json_campaign_store")
-                        || (body.contains("!= CapabilityStatus::Supported")
-                            && body.contains("return Err(TauriCommandError::validation"))
-                })
-                .unwrap_or(false);
-            if !has_guard {
-                let line_no = source[..call_start].matches('\n').count() + 1;
-                let line = source[call_start..]
-                    .find('\n')
-                    .map(|i| source[call_start..call_start + i].to_string())
-                    .unwrap_or_else(|| source[call_start..].to_string());
-                violations.push(format!(
-                    "{name} (line {line_no}): json_character_store 直连无能力守卫——\
-                     SQLite 下 Supported 能力或未 fail-closed 的路径直连 JSON store 必失败: {line}"
-                ));
-            }
+        for v in scan_character_store_direct_connections(&source) {
+            all_violations.push(format!("{name}: {v}"));
         }
     }
     assert!(
-        violations.is_empty(),
+        all_violations.is_empty(),
         "命令层直连 JSON CharacterStore 违规：\n{}",
-        violations.join("\n")
+        all_violations.join("\n")
+    );
+}
+
+/// Gate 4 八审 P2 判别力测试：改进后的守卫识别器必须能抓出"声称 Supported 却
+/// 静默读 JSON"的漏网命令。
+///
+/// - `unguarded_async`：`pub(crate) async fn` 签名下 `json_character_store
+///   (CharacterCommands)` 无守卫直连——**必须抓出**。旧 `\nfn ` 文本匹配识别
+///   不了 `pub(crate) async fn` 完整签名，可能框到错误函数而漏检。
+/// - `guarded_explicit`：`capability(CampaignLifecycle) != Supported` + return Err
+///   前置守卫保护同一类直连——**放行**。
+/// - `guarded_via_campaign`：`json_campaign_store_owned(CardCommands)`（Unsupported
+///   能力）在直连前 fail-closed——**放行**。
+#[test]
+fn gate_guard_recognizes_unsupported_capability_guards() {
+    let command_attr = format!("#[{}]", "tauri::command");
+    let cmds = format!(
+        "// unguarded async Supported direct read\n\
+         {command_attr}\n\
+         pub(crate) async fn unguarded_async(state: tauri::State<'_, Arc<AppState>>) -> Result<(), TauriCommandError> {{\n\
+         \x20   let store = state.json_character_store(BackendCapability::CharacterCommands, \"async op\")?;\n\
+         \x20   let _ = store.list();\n\
+         \x20   Ok(())\n\
+         }}\n\
+         \n\
+         {command_attr}\n\
+         pub(crate) fn guarded_explicit(state: tauri::State<'_, Arc<AppState>>) -> Result<(), TauriCommandError> {{\n\
+         \x20   if state.storage().capability(BackendCapability::CampaignLifecycle) != CapabilityStatus::Supported {{\n\
+         \x20       return Err(TauriCommandError::validation(\"nope\".into()));\n\
+         \x20   }}\n\
+         \x20   let s = state.json_character_store(BackendCapability::CharacterCommands, \"op2\")?;\n\
+         \x20   let _ = s.list();\n\
+         \x20   Ok(())\n\
+         }}\n\
+         \n\
+         {command_attr}\n\
+         pub(crate) fn guarded_via_campaign(state: tauri::State<'_, Arc<AppState>>) -> Result<(), TauriCommandError> {{\n\
+         \x20   let _ = state.json_campaign_store_owned(\n\
+         \x20       BackendCapability::CardCommands,\n\
+         \x20       \"guarded\",\n\
+         \x20   )?;\n\
+         \x20   let s = state.json_character_store(BackendCapability::CharacterCommands, \"op3\")?;\n\
+         \x20   let _ = s.list();\n\
+         \x20   Ok(())\n\
+         }}\n\
+         \n\
+         {command_attr}\n\
+         pub(crate) fn guarded_via_require(state: tauri::State<'_, Arc<AppState>>) -> Result<(), TauriCommandError> {{\n\
+         \x20   state.storage().require_supported(\n\
+         \x20       BackendCapability::CardCommands,\n\
+         \x20       \"guarded by require_supported\",\n\
+         \x20   ).map_err(TauriCommandError::validation)?;\n\
+         \x20   let s = state.json_character_store(BackendCapability::CharacterCommands, \"op4\")?;\n\
+         \x20   let _ = s.list();\n\
+         \x20   Ok(())\n\
+         }}\n",
+    );
+
+    let violations = scan_character_store_direct_connections(&cmds);
+    // 只有 unguarded_async 应被抓出；两个被守卫的命令放行。
+    assert_eq!(
+        violations.len(),
+        1,
+        "exactly one unguarded command must be flagged, got: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("unguarded_async"),
+        "violation must point at the unguarded async command, got: {}",
+        violations[0]
+    );
+    assert!(
+        violations[0].contains("CharacterCommands"),
+        "violation must name the capability, got: {}",
+        violations[0]
     );
 }
