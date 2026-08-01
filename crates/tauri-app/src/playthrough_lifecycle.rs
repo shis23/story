@@ -305,17 +305,22 @@ mod tests {
             let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
                 let id_for_validation = switch_id.clone();
-                set_active_campaign_in_state(&switch_state, switch_id, move || {
-                    switch_entered_for_thread.wait();
-                    release_switch_for_thread.wait();
-                    if switch_store.get_campaign(&id_for_validation).is_some() {
-                        Ok(())
-                    } else {
-                        Err(TauriCommandError::not_found(
-                            "switch target disappeared during validation",
-                        ))
-                    }
-                })
+                set_active_campaign_in_state(
+                    &switch_state,
+                    switch_id,
+                    move || {
+                        switch_entered_for_thread.wait();
+                        release_switch_for_thread.wait();
+                        if switch_store.get_campaign(&id_for_validation).is_some() {
+                            Ok(())
+                        } else {
+                            Err(TauriCommandError::not_found(
+                                "switch target disappeared during validation",
+                            ))
+                        }
+                    },
+                    |_, _| {},
+                )
             });
 
             // The switch now owns the update lock and is paused inside its
@@ -411,17 +416,22 @@ mod tests {
             let release_switch_for_thread = Arc::clone(&release_switch);
             let switch = std::thread::spawn(move || {
                 let id_for_validation = switch_id.clone();
-                set_active_campaign_in_state(&switch_state, switch_id, move || {
-                    switch_entered_for_thread.wait();
-                    release_switch_for_thread.wait();
-                    if switch_store.get_campaign(&id_for_validation).is_some() {
-                        Ok(())
-                    } else {
-                        Err(TauriCommandError::not_found(
-                            "switch target disappeared during validation",
-                        ))
-                    }
-                })
+                set_active_campaign_in_state(
+                    &switch_state,
+                    switch_id,
+                    move || {
+                        switch_entered_for_thread.wait();
+                        release_switch_for_thread.wait();
+                        if switch_store.get_campaign(&id_for_validation).is_some() {
+                            Ok(())
+                        } else {
+                            Err(TauriCommandError::not_found(
+                                "switch target disappeared during validation",
+                            ))
+                        }
+                    },
+                    |_, _| {},
+                )
             });
 
             // Hold the update lock across the switch while deletion is

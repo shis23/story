@@ -715,7 +715,9 @@ pub struct AppState {
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
     pub active_campaign: Mutex<Option<Id>>,
     /// Serialize active Campaign switching with deletion and pointer persistence.
-    pub(crate) active_campaign_update: Mutex<()>,
+    /// Gate 4 六审 P1：独立 SQLite 并发测试需作为可控屏障持有该锁，以钉死
+    /// 删除/激活的危险窗口。公开的是锁句柄，无任何 backend 分派逻辑。
+    pub active_campaign_update: Mutex<()>,
     /// Turn/Attempt/Accept/Postprocess workflow adapters selected once at
     /// construction from the startup-pinned storage backend (Gate 3).
     pub turn_workflow: Arc<backend_workflows::TurnWorkflow>,
@@ -786,30 +788,42 @@ impl AppState {
             regex_scripts: vec![],
         }));
 
-        // 启动恢复：从 CharacterStore 把已导入的角色卡 + 世界书同步进 tool_ctx
+        // 启动恢复：从存储把已导入的角色卡 + 世界书同步进 tool_ctx
         // （否则每次重启 dev，tool_ctx 都是空的，写作时报"没有可用角色卡"）
-        // 世界书：最后一张卡的条目 + 所有其他卡的 is_global 条目（全局共享）
-        if let Some(store) = character_store.as_deref() {
-            let stored_chars = store.list();
-            if !stored_chars.is_empty() {
-                let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-                for stored in &stored_chars {
-                    ctx.characters
-                        .push(Arc::new(stored_info_to_character(stored)));
+        // 世界书：最后一张卡的条目 + 所有其他卡的 is_global 条目（全局共享）。
+        // Gate 4 六审 P1：JSON 走 CharacterStore；SQLite 走 facade
+        // `list_characters()`（V007 characters 表），否则 SQLite 重启后
+        // tool_ctx.characters 恒为空，写作运行时看不到已导入角色。
+        let stored_chars: Vec<storage::StoredCharacter> =
+            if let Some(store) = character_store.as_deref() {
+                store.list()
+            } else {
+                match storage.list_characters() {
+                    Ok(chars) => chars,
+                    Err(e) => {
+                        tracing::warn!("启动恢复：SQLite 角色库读取失败，tool_ctx 留空: {e}");
+                        Vec::new()
+                    }
                 }
-                // 最后一张作为当前角色，其条目全收；其他卡只收 is_global
-                if let Some(last) = stored_chars.last() {
-                    let active_name = &last.info.name;
-                    ctx.world_info = Some(Arc::new(collect_world_info_for_active(
-                        &stored_chars,
-                        active_name,
-                    )));
-                }
-                tracing::info!(
-                    "启动恢复：从存储载入 {} 张角色卡 + 世界书",
-                    stored_chars.len()
-                );
+            };
+        if !stored_chars.is_empty() {
+            let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            for stored in &stored_chars {
+                ctx.characters
+                    .push(Arc::new(stored_info_to_character(stored)));
             }
+            // 最后一张作为当前角色，其条目全收；其他卡只收 is_global
+            if let Some(last) = stored_chars.last() {
+                let active_name = &last.info.name;
+                ctx.world_info = Some(Arc::new(collect_world_info_for_active(
+                    &stored_chars,
+                    active_name,
+                )));
+            }
+            tracing::info!(
+                "启动恢复：从存储载入 {} 张角色卡 + 世界书",
+                stored_chars.len()
+            );
         }
 
         // 向量存储（持久化到 data/vectors.json）

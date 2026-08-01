@@ -739,35 +739,50 @@ pub fn set_active_campaign(
         None
     };
 
-    // 世界书已就绪，此刻才提交活跃指针（失败不改指针）。
-    set_active_campaign_in_state(state.inner().as_ref(), campaign_id.clone(), || {
-        if !state
-            .storage()
-            .campaign_exists(&campaign_id)
-            .map_err(TauriCommandError::internal)?
-        {
-            return Err(TauriCommandError::not_found(format!(
-                "找不到 campaign id={id}"
-            )));
-        }
-        Ok(())
-    })?;
-    if let Some(book) = prepared_book {
-        apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
-    }
+    // 世界书已就绪，此刻才提交活跃指针（失败不改指针）。tool_ctx 世界书写入
+    // 作为 after_commit 钩子在锁内执行（Gate 4 六审 P1：与指针提交原子，
+    // 删除线程无法在指针提交后、世界书写入前插入清指针）。
+    set_active_campaign_in_state(
+        state.inner().as_ref(),
+        campaign_id.clone(),
+        || {
+            if !state
+                .storage()
+                .campaign_exists(&campaign_id)
+                .map_err(TauriCommandError::internal)?
+            {
+                return Err(TauriCommandError::not_found(format!(
+                    "找不到 campaign id={id}"
+                )));
+            }
+            Ok(())
+        },
+        |state, id| {
+            if let Some(book) = prepared_book {
+                apply_campaign_world_info_to_tool_ctx(state, id, &book);
+            }
+        },
+    )?;
     Ok(())
 }
 
 /// Commit an active Campaign selection as one serialized update. The validator
-/// runs under the same lock so deletion cannot invalidate a selection between
-/// validation, pointer persistence and the in-memory commit.
-pub(crate) fn set_active_campaign_in_state<F>(
+/// and the `after_commit` hook run under the same lock so deletion cannot
+/// invalidate a selection between validation, pointer persistence, the
+/// in-memory commit and any follow-up state (e.g. tool_ctx world-info write).
+///
+/// Gate 4 六审 P1：`after_commit` 在锁内执行——激活命令写指针与写 tool_ctx
+/// 世界书成为一个原子单元，删除线程清指针必须等待整个提交完成，杜绝
+/// “指针已清空、旧 Campaign 世界书又被写回 tool_ctx”的悬挂状态。
+pub(crate) fn set_active_campaign_in_state<F, G>(
     state: &AppState,
     campaign_id: Id,
     validate: F,
+    after_commit: G,
 ) -> Result<(), TauriCommandError>
 where
     F: FnOnce() -> Result<(), TauriCommandError>,
+    G: FnOnce(&AppState, &Id),
 {
     let _update = state
         .active_campaign_update
@@ -781,7 +796,8 @@ where
     *state
         .active_campaign
         .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id);
+        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
+    after_commit(state, &campaign_id);
     Ok(())
 }
 

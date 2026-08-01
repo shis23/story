@@ -88,24 +88,10 @@ fn sqlite_command_lifecycle_active_set_and_character_delete() {
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate SQLite authority");
 
-    // ─── 0. 真实 SQLite AppState ─────────────────────────────────────────
-    // SQLite 已全局激活：AppState::new_with_backend 走 SQLite 分支
-    // （ConversationStore 挂 SqliteConversationPersistence，storage 分派到
-    // sqlite_runtime）。不触碰任何 JSON store。
-    let data_dir = temp.path().to_path_buf();
-    let storage = Arc::new(StorageFacade::new(
-        data_dir.clone(),
-        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
-    ));
-    storage
-        .validate_runtime_authority()
-        .expect("facade/runtime authority must match");
-    let state = Arc::new(
-        storyforge_lib::AppState::new_with_backend(data_dir.clone(), storage)
-            .expect("SQLite AppState must construct"),
-    );
-
-    // ─── 1. 种子：角色库角色（含 embedded 世界书模板）+ 卡 + Campaign ──
+    // ─── 0. 先种子角色（SQLite 角色库 V007），再构造 AppState ────────────
+    // Gate 4 六审 P1：AppState 构造时的启动恢复必须从 SQLite 角色库把已导入
+    // 角色同步进 tool_ctx——否则 SQLite 重启后 tool_ctx.characters 恒为空，
+    // 写作运行时看不到角色。因此种子必须先于 AppState 构造。
     // 角色 source 与卡 source 一致：set_active_campaign 经 resolve_character
     // _world_info_template 用 source 反查角色模板；delete_character 级联用
     // source 反查卡 → Campaign。
@@ -113,12 +99,10 @@ fn sqlite_command_lifecycle_active_set_and_character_delete() {
     let card_id = Id::new();
     let campaign_id = Id::new();
     {
+        // 种子前先建 facade（SQLite 已激活），种子写入直接走 sqlite_runtime。
         let book = book_with_entry("village");
         let info = sample_character_info("Elena", Some(source_id.as_str().to_string()), Some(book));
-        state
-            .storage()
-            .save_character(info)
-            .expect("save character");
+        sqlite_runtime::save_character(&info).expect("save character");
 
         // 卡：payload 走 save_card_payload（V001 character_cards 表）。payload
         // 形状 = Tauri StoredCard（{ card, imported_at }），与生产加载器一致。
@@ -152,16 +136,47 @@ fn sqlite_command_lifecycle_active_set_and_character_delete() {
         sqlite_runtime::save_campaign(&campaign).expect("save campaign");
 
         // 会话（conversations 表无 FK，独立种子；campaign 绑定 conv_id）。
-        let conv = state
-            .conv_store
-            .create_persisted(None, Some(campaign_id.clone()))
-            .expect("create conversation");
+        // ConversationStore 需挂 SQLite persistence——其 `persist` 走库。
+        // 此处用 sqlite_runtime 直接种子会话 + 绑定 conv_id（command 只读缓存，
+        // 见后文 delete_character 会话缓存断言）。
+        let conv =
+            storyforge_domain::conversation::Conversation::new(None, Some(campaign_id.clone()));
+        sqlite_runtime::save_conversation(&conv).expect("save conversation");
         let mut loaded = sqlite_runtime::get_campaign(&campaign_id)
             .expect("read campaign")
             .expect("campaign exists");
         loaded.conversation_id = Some(conv.id.clone());
         sqlite_runtime::save_campaign(&loaded).expect("bind conversation id");
     }
+
+    // ─── 1. 真实 SQLite AppState（构造时启动恢复角色）────────────────────
+    // SQLite 已全局激活：AppState::new_with_backend 走 SQLite 分支
+    // （ConversationStore 挂 SqliteConversationPersistence，storage 分派到
+    // sqlite_runtime）。不触碰任何 JSON store。
+    let data_dir = temp.path().to_path_buf();
+    let storage = Arc::new(StorageFacade::new(
+        data_dir.clone(),
+        PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+    ));
+    storage
+        .validate_runtime_authority()
+        .expect("facade/runtime authority must match");
+    let state = Arc::new(
+        storyforge_lib::AppState::new_with_backend(data_dir.clone(), storage)
+            .expect("SQLite AppState must construct"),
+    );
+
+    // 六审 P1 回归：启动恢复后 tool_ctx.characters 必须含已导入角色。
+    assert!(
+        state
+            .tool_ctx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .characters
+            .iter()
+            .any(|c| c.name == "Elena"),
+        "SQLite 启动恢复必须把角色载入 tool_ctx.characters"
+    );
 
     // ─── 2. set_active_campaign：指针前准备世界书 → 成功 + 注入 ──────────
     assert_eq!(
@@ -299,17 +314,19 @@ fn sqlite_command_lifecycle_active_set_and_character_delete() {
             .all(|c| c.campaign_id.as_ref() != Some(&campaign_id)),
         "conversation cache must drop the deleted campaign's conversation"
     );
-    // tool_ctx 角色移除 + 世界书重建（角色库已删该角色）。
+    // tool_ctx 角色移除 + 世界书重建（角色库已删该角色）。删除前
+    // tool_ctx.characters 含 Elena（启动恢复），删除后必须为空。
     let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
     assert!(
         ctx.characters.iter().all(|c| c.name != "Elena"),
         "tool_ctx characters must drop the deleted character"
     );
-    // 库内行已删（角色 + 卡 + campaign + conversations）。
+    // 库内行已删（角色 + 卡 + campaign + conversations）。SQLite 角色库只按
+    // 存储 id / source id 查询，不用角色名（六审 P2：旧断言按名查是假阳性）。
     assert!(
         state
             .storage()
-            .get_character("Elena")
+            .get_character(source_id.as_str())
             .expect("read")
             .is_none()
     );

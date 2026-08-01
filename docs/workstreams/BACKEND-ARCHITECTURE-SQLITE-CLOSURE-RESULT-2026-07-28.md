@@ -991,5 +991,54 @@ character` 收集受影响 Campaign/会话时用 `if let Ok` / `.ok()` 忽略错
 `applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
 `npm run build` / `git diff --check`。
 
+### 30.13 Gate 4 六审修复（2026-07-31）
+
+> 五审判定 INCOMPLETE（2 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 SQLite 重启后不恢复角色到运行时（属实）**：`AppState` 启动恢复只走 JSON
+`CharacterStore`（`character_store` 在 SQLite 下为 `None`），SQLite 的
+`tool_ctx.characters` 恒为空数组，写作入口直接消费该数组——角色虽在 V007
+角色库、重启后写作运行时看不到。
+- 修复：启动恢复改为 backend-neutral——JSON 走 `CharacterStore::list()`，
+  SQLite 走 facade `list_characters()`（读 V007 `characters` 表）。两种后端
+  共用同一恢复逻辑（`stored_info_to_character` / `collect_world_info_for_active`）。
+  SQLite 角色库读取失败显式告警、留空，不 panic。
+- 测试：`sqlite_command_lifecycle.rs` 改为**先种子角色再构造 AppState**，断言
+  构造后 `tool_ctx.characters` 含该角色（启动恢复回归）。
+
+**P1 激活 Campaign 与删除角色仍有并发竞态（属实）**：激活命令写完指针后释放
+`active_campaign_update` 锁、随后才更新世界书；角色删除先删数据库、之后才取
+同一把锁。并发时理论窗口：激活提交指针、删除清指针、激活再把旧 Campaign
+世界书写回 tool_ctx。
+- 修复：`set_active_campaign_in_state` 新增 `after_commit` 钩子，在
+  `active_campaign_update` 锁内、指针提交后立即执行；`set_active_campaign` 把
+  tool_ctx 世界书写入移入该钩子——指针提交与世界书注入成为原子单元，删除线程
+  无法在两者之间插入清指针。`playthrough_lifecycle` 两处调用传空钩子。
+  同时 `active_campaign_update` 字段由 `pub(crate)` 提升为 `pub`（锁句柄，
+  供独立 SQLite 并发测试作可控屏障；无分派逻辑）。
+- 测试：新增独立二进制 `tests/sqlite_command_concurrency.rs`——主线程持有
+  `active_campaign_update` 锁，删除线程先删库（级联删 Campaign A）后阻塞在锁
+  上，激活线程对已删 A 重新激活也阻塞；释放锁后串行完成。断言最终一致性：
+  指针绝不指向已删除的 A、tool_ctx.world_info 绝不残留 A 的书、A 行已删。
+  （诚实记录：五审代码中 `apply_campaign_world_info_to_tool_ctx` 的 active
+  检查 + 删除后 `rebuild_world_info_in_tool_ctx` 覆盖已使该竞态难以确定性触发；
+  锁内原子化消除理论窗口，测试作为最终一致性回归护栏。）
+
+**P2 新测试两条假阳性断言（属实）**：测试在 AppState 创建后才写角色，删除前
+`tool_ctx.characters` 本就为空，`all(...)` 自然通过；用角色名 "Elena" 查询，
+但 SQLite 角色库只按存储 id / source id 查询，删除前该查询已是 None。
+- 修复：种子移到 AppState 构造**之前**（启动恢复真正载入角色），删除后断言
+  `tool_ctx.characters` 从含 Elena 变为不含；`get_character` 改用 `source_id`
+  查询。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings`（0 警告）/ `cargo test --workspace`
+（全绿，405 lib + 81 个测试套件 ok）/ **10 个 sqlite 集成测试**（含新
+`sqlite_command_concurrency`）全过 / `backend-baseline.mjs`
+（`commandAttributes=175`、`registered=175`、`unsupported: []`、
+`applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
+`npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。
