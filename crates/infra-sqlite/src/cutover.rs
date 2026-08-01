@@ -68,9 +68,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::backend::StorageBackend;
-use crate::connection::Database;
+use crate::connection::{Database, STORYFORGE_APPLICATION_ID};
 use crate::error::{Result, SqliteError};
 use crate::importer::JsonImporter;
+use crate::lease::AuthorityLeaseGuard;
 use crate::readiness::{self, SourceManifestReport};
 
 /// Current marker schema version. Bumped only on breaking marker format changes.
@@ -198,6 +199,8 @@ pub struct CutoverDiagnostics {
 }
 
 /// The authoritative-backend marker persisted alongside the database.
+///
+/// Optional fields use `#[serde(default)]` so older markers still parse.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackendMarker {
     pub version: u32,
@@ -205,16 +208,41 @@ pub struct BackendMarker {
     pub schema_version: i64,
     pub manifest_hash: String,
     pub created_at: String,
+    /// Authority identity bound to the published database (cutover-time random id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+    /// One-time cutover nonce, co-stored in the DB `authority_binding` row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover_nonce: Option<String>,
 }
 
 impl BackendMarker {
-    pub fn sqlite(schema_version: i64, manifest_hash: &str) -> Self {
+    pub fn sqlite(
+        schema_version: i64,
+        manifest_hash: &str,
+        authority_id: &str,
+        cutover_nonce: &str,
+    ) -> Self {
         BackendMarker {
             version: MARKER_VERSION,
             backend: StorageBackend::Sqlite.as_str().to_string(),
             schema_version,
             manifest_hash: manifest_hash.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            authority_id: Some(authority_id.to_string()),
+            cutover_nonce: Some(cutover_nonce.to_string()),
+        }
+    }
+
+    pub fn json_authoritative() -> Self {
+        BackendMarker {
+            version: MARKER_VERSION,
+            backend: StorageBackend::Json.as_str().to_string(),
+            schema_version: 0,
+            manifest_hash: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            authority_id: None,
+            cutover_nonce: None,
         }
     }
 
@@ -237,6 +265,8 @@ pub enum MarkerStatus {
     SqliteAuthoritative {
         schema_version: i64,
         manifest_hash: String,
+        /// Present when the marker carries an authority binding (Gate 5+).
+        authority_id: Option<String>,
     },
     /// Marker claims JSON authority.
     JsonAuthoritative,
@@ -262,7 +292,10 @@ pub enum CutoverFault {
     /// Fail after the temp DB is published but **before** the marker is written.
     /// This is the most dangerous window: the DB exists but authority is ambiguous.
     AfterPublishBeforeMarker,
-    /// Fail after the marker is written but before the audit reopen.
+    /// Fail after the final published-DB audit but **before** the marker is written.
+    AfterAudit,
+    /// Fail after the marker is written (no further fallible steps remain;
+    /// retained for fault-matrix compatibility — report construction only).
     AfterMarker,
 }
 
@@ -305,6 +338,20 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
             };
         }
     };
+    // Unknown / too-new marker version is always stale — refuse regardless of env.
+    if marker.version > MARKER_VERSION {
+        return MarkerStatus::Stale {
+            reason: format!(
+                "marker version {} is newer than supported {}",
+                marker.version, MARKER_VERSION
+            ),
+        };
+    }
+    if marker.version == 0 {
+        return MarkerStatus::Stale {
+            reason: "marker version 0 is invalid".into(),
+        };
+    }
     match marker.backend() {
         Ok(StorageBackend::Sqlite) => {
             if !plan.db_path.exists() {
@@ -312,11 +359,12 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
                     reason: "marker claims sqlite but database file is missing".into(),
                 };
             }
-            // Verify the DB is openable and at the recorded schema version.
-            match verify_database(&plan.db_path, marker.schema_version) {
+            // Verify schema + authority binding (marker ↔ DB).
+            match verify_database_with_marker(&plan.db_path, &marker) {
                 Ok(()) => MarkerStatus::SqliteAuthoritative {
                     schema_version: marker.schema_version,
                     manifest_hash: marker.manifest_hash.clone(),
+                    authority_id: marker.authority_id.clone(),
                 },
                 Err(e) => MarkerStatus::Stale {
                     reason: format!("database verification failed: {e}"),
@@ -330,13 +378,14 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     }
 }
 
-/// Verify a database is openable, migrated, and at the expected schema version.
-fn verify_database(db_path: &Path, expected_version: i64) -> Result<()> {
+/// Verify a database is openable, migrated, and bound to the marker identity.
+fn verify_database_with_marker(db_path: &Path, marker: &BackendMarker) -> Result<()> {
     let db = Database::open(db_path)?;
     let version = crate::migrations::current_version(&db)?;
-    if version != expected_version {
+    if version != marker.schema_version {
         return Err(SqliteError::Other(format!(
-            "database schema version {version} != marker version {expected_version}"
+            "database schema version {version} != marker version {}",
+            marker.schema_version
         )));
     }
     // Confirm the DB can answer a basic read query.
@@ -345,6 +394,140 @@ fn verify_database(db_path: &Path, expected_version: i64) -> Result<()> {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })?;
+
+    // Authority identity: when the marker carries a binding, the DB must match.
+    // Markers without authority_id (legacy) still require a completed import_runs
+    // row whose source hash matches the marker's manifest_hash.
+    validate_marker_db_binding(&db, marker)?;
+    Ok(())
+}
+
+/// Ensure the marker is bound to the actual database (authority_id + manifest).
+fn validate_marker_db_binding(db: &Database, marker: &BackendMarker) -> Result<()> {
+    // Completed import_runs row whose source hash matches the marker.
+    let stored: Option<(Option<String>, Option<String>, String)> = db
+        .connection()
+        .query_row(
+            "SELECT authority_id, cutover_nonce, source_manifest_hash              FROM import_runs WHERE status = 'completed'              ORDER BY finished_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let Some((db_authority, db_nonce, db_hash)) = stored else {
+        return Err(SqliteError::Other(
+            "marker/DB binding rejected: no completed import_runs row".into(),
+        ));
+    };
+    if db_hash != marker.manifest_hash {
+        return Err(SqliteError::Other(format!(
+            "marker/DB binding rejected: manifest_hash mismatch marker={} db={db_hash}",
+            marker.manifest_hash
+        )));
+    }
+
+    if let Some(ref marker_aid) = marker.authority_id {
+        // Prefer authority_binding table; fall back to import_runs columns.
+        let binding = read_authority_binding(db)?;
+        let (bound_aid, bound_nonce) = match binding {
+            Some((a, n)) => (a, n),
+            None => (
+                db_authority.unwrap_or_default(),
+                db_nonce.unwrap_or_default(),
+            ),
+        };
+        if bound_aid.is_empty() || bound_aid != *marker_aid {
+            return Err(SqliteError::Other(format!(
+                "marker/DB binding rejected: authority_id mismatch marker={marker_aid} db={bound_aid}"
+            )));
+        }
+        if let Some(ref marker_nonce) = marker.cutover_nonce
+            && bound_nonce != *marker_nonce
+        {
+            return Err(SqliteError::Other(
+                "marker/DB binding rejected: cutover_nonce mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_authority_binding(db: &Database) -> Result<Option<(String, String)>> {
+    let has_table: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='authority_binding'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let row = db
+        .connection()
+        .query_row(
+            "SELECT authority_id, cutover_nonce FROM authority_binding WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok();
+    Ok(row)
+}
+
+/// Generate the authority identity for a cutover attempt.
+///
+/// `authority_id` 由 (规范化 data_dir, source manifest hash) 确定性派生：同一
+/// 数据目录 + 同一源的重试（recover / 中断续跑）得到同一身份，发布探测可以安全
+/// 识别「上次中断发布的自身产物」；不同目录或不同源的库身份不同，绝不误放行。
+/// `cutover_nonce` 每次尝试随机生成，作为一次性绑定凭证写入 DB + marker。
+fn new_authority_identity(data_dir: &Path, source_manifest_hash: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let canonical = fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(source_manifest_hash.as_bytes());
+    let digest = hex_encode(hasher.finalize());
+    let authority_id = format!("aid-{}", &digest[..16]);
+
+    // 一次性 nonce：时间 + 进程 + 计数器混合，保证同身份的两attempt可区分。
+    let nonce = {
+        let mut hasher = Sha256::new();
+        hasher.update(authority_id.as_bytes());
+        hasher.update(b"|");
+        hasher.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos().to_le_bytes())
+                .unwrap_or([0; 16]),
+        );
+        hasher.update(std::process::id().to_le_bytes());
+        hex_encode(hasher.finalize())
+    };
+    let cutover_nonce = nonce.chars().take(32).collect();
+    (authority_id, cutover_nonce)
+}
+
+/// Persist the authority binding into the published (or temp) database.
+fn write_authority_binding(db: &Database, authority_id: &str, cutover_nonce: &str) -> Result<()> {
+    db.connection().execute(
+        "INSERT INTO authority_binding (id, authority_id, cutover_nonce, created_at) \
+         VALUES (1, ?1, ?2, ?3) \
+         ON CONFLICT(id) DO UPDATE SET \
+            authority_id = excluded.authority_id, \
+            cutover_nonce = excluded.cutover_nonce, \
+            created_at = excluded.created_at",
+        rusqlite::params![authority_id, cutover_nonce, chrono::Utc::now().to_rfc3339()],
+    )?;
+    // Also stamp the latest completed import_runs row for defense in depth.
+    let _ = db.connection().execute(
+        "UPDATE import_runs SET authority_id = ?1, cutover_nonce = ?2 \
+         WHERE status = 'completed' AND run_id = ( \
+            SELECT run_id FROM import_runs WHERE status = 'completed' \
+            ORDER BY finished_at DESC LIMIT 1 \
+         )",
+        rusqlite::params![authority_id, cutover_nonce],
+    );
     Ok(())
 }
 
@@ -369,6 +552,7 @@ pub fn run_cutover_with_fault(
         MarkerStatus::SqliteAuthoritative {
             schema_version,
             ref manifest_hash,
+            ..
         } => {
             // Already cut over: audit the SQLite DB only. Never re-open JSON
             // source trees — SQLite is the sole authority after the marker.
@@ -391,12 +575,18 @@ pub fn run_cutover_with_fault(
     // database; on Unix flock provides the same.
     let _lock_guard = acquire_cutover_lock(plan)?;
 
+    // 权威写者租约：EXCLUSIVE 覆盖整个 cutover（跨进程互斥；同进程可重入，
+    // 与进程启动时持有的 SHARED 租约兼容）。普通写者进程（JSON/SQLite）持有
+    // SHARED 时，并发 cutover 必须 fail closed（审查一.3）。
+    let _lease_guard = AuthorityLeaseGuard::acquire_exclusive_in(&plan.data_dir)?;
+
     // Re-check authority after lock to close the TOCTOU window between the
     // pre-lock inspect and exclusive lock acquisition.
     match inspect_marker(plan) {
         MarkerStatus::SqliteAuthoritative {
             schema_version,
             ref manifest_hash,
+            ..
         } => {
             let report = audit_sqlite_authoritative(plan, schema_version, manifest_hash)?;
             return Ok(CutoverOutcome::AlreadyCutover(report));
@@ -430,6 +620,14 @@ pub fn run_cutover_with_fault(
         ));
     }
 
+    // ── Step 2.5: 生成权威身份 ────────────────────────────────────────
+    // 身份与 (data_dir, source hash) 确定性绑定 + 随机 nonce：写入 temp DB
+    // （authority_binding + import_runs 列）与 marker，把 marker 绑定到实际
+    // 发布的数据库（审查 P1：marker 不得授权无关 DB，发布探测也靠它识别自身
+    // 产物）。
+    let (authority_id, cutover_nonce) =
+        new_authority_identity(&plan.data_dir, &manifest.manifest_hash);
+
     // ── Step 3: Import JSON → temp DB ────────────────────────────────
     // If a temp DB from a previous failed attempt exists, discard it first.
     discard_temp_db(plan);
@@ -438,6 +636,8 @@ pub fn run_cutover_with_fault(
     crate::migrations::migrate(&mut import_db)?;
     let mut importer = JsonImporter::new(&mut import_db);
     let import_report = importer.import_data_dir(&plan.data_dir)?;
+    // 把身份绑定写入 temp DB：发布后即使 marker 未写，最终 DB 也自证归属。
+    write_authority_binding(&import_db, &authority_id, &cutover_nonce)?;
     let schema_version = crate::migrations::current_version(&import_db)?;
 
     if fault == CutoverFault::AfterImport {
@@ -477,7 +677,7 @@ pub fn run_cutover_with_fault(
     // If a previous final DB exists (from a prior failed publish), we remove
     // it first. This is safe because the marker has NOT been written yet,
     // so JSON is still authoritative.
-    atomic_publish_db(plan)?;
+    atomic_publish_db(plan, &manifest.manifest_hash, &authority_id)?;
 
     if fault == CutoverFault::AfterPublishBeforeMarker {
         // The DB is published but the marker is not. This is the ambiguous
@@ -489,8 +689,24 @@ pub fn run_cutover_with_fault(
         ));
     }
 
-    // ── Step 7: Write the marker LAST ────────────────────────────────
-    let marker = BackendMarker::sqlite(schema_version, &manifest.manifest_hash);
+    // ── Step 7: 审计已发布 DB（必须发生在 marker 之前）──────────────
+    // 审查一.5：marker 是提交点；marker 写入之后不允许再有任何可失败步骤。
+    audit_published_database(&plan.db_path)?;
+
+    if fault == CutoverFault::AfterAudit {
+        // 审计通过后、marker 写入前失败：DB 已发布但 JSON 仍权威。
+        return Err(SqliteError::Other(
+            "injected fault: after audit, before marker".into(),
+        ));
+    }
+
+    // ── Step 8: Write the marker LAST ────────────────────────────────
+    let marker = BackendMarker::sqlite(
+        schema_version,
+        &manifest.manifest_hash,
+        &authority_id,
+        &cutover_nonce,
+    );
     write_marker_atomically(&plan.marker_path(), &marker)?;
 
     if fault == CutoverFault::AfterMarker {
@@ -499,10 +715,7 @@ pub fn run_cutover_with_fault(
         ));
     }
 
-    // ── Step 8: Reopen through production path + audit ───────────────
-    audit_published_database(&plan.db_path)?;
-
-    // Use the sanitised backup label (never the raw input) in the report.
+    // 至此无任何可失败步骤：只做纯内存报告构造。
     let report = CutoverReport::from_manifest_and_import(
         &manifest,
         schema_version,
@@ -636,7 +849,7 @@ fn table_count(db: &Database, table: &str) -> Result<usize> {
 
 /// Rebuild the source-manifest hash from stored payload_json rows so verification
 /// is independent of the importer's self-reported import_runs value.
-fn recompute_db_content_hash(db: &Database) -> Result<String> {
+pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
@@ -668,6 +881,28 @@ fn recompute_db_content_hash(db: &Database) -> Result<String> {
         }
     }
 
+    /// 读 (campaign_id, payload_json) 对，投影与源侧 manifest 完全一致：
+    /// 每行参与 hash 前绑定 campaign_id，保证 hash 区分不同 campaign。
+    fn load_world_info_pairs(db: &Database) -> Result<Vec<(String, Value)>> {
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT campaign_id, payload_json FROM campaign_world_info")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (campaign_id, raw) = row?;
+            let value: Value = serde_json::from_str(&raw).map_err(|e| {
+                SqliteError::Other(format!(
+                    "corrupt payload_json in campaign_world_info id={campaign_id}: {e}"
+                ))
+            })?;
+            out.push((campaign_id, value));
+        }
+        Ok(out)
+    }
+
     let cards = load_payloads(db, "character_cards")?;
     let campaigns = load_payloads(db, "campaigns")?;
     let instances = load_payloads(db, "character_instances")?;
@@ -678,7 +913,9 @@ fn recompute_db_content_hash(db: &Database) -> Result<String> {
     let conversations = load_payloads(db, "conversations")?;
     // Gate 4/5 可选集合：与 importer 相同的重建投影（非空才参与 hash）。
     let mvu_translations = load_payloads(db, "mvu_translations")?;
-    let world_info = load_payloads(db, "campaign_world_info")?;
+    // 世界书必须绑定 campaign_id：两局内容相同但归属不同 campaign 的条目
+    // hash 必须不同（与 readiness/importer 的投影完全一致）。
+    let world_info = load_world_info_pairs(db)?;
     let compress_jobs = {
         let mut stmt = db.connection().prepare(
             "SELECT job_id, campaign_id, conversation_id, lineage_id, kind, status, attempts, \
@@ -787,7 +1024,7 @@ fn recompute_db_content_hash(db: &Database) -> Result<String> {
         hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
     }
     if !world_info.is_empty() {
-        hash_named_array(&mut hasher, "campaign_world_info", &world_info);
+        crate::readiness::hash_world_info_pairs(&mut hasher, &world_info);
     }
     if !compress_jobs.is_empty() {
         hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
@@ -817,10 +1054,19 @@ fn check_count(db: &Database, table: &str, id_column: &str, expected: usize) -> 
 ///
 /// On Windows, `fs::rename` fails if the destination exists, so we remove a
 /// stale final DB first (only safe because the marker hasn't been written).
-fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
+fn atomic_publish_db(
+    plan: &CutoverPlan,
+    expected_manifest_hash: &str,
+    expected_authority_id: &str,
+) -> Result<()> {
     let temp = plan.temp_db_path();
     let final_path = &plan.db_path;
 
+    eprintln!(
+        "[BI2] p0 temp={} final={}",
+        temp.display(),
+        final_path.display()
+    );
     if !temp.exists() {
         return Err(SqliteError::Other(
             "temp database missing during publish".into(),
@@ -830,7 +1076,8 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
     // If a final DB already exists (re-publish after partial failure),
     // move it aside. JSON is still authoritative at this point.
     if final_path.exists() {
-        // 只允许让位「上次中断发布的自身产物」（带 storyforge schema 迁移）；
+        // 只允许让位「上次中断发布的自身产物」（带 storyforge schema 迁移 +
+        // application_id + 匹配源 hash 的 completed import + 匹配身份的绑定）；
         // 无关/损坏的既有数据库必须 fail closed——绝不静默让新 authority 顶替
         // 用户数据（无 marker 不意味着目标文件可以被覆盖）。
         //
@@ -839,7 +1086,8 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
         // 否则若目标是被其它程序**正在使用**的 WAL 数据库，先删 sidecar 会丢
         // 未 checkpoint 的事务，而用会改 journal_mode 的 open 去探测外部库会写
         // 入它的 header（破坏数据）。审查跟进 P1。
-        if !owned_by_storyforge_readonly(final_path)? {
+        if !owned_by_storyforge_readonly(final_path, expected_manifest_hash, expected_authority_id)?
+        {
             return Err(SqliteError::Other(format!(
                 "refusing to overwrite existing non-StoryForge database at {}; \
                  move or delete it to proceed",
@@ -847,9 +1095,10 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
             )));
         }
         // 所有权确认（自身上次中断发布的产物）：现在可以安全清理 sidecar。
+        // 审查一.5：清理失败必须传播（NotFound 除外），绝不静默吞掉。
         for sidecar in ["-wal", "-shm"] {
             let path = format!("{}{sidecar}", final_path.display());
-            let _ = fs::remove_file(&path);
+            remove_sidecar_ignoring_missing(&path)?;
         }
         let backup_name = format!(
             "{}.pre-publish-{}.sqlite3",
@@ -869,30 +1118,85 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
         // clear now that we know there is no live database holding them.
         for sidecar in ["-wal", "-shm"] {
             let path = format!("{}{sidecar}", final_path.display());
-            let _ = fs::remove_file(&path);
+            remove_sidecar_ignoring_missing(&path)?;
         }
     }
 
     // Atomic rename: temp → final.
+    match std::fs::rename(&temp, final_path.with_extension("probe")) {
+        Ok(_) => {
+            let _ = std::fs::rename(final_path.with_extension("probe"), &temp);
+        }
+        Err(e) => eprintln!("[BI4] probe rename FAILED: {e}"),
+    }
     fs::rename(temp, final_path)?;
+
+    // 审查一.5：rename 后 fsync 已发布 DB 文件（持久化发布结果）。
+    fsync_file(final_path)?;
 
     Ok(())
 }
 
+/// Remove a sidecar file; `NotFound` is treated as success (nothing to clean),
+/// any other error must propagate — a silently swallowed cleanup failure could
+/// leave a half-removed sidecar or hide a permission problem.
+fn remove_sidecar_ignoring_missing(path: &str) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SqliteError::Other(format!(
+            "failed to remove database sidecar {path}: {e}"
+        ))),
+    }
+}
+
+/// fsync a file。注意：Windows 上 `FlushFileBuffers` 要求句柄有**写**访问
+/// （只读句柄会返回 ERROR_ACCESS_DENIED），所以这里用 write 方式打开。
+fn fsync_file(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// fsync the parent directory so the rename itself is durable. Windows cannot
+/// open directories for fsync, so this is unix-only.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Read-only ownership probe: open the file with `SQLITE_OPEN_READONLY` (no
-/// `READ_WRITE`, no `CREATE`, **no PRAGMA writes**) and check for a
-/// StoryForge `schema_migrations` table whose version is >= 1.
+/// `READ_WRITE`, no `CREATE`, **no PRAGMA writes**) and require ALL of:
+///
+/// 1. `PRAGMA application_id == STORYFORGE_APPLICATION_ID`
+/// 2. a `schema_migrations` table whose `MAX(version) >= 1`
+/// 3. a completed `import_runs` row whose `source_manifest_hash` equals the
+///    manifest being cut over
+/// 4. an `authority_binding` row whose `authority_id` equals this cutover's
+///    derived identity
 ///
 /// This never mutates the target database: it cannot flip WAL mode, cannot
 /// create the file, and cannot truncate `-wal`/`-shm`. Any error (unreadable,
 /// not a database, locked) is treated as "not ours" so the caller fails
 /// closed rather than risking a foreign DB.
-fn owned_by_storyforge_readonly(path: &Path) -> Result<bool> {
+fn owned_by_storyforge_readonly(
+    path: &Path,
+    expected_manifest_hash: &str,
+    expected_authority_id: &str,
+) -> Result<bool> {
     use rusqlite::OpenFlags;
     // SQLITE_OPEN_READ_WRITE must NOT be set: opening a WAL-mode DB read/write
     // can checkpoint/rotate the -wal sidecar; opening foreign DBs read/write
     // lets rusqlite's PRAGMA setup touch their header. Read-only is a pure
-    // probe. URI mode lets us pass `?mode=ro` and `nolock=1` so we do not
+    // probe. URI mode lets us pass `?mode=ro` and `immutable=1` so we do not
     // contend on a live DB's locks either.
     let uri = path
         .to_str()
@@ -908,6 +1212,17 @@ fn owned_by_storyforge_readonly(path: &Path) -> Result<bool> {
         // Cannot open read-only (locked / not a DB / foreign schema) → not ours.
         Err(_) => return Ok(false),
     };
+
+    // 1. application_id 魔数：非 StoryForge 库（含带同名 schema_migrations 的
+    //    外部库）在此被拒绝。
+    let app_id: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .unwrap_or(-1);
+    if app_id != i64::from(STORYFORGE_APPLICATION_ID) {
+        return Ok(false);
+    }
+
+    // 2. schema_migrations 存在且 MAX(version)>=1。
     let has_table: i64 = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations' LIMIT 1",
@@ -923,15 +1238,51 @@ fn owned_by_storyforge_readonly(path: &Path) -> Result<bool> {
             row.get(0)
         })
         .unwrap_or(0);
-    Ok(version >= 1)
+    if version < 1 {
+        return Ok(false);
+    }
+
+    // 3. 最近一次 completed import 的源 hash 必须等于本次 cutover 的源。
+    let stored_hash: Option<String> = conn
+        .query_row(
+            "SELECT source_manifest_hash FROM import_runs \
+             WHERE status = 'completed' ORDER BY finished_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if stored_hash.as_deref() != Some(expected_manifest_hash) {
+        return Ok(false);
+    }
+
+    // 4. 权威身份绑定：DB 记录的身份必须等于本次 cutover 派生的身份
+    //    （不同 data_dir / 不同源 → 不同身份 → 拒绝让位）。
+    let bound: Option<String> = conn
+        .query_row(
+            "SELECT authority_id FROM authority_binding WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if bound.as_deref() != Some(expected_authority_id) {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
-/// Write the marker atomically (write to temp file, then rename).
+/// Write the marker atomically (write to temp file, fsync, then rename and
+/// fsync again; fsync the parent directory on unix).
 fn write_marker_atomically(marker_path: &Path, marker: &BackendMarker) -> Result<()> {
     let content = serde_json::to_vec_pretty(marker)?;
     let tmp_path = marker_path.with_extension("json.tmp");
     fs::write(&tmp_path, &content)?;
+    // 审查一.5：rename 前 fsync tmp 文件。
+    fsync_file(&tmp_path)?;
     fs::rename(&tmp_path, marker_path)?;
+    // 审查一.5：rename 后 fsync marker 文件 + 父目录（unix）。
+    fsync_file(marker_path)?;
+    fsync_parent_dir(marker_path)?;
     Ok(())
 }
 

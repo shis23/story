@@ -2,9 +2,13 @@
 //!
 //! Verifies the exported JSON is readable, matches counts, redacts secrets,
 //! includes a manifest, and is independently importable (re-import equivalence).
+//!
+//! Gate 5 审查二.1：严格导出目标校验（forbidden targets、符号链接/junction、
+//! 普通文件、嵌套新目录）——任何拒绝都必须保持源 DB 与目标路径字节不变。
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::JsonImporter;
@@ -283,4 +287,239 @@ fn reverse_export_replaces_stale_conversation_files_atomically() {
             .join("conv-1.json")
             .exists()
     );
+}
+
+// ─── Gate 5 审查二.1：严格导出目标校验 ────────────────────────────────────
+
+fn db_bytes(path: &Path) -> Vec<u8> {
+    fs::read(path).unwrap()
+}
+
+/// 目录树确定性快照（相对路径 → 字节），用于断言导出尝试前后目标不变。
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            let meta = fs::symlink_metadata(&p).unwrap();
+            if meta.is_dir() {
+                walk(&p, root, out);
+            } else {
+                out.insert(rel, fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// 目标可能是文件（读字节）或目录（树快照）；不存在为 None。
+type TargetSnapshot = Option<BTreeMap<PathBuf, Vec<u8>>>;
+
+fn snapshot_target(target: &Path) -> TargetSnapshot {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_file() => {
+            let mut map = BTreeMap::new();
+            map.insert(PathBuf::from("<file>"), fs::read(target).unwrap());
+            Some(map)
+        }
+        Ok(_) => Some(snapshot_tree(target)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => None,
+    }
+}
+
+fn assert_rejected_with_bytes_unchanged(name: &str, db_path: &Path, target: &Path, db: &Database) {
+    let db_before = db_bytes(db_path);
+    let target_before = snapshot_target(target);
+    let err = export_sqlite_to_json(db, target).unwrap_err();
+    assert!(
+        err.to_string().contains("refusing"),
+        "{name}: expected refusal, got: {err}"
+    );
+    assert_eq!(
+        db_before,
+        db_bytes(db_path),
+        "{name}: source DB bytes changed"
+    );
+    assert_eq!(
+        target_before,
+        snapshot_target(target),
+        "{name}: target path bytes/tree changed by a rejected export"
+    );
+}
+
+fn cutover_setup(dir: &TempDir) -> PathBuf {
+    let db_path = dir.path().join("storyforge.sqlite3");
+    let request = CutoverRequest {
+        plan: CutoverPlan::new(dir.path(), &db_path),
+        label: "forbidden-targets".into(),
+    };
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    db_path
+}
+
+#[test]
+fn reverse_export_rejects_every_forbidden_target_without_touching_bytes() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = cutover_setup(&dir);
+    // 锁文件在 cutover 后可能已被清理——显式确保存在使断言确定。
+    fs::write(dir.path().join("storyforge.cutover.lock"), b"").unwrap();
+    fs::write(dir.path().join("storyforge.authority.lock"), b"").unwrap();
+
+    let data = dir.path();
+    let db = Database::open(&db_path).unwrap();
+    let targets: Vec<(&str, PathBuf)> = vec![
+        ("source DB file", db_path.clone()),
+        (
+            "source DB -wal",
+            PathBuf::from(format!("{}-wal", db_path.display())),
+        ),
+        (
+            "source DB -shm",
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ),
+        ("backend marker", data.join("storyforge.backend.json")),
+        ("cutover lock", data.join("storyforge.cutover.lock")),
+        ("authority lock", data.join("storyforge.authority.lock")),
+        ("backup dir", data.join("sqlite-backups")),
+        ("cards.json", data.join("cards.json")),
+        ("campaigns.json", data.join("campaigns.json")),
+        ("turns.json", data.join("turns.json")),
+        ("instances.json", data.join("instances.json")),
+        ("knowledge.json", data.join("knowledge.json")),
+        ("tasks.json", data.join("tasks.json")),
+        ("round_summaries.json", data.join("round_summaries.json")),
+        ("mvu_translations.json", data.join("mvu_translations.json")),
+        ("compress_jobs.json", data.join("compress_jobs.json")),
+        ("characters.json", data.join("characters.json")),
+        ("conversations dir", data.join("conversations")),
+        ("campaign_world_info dir", data.join("campaign_world_info")),
+        ("live data root", data.to_path_buf()),
+    ];
+    for (name, target) in &targets {
+        assert_rejected_with_bytes_unchanged(name, &db_path, target, &db);
+    }
+    drop(db);
+}
+
+#[test]
+fn reverse_export_rejects_plain_file_target_without_overwriting() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = cutover_setup(&dir);
+
+    let target = dir.path().join("plain-target");
+    fs::write(&target, b"i am a plain file, not a directory").unwrap();
+    let db_before = db_bytes(&db_path);
+    let target_before = fs::read(&target).unwrap();
+
+    let db = Database::open(&db_path).unwrap();
+    let err = export_sqlite_to_json(&db, &target).unwrap_err();
+    assert!(
+        err.to_string().contains("refusing"),
+        "plain file target must be rejected, got: {err}"
+    );
+    drop(db);
+    assert_eq!(db_before, db_bytes(&db_path), "source DB bytes changed");
+    assert_eq!(
+        target_before,
+        fs::read(&target).unwrap(),
+        "plain file target must not be overwritten"
+    );
+}
+
+#[cfg(unix)]
+fn make_dir_link(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn make_dir_link(target: &Path, link: &Path) {
+    // mklink /J 创建 junction：普通用户无需管理员权限；junction 与符号链接
+    // 一样带 reparse point 属性，symlink_metadata 会报告 is_symlink。
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink /J");
+    assert!(
+        out.status.success(),
+        "mklink failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn reverse_export_rejects_symlink_or_junction_target() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = cutover_setup(&dir);
+
+    let real = dir.path().join("real-target-dir");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link-target");
+    make_dir_link(&real, &link);
+    let real_before = snapshot_tree(&real);
+
+    let db = Database::open(&db_path).unwrap();
+    let err = export_sqlite_to_json(&db, &link).unwrap_err();
+    drop(db);
+    assert!(
+        err.to_string().contains("symbolic link") || err.to_string().contains("refusing"),
+        "symlink/junction target must be rejected, got: {err}"
+    );
+    // 链接仍是链接（未被跟随/覆盖），真实目录内容不变。
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "target link must remain a link"
+    );
+    assert_eq!(real_before, snapshot_tree(&real), "link target dir changed");
+}
+
+#[test]
+fn reverse_export_rejects_ancestor_of_live_data_root() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    sample_source(&data);
+    let db_path = data.join("storyforge.sqlite3");
+    let request = CutoverRequest {
+        plan: CutoverPlan::new(&data, &db_path),
+        label: "ancestor-test".into(),
+    };
+    run_cutover(&request).unwrap();
+
+    let db = Database::open(&db_path).unwrap();
+    // 目标是数据根的祖先（temp 根）→ 必须拒绝。
+    let err = export_sqlite_to_json(&db, root.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("refusing"),
+        "ancestor target must be rejected, got: {err}"
+    );
+    // 兄弟目录 → 允许。
+    let ok_target = root.path().join("export-out");
+    let result = export_sqlite_to_json(&db, &ok_target).unwrap();
+    assert!(result.manifest_path.exists());
+}
+
+#[test]
+fn reverse_export_allows_nonexistent_nested_target() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = cutover_setup(&dir);
+
+    let db = Database::open(&db_path).unwrap();
+    let target = dir.path().join("nested").join("a").join("b");
+    let result = export_sqlite_to_json(&db, &target).unwrap();
+    assert!(result.manifest_path.exists());
+    assert!(target.join("cards.json").exists());
+    assert!(target.join("conversations").join("conv-1.json").exists());
 }

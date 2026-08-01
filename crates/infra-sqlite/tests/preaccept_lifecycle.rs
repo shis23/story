@@ -1374,8 +1374,8 @@ fn schema_upgrades_to_v4_preaccept_outbox() {
     assert!(migrations.iter().any(|m| m.version == 4));
     let v1 = migrations.iter().find(|m| m.version == 1).unwrap().clone();
     storyforge_infra_sqlite::migrations::migrate_with(&mut db, &[v1]).unwrap();
-    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7]);
-    assert_eq!(current_version(&db).unwrap(), 7);
+    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(current_version(&db).unwrap(), 8);
     let exists: i64 = db
         .connection()
         .query_row(

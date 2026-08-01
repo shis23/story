@@ -568,8 +568,10 @@ impl SqliteProductionRepository {
 
     /// JSON `CampaignStore::delete_campaign` 等价：单事务内按依赖序级联清理
     /// 一局活动的全部 SQLite 行（mutation_commits → chronicle jobs →
-    /// preaccept_outbox → attempts → turns → conversations → summaries/covers →
-    /// tasks/knowledge/instances/world_info → campaign）。FK 失败整体回滚。
+    /// preaccept_outbox → attempts → turns → summaries/covers →
+    /// conversations → tasks/knowledge/instances/world_info → campaign）。
+    /// conversations 必须在 round_summaries 之后删除（round_summaries 的
+    /// conversation_id FK 指向 conversations）；FK 失败整体回滚。
     /// 返回是否实际删除。
     pub fn delete_campaign_cascade(db: &mut Database, campaign_id: &Id) -> Result<bool> {
         migrations::migrate(db)?;
@@ -610,10 +612,6 @@ impl SqliteProductionRepository {
             [campaign_id.as_str()],
         )?;
         tx.execute(
-            "DELETE FROM conversations WHERE campaign_id = ?1",
-            [campaign_id.as_str()],
-        )?;
-        tx.execute(
             "DELETE FROM round_summary_covers WHERE parent_id IN \
              (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1) \
              OR child_id IN (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1)",
@@ -621,6 +619,13 @@ impl SqliteProductionRepository {
         )?;
         tx.execute(
             "DELETE FROM round_summaries WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        // conversations 最后删除（round_summaries.conversation_id → conversations
+        // FK——必须先删 summaries 再删 conversations，否则带摘要的 Campaign
+        // 删除必撞 FK 约束整体回滚；与 delete_card_cascade_tx 同序）。
+        tx.execute(
+            "DELETE FROM conversations WHERE campaign_id = ?1",
             [campaign_id.as_str()],
         )?;
         tx.execute(

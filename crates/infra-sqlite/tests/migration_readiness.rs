@@ -263,9 +263,9 @@ fn v1_and_v2_databases_upgrade_to_v3_publication_schema() {
         )
         .unwrap();
 
-    // Upgrade through V2..V5
-    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7]);
-    assert_eq!(current_version(&db).unwrap(), 7);
+    // Upgrade through V2..V8
+    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(current_version(&db).unwrap(), 8);
     let cards: i64 = db
         .connection()
         .query_row(
@@ -297,7 +297,7 @@ fn publication_seed_survives_v3_and_job_table_is_empty_until_publish() {
     let dir = TempDir::new().unwrap();
     let mut db = Database::open(dir.path().join("db.sqlite3")).unwrap();
     migrate(&mut db).unwrap();
-    assert_eq!(current_version(&db).unwrap(), 7);
+    assert_eq!(current_version(&db).unwrap(), 8);
 
     let mut campaign = Campaign::new(Id::from_str("card"), "Jobs");
     campaign.id = Id::from_str("camp-jobs");
@@ -383,7 +383,7 @@ fn backup_uses_unique_paths_and_backup_db_schema_version() {
 
     let backup_db = Database::open(&first.backup_db_path).unwrap();
     assert_eq!(current_version(&backup_db).unwrap(), first.schema_version);
-    assert_eq!(first.schema_version, 7);
+    assert_eq!(first.schema_version, 8);
 }
 
 #[test]

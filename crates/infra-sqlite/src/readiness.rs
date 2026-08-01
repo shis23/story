@@ -64,6 +64,13 @@ pub struct ExportSnapshot {
     pub redacted_fields: Vec<String>,
 }
 
+/// Recompute the DB content hash with the same projection as the source
+/// manifest (world-info entries bind campaign_id). Test-facing wrapper over
+/// the cutover verifier so import tests can assert recompute == manifest.
+pub fn recompute_db_content_hash_for_test(db: &Database) -> Result<String> {
+    crate::cutover::recompute_db_content_hash(db)
+}
+
 /// Read-only dry-run over a JSON source tree. Must not open/write a live DB.
 pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceManifestReport> {
     let data_dir = data_dir.as_ref();
@@ -71,18 +78,38 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
         return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
     }
 
-    let cards = read_json_array(data_dir.join("cards.json"), true)?;
-    let campaigns = read_json_array(data_dir.join("campaigns.json"), true)?;
-    let instances = read_json_array(data_dir.join("instances.json"), true)?;
-    let knowledge = read_json_array(data_dir.join("knowledge.json"), true)?;
-    let tasks = read_json_array(data_dir.join("tasks.json"), true)?;
-    let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
-    let turns = read_json_array(data_dir.join("turns.json"), true)?;
+    // 审查一.6：核心布局文件是**必需**的（缺失 → 报错，不得当作空集合）；
+    // 可选集合（mvu / compress_jobs / characters / world_info）保持可选。
+    let cards = read_json_array(data_dir.join("cards.json"), false)?;
+    let campaigns = read_json_array(data_dir.join("campaigns.json"), false)?;
+    let instances = read_json_array(data_dir.join("instances.json"), false)?;
+    let knowledge = read_json_array(data_dir.join("knowledge.json"), false)?;
+    let tasks = read_json_array(data_dir.join("tasks.json"), false)?;
+    let summaries = read_json_array(data_dir.join("round_summaries.json"), false)?;
+    let turns = read_json_array(data_dir.join("turns.json"), false)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
     let world_info = read_world_info_dir(data_dir.join("campaign_world_info"))?;
     let compress_jobs = read_compress_jobs_array(data_dir)?;
     let characters = read_characters_array(data_dir)?;
+
+    // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝。
+    let campaign_ids: HashSet<String> = campaigns
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    strict_validate_entries("cards", &cards, &campaign_ids)?;
+    strict_validate_entries("campaigns", &campaigns, &campaign_ids)?;
+    strict_validate_entries("instances", &instances, &campaign_ids)?;
+    strict_validate_entries("knowledge", &knowledge, &campaign_ids)?;
+    strict_validate_entries("tasks", &tasks, &campaign_ids)?;
+    strict_validate_entries("round_summaries", &summaries, &campaign_ids)?;
+    strict_validate_entries("turns", &turns, &campaign_ids)?;
+    strict_validate_entries("conversations", &conversations, &campaign_ids)?;
+    strict_validate_entries("mvu_translations", &mvu_translations, &campaign_ids)?;
+    strict_validate_entries("compress_jobs", &compress_jobs, &campaign_ids)?;
+    strict_validate_entries("characters", &characters, &campaign_ids)?;
+    strict_validate_world_info(&world_info, &campaign_ids)?;
 
     // Keep labels/order identical to the importer so hashes are comparable.
     let mut hasher = Sha256::new();
@@ -98,9 +125,9 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     if !mvu_translations.is_empty() {
         hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
     }
+    // 审查一.6：世界书 hash 绑定 campaign_id（与 importer / cutover 同投影）。
     if !world_info.is_empty() {
-        let payloads: Vec<Value> = world_info.iter().map(|(_, v)| v.clone()).collect();
-        hash_named_array(&mut hasher, "campaign_world_info", &payloads);
+        hash_world_info_pairs(&mut hasher, &world_info);
     }
     if !compress_jobs.is_empty() {
         hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
@@ -131,12 +158,16 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
 
 /// 读 `campaign_world_info/{campaign_id}.json` 目录；文件名即 campaign_id。
 /// importer 与 readiness 共用（hash 必须同投影）。
+///
+/// 审查一.6：read_dir 的每个错误都必须传播（禁止 filter_map(...ok()) 吞错）。
 pub(crate) fn read_world_info_dir(dir: PathBuf) -> Result<Vec<(String, Value)>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<PathBuf>>>()?
+        .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
     paths.sort();
@@ -261,6 +292,593 @@ fn normalize_character_entry(entry: Value) -> Result<Value> {
         "info": info.clone(),
         "imported_at": imported_at,
     }))
+}
+
+/// 世界书 hash 投影：每本书在参与 hash 前绑定 campaign_id（文件名）。
+/// readiness（源侧 manifest）、importer（snapshot）与 cutover（DB 重建）三处
+/// 必须完全一致——两局内容相同但归属不同 campaign 的条目 hash 必须不同。
+pub(crate) fn hash_world_info_pairs(hasher: &mut Sha256, items: &[(String, Value)]) {
+    hasher.update(b"campaign_world_info\0");
+    let mut encoded: Vec<String> = items
+        .iter()
+        .map(|(campaign_id, book)| {
+            stable_json(&serde_json::json!({
+                "campaign_id": campaign_id,
+                "book": book,
+            }))
+        })
+        .collect();
+    encoded.sort();
+    for item in encoded {
+        hasher.update(item.as_bytes());
+        hasher.update(b"\n");
+    }
+}
+
+// ─── Gate 5 审查一.6：严格布局校验 ───────────────────────────────────────
+//
+// 镜像 JSON store 层（tauri-app campaign_store / turn_store / storage /
+// conversation store）使用的 domain/store 类型：字段类型、枚举集合、必填
+// 字符串字段。任一畸形条目（未知枚举值、负数数值、错误布尔类型、损坏
+// CharacterInfo、非字符串 Id 等）→ CorruptImportInput，整体 fail closed，
+// 绝不静默丢弃/归一化。注意：不要求 domain 类型的全部必填字段——历史数据与
+// 既有测试夹具在部分字段上比 domain 更宽松，这里只收紧「值存在但类型/取值
+// 非法」与「结构关键字段缺失」两类畸形。
+
+fn err_entry(kind: &str, index: usize, reason: impl std::fmt::Display) -> SqliteError {
+    SqliteError::CorruptImportInput(format!("{kind}[{index}]: {reason}"))
+}
+
+/// 必填字符串字段（Id 形状）：缺失/非字符串/空 → Err。
+fn req_str<'v>(kind: &str, index: usize, item: &'v Value, key: &str) -> Result<&'v str> {
+    let v = item
+        .get(key)
+        .ok_or_else(|| err_entry(kind, index, format!("missing field '{key}'")))?;
+    let s = v.as_str().ok_or_else(|| {
+        err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a string, got {v}"),
+        )
+    })?;
+    if s.is_empty() {
+        return Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must not be empty"),
+        ));
+    }
+    Ok(s)
+}
+
+/// 可选字符串：缺省/null → None；非字符串（数字/布尔/对象）→ Err。
+fn opt_str_strict<'v>(
+    kind: &str,
+    index: usize,
+    item: &'v Value,
+    key: &str,
+) -> Result<Option<&'v str>> {
+    match item.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a string or null, got {other}"),
+        )),
+    }
+}
+
+/// 可选布尔：缺省/null → None；非布尔 → Err（禁止 "yes"/1 等静默强制转换）。
+fn opt_bool_strict(kind: &str, index: usize, item: &Value, key: &str) -> Result<Option<bool>> {
+    match item.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a boolean, got {other}"),
+        )),
+    }
+}
+
+/// 可选无符号整数：缺省/null → None；负数或非整数 → Err（禁止静默钳 0）。
+fn opt_u64_strict(kind: &str, index: usize, item: &Value, key: &str) -> Result<Option<u64>> {
+    match item.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                Ok(Some(u))
+            } else if let Some(i) = n.as_i64() {
+                if i < 0 {
+                    Err(err_entry(
+                        kind,
+                        index,
+                        format!("field '{key}' must not be negative (got {i})"),
+                    ))
+                } else {
+                    Err(err_entry(
+                        kind,
+                        index,
+                        format!("field '{key}' is not a valid u64"),
+                    ))
+                }
+            } else {
+                Err(err_entry(
+                    kind,
+                    index,
+                    format!("field '{key}' must be an integer, got {n}"),
+                ))
+            }
+        }
+        Some(Value::String(s)) if s.parse::<u64>().is_ok() => Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a number, not a string"),
+        )),
+        Some(other) => Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be an integer, got {other}"),
+        )),
+    }
+}
+
+/// 可选枚举：缺省/null → Ok；字符串小写后必须在允许集合内；其它类型 → Err。
+fn check_enum(kind: &str, index: usize, item: &Value, key: &str, allowed: &[&str]) -> Result<()> {
+    let Some(v) = item.get(key) else {
+        return Ok(());
+    };
+    if v.is_null() {
+        return Ok(());
+    }
+    let s = v.as_str().ok_or_else(|| {
+        err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a string enum value, got {v}"),
+        )
+    })?;
+    let lower = s.to_ascii_lowercase();
+    if !allowed.contains(&lower.as_str()) {
+        return Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' has unknown value {s:?} (allowed: {allowed:?})"),
+        ));
+    }
+    Ok(())
+}
+
+/// 可选字符串数组。
+fn check_str_array(kind: &str, index: usize, item: &Value, key: &str) -> Result<()> {
+    let Some(v) = item.get(key) else {
+        return Ok(());
+    };
+    if v.is_null() {
+        return Ok(());
+    }
+    let arr = v.as_array().ok_or_else(|| {
+        err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be an array of strings, got {v}"),
+        )
+    })?;
+    for e in arr {
+        if !e.is_string() {
+            return Err(err_entry(
+                kind,
+                index,
+                format!("field '{key}' must contain only strings, got {e}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 可选数组（元素类型不深查）。
+fn check_array(kind: &str, index: usize, item: &Value, key: &str) -> Result<()> {
+    let Some(v) = item.get(key) else {
+        return Ok(());
+    };
+    if v.is_null() {
+        return Ok(());
+    }
+    if !v.is_array() {
+        return Err(err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be an array, got {v}"),
+        ));
+    }
+    Ok(())
+}
+
+/// 对一种布局条目集合做严格校验；`campaign_ids` 用于世界书归属校验。
+pub(crate) fn strict_validate_entries(
+    kind: &str,
+    items: &[Value],
+    campaign_ids: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for (index, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            return Err(err_entry(kind, index, "entry must be a JSON object"));
+        }
+        match kind {
+            "cards" => {
+                let inner = match item.get("card") {
+                    None => item,
+                    Some(card) if card.is_object() => card,
+                    Some(other) => {
+                        return Err(err_entry(
+                            kind,
+                            index,
+                            format!("field 'card' must be an object, got {other}"),
+                        ));
+                    }
+                };
+                req_str(kind, index, inner, "id")?;
+                req_str(kind, index, inner, "name")?;
+                opt_str_strict(kind, index, inner, "source_character_id")?;
+                check_enum(
+                    kind,
+                    index,
+                    inner,
+                    "extraction_status",
+                    &["unknown", "extracted", "fallback"],
+                )?;
+                check_array(kind, index, inner, "character_definitions")?;
+                check_array(kind, index, inner, "campaign_variable_schema")?;
+                opt_str_strict(kind, index, item, "imported_at")?;
+            }
+            "campaigns" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "card_id")?;
+                req_str(kind, index, item, "name")?;
+                opt_str_strict(kind, index, item, "created_at")?;
+                opt_u64_strict(kind, index, item, "revision")?;
+                opt_u64_strict(kind, index, item, "chronicle_revision")?;
+                opt_str_strict(kind, index, item, "conversation_id")?;
+                opt_str_strict(kind, index, item, "lineage_id")?;
+                opt_str_strict(kind, index, item, "story_clock")?;
+                check_array(kind, index, item, "variables")?;
+                check_array(kind, index, item, "variable_schema")?;
+            }
+            "instances" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                req_str(kind, index, item, "name")?;
+                opt_str_strict(kind, index, item, "definition_id")?;
+                opt_bool_strict(kind, index, item, "is_temporary")?;
+            }
+            "knowledge" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                opt_str_strict(kind, index, item, "character_id")?;
+                opt_str_strict(kind, index, item, "content")?;
+                opt_str_strict(kind, index, item, "knowledge_text")?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "source",
+                    &["witnessed", "told_by_other", "inferred", "backstory"],
+                )?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "propagation_policy",
+                    &["open", "private", "group_restricted"],
+                )?;
+                opt_u64_strict(kind, index, item, "turn_number")?;
+                opt_u64_strict(kind, index, item, "source_turn")?;
+                opt_bool_strict(kind, index, item, "pinned")?;
+            }
+            "tasks" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                req_str(kind, index, item, "title")?;
+                opt_str_strict(kind, index, item, "description")?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "status",
+                    &[
+                        "pending",
+                        "active",
+                        "likely_completed",
+                        "completed",
+                        "abandoned",
+                    ],
+                )?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "source",
+                    &["user_planned", "extracted_from_narrative"],
+                )?;
+                opt_u64_strict(kind, index, item, "created_turn")?;
+                check_array(kind, index, item, "triggers")?;
+                check_array(kind, index, item, "related_characters")?;
+            }
+            "round_summaries" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                req_str(kind, index, item, "conversation_id")?;
+                opt_str_strict(kind, index, item, "content")?;
+                opt_str_strict(kind, index, item, "created_at")?;
+                opt_u64_strict(kind, index, item, "turn")?;
+                opt_u64_strict(kind, index, item, "turn_end")?;
+                opt_u64_strict(kind, index, item, "level")?;
+                opt_str_strict(kind, index, item, "covered_by")?;
+                opt_str_strict(kind, index, item, "lineage_id")?;
+                check_str_array(kind, index, item, "covers")?;
+            }
+            "turns" => {
+                req_str(kind, index, item, "turn_id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                req_str(kind, index, item, "conversation_id")?;
+                req_str(kind, index, item, "input_node_id")?;
+                opt_u64_strict(kind, index, item, "base_campaign_revision")?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "status",
+                    &[
+                        "generating",
+                        "draft_ready",
+                        "deriving_state",
+                        "awaiting_acceptance",
+                        "committing",
+                        "committed",
+                        "degraded",
+                        "failed",
+                        "abandoned",
+                    ],
+                )?;
+                opt_str_strict(kind, index, item, "accepted_attempt_id")?;
+                opt_str_strict(kind, index, item, "failure_reason")?;
+                opt_str_strict(kind, index, item, "created_at")?;
+                opt_str_strict(kind, index, item, "updated_at")?;
+                if let Some(attempts) = item.get("attempts") {
+                    let arr = attempts.as_array().ok_or_else(|| {
+                        err_entry(
+                            kind,
+                            index,
+                            format!("field 'attempts' must be an array, got {attempts}"),
+                        )
+                    })?;
+                    for (ai, attempt) in arr.iter().enumerate() {
+                        if !attempt.is_object() {
+                            return Err(err_entry(
+                                kind,
+                                index,
+                                format!("attempts[{ai}] must be an object"),
+                            ));
+                        }
+                        req_str(kind, index, attempt, "attempt_id")?;
+                        req_str(kind, index, attempt, "variant_id")?;
+                        opt_str_strict(kind, index, attempt, "draft_hash")?;
+                        opt_str_strict(kind, index, attempt, "created_at")?;
+                        check_enum(
+                            kind,
+                            index,
+                            attempt,
+                            "status",
+                            &[
+                                "generating",
+                                "draft_ready",
+                                "deriving_state",
+                                "awaiting_acceptance",
+                                "committing",
+                                "committed",
+                                "stale",
+                                "discarded",
+                                "superseded",
+                                "failed",
+                            ],
+                        )?;
+                    }
+                }
+            }
+            "conversations" => {
+                req_str(kind, index, item, "id")?;
+                opt_str_strict(kind, index, item, "campaign_id")?;
+                opt_str_strict(kind, index, item, "character_id")?;
+                check_array(kind, index, item, "nodes")?;
+                // 领域 Conversation 用 DateTime<Utc>：created_at/updated_at 必须
+                // 是合法 RFC3339（镜像 app-conversation 的权威解析）。
+                for key in ["created_at", "updated_at"] {
+                    let Some(v) = item.get(key) else {
+                        continue;
+                    };
+                    let s = v.as_str().ok_or_else(|| {
+                        err_entry(
+                            kind,
+                            index,
+                            format!("field '{key}' must be an RFC3339 timestamp string, got {v}"),
+                        )
+                    })?;
+                    chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+                        err_entry(
+                            kind,
+                            index,
+                            format!("field '{key}' is not a valid RFC3339 timestamp ({e})"),
+                        )
+                    })?;
+                }
+                opt_u64_strict(kind, index, item, "archived_upto")?;
+            }
+            "mvu_translations" => {
+                req_str(kind, index, item, "source_character_id")?;
+                opt_str_strict(kind, index, item, "character_name")?;
+                opt_str_strict(kind, index, item, "analyzed_at")?;
+                let Some(translation) = item.get("translation") else {
+                    return Err(err_entry(kind, index, "missing field 'translation'"));
+                };
+                if !translation.is_object() {
+                    return Err(err_entry(
+                        kind,
+                        index,
+                        format!("field 'translation' must be an object, got {translation}"),
+                    ));
+                }
+            }
+            "compress_jobs" => {
+                req_str(kind, index, item, "id")?;
+                req_str(kind, index, item, "campaign_id")?;
+                opt_str_strict(kind, index, item, "conversation_id")?;
+                opt_str_strict(kind, index, item, "lineage_id")?;
+                check_enum(kind, index, item, "kind", &["auto", "manual"])?;
+                check_enum(
+                    kind,
+                    index,
+                    item,
+                    "status",
+                    &["pending", "running", "succeeded", "failed"],
+                )?;
+                opt_u64_strict(kind, index, item, "attempts")?;
+                opt_u64_strict(kind, index, item, "max_attempts")?;
+                opt_u64_strict(kind, index, item, "uncovered_a_at_enqueue")?;
+                opt_u64_strict(kind, index, item, "uncovered_b_at_enqueue")?;
+                opt_str_strict(kind, index, item, "last_error")?;
+                opt_str_strict(kind, index, item, "created_at")?;
+                opt_str_strict(kind, index, item, "updated_at")?;
+            }
+            "characters" => {
+                req_str(kind, index, item, "id")?;
+                opt_str_strict(kind, index, item, "imported_at")?;
+                let info = item
+                    .get("info")
+                    .ok_or_else(|| err_entry(kind, index, "missing field 'info'"))?;
+                if !info.is_object() {
+                    return Err(err_entry(
+                        kind,
+                        index,
+                        format!("field 'info' must be an object, got {info}"),
+                    ));
+                }
+                // CharacterInfo 镜像（tauri-app commands/characters.rs）：必填
+                // 字符串字段 + 布尔/数组字段类型。
+                for key in [
+                    "name",
+                    "description",
+                    "personality",
+                    "scenario",
+                    "first_mes",
+                    "system_prompt",
+                    "creator",
+                    "spec_version",
+                ] {
+                    req_str(kind, index, info, key)?;
+                }
+                for key in [
+                    "mes_example",
+                    "post_history_instructions",
+                    "character_version",
+                ] {
+                    opt_str_strict(kind, index, info, key)?;
+                }
+                opt_str_strict(kind, index, info, "source_character_id")?;
+                check_str_array(kind, index, info, "tags")?;
+                check_str_array(kind, index, info, "alternate_greetings")?;
+                opt_bool_strict(kind, index, info, "has_world_info")?;
+                opt_bool_strict(kind, index, info, "has_renderable_assets")?;
+                opt_u64_strict(kind, index, info, "world_info_count")?;
+                check_array(kind, index, info, "world_info_entries")?;
+            }
+            "world_info" => {
+                // 见 strict_validate_world_info（需要 campaign_id 上下文）。
+                let _ = campaign_ids;
+                return Err(err_entry(kind, index, "use strict_validate_world_info"));
+            }
+            other => {
+                return Err(SqliteError::Other(format!(
+                    "strict_validate_entries: unknown kind {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 世界书严格校验：文件归属的 campaign_id 必须存在于 campaigns.json；
+/// book 必须是对象且 entries 数组元素逐字段校验。
+pub(crate) fn strict_validate_world_info(
+    entries: &[(String, Value)],
+    campaign_ids: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for (campaign_id, book) in entries {
+        if !campaign_ids.contains(campaign_id) {
+            return Err(SqliteError::CorruptImportInput(format!(
+                "world_info: campaign_id {campaign_id} has no matching campaign"
+            )));
+        }
+        if !book.is_object() {
+            return Err(SqliteError::CorruptImportInput(format!(
+                "world_info[{campaign_id}]: book must be a JSON object"
+            )));
+        }
+        let Some(entries_arr) = book.get("entries") else {
+            return Err(SqliteError::CorruptImportInput(format!(
+                "world_info[{campaign_id}]: missing field 'entries'"
+            )));
+        };
+        let arr = entries_arr.as_array().ok_or_else(|| {
+            SqliteError::CorruptImportInput(format!(
+                "world_info[{campaign_id}]: 'entries' must be an array"
+            ))
+        })?;
+        for (index, entry) in arr.iter().enumerate() {
+            if !entry.is_object() {
+                return Err(err_entry(
+                    "world_info",
+                    index,
+                    format!("entries[{index}] must be an object"),
+                ));
+            }
+            let Some(content) = entry.get("content") else {
+                return Err(err_entry("world_info", index, "missing field 'content'"));
+            };
+            if !content.is_string() {
+                return Err(err_entry(
+                    "world_info",
+                    index,
+                    format!("field 'content' must be a string, got {content}"),
+                ));
+            }
+            check_str_array("world_info", index, entry, "keys")?;
+            for key in ["constant", "selective", "disabled"] {
+                opt_bool_strict("world_info", index, entry, key)?;
+            }
+            check_enum(
+                "world_info",
+                index,
+                entry,
+                "route",
+                &["constant", "selective", "both", "disabled"],
+            )?;
+            for key in ["depth", "order", "position"] {
+                if let Some(v) = entry.get(key)
+                    && !v.is_null()
+                    && !v.is_i64()
+                    && !v.is_u64()
+                {
+                    return Err(err_entry(
+                        "world_info",
+                        index,
+                        format!("field '{key}' must be an integer, got {v}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Create a SQLite backup checkpoint + manifest without mutating the live DB contents.
@@ -1017,11 +1635,16 @@ fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
 }
 
 fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
+    // 审查一.6：conversations 目录沿用既有 manifest 逻辑（可选——目录缺失 =
+    // 无会话，应用运行时按需创建）；但目录**存在而不可读**（如被文件顶替）时
+    // read_dir 错误必须传播，绝不静默当作空。
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<PathBuf>>>()?
+        .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
     // Match importer path-order sorting so hashes stay aligned.

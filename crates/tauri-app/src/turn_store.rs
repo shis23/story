@@ -102,6 +102,10 @@ impl TurnStore {
     // ─── 写入 ──────────────────────────────────────────────────────────────
 
     /// 创建新 TurnRecord（如果该 Campaign 已有活动 Turn 则拒绝）。
+    ///
+    /// 审查跟进 P2（三.9）：先在候选副本上修改并持久化，`persist` 成功后才
+    /// 用候选副本替换 `self.turns`——写盘失败时内存与磁盘都保持原值，杜绝
+    /// 「命令报告失败、内存却已出现新 Turn」的分裂态。
     pub fn create_turn(&self, record: TurnRecord) -> Result<(), String> {
         let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
         // 唯一约束：同一 Campaign 只能有一个活动 Turn
@@ -114,21 +118,28 @@ impl TurnStore {
                 record.campaign_id
             ));
         }
-        turns.push(record);
-        persist_turns(&self.turns_path, &turns)
+        let mut candidate = turns.clone();
+        candidate.push(record);
+        persist_turns(&self.turns_path, &candidate)?;
+        *turns = candidate;
+        Ok(())
     }
 
     /// 全量替换 TurnRecord（by turn_id）。
     ///
     /// 调用方负责保证状态转换合法性，本方法只做持久化。
+    /// 候选 → 持久化 → 换入（三.9）：失败时内存回滚到持久化前的快照。
     pub fn save_turn(&self, record: TurnRecord) -> Result<(), String> {
         let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = turns.iter().position(|t| t.turn_id == record.turn_id) {
-            turns[idx] = record;
+        let mut candidate = turns.clone();
+        if let Some(idx) = candidate.iter().position(|t| t.turn_id == record.turn_id) {
+            candidate[idx] = record;
         } else {
-            turns.push(record);
+            candidate.push(record);
         }
-        persist_turns(&self.turns_path, &turns)
+        persist_turns(&self.turns_path, &candidate)?;
+        *turns = candidate;
+        Ok(())
     }
 
     /// CAS（Compare-And-Swap）Turn 状态转换。
@@ -218,6 +229,32 @@ impl TurnStore {
             return Err(error);
         }
         Ok(deleted)
+    }
+
+    /// 活动 Turn 屏障 + 写操作合并进同一临界区（三.5 TOCTOU 修复）。
+    ///
+    /// 持有 turns 锁期间校验「该 Campaign 无活动 Turn」，通过后执行 `f`。
+    /// 直接写 Campaign 的入口（变量 / 任务 / 实例）必须先过此守卫再落盘——
+    /// 「先查再写」的检查与写入不再被 `create_turn` 插入窗口分开。
+    ///
+    /// 锁序约定：turns → CampaignStore 内部集合锁（campaigns/instances/…）。
+    /// CampaignStore 的任何方法都不会反向取 turns 锁，因此不会死锁。
+    pub(crate) fn with_idle_turn_guard<R>(
+        &self,
+        campaign_id: &Id,
+        f: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        let turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(turn) = turns
+            .iter()
+            .find(|t| &t.campaign_id == campaign_id && t.status.is_active())
+        {
+            return Err(format!(
+                "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
+                turn.turn_id, turn.status
+            ));
+        }
+        f()
     }
 
     // ─── 测试辅助 ──────────────────────────────────────────────────────────

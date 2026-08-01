@@ -54,8 +54,11 @@ impl CharacterStore {
         };
 
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        chars.push(stored.clone());
-        self.persist(&chars)?;
+        let mut candidate = chars.clone();
+        candidate.push(stored.clone());
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(stored)
     }
 
@@ -78,9 +81,12 @@ impl CharacterStore {
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = chars.len();
-        chars.retain(|c| c.id != id);
-        if chars.len() < before {
-            self.persist(&chars)?;
+        let mut candidate = chars.clone();
+        candidate.retain(|c| c.id != id);
+        if candidate.len() < before {
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            self.persist(&candidate)?;
+            *chars = candidate;
             Ok(true)
         } else {
             Ok(false)
@@ -95,19 +101,23 @@ impl CharacterStore {
         new_route: &str,
     ) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let char = chars
+        if !chars.iter().any(|c| c.id == id) {
+            return Err(format!("角色卡不存在: {id}"));
+        }
+        let mut candidate = chars.clone();
+        let char = candidate
             .iter_mut()
             .find(|c| c.id == id)
-            .ok_or_else(|| format!("角色卡不存在: {id}"))?;
-
+            .expect("existence pre-checked");
         let entry = char
             .info
             .world_info_entries
             .get_mut(entry_index)
             .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
-
         entry.route = new_route.to_string();
-        self.persist(&chars)?;
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(())
     }
 
@@ -125,11 +135,14 @@ impl CharacterStore {
         order: i32,
     ) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let char = chars
+        if !chars.iter().any(|c| c.id == id) {
+            return Err(format!("角色卡不存在: {id}"));
+        }
+        let mut candidate = chars.clone();
+        let char = candidate
             .iter_mut()
             .find(|c| c.id == id)
-            .ok_or_else(|| format!("角色卡不存在: {id}"))?;
-
+            .expect("existence pre-checked");
         let entry = char
             .info
             .world_info_entries
@@ -145,7 +158,9 @@ impl CharacterStore {
         // 同步更新计数
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars)?;
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(())
     }
 
@@ -159,10 +174,14 @@ impl CharacterStore {
         is_global: bool,
     ) -> Result<usize, String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let char = chars
+        if !chars.iter().any(|c| c.id == id) {
+            return Err(format!("角色卡不存在: {id}"));
+        }
+        let mut candidate = chars.clone();
+        let char = candidate
             .iter_mut()
             .find(|c| c.id == id)
-            .ok_or_else(|| format!("角色卡不存在: {id}"))?;
+            .expect("existence pre-checked");
 
         // 新条目默认路由：蓝灯→Constant，绿灯→Selective
         let route = if constant { "Constant" } else { "Selective" }.to_string();
@@ -179,25 +198,38 @@ impl CharacterStore {
         let new_index = char.info.world_info_entries.len() - 1;
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = true;
-        self.persist(&chars)?;
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(new_index)
     }
 
     /// 删除世界书条目
     pub fn delete_world_info_entry(&self, id: &str, entry_index: usize) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let char = chars
-            .iter_mut()
-            .find(|c| c.id == id)
-            .ok_or_else(|| format!("角色卡不存在: {id}"))?;
-
-        if entry_index >= char.info.world_info_entries.len() {
+        if !chars.iter().any(|c| c.id == id) {
+            return Err(format!("角色卡不存在: {id}"));
+        }
+        if entry_index
+            >= chars
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.info.world_info_entries.len())
+                .unwrap_or(0)
+        {
             return Err(format!("世界书条目索引越界: {entry_index}"));
         }
+        let mut candidate = chars.clone();
+        let char = candidate
+            .iter_mut()
+            .find(|c| c.id == id)
+            .expect("existence pre-checked");
         char.info.world_info_entries.remove(entry_index);
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars)?;
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(())
     }
 
@@ -208,15 +240,20 @@ impl CharacterStore {
         entries: Vec<crate::WorldInfoEntryInfo>,
     ) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let char = chars
+        if !chars.iter().any(|c| c.id == id) {
+            return Err(format!("角色卡不存在: {id}"));
+        }
+        let mut candidate = chars.clone();
+        let char = candidate
             .iter_mut()
             .find(|c| c.id == id)
-            .ok_or_else(|| format!("角色卡不存在: {id}"))?;
-
+            .expect("existence pre-checked");
         char.info.world_info_entries = entries;
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars)?;
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        self.persist(&candidate)?;
+        *chars = candidate;
         Ok(())
     }
 

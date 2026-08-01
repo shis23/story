@@ -435,3 +435,262 @@ fn cutover_report_redacts_secret_shaped_labels() {
     assert!(!json.contains("C:\\"));
     assert!(!json.contains("/tmp/"));
 }
+
+// ── Gate 5 审查一.2：marker 必须绑定实际数据库 ──────────────────────────
+
+/// 与 sample_source 内容不同的第二份源（得到不同的 manifest hash）。
+fn other_source(dir: &Path) {
+    write_json(
+        &dir.join("cards.json"),
+        &serde_json::json!([{
+            "id": "card-2", "name": "Other Hero", "source_character_id": "char-2"
+        }]),
+    );
+    write_json(
+        &dir.join("campaigns.json"),
+        &serde_json::json!([{
+            "id": "camp-2", "card_id": "card-2", "name": "Other",
+            "created_at": "2026-07-14T00:00:00Z", "revision": 0,
+            "chronicle_revision": 0, "conversation_id": "conv-2", "lineage_id": "lin-2"
+        }]),
+    );
+    write_json(
+        &dir.join("conversations").join("conv-2.json"),
+        &serde_json::json!({
+            "id": "conv-2", "campaign_id": "camp-2", "character_id": null,
+            "created_at": "2026-07-14T00:00:00Z", "updated_at": "2026-07-14T00:00:00Z",
+            "nodes": []
+        }),
+    );
+    write_json(&dir.join("instances.json"), &serde_json::json!([]));
+    write_json(&dir.join("knowledge.json"), &serde_json::json!([]));
+    write_json(&dir.join("tasks.json"), &serde_json::json!([]));
+    write_json(&dir.join("round_summaries.json"), &serde_json::json!([]));
+    write_json(&dir.join("turns.json"), &serde_json::json!([]));
+}
+
+#[test]
+fn cutover_persists_authority_binding_in_db_and_marker() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    match run_cutover(&request).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // marker 携带 authority_id + cutover_nonce。
+    let marker: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("storyforge.backend.json")).unwrap(),
+    )
+    .unwrap();
+    let marker_aid = marker["authority_id"]
+        .as_str()
+        .expect("marker authority_id");
+    let marker_nonce = marker["cutover_nonce"]
+        .as_str()
+        .expect("marker cutover_nonce");
+    assert!(!marker_aid.is_empty());
+    assert!(!marker_nonce.is_empty());
+
+    // DB 记录同一身份（authority_binding 行 + import_runs 列）。
+    let db = Database::open(dir.path().join("storyforge.sqlite3")).unwrap();
+    let (db_aid, db_nonce): (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT authority_id, cutover_nonce FROM authority_binding WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(db_aid, marker_aid, "DB authority_id must match marker");
+    assert_eq!(db_nonce, marker_nonce, "DB nonce must match marker");
+    let runs: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM import_runs \
+             WHERE status='completed' AND authority_id = ?1 AND cutover_nonce = ?2",
+            rusqlite::params![marker_aid, marker_nonce],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(runs, 1, "completed import_runs must carry the binding");
+}
+
+#[test]
+fn marker_a_with_database_b_is_rejected_not_already_cutover() {
+    let dir_a = TempDir::new().unwrap();
+    sample_source(dir_a.path());
+    let req_a = make_request(dir_a.path());
+    match run_cutover(&req_a).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // 第二份源在另一目录做真实导入 → 不同的 manifest hash + 身份。
+    let dir_b = TempDir::new().unwrap();
+    other_source(dir_b.path());
+    let req_b = make_request(dir_b.path());
+    match run_cutover(&req_b).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // 用 DB B 替换 dir_a 的最终 DB，保留 marker A（marker A ↔ DB B 不绑定）。
+    let db_b_bytes = fs::read(dir_b.path().join("storyforge.sqlite3")).unwrap();
+    fs::copy(
+        dir_b.path().join("storyforge.sqlite3"),
+        dir_a.path().join("storyforge.sqlite3"),
+    )
+    .unwrap();
+    let marker_a_bytes = fs::read(dir_a.path().join("storyforge.backend.json")).unwrap();
+
+    // inspect_marker 必须判 Stale，而不是 SqliteAuthoritative。
+    let status = inspect_marker(&req_a.plan);
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "marker A + DB B must be Stale, got {status:?}"
+    );
+
+    // 启动路径必须报错（NOT AlreadyCutover），字节不得被改动。
+    let err = recover_or_verify(&req_a)
+        .expect_err("marker A + DB B must be rejected with an error, not AlreadyCutover");
+    assert!(
+        err.to_string().contains("stale"),
+        "error must mention stale marker, got: {err}"
+    );
+    assert_eq!(
+        fs::read(dir_a.path().join("storyforge.sqlite3")).unwrap(),
+        db_b_bytes,
+        "DB B bytes must be untouched"
+    );
+    assert_eq!(
+        fs::read(dir_a.path().join("storyforge.backend.json")).unwrap(),
+        marker_a_bytes,
+        "marker A bytes must be untouched"
+    );
+}
+
+#[test]
+fn marker_version_newer_than_supported_is_stale() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let marker = serde_json::json!({
+        "version": 999,
+        "backend": "sqlite",
+        "schema_version": 1,
+        "manifest_hash": "whatever",
+        "created_at": "2026-07-13T00:00:00Z"
+    });
+    fs::write(
+        dir.path().join("storyforge.backend.json"),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+
+    let status = inspect_marker(&make_plan(dir.path()));
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "unknown/too-new marker version must be stale, got {status:?}"
+    );
+    let err = run_cutover(&make_request(dir.path())).unwrap_err();
+    assert!(
+        err.to_string().contains("stale"),
+        "run_cutover must refuse a too-new marker, got: {err}"
+    );
+}
+
+#[test]
+fn marker_without_binding_against_db_without_completed_import_is_stale() {
+    // 老式 marker（无 authority_id）配对“无 completed import”的 DB → Stale。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        storyforge_infra_sqlite::migrations::migrate(&mut db).unwrap();
+    }
+    let marker = serde_json::json!({
+        "version": 1,
+        "backend": "sqlite",
+        "schema_version": 8,
+        "manifest_hash": "legacy-hash",
+        "created_at": "2026-07-13T00:00:00Z"
+    });
+    fs::write(
+        dir.path().join("storyforge.backend.json"),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+
+    let status = inspect_marker(&make_plan(dir.path()));
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "marker without binding + DB without completed import must be Stale, got {status:?}"
+    );
+}
+
+// ── Gate 5 审查一.5：audit 先于 marker；marker 之后无可失败步骤 ──────────
+
+#[test]
+fn fault_after_audit_before_marker_leaves_json_authoritative() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+
+    // 新顺序：publish → audit → marker。AfterAudit 必须发生在 marker 之前：
+    // 故障后不得有 marker，JSON 保持权威。
+    let err = run_cutover_with_fault(&request, CutoverFault::AfterAudit).unwrap_err();
+    assert!(
+        err.to_string().contains("after audit"),
+        "fault message must identify the audit step, got: {err}"
+    );
+
+    // DB 已发布但 marker 未写 → JSON 仍权威。
+    assert!(
+        dir.path().join("storyforge.sqlite3").exists(),
+        "DB is published before the marker step"
+    );
+    assert!(
+        !dir.path().join("storyforge.backend.json").exists(),
+        "audit happens BEFORE marker write: no marker may exist after AfterAudit"
+    );
+    assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
+
+    // 恢复：重新跑完整 cutover 成功（发布过的自身 DB 可让位）。
+    let outcome = recover_or_verify(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
+#[test]
+fn marker_write_failure_keeps_json_authoritative_and_recovers() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+
+    // 用目录占住 marker 路径：write_marker_atomically 的 rename 必然失败。
+    let marker_dir = dir.path().join("storyforge.backend.json");
+    fs::create_dir(&marker_dir).unwrap();
+
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("marker")
+            || err.to_string().contains("rename")
+            || err.to_string().contains("directory"),
+        "marker write failure must surface, got: {err}"
+    );
+
+    // marker 未写（目录原样保留）；JSON 源未动。
+    assert!(marker_dir.is_dir(), "marker path is still a directory");
+    assert!(dir.path().join("campaigns.json").exists());
+
+    // 清理后恢复成功。
+    fs::remove_dir(&marker_dir).unwrap();
+    let outcome = recover_or_verify(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(dir.path().join("storyforge.backend.json").is_file());
+}

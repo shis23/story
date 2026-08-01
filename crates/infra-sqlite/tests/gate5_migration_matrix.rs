@@ -916,9 +916,9 @@ fn previous_schema_v6_migrates_to_v7_preserving_data() {
         )
         .unwrap();
 
-    // v6 → v7：数据保留、schema 前进、新表可用。
+    // v6 → latest：数据保留、schema 前进、新表可用。
     migrate(&mut db).unwrap();
-    assert_eq!(current_version(&db).unwrap(), 7);
+    assert_eq!(current_version(&db).unwrap(), 8);
     let campaigns: i64 = db
         .connection()
         .query_row("SELECT COUNT(*) FROM campaigns", [], |r| r.get(0))

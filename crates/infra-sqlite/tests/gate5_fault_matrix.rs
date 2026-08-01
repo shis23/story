@@ -456,3 +456,221 @@ fn preaccept_outbox_journal_survives_reopen_and_recovery_refails_turn() {
     assert_eq!(persisted.status, TurnStatus::Failed);
     let _ = draft;
 }
+
+// ─── 5. Gate 5 审查一.4：外部 WAL 库（连接存活 + 伪 schema_migrations）─────
+//
+// 判别点：旧只读探测只看 schema_migrations 存在且 MAX(version)>=1，会把带
+// 同名迁移表的外部库误判为自身产物 → 删除 -wal/-shm（销毁未 checkpoint 事务）
+// → 发布覆盖。本测试构造该场景并把外部连接保持存活，要求 fail closed 且字节
+// 完全不变、未 checkpoint 数据仍可读。
+
+#[test]
+fn foreign_wal_database_with_live_connection_and_migrations_is_rejected_bytes_intact() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+    let wal_path = db_path.with_extension("sqlite3-wal");
+    let shm_path = db_path.with_extension("sqlite3-shm");
+
+    // 外部 WAL 库：带 schema_migrations 表（旧探测会误判为自身）+ 未 checkpoint
+    // 事务；**连接保持存活**（不 drop、不 checkpoint）。
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO schema_migrations (version, name) VALUES (1, 'foreign-app');
+         CREATE TABLE user_data (id INTEGER PRIMARY KEY, note TEXT);
+         INSERT INTO user_data (note) VALUES ('precious wal row');",
+    )
+    .unwrap();
+    assert!(wal_path.exists(), "WAL sidecar must exist");
+    let wal_before = fs::read(&wal_path).unwrap();
+    assert!(!wal_before.is_empty(), "WAL must carry uncheckpointed data");
+    let shm_before = fs::read(&shm_path).unwrap_or_default();
+    let db_before = fs::read(&db_path).unwrap();
+
+    // cutover 必须 fail closed：带迁移表的外部库同样不是 StoryForge 产物。
+    let err = run_cutover(&request(dir.path()))
+        .expect_err("cutover must refuse to overwrite a foreign WAL database");
+    assert!(
+        err.to_string().contains("non-StoryForge"),
+        "error must explain the refusal, got: {err}"
+    );
+
+    // 字节不变：-wal / -shm / 主库。注意：必须在存活连接执行任何查询**之前**
+    // 断言——-shm 是存活连接自己的共享内存索引，其首次读锁会合法改写 read-marks；
+    // cutover 全程不得触碰 sidecar（这才是被测试的不变量）。
+    assert_eq!(
+        fs::read(&wal_path).unwrap(),
+        wal_before,
+        "-wal sidecar must be byte-identical"
+    );
+    assert_eq!(
+        fs::read(&shm_path).unwrap_or_default(),
+        shm_before,
+        "-shm sidecar must be byte-identical"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        db_before,
+        "main db must be byte-identical"
+    );
+
+    // 连接仍存活：未 checkpoint 数据必须仍可读（-wal 未被删/截断）。
+    let note: String = conn
+        .query_row("SELECT note FROM user_data WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(note, "precious wal row");
+    drop(conn);
+
+    // 无 marker；JSON 仍权威。
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert!(dir.path().join("campaigns.json").exists());
+}
+// ─── 6. Gate 5 审查一.4：另一份 StoryForge 库（不同身份）在目标路径 ──────
+
+#[test]
+fn other_storyforge_database_at_target_is_rejected_bytes_unchanged() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+
+    // 另一目录做真实 cutover → 另一个 authority 身份的 StoryForge 库。
+    let other = TempDir::new().unwrap();
+    write_source(other.path());
+    // 内容微调 → 不同 manifest hash（身份还绑定 data_dir，双保险）。
+    write_json(
+        &other.path().join("campaigns.json"),
+        serde_json::json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "其他来源局",
+            "conversation_id": "conv-1", "revision": 0,
+            "chronicle_revision": 0, "lineage_id": "lin-1",
+            "story_clock": "Day 1", "variables": [], "variable_schema": [],
+            "created_at": "2026-07-02T00:00:01Z"
+        }]),
+    );
+    match run_cutover(&request(other.path())).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other_outcome => panic!("expected Completed, got {other_outcome:?}"),
+    }
+    let other_db_bytes = fs::read(other.path().join("storyforge.sqlite3")).unwrap();
+    fs::copy(other.path().join("storyforge.sqlite3"), &db_path).unwrap();
+
+    // 无 marker；run_cutover 必须拒绝（非本次 cutover 的自身产物）。
+    assert!(matches!(
+        inspect_marker(&request(dir.path()).plan),
+        MarkerStatus::Absent
+    ));
+    let err = run_cutover(&request(dir.path()))
+        .expect_err("another StoryForge DB at the target must be refused");
+    assert!(
+        err.to_string().contains("non-StoryForge"),
+        "error must explain the refusal, got: {err}"
+    );
+
+    // 字节不变；无 marker；JSON 权威。
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        other_db_bytes,
+        "other StoryForge DB bytes must be untouched"
+    );
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert!(dir.path().join("campaigns.json").exists());
+}
+
+// ─── 7. Gate 5 审查一.4：普通非 SQLite 文件在目标路径 ────────────────────
+
+#[test]
+fn plain_text_file_at_target_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+    fs::write(&db_path, b"this is definitely not a sqlite database").unwrap();
+    let bytes_before = fs::read(&db_path).unwrap();
+
+    let err = run_cutover(&request(dir.path()))
+        .expect_err("cutover must refuse to replace a plain text file");
+    assert!(
+        err.to_string().contains("non-StoryForge"),
+        "error must explain the refusal, got: {err}"
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), bytes_before);
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+}
+// ─── 8. Gate 5 审查一.5：sidecar 清理失败必须传播，最终 DB 不被触碰 ──────
+
+#[test]
+fn sidecar_cleanup_failure_propagates_and_final_db_untouched() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    // 把 -wal 路径做成目录：remove_file 必失败（非 NotFound）。
+    fs::create_dir(dir.path().join("storyforge.sqlite3-wal")).unwrap();
+
+    let err =
+        run_cutover(&request(dir.path())).expect_err("sidecar cleanup failure must propagate");
+    assert!(
+        err.to_string().contains("sidecar") || err.to_string().contains("-wal"),
+        "error must mention the failed sidecar cleanup, got: {err}"
+    );
+
+    // 发布未发生：无最终 DB、无 marker；JSON 权威。
+    assert!(
+        !dir.path().join("storyforge.sqlite3").exists(),
+        "final DB must not be published when sidecar cleanup fails"
+    );
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert!(dir.path().join("campaigns.json").exists());
+
+    // 清理后 cutover 完成。
+    fs::remove_dir(dir.path().join("storyforge.sqlite3-wal")).unwrap();
+    match run_cutover(&request(dir.path())).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("expected Completed after cleanup, got {other:?}"),
+    }
+}
+
+#[test]
+fn sidecar_cleanup_failure_with_existing_owned_db_leaves_final_db_untouched() {
+    let dir = TempDir::new().unwrap();
+    write_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+
+    // 第一次：AfterPublishBeforeMarker → 自身产物 DB 已发布、marker 未写。
+    let err = storyforge_infra_sqlite::cutover::run_cutover_with_fault(
+        &request(dir.path()),
+        storyforge_infra_sqlite::cutover::CutoverFault::AfterPublishBeforeMarker,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("after publish"));
+    assert!(db_path.exists());
+    let db_bytes = fs::read(&db_path).unwrap();
+
+    // 用目录顶替 -wal 路径（窗口内外部进程占用 sidecar 的模拟）。
+    fs::create_dir(dir.path().join("storyforge.sqlite3-wal")).unwrap();
+
+    // 恢复 cutover：所有权探测通过（自身产物）→ sidecar 清理失败 → 传播错误，
+    // 最终 DB 保持原字节、marker 不写。
+    let err2 = recover_or_verify(&request(dir.path()))
+        .expect_err("sidecar cleanup failure must propagate on recovery");
+    assert!(
+        err2.to_string().contains("sidecar") || err2.to_string().contains("-wal"),
+        "error must mention the failed sidecar cleanup, got: {err2}"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        db_bytes,
+        "existing final DB must remain byte-identical"
+    );
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+
+    // 清理后恢复成功。
+    fs::remove_dir(dir.path().join("storyforge.sqlite3-wal")).unwrap();
+    let outcome = recover_or_verify(&request(dir.path())).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(matches!(
+        inspect_marker(&request(dir.path()).plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}

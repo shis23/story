@@ -10,8 +10,8 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::turn::{
-    AttemptStatus, Mutation, MutationBatch, QualityAcceptDecision, QualityReport, QualitySeverity,
-    TurnAttempt, TurnRecord, TurnStatus, quality_accept_decision,
+    AttemptStatus, Mutation, MutationBatch, MutationBatchStatus, QualityAcceptDecision,
+    QualityReport, QualitySeverity, TurnAttempt, TurnRecord, TurnStatus, quality_accept_decision,
 };
 
 use crate::campaign_store::CampaignStore;
@@ -119,6 +119,13 @@ pub fn apply_postprocess_to_attempt(
 }
 
 /// Mark the accepted attempt Committed and supersede other active attempts.
+///
+/// 四.2（三.4 命令层）：JSON 最终持久化状态必须与 SQLite 完全一致——SQLite
+/// `accept_turn` 在提交时把 `pending_state_changes` 的 batch status 翻为
+/// `Committed` 后落库；JSON 侧此前把 batch 以 `Prepared` 永久落盘（write-ahead
+/// journal 阶段的状态），与 SQLite 真值分叉。本函数在终态标记（candidate →
+/// persist → swap 原子写）内把 batch 翻为 `Committed`，提交后的持久化状态
+/// 与 SQLite 逐字节等价（"committed"）。
 pub fn finalize_committed_turn(record: &mut TurnRecord, attempt_id: &Id, turn_status: TurnStatus) {
     record.status = turn_status;
     record.accepted_attempt_id = Some(attempt_id.clone());
@@ -127,6 +134,11 @@ pub fn finalize_committed_turn(record: &mut TurnRecord, attempt_id: &Id, turn_st
             att.status = AttemptStatus::Superseded;
         } else if att.attempt_id == *attempt_id {
             att.status = AttemptStatus::Committed;
+            // 提交完成：批处理状态翻为 Committed（与 SQLite `accept_turn`
+            // 持久化语义一致；Prepared 仅用于提交前的 write-ahead journal）。
+            if let Some(batch) = att.pending_state_changes.as_mut() {
+                batch.status = MutationBatchStatus::Committed;
+            }
         }
     }
     record.touch();

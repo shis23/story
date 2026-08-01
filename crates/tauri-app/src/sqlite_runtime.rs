@@ -374,6 +374,257 @@ pub fn add_knowledge_batch(entries: &[CharacterKnowledgeEntry]) -> Result<(), St
     })
 }
 
+/// 三.5：活动 Turn 屏障下的原子读改写（backend-neutral facade 的 SQLite 侧）。
+///
+/// 「检查活动 Turn + 写入」在**同一个 BEGIN IMMEDIATE 事务**内完成——检查与
+/// 写入之间不存在让 Turn 插入的窗口（旧实现 `reject_if_active_turn` 检查后
+/// 再单独写盘是 TOCTOU：检查通过后、写入前 Turn 可被创建，写盘就落在活动
+/// Turn 期间）。任一失败整体回滚（活动 Turn 仍在、数据未变）。
+fn with_active_turn_mutation<R>(
+    campaign_id: &Id,
+    f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    with_db_mut(|db| {
+        let uow = storyforge_infra_sqlite::UnitOfWork::begin(db.connection_mut())
+            .map_err(|e| e.to_string())?;
+        let tx = uow.transaction().map_err(|e| e.to_string())?;
+        // 前置：活动 Turn 检查在事务内执行（与写入同事务）。
+        let active_turn_id: Option<String> = tx
+            .query_row(
+                r#"
+                SELECT turn_id FROM turns
+                WHERE campaign_id = ?1
+                  AND status IN ('generating', 'draft_ready', 'deriving_state',
+                                 'awaiting_acceptance', 'committing')
+                LIMIT 1
+                "#,
+                [campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(turn_id) = active_turn_id {
+            return Err(format!(
+                "当前有未完成的轮次（turn_id={turn_id}），请先 Accept、Discard 或 Abandon 后再修改"
+            ));
+        }
+        let result = f(tx)?;
+        uow.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    })
+}
+
+/// 活动 Turn 屏障 + Campaign 读改写（单 UoW）。返回更新后的 Campaign。
+pub(crate) fn mutate_idle_campaign<F>(campaign_id: &Id, f: F) -> Result<Option<Campaign>, String>
+where
+    F: FnOnce(&mut Campaign) -> Result<(), String>,
+{
+    with_active_turn_mutation(campaign_id, |tx| {
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM campaigns WHERE campaign_id = ?1",
+                [campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mut campaign: Campaign =
+            serde_json::from_str(&payload).map_err(|e| format!("反序列化 Campaign 失败: {e}"))?;
+        f(&mut campaign)?;
+        tx.execute(
+            r#"
+            UPDATE campaigns SET
+                card_id=?2, name=?3, conversation_id=?4, revision=?5,
+                chronicle_revision=?6, lineage_id=?7, story_clock=?8,
+                created_at=?9, payload_json=?10
+            WHERE campaign_id=?1
+            "#,
+            rusqlite::params![
+                campaign.id.as_str(),
+                campaign.card_id.as_str(),
+                campaign.name,
+                campaign.conversation_id.as_ref().map(Id::as_str),
+                campaign.revision,
+                campaign.chronicle_revision,
+                campaign.lineage_id.as_ref().map(Id::as_str),
+                campaign.current_story_clock(),
+                campaign.created_at,
+                serde_json::to_string(&campaign)
+                    .map_err(|e| format!("序列化 Campaign 失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(campaign))
+    })
+}
+
+/// 活动 Turn 屏障 + 角色实例读改写（单 UoW）。返回更新后的实例。
+pub(crate) fn mutate_idle_instance<F>(
+    campaign_id: &Id,
+    instance_id: &Id,
+    f: F,
+) -> Result<Option<CharacterInstance>, String>
+where
+    F: FnOnce(&mut CharacterInstance) -> Result<(), String>,
+{
+    with_active_turn_mutation(campaign_id, |tx| {
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM character_instances \
+                 WHERE instance_id = ?1 AND campaign_id = ?2",
+                rusqlite::params![instance_id.as_str(), campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mut instance: CharacterInstance =
+            serde_json::from_str(&payload).map_err(|e| format!("反序列化角色实例失败: {e}"))?;
+        f(&mut instance)?;
+        tx.execute(
+            r#"
+            UPDATE character_instances SET
+                campaign_id=?2, definition_id=?3, name=?4, is_temporary=?5,
+                payload_json=?6
+            WHERE instance_id=?1
+            "#,
+            rusqlite::params![
+                instance.id.as_str(),
+                instance.campaign_id.as_str(),
+                instance.definition_id.as_ref().map(Id::as_str),
+                instance.name,
+                instance.is_temporary,
+                serde_json::to_string(&instance).map_err(|e| format!("序列化角色实例失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(instance))
+    })
+}
+
+/// 活动 Turn 屏障 + Campaign 存在性校验 + 实例写入（单 UoW）。
+/// `validate` 在事务内、写入前对既有实例做重复检查。
+pub(crate) fn add_idle_instance(
+    campaign_id: &Id,
+    instance: &CharacterInstance,
+    validate: impl FnOnce(&[CharacterInstance]) -> Result<(), String>,
+) -> Result<(), String> {
+    with_active_turn_mutation(campaign_id, |tx| {
+        let campaign_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM campaigns WHERE campaign_id = ?1",
+                [campaign_id.as_str()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(false);
+        if !campaign_exists {
+            return Err(format!("找不到 campaign {campaign_id}"));
+        }
+        let mut existing: Vec<CharacterInstance> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare("SELECT payload_json FROM character_instances WHERE campaign_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([campaign_id.as_str()], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let payload = row.map_err(|e| e.to_string())?;
+                existing.push(
+                    serde_json::from_str(&payload)
+                        .map_err(|e| format!("反序列化角色实例失败: {e}"))?,
+                );
+            }
+        }
+        validate(&existing)?;
+        tx.execute(
+            r#"
+            INSERT INTO character_instances (
+                instance_id, campaign_id, definition_id, name, is_temporary, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            rusqlite::params![
+                instance.id.as_str(),
+                instance.campaign_id.as_str(),
+                instance.definition_id.as_ref().map(Id::as_str),
+                instance.name,
+                instance.is_temporary,
+                serde_json::to_string(instance).map_err(|e| format!("序列化角色实例失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// 活动 Turn 屏障 + 新建任务（单 UoW；任务的 campaign 必须与守卫一致）。
+pub(crate) fn add_idle_task(campaign_id: &Id, task: &StoryTask) -> Result<(), String> {
+    if &task.campaign_id != campaign_id {
+        return Err(format!(
+            "任务 {} campaign 不匹配: {}, expected={campaign_id}",
+            task.id, task.campaign_id
+        ));
+    }
+    with_active_turn_mutation(campaign_id, |tx| {
+        tx.execute(
+            "INSERT INTO story_tasks (task_id, campaign_id, payload_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                task.id.as_str(),
+                task.campaign_id.as_str(),
+                serde_json::to_string(task).map_err(|e| format!("序列化任务失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// 活动 Turn 屏障 + 任务读改写（单 UoW；屏障按任务所属 campaign 校验）。
+pub(crate) fn mutate_idle_task<F>(task_id: &Id, f: F) -> Result<Option<StoryTask>, String>
+where
+    F: FnOnce(&mut StoryTask) -> Result<(), String>,
+{
+    // 先取任务所属 campaign（仅用于选定屏障目标；事务内重新读取真值，
+    // 且 `get_task` 在进入 with_active_turn_mutation 前已释放进程锁）。
+    let campaign_id = match get_task(task_id)? {
+        Some(task) => task.campaign_id.clone(),
+        None => return Ok(None),
+    };
+    with_active_turn_mutation(&campaign_id, |tx| {
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM story_tasks WHERE task_id = ?1",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mut task: StoryTask =
+            serde_json::from_str(&payload).map_err(|e| format!("反序列化任务失败: {e}"))?;
+        f(&mut task)?;
+        tx.execute(
+            "UPDATE story_tasks SET campaign_id=?2, payload_json=?3 WHERE task_id=?1",
+            rusqlite::params![
+                task.id.as_str(),
+                task.campaign_id.as_str(),
+                serde_json::to_string(&task).map_err(|e| format!("序列化任务失败: {e}"))?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(task))
+    })
+}
+
 /// JSON `CampaignStore::create_campaign_with_instances` 等价：从卡 payload 构建
 /// Protagonist/Supporting 实例并单事务写入（清空既有实例 → Campaign → 实例）。
 /// 返回 (StoredCard, Campaign, instance_count)，与 JSON 语义一致。
@@ -1581,7 +1832,7 @@ fn delete_card_cascade_tx(tx: &rusqlite::Transaction<'_>, card_id: &str) -> Resu
             [campaign_id],
         )
         .map_err(|e| e.to_string())?;
-        // turn_attempts → turns → conversations
+        // turn_attempts → turns
         tx.execute(
             "DELETE FROM turn_attempts WHERE turn_id IN \
              (SELECT turn_id FROM turns WHERE campaign_id = ?1)",
@@ -1590,11 +1841,6 @@ fn delete_card_cascade_tx(tx: &rusqlite::Transaction<'_>, card_id: &str) -> Resu
         .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM turns WHERE campaign_id = ?1", [campaign_id])
             .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM conversations WHERE campaign_id = ?1",
-            [campaign_id],
-        )
-        .map_err(|e| e.to_string())?;
         // chronicle summaries / covers / tasks / knowledge / instances / world info
         tx.execute(
             "DELETE FROM round_summary_covers WHERE parent_id IN \
@@ -1605,6 +1851,14 @@ fn delete_card_cascade_tx(tx: &rusqlite::Transaction<'_>, card_id: &str) -> Resu
         .map_err(|e| e.to_string())?;
         tx.execute(
             "DELETE FROM round_summaries WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // conversations 最后删除（round_summaries 的 conversation_id FK 指向
+        // conversations——三.7 修复：必须先删 summaries 再删 conversations，
+        // 否则带摘要的 Campaign 删除必撞 FK 约束整体回滚）。
+        tx.execute(
+            "DELETE FROM conversations WHERE campaign_id = ?1",
             [campaign_id],
         )
         .map_err(|e| e.to_string())?;

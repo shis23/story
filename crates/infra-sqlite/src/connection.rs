@@ -4,6 +4,12 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::error::{Result, SqliteError};
 
+/// StoryForge 数据库 `PRAGMA application_id` 魔数（ASCII "STFG"）。
+///
+/// 只读所有权探测与 cutover 发布路径都依赖该常量，避免把外部 SQLite 文件
+/// 误判为自身产物。写入是幂等的：已是该值时不再改写。
+pub const STORYFORGE_APPLICATION_ID: i32 = 0x5354_4647; // 'S''T''F''G'
+
 /// 打开并配置 StoryForge SQLite 连接。
 ///
 /// 固定 PRAGMA（见 ADR 0001）：
@@ -12,6 +18,7 @@ use crate::error::{Result, SqliteError};
 /// - busy_timeout=5000
 /// - synchronous=NORMAL
 /// - temp_store=MEMORY
+/// - application_id=STORYFORGE_APPLICATION_ID（幂等）
 pub struct Database {
     path: PathBuf,
     conn: Connection,
@@ -74,6 +81,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "busy_timeout", 5000i64)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    ensure_application_id(conn)?;
 
     // 校验 foreign_keys 确实打开（部分连接模式可能忽略）
     let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
@@ -81,6 +89,15 @@ fn configure_connection(conn: &Connection) -> Result<()> {
         return Err(SqliteError::Other(
             "failed to enable foreign_keys PRAGMA".into(),
         ));
+    }
+    Ok(())
+}
+
+/// 幂等写入 application_id；已是目标值时不改写。
+fn ensure_application_id(conn: &Connection) -> Result<()> {
+    let current: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    if current != i64::from(STORYFORGE_APPLICATION_ID) {
+        conn.pragma_update(None, "application_id", STORYFORGE_APPLICATION_ID)?;
     }
     Ok(())
 }

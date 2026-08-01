@@ -62,6 +62,11 @@ pub fn builtin_migrations() -> Vec<Migration> {
             name: "gate4_review_fixups",
             sql: include_str!("../migrations/V007__gate4_fixups.sql"),
         },
+        Migration {
+            version: 8,
+            name: "authority_binding",
+            sql: include_str!("../migrations/V008__authority_binding.sql"),
+        },
     ]
 }
 
@@ -234,12 +239,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(current_version(&db).unwrap(), 7);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(current_version(&db).unwrap(), 8);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 7);
+        assert_eq!(current_version(&db).unwrap(), 8);
 
         // 核心表应存在
         for table in [
@@ -258,6 +263,7 @@ mod tests {
             "chronicle_compress_jobs",
             "campaign_world_info",
             "characters",
+            "authority_binding",
         ] {
             let exists: i64 = db
                 .connection()
@@ -283,8 +289,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7]);
-        assert_eq!(current_version(&db).unwrap(), 7);
+        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(current_version(&db).unwrap(), 8);
         let cards: i64 = db
             .connection()
             .query_row(

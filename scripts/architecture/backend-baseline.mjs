@@ -139,14 +139,14 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
     .reduce((sum, [, count]) => sum + count, 0)
   sqlite.methodFlagReferencesByFile = Object.fromEntries(methodFlagFiles)
   // Direct legacy JSON store accessors (json_character_store / json_campaign_store /
-  // json_turn_store / json_compress_job_store) must be confined to:
-  //   - the facade + named backend adapter (methodFlagWhitelist), and
-  //   - commands/* (which only use them via best-effort `.ok()` for regex/script
-  //     context that degrades gracefully under SQLite — pre-existing, benign).
-  // Anywhere else (card_studio_api, playthrough_lifecycle, runtime_support, …)
-  // is a backend-policy leak: it makes the path JSON-only and silently breaks
-  // under SQLite authority (Gate 5 review-followup: cardstudio_create_from_character
-  // previously called json_character_store directly and failed under SQLite).
+  // json_turn_store / json_compress_job_store) must be confined to the facade +
+  // named backend adapter (methodFlagWhitelist). commands/* is NO LONGER a
+  // whitelist: the Gate-5 review-followup replaced every command-side
+  // `.ok()`-hidden json_character_store access with the backend-neutral
+  // `collect_scoped_regex_scripts_for_backend` resolver (stored/source/card/name
+  // mapping through the facade). Any reference in commands, card_studio_api,
+  // playthrough_lifecycle, runtime_support, … is a backend-policy leak: it makes
+  // the path JSON-only and silently breaks under SQLite authority.
   const legacyStoreAccessorPattern =
     /\.json_(?:character|campaign|turn|compress_job)_store\b/g
   const legacyAccessorFiles = new Map()
@@ -158,8 +158,7 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
         count,
       )
   }
-  const legacyAccessorAllowed = (name) =>
-    methodFlagWhitelist.includes(name) || name.startsWith('commands/')
+  const legacyAccessorAllowed = (name) => methodFlagWhitelist.includes(name)
   sqlite.applicationLegacyStoreAccessorReferences = [...legacyAccessorFiles.entries()]
     .filter(([name]) => !legacyAccessorAllowed(name))
     .reduce((sum, [, count]) => sum + count, 0)

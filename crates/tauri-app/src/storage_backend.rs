@@ -13,12 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use storyforge_app_conversation::ConversationStore;
+#[cfg(test)]
+use storyforge_infra_sqlite::backend::DEFAULT_BACKEND_ENV_VAR;
 use storyforge_infra_sqlite::backend::{
     BackendDiagnostics, BackendSelection, PinnedBackend, StorageBackend,
 };
 use storyforge_infra_sqlite::cutover::{
     CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, inspect_marker, recover_or_verify,
 };
+use storyforge_infra_sqlite::lease::hold_process_shared_lease;
 use storyforge_infra_sqlite::migrations::current_version;
 
 use crate::campaign_store::{CampaignStore, StoredCard};
@@ -549,8 +552,12 @@ impl StorageFacade {
         if self.is_sqlite() {
             sqlite_runtime::save_campaign(campaign)
         } else {
+            // JSON 分支必须是 upsert（与 SQLite `save_campaign` 的
+            // INSERT ... ON CONFLICT DO UPDATE 语义对齐）。Gate 5 三.6 修复：
+            // 旧实现误用 `update_campaign`（仅更新既有行），fork / import 落
+            // 新 Campaign 时 JSON 侧静默 no-op，fork 的 Campaign 从未落盘。
             self.json_campaign_store(BackendCapability::CampaignLifecycle, "save campaign")?
-                .update_campaign(campaign.clone())
+                .save_campaign(campaign.clone())
         }
     }
 
@@ -583,6 +590,138 @@ impl StorageFacade {
         } else {
             self.json_campaign_store(BackendCapability::CampaignLifecycle, "update instance")?
                 .update_instance(instance.clone())
+        }
+    }
+
+    // ─── Gate 5: 三.5 active-turn 原子空闲修改（backend-neutral）────────────
+    //
+    // 「检查活动 Turn + 写入」合并进同一原子单元：JSON 在 TurnStore 的 turns
+    // 锁守卫内完成 candidate→persist→swap（锁序 turns → CampaignStore 集合锁，
+    // 与 `create_turn` 同序、无反向嵌套）；SQLite 在单个 BEGIN IMMEDIATE UoW
+    // 内检查 + 写入。彻底消除「先查后写」的 TOCTOU 窗口（审查三.5）。
+
+    /// 活动 Turn 屏障下的 Campaign 读改写。Campaign 不存在 → Ok(None)。
+    pub fn mutate_idle_campaign<F>(
+        &self,
+        campaign_id: &Id,
+        f: F,
+    ) -> Result<Option<Campaign>, String>
+    where
+        F: FnOnce(&mut Campaign) -> Result<(), String>,
+    {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_idle_campaign(campaign_id, f)
+        } else {
+            let turn_store = self.json_turn_store("idle campaign mutation")?;
+            let campaign_store = self.json_campaign_store(
+                BackendCapability::CampaignLifecycle,
+                "idle campaign mutation",
+            )?;
+            turn_store.with_idle_turn_guard(campaign_id, || {
+                campaign_store.mutate_campaign_candidate(campaign_id, f)
+            })
+        }
+    }
+
+    /// 活动 Turn 屏障下的角色实例读改写。实例不存在 → Ok(None)。
+    pub fn mutate_idle_instance<F>(
+        &self,
+        campaign_id: &Id,
+        instance_id: &Id,
+        f: F,
+    ) -> Result<Option<CharacterInstance>, String>
+    where
+        F: FnOnce(&mut CharacterInstance) -> Result<(), String>,
+    {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_idle_instance(campaign_id, instance_id, f)
+        } else {
+            let turn_store = self.json_turn_store("idle instance mutation")?;
+            let campaign_store = self.json_campaign_store(
+                BackendCapability::CampaignLifecycle,
+                "idle instance mutation",
+            )?;
+            turn_store.with_idle_turn_guard(campaign_id, || {
+                campaign_store.mutate_instance_candidate(campaign_id, instance_id, f)
+            })
+        }
+    }
+
+    /// 活动 Turn 屏障 + Campaign 存在性校验 + 实例写入（同一原子单元）。
+    /// `validate` 在写盘前对既有实例列表做重复检查（同名 / 同 definition）。
+    pub(crate) fn add_idle_instance(
+        &self,
+        campaign_id: &Id,
+        instance: &CharacterInstance,
+        validate: impl FnOnce(&[CharacterInstance]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::add_idle_instance(campaign_id, instance, validate)
+        } else {
+            let turn_store = self.json_turn_store("idle instance add")?;
+            let campaign_store = self
+                .json_campaign_store(BackendCapability::CampaignLifecycle, "idle instance add")?;
+            turn_store.with_idle_turn_guard(campaign_id, || {
+                campaign_store.add_instance_guarded(campaign_id, instance, validate)
+            })
+        }
+    }
+
+    /// 活动 Turn 屏障下的新建任务（同一原子单元）。
+    pub fn add_idle_task(&self, campaign_id: &Id, task: &StoryTask) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::add_idle_task(campaign_id, task)
+        } else {
+            let turn_store = self.json_turn_store("idle task add")?;
+            let campaign_store = self
+                .json_campaign_store(BackendCapability::KnowledgeTaskCommands, "idle task add")?;
+            turn_store.with_idle_turn_guard(campaign_id, || campaign_store.add_task(task.clone()))
+        }
+    }
+
+    /// 活动 Turn 屏障下的任务读改写（屏障按任务所属 campaign 校验）。
+    /// 任务不存在 → Ok(None)。
+    pub fn mutate_idle_task<F>(&self, task_id: &Id, f: F) -> Result<Option<StoryTask>, String>
+    where
+        F: FnOnce(&mut StoryTask) -> Result<(), String>,
+    {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_idle_task(task_id, f)
+        } else {
+            let campaign_store = self.json_campaign_store(
+                BackendCapability::KnowledgeTaskCommands,
+                "idle task mutation",
+            )?;
+            let Some(task) = campaign_store.get_task(task_id) else {
+                return Ok(None);
+            };
+            let campaign_id = task.campaign_id.clone();
+            let turn_store = self.json_turn_store("idle task mutation")?;
+            turn_store.with_idle_turn_guard(&campaign_id, || {
+                let mut candidate = campaign_store
+                    .get_task(task_id)
+                    .ok_or_else(|| format!("任务 {task_id} 不存在"))?;
+                f(&mut candidate)?;
+                let updated = candidate.clone();
+                campaign_store.update_task(candidate)?;
+                Ok(Some(updated))
+            })
+        }
+    }
+
+    /// 删除一局活动的全部压缩任务（delete_card 级联用，Gate 5 三.7）。
+    ///
+    /// SQLite：`delete_card_payload` 的单事务级联已含 chronicle_compress_jobs，
+    /// 此处返回 0（no-op）；JSON：CompressJobStore 候选 → 持久化 → 换入删除。
+    pub(crate) fn delete_compress_jobs_for_campaign(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<usize, String> {
+        if self.is_sqlite() {
+            Ok(0)
+        } else {
+            self.json_compress_job_store("delete card compress jobs cascade")?
+                .delete_for_campaign(campaign_id)
         }
     }
 
@@ -1618,49 +1757,107 @@ pub fn resolve_backend(data_dir: &Path) -> Result<BackendResolution, BackendWiri
 }
 
 /// Inner resolution logic without the OnceLock — testable in isolation.
+///
+/// Marker-first（审查一.1）：**先**检查后端 marker，再结合 env 解析：
+/// - 有效 sqlite marker → SQLite 权威（env=json 必须 fail closed，绝不回退 JSON；
+///   env=sqlite / 无 env → SQLite）；
+/// - JsonAuthoritative marker（官方 reverse-cutover 写入）→ JSON 权威；
+///   env=sqlite 是合法全新 opt-in，可重跑 cutover（forward 路径）；
+/// - Stale marker → 无论 env 是什么都拒绝（JSON 与 SQLite 都不放行）；
+/// - 无 marker → env=sqlite 走 cutover，否则 JSON。
+///
+/// JSON 与 SQLite 分支在决议成功后都持有进程级 SHARED authority 租约
+/// （`storyforge.authority.lock`），把并发 cutover 挡在门外（审查一.3）。
 fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWiringError> {
     let selection = BackendSelection::from_env(None);
+    let db_path = data_dir.join(SQLITE_DB_FILENAME);
+    let plan = CutoverPlan::new(data_dir, &db_path);
+
+    // 解析 env（未知值直接拒绝），但**不**用它拍板——marker 优先。
+    let env_backend = selection
+        .resolve()
+        .map_err(|e| BackendWiringError::Selection(format!("{e}")))?;
     let pinned = PinnedBackend::resolve(&selection)
         .map_err(|e| BackendWiringError::Selection(format!("{e}")))?;
+    let pinned_source = pinned.source();
 
-    match pinned.backend() {
-        StorageBackend::Json => {
-            let diag = BackendDiagnostics::from_pinned(&pinned, None);
-            Ok(BackendResolution {
-                pinned,
-                db_path: None,
-                diagnostics: diag,
-                cutover_performed: false,
-            })
+    let run_sqlite = || -> Result<BackendResolution, BackendWiringError> {
+        // 运行 cutover（或验证已完成）。
+        let request = CutoverRequest {
+            plan: plan.clone(),
+            label: "app-startup".to_string(),
+        };
+        let outcome =
+            recover_or_verify(&request).map_err(|e| BackendWiringError::Cutover(format!("{e}")))?;
+
+        let cutover_performed = matches!(outcome, CutoverOutcome::Completed(_));
+
+        let schema_version = {
+            let db = storyforge_infra_sqlite::Database::open(&db_path)
+                .map_err(|e| BackendWiringError::Cutover(format!("reopen: {e}")))?;
+            current_version(&db).unwrap_or(0)
+        };
+
+        // SQLite 权威决议成功：持有进程级 SHARED 租约，阻挡并发 cutover。
+        hold_process_shared_lease(data_dir)
+            .map_err(|e| BackendWiringError::Lease(format!("{e}")))?;
+
+        let sqlite_pinned = PinnedBackend::new(StorageBackend::Sqlite, pinned_source);
+        let diag = BackendDiagnostics::from_pinned(&sqlite_pinned, Some(schema_version));
+        Ok(BackendResolution {
+            pinned: sqlite_pinned,
+            db_path: Some(db_path),
+            diagnostics: diag,
+            cutover_performed,
+        })
+    };
+
+    let run_json = || -> Result<BackendResolution, BackendWiringError> {
+        // JSON 权威决议成功：持有进程级 SHARED 租约（普通 JSON 写者进程）。
+        hold_process_shared_lease(data_dir)
+            .map_err(|e| BackendWiringError::Lease(format!("{e}")))?;
+        let diag = BackendDiagnostics::from_pinned(&pinned, None);
+        Ok(BackendResolution {
+            pinned,
+            db_path: None,
+            diagnostics: diag,
+            cutover_performed: false,
+        })
+    };
+
+    match inspect_marker(&plan) {
+        MarkerStatus::SqliteAuthoritative { .. } => {
+            // 有效 sqlite marker 在握：env 只能允许 sqlite / 缺省。
+            if env_backend == StorageBackend::Json && selection.is_explicit() {
+                return Err(BackendWiringError::Selection(
+                    "storage backend marker claims SQLite authority, but \
+                     STORYFORGE_STORAGE_BACKEND=json was set; refusing to fall back \
+                     to JSON (delete the marker to reset authority)"
+                        .to_string(),
+                ));
+            }
+            run_sqlite()
         }
-        StorageBackend::Sqlite => {
-            let db_path = data_dir.join(SQLITE_DB_FILENAME);
-            let plan = CutoverPlan::new(data_dir, &db_path);
-
-            // Run the cutover (or verify if already done).
-            let request = CutoverRequest {
-                plan: plan.clone(),
-                label: "app-startup".to_string(),
-            };
-            let outcome = recover_or_verify(&request)
-                .map_err(|e| BackendWiringError::Cutover(format!("{e}")))?;
-
-            let cutover_performed = matches!(outcome, CutoverOutcome::Completed(_));
-
-            let schema_version = {
-                let db = storyforge_infra_sqlite::Database::open(&db_path)
-                    .map_err(|e| BackendWiringError::Cutover(format!("reopen: {e}")))?;
-                current_version(&db).unwrap_or(0)
-            };
-
-            let diag = BackendDiagnostics::from_pinned(&pinned, Some(schema_version));
-
-            Ok(BackendResolution {
-                pinned,
-                db_path: Some(db_path),
-                diagnostics: diag,
-                cutover_performed,
-            })
+        MarkerStatus::JsonAuthoritative => {
+            // JSON 权威（reverse-cutover 产物）：env=sqlite 是合法全新 opt-in。
+            if env_backend == StorageBackend::Sqlite && selection.is_explicit() {
+                run_sqlite()
+            } else {
+                run_json()
+            }
+        }
+        MarkerStatus::Absent => {
+            if env_backend == StorageBackend::Sqlite && selection.is_explicit() {
+                run_sqlite()
+            } else {
+                run_json()
+            }
+        }
+        MarkerStatus::Stale { reason } => {
+            // 无论 env 是什么都拒绝：JSON 与 SQLite 都不放行。
+            Err(BackendWiringError::Selection(format!(
+                "stale backend marker; refusing to start until resolved: {reason}"
+            )))
         }
     }
 }
@@ -1701,6 +1898,8 @@ pub enum BackendWiringError {
     Selection(String),
     #[error("cutover error: {0}")]
     Cutover(String),
+    #[error("authority lease error: {0}")]
+    Lease(String),
 }
 
 #[cfg(test)]
@@ -1987,5 +2186,170 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(state.storage(), &facade));
         assert_eq!(state.storage().backend(), StorageBackend::Json);
         assert_eq!(state.storage().data_dir(), dir.path());
+    }
+    // ─── Gate 5 审查一.1：marker 优先于环境变量与默认 JSON ────────────────
+
+    /// 跑一次真实 cutover，得到有效 sqlite marker + DB（source 完备）。
+    /// Wave-1 决议区测试辅助；当前无调用者（clippy -D warnings 死代码）。
+    #[allow(dead_code)]
+    fn cut_over(dir: &Path) {
+        let plan =
+            storyforge_infra_sqlite::cutover::CutoverPlan::new(dir, dir.join(SQLITE_DB_FILENAME));
+        let request = storyforge_infra_sqlite::cutover::CutoverRequest {
+            plan,
+            label: "marker-first".into(),
+        };
+        match storyforge_infra_sqlite::cutover::run_cutover(&request).unwrap() {
+            storyforge_infra_sqlite::cutover::CutoverOutcome::Completed(_) => {}
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn set_env_json() {
+        // SAFETY: test-only; no concurrent threads depend on this env var.
+        unsafe {
+            std::env::set_var(DEFAULT_BACKEND_ENV_VAR, "json");
+        }
+    }
+
+    fn set_env_sqlite() {
+        // SAFETY: test-only.
+        unsafe {
+            std::env::set_var(DEFAULT_BACKEND_ENV_VAR, "sqlite");
+        }
+    }
+
+    fn clear_env() {
+        // SAFETY: test-only.
+        unsafe {
+            std::env::remove_var(DEFAULT_BACKEND_ENV_VAR);
+        }
+    }
+
+    #[test]
+    fn valid_sqlite_marker_wins_over_default_json_without_env() {
+        // 审查核心 bug：重启后无 env 时，默认 JSON 不得重新启用——
+        // 有效 sqlite marker 存在时必须以 SQLite 权威启动。
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        set_env_sqlite();
+        let first = resolve_backend_inner(dir.path()).unwrap();
+        assert!(first.is_sqlite(), "setup cutover must pin sqlite");
+        clear_env();
+
+        // marker 存在、无 env → 仍须 SQLite。
+        let resolution = resolve_backend_inner(dir.path()).unwrap();
+        assert!(
+            resolution.is_sqlite(),
+            "valid sqlite marker must beat default JSON, got {:?}",
+            resolution.pinned.backend()
+        );
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+    }
+
+    #[test]
+    fn env_json_with_valid_sqlite_marker_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        set_env_sqlite();
+        let _ = resolve_backend_inner(dir.path()).unwrap();
+
+        // env=json 不允许把已有 sqlite 权威悄悄退回 JSON。
+        set_env_json();
+        let err = resolve_backend_inner(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("marker"),
+            "env=json + sqlite marker must fail closed mentioning the marker, got: {err}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn stale_marker_refused_for_both_env_values() {
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        // 版本过新的 marker（inspect_marker 判 Stale）。
+        let marker = serde_json::json!({
+            "version": 99,
+            "backend": "sqlite",
+            "schema_version": 1,
+            "manifest_hash": "x",
+            "created_at": "2026-07-13T00:00:00Z"
+        });
+        std::fs::write(
+            dir.path().join("storyforge.backend.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        // env=json：不得静默回退 JSON。
+        set_env_json();
+        let err_json = resolve_backend_inner(dir.path()).unwrap_err();
+        assert!(
+            err_json.to_string().to_lowercase().contains("stale"),
+            "stale marker + env=json must fail closed, got: {err_json}"
+        );
+        clear_env();
+
+        // env=sqlite：同样拒绝（不得重跑 cutover）。
+        set_env_sqlite();
+        let err_sqlite = resolve_backend_inner(dir.path()).unwrap_err();
+        assert!(
+            err_sqlite.to_string().to_lowercase().contains("stale"),
+            "stale marker + env=sqlite must fail closed, got: {err_sqlite}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn json_authoritative_marker_allows_json_and_fresh_sqlite_optin() {
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        // JsonAuthoritative marker（官方 reverse-cutover 才会写）。
+        let marker = serde_json::json!({
+            "version": 1,
+            "backend": "json",
+            "schema_version": 0,
+            "manifest_hash": "",
+            "created_at": "2026-07-13T00:00:00Z"
+        });
+        std::fs::write(
+            dir.path().join("storyforge.backend.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        clear_env();
+        let json_default = resolve_backend_inner(dir.path()).unwrap();
+        assert!(!json_default.is_sqlite(), "JSON marker + no env → JSON");
+
+        set_env_json();
+        let json_explicit = resolve_backend_inner(dir.path()).unwrap();
+        assert!(!json_explicit.is_sqlite(), "JSON marker + env=json → JSON");
+        clear_env();
+
+        // env=sqlite：合法的全新 opt-in，可重跑 cutover。
+        set_env_sqlite();
+        let sqlite = resolve_backend_inner(dir.path()).unwrap();
+        assert!(
+            sqlite.is_sqlite(),
+            "JSON marker + env=sqlite is a legitimate fresh opt-in"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn env_sqlite_without_source_files_fails_closed() {
+        // 空目录（无任何布局文件）+ env=sqlite：不得静默成功，必须报错。
+        let dir = TempDir::new().unwrap();
+        set_env_sqlite();
+        let err = resolve_backend_inner(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("source")
+                || err.to_string().to_lowercase().contains("missing")
+                || err.to_string().to_lowercase().contains("import"),
+            "empty dir + env=sqlite must fail closed, got: {err}"
+        );
+        clear_env();
     }
 }

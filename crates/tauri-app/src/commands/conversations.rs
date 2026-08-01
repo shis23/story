@@ -14,10 +14,9 @@ use storyforge_infra_regex::{
 
 use crate::AppState;
 use crate::error::TauriCommandError;
-use crate::storage_backend::BackendCapability;
 use crate::{
-    collect_scoped_regex_scripts, get_conn_store, get_global_regex_store, get_preset_store,
-    merge_runtime_regex_scripts,
+    collect_scoped_regex_scripts_for_backend, get_conn_store, get_global_regex_store,
+    get_preset_store, merge_runtime_regex_scripts,
 };
 use storyforge_app_conversation::ConversationStore;
 
@@ -464,17 +463,20 @@ fn collect_character_scoped_regex_scripts(
     state: &AppState,
 ) -> Vec<RegexScript> {
     let tool_snapshot = state.snapshot_tool_ctx();
-    collect_scoped_regex_scripts(
+    // 三.4：经 backend-neutral 解析器走 facade（stored/source/card/name 映射），
+    // 不再以 .ok() 隐藏 JSON 角色库访问——SQLite 下同样可解析。
+    // 与上方 campaign-scoped 分支同款 best-effort：解析失败记日志并降级为空。
+    match collect_scoped_regex_scripts_for_backend(
         conversation.character_id.as_deref(),
         &tool_snapshot.characters,
-        state
-            .storage()
-            .json_character_store(
-                BackendCapability::CharacterCommands,
-                "conversation scoped regex context",
-            )
-            .ok(),
-    )
+        Some(state.storage()),
+    ) {
+        Ok(scripts) => scripts,
+        Err(error) => {
+            tracing::warn!("conversation scoped regex context unavailable: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn conversation_display_dto(

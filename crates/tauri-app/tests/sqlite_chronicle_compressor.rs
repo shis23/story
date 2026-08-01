@@ -6,6 +6,8 @@
 //! A→B publish → late-result rejection → fault-injection rollback with job
 //! retry → crash recovery (Running→Pending).
 
+use std::sync::Arc;
+
 use storyforge_app_agent::chronicle_compressor::{
     plan_level_batch, publish_with_deterministic_texts,
 };
@@ -14,8 +16,11 @@ use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::Campaign;
 use storyforge_domain::chronicle::ChronicleLevel;
 use storyforge_domain::conversation::Conversation;
+use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 use storyforge_infra_sqlite::publication::PublishFault;
+use storyforge_lib::AppState;
 use storyforge_lib::sqlite_runtime;
+use storyforge_lib::storage_backend::StorageFacade;
 
 fn leaf(campaign_id: &Id, conversation_id: &Id, lineage_id: &Id, turn: u32) -> RoundSummary {
     RoundSummary::new(
@@ -29,8 +34,8 @@ fn leaf(campaign_id: &Id, conversation_id: &Id, lineage_id: &Id, turn: u32) -> R
     .with_lineage(lineage_id.clone())
 }
 
-#[test]
-fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
+#[tokio::test]
+async fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate SQLite authority");
@@ -248,4 +253,147 @@ fn sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery() {
         storyforge_lib::sqlite_compress_jobs::CompressJobStatus::Succeeded
     );
     assert_eq!(job_final.last_error, None);
+
+    // ── 10. 三.1：真实 worker 的发布步骤重确认 Running ─────────────────
+    // 注入 compress：执行期间把 job 经 facade 终态化为 Succeeded（模拟并发
+    // worker/恢复流程），再返回真实批次。worker 发布前必须重确认 Running 并
+    // 丢弃迟到批次——终态 job 的 summary/coverage/revision 不得被改写。
+    let wcamp_id = Id::from_str("worker-camp-2");
+    let wconv_id = Id::from_str("worker-conv-2");
+    let wlin_id = Id::from_str("worker-lin-2");
+    let mut wcampaign = Campaign::new(Id::from_str("worker-card-2"), "Worker Camp 2");
+    wcampaign.id = wcamp_id.clone();
+    wcampaign.conversation_id = Some(wconv_id.clone());
+    wcampaign.lineage_id = Some(wlin_id.clone());
+    sqlite_runtime::save_campaign(&wcampaign).expect("save worker campaign");
+    let mut wconversation = Conversation::new(None, Some(wcamp_id.clone()));
+    wconversation.id = wconv_id.clone();
+    sqlite_runtime::save_conversation(&wconversation).expect("save worker conversation");
+    let wleaves: Vec<RoundSummary> = (1..=5)
+        .map(|turn| leaf(&wcamp_id, &wconv_id, &wlin_id, turn))
+        .collect();
+    for summary in &wleaves {
+        sqlite_runtime::seed_summary(summary).expect("seed worker summary");
+    }
+    let (wjob, _) = sqlite_runtime::compress_enqueue_or_get_open(
+        &wcamp_id,
+        Some(wconv_id.clone()),
+        Some(wlin_id.clone()),
+        wleaves.len() as u32,
+        0,
+    )
+    .expect("enqueue worker job");
+    let wjob_id = wjob.id.clone();
+
+    let data_dir = temp.path().to_path_buf();
+    let state = Arc::new(
+        AppState::new_with_backend(
+            data_dir,
+            Arc::new(StorageFacade::new(
+                temp.path().to_path_buf(),
+                PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env),
+            )),
+        )
+        .expect("SQLite AppState for worker"),
+    );
+    let entries = sqlite_runtime::list_summaries(&wcamp_id).expect("list worker entries");
+    let (ids, spans, groups) = plan_level_batch(&entries, ChronicleLevel::A, 4, 2)
+        .expect("plan worker")
+        .expect("worker groups");
+    let outcome = publish_with_deterministic_texts(
+        &wcamp_id,
+        &wlin_id,
+        &wconv_id,
+        &entries,
+        &ids,
+        &spans,
+        &groups,
+        ChronicleLevel::B,
+    )
+    .expect("deterministic worker publish");
+
+    let state_for_compress = state.clone();
+    let wjob_for_compress = wjob_id.clone();
+    let wcamp_for_compress = wcamp_id.clone();
+    storyforge_lib::backend_workflows::spawn_compress_job_worker_with(
+        state.clone(),
+        wjob_id.clone(),
+        move |_st, _campaign_id, _lineage, _conv, _entries, _cancel| {
+            let outcome = outcome.clone();
+            let job_id = wjob_for_compress.clone();
+            let state = state_for_compress.clone();
+            let campaign_id = wcamp_for_compress.clone();
+            Box::pin(async move {
+                // 压缩执行期间被并发终态化。
+                assert!(
+                    state
+                        .storage()
+                        .succeed_compress_job(&job_id)
+                        .expect("succeed mid-run"),
+                    "worker 已 claim，job 必须 Running"
+                );
+                let _ = campaign_id;
+                Ok(vec![outcome])
+            })
+        },
+    );
+
+    // 等待 worker 收敛：job 终态且发布步骤已跑完。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let done = sqlite_runtime::compress_list_all()
+            .expect("list jobs")
+            .into_iter()
+            .find(|j| j.id == wjob_id)
+            .map(|j| j.status == storyforge_lib::sqlite_compress_jobs::CompressJobStatus::Succeeded)
+            .unwrap_or(false);
+        if done || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 断言：迟到批次被丢弃——没有新增 B、covered_by 未变、revision 未推进。
+    let after = sqlite_runtime::list_summaries(&wcamp_id).expect("list after worker");
+    assert_eq!(
+        after.len(),
+        wleaves.len(),
+        "迟到批次不得新增 summary（worker 发布被丢弃）"
+    );
+    assert!(
+        after
+            .iter()
+            .filter(|s| s.chronicle_level() == ChronicleLevel::B)
+            .count()
+            == 0,
+        "迟到批次不得产生 B 级 summary"
+    );
+    assert!(
+        after
+            .iter()
+            .filter(|s| s.is_leaf_a() && s.covered_by.is_none())
+            .count()
+            == wleaves.len(),
+        "迟到批次不得改写 covered_by"
+    );
+    let wcampaign_after = sqlite_runtime::get_campaign(&wcamp_id)
+        .expect("read campaign")
+        .expect("campaign exists");
+    assert_eq!(
+        wcampaign_after.chronicle_revision, 0,
+        "迟到批次不得推进 chronicle_revision"
+    );
+    let wjob_after = sqlite_runtime::compress_list_all()
+        .expect("list jobs")
+        .into_iter()
+        .find(|j| j.id == wjob_id)
+        .expect("job row");
+    assert_eq!(
+        wjob_after.status,
+        storyforge_lib::sqlite_compress_jobs::CompressJobStatus::Succeeded,
+        "job 保持并发终态化的 Succeeded"
+    );
+    assert_eq!(wjob_after.last_error, None);
+    drop(state);
 }

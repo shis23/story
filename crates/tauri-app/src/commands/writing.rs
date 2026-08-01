@@ -23,11 +23,11 @@ use crate::{
     AppState, BackendTurnAttemptSink, PromptHookPendingGuard, PromptHookPendingMap,
     append_missing_campaign_scoped_regex_scripts, begin_writing_operation, check_turn_barrier,
     clear_current_cancel_if, collect_mvu_fallback_fragments_for_backend,
-    collect_mvu_update_rules_for_backend, collect_scoped_regex_scripts, fill_agent_profile_context,
-    fill_campaign_context_async, fill_far_memory_hits, fill_profile_context, fill_regex_context,
-    get_active_turn_for_backend, get_global_regex_store, get_preset_store,
-    postprocess_variable_keys, prepare_start_conversation_async, run_shared_postprocess_background,
-    service_fail_turn, update_turn_record,
+    collect_mvu_update_rules_for_backend, collect_scoped_regex_scripts_for_backend,
+    fill_agent_profile_context, fill_campaign_context_async, fill_far_memory_hits,
+    fill_profile_context, fill_regex_context, get_active_turn_for_backend, get_global_regex_store,
+    get_preset_store, postprocess_variable_keys, prepare_start_conversation_async,
+    run_shared_postprocess_background, service_fail_turn, update_turn_record,
 };
 
 // ─── M1 写作命令 ───────────────────────────────────────────────────────────
@@ -117,16 +117,12 @@ pub(crate) async fn regenerate_impl(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
-        regex_scripts: collect_scoped_regex_scripts(
+        regex_scripts: collect_scoped_regex_scripts_for_backend(
             regex_character_id.as_deref(),
             &tool_snapshot.characters,
-            app.storage()
-                .json_character_store(
-                    crate::storage_backend::BackendCapability::CharacterCommands,
-                    "regenerate scoped regex context",
-                )
-                .ok(),
-        ),
+            Some(app.storage()),
+        )
+        .map_err(TauriCommandError::storage)?,
         campaign_runtime: None,
         agent_profile_config: None,
         recent_summaries: vec![],
@@ -955,16 +951,12 @@ pub(crate) async fn start_writing(
     let regex_character_id = start_target.regex_character_id;
     ctx.conversation_id = conversation_id.clone();
     let campaign_regex_scripts = std::mem::take(&mut ctx.regex_scripts);
-    ctx.regex_scripts = collect_scoped_regex_scripts(
+    ctx.regex_scripts = collect_scoped_regex_scripts_for_backend(
         regex_character_id.as_deref(),
         &tool_snapshot.characters,
-        app.storage()
-            .json_character_store(
-                crate::storage_backend::BackendCapability::CharacterCommands,
-                "writing scoped regex context",
-            )
-            .ok(),
-    );
+        Some(app.storage()),
+    )
+    .map_err(TauriCommandError::storage)?;
     append_missing_campaign_scoped_regex_scripts(&mut ctx, campaign_regex_scripts);
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置

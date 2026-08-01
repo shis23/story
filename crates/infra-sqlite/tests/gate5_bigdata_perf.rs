@@ -475,6 +475,32 @@ fn bigdata_migration_export_reimport_and_recovery_timings() {
             .as_millis()
             .saturating_sub(t3.elapsed().as_millis()),
     );
+
+    // ── 5. 重启/重开计时：真实 reopen（冷启动）────────────────────────
+    // 审查二：旧方法测的不是真正的重开（复用已有连接/包含预热）。这里先关闭
+    // 全部既有句柄，再用**全新** `Database::open` + `current_version` + 一条读
+    // 查询完成重开，测量第一次冷重开成本；无人工 sleep，完全确定性。
+    drop(db);
+    let t5 = Instant::now();
+    {
+        let reopened = Database::open(&db_path).unwrap();
+        let version = storyforge_infra_sqlite::migrations::current_version(&reopened).unwrap();
+        let turn_count: i64 = reopened
+            .connection()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        println!(
+            "[bigdata] reopen_restart={}ms (version={version}, turns={turn_count})",
+            t5.elapsed().as_millis()
+        );
+        assert_eq!(version, 8, "reopened DB must be fully migrated");
+        // 第 4 步恢复了 5 个 Generating turn（fail_incomplete 只改状态不删行）。
+        assert_eq!(
+            turn_count,
+            (N_CAMPAIGNS * TURNS_PER_CAMPAIGN) as i64 + 5,
+            "reopened DB must serve the same data"
+        );
+    }
     let _ = entity_count;
 }
 

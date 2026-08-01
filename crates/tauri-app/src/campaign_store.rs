@@ -226,14 +226,17 @@ impl CampaignStore {
     pub fn save_card(&self, card: CharacterCard) -> Result<StoredCard, String> {
         self.ensure_json_write_allowed()?;
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidate = cards.clone();
         // 同 source_character_id 去重（重跑识别时覆盖）
-        cards.retain(|c| c.card.source_character_id != card.source_character_id);
+        candidate.retain(|c| c.card.source_character_id != card.source_character_id);
         let stored = StoredCard {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
-        cards.push(stored.clone());
-        persist(&self.cards_path, &cards)?;
+        candidate.push(stored.clone());
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.cards_path, &candidate)?;
+        *cards = candidate;
         Ok(stored)
     }
 
@@ -260,13 +263,16 @@ impl CampaignStore {
             return Err(FORCE_RERUN_BLOCKED_BY_CAMPAIGN.to_string());
         }
 
-        cards.retain(|c| c.card.source_character_id != source_character_id);
+        let mut candidate = cards.clone();
+        candidate.retain(|c| c.card.source_character_id != source_character_id);
         let stored = StoredCard {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
-        cards.push(stored.clone());
-        persist(&self.cards_path, &cards)?;
+        candidate.push(stored.clone());
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.cards_path, &candidate)?;
+        *cards = candidate;
         Ok(stored)
     }
 
@@ -278,8 +284,11 @@ impl CampaignStore {
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Some(idx) = cards.iter().position(|c| c.card.id == stored.card.id) {
-            cards[idx] = stored.clone();
-            persist(&self.cards_path, &cards)?;
+            let mut candidate = cards.clone();
+            candidate[idx] = stored.clone();
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.cards_path, &candidate)?;
+            *cards = candidate;
             Ok(Some(stored))
         } else {
             Ok(None)
@@ -288,6 +297,9 @@ impl CampaignStore {
 
     pub fn delete_card(&self, id: &Id) -> Result<bool, String> {
         self.ensure_json_write_allowed()?;
+        // World-info reads/writes and card deletion use the same outer lock
+        // (与 delete_campaign 同款：先取锁再判存在，删除期间写者无法重建文件)。
+        let mut world_info = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
@@ -296,42 +308,139 @@ impl CampaignStore {
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
 
-        let before = cards.len();
         // 先记下要删的卡的 source_character_id（用于级联删 MVU 翻译）
         let source_ids: Vec<Id> = cards
             .iter()
             .filter(|c| c.card.id == *id)
             .map(|c| c.card.source_character_id.clone())
             .collect();
-        cards.retain(|c| c.card.id != *id);
-        let changed = cards.len() != before;
-        if changed {
-            persist(&self.cards_path, &cards)?;
-            // 级联删除：该卡的 campaign + instances
-            let camp_ids: Vec<Id> = campaigns
-                .iter()
-                .filter(|c| c.card_id == *id)
-                .map(|c| c.id.clone())
-                .collect();
-            for camp_id in &camp_ids {
-                campaigns.retain(|c| c.id != *camp_id);
-                instances.retain(|i| i.campaign_id != *camp_id);
-                knowledge.retain(|k| k.campaign_id != *camp_id);
-                tasks.retain(|t| t.campaign_id != *camp_id);
-                summaries.retain(|s| s.campaign_id != *camp_id);
-            }
-            persist(&self.campaigns_path, &campaigns)?;
-            persist(&self.instances_path, &instances)?;
-            persist(&self.knowledge_path, &knowledge)?;
-            persist(&self.tasks_path, &tasks)?;
-            persist(&self.summaries_path, &summaries)?;
-            // 级联删除：该卡的 MVU 翻译
-            for source_id in &source_ids {
-                mvu.retain(|m| m.source_character_id != *source_id);
-            }
-            persist(&self.mvu_path, &mvu)?;
+        // 该卡的 campaign ids（级联范围 + 世界书文件清理）
+        let camp_ids: Vec<Id> = campaigns
+            .iter()
+            .filter(|c| c.card_id == *id)
+            .map(|c| c.id.clone())
+            .collect();
+        let changed = cards.iter().any(|c| c.card.id == *id);
+        if !changed {
+            return Ok(false);
         }
-        Ok(changed)
+
+        // ── 候选状态（内存副本上过滤，持久化全部成功后才换入）──
+        let mut next_cards = cards.clone();
+        next_cards.retain(|c| c.card.id != *id);
+        let mut next_campaigns = campaigns.clone();
+        let mut next_instances = instances.clone();
+        let mut next_knowledge = knowledge.clone();
+        let mut next_tasks = tasks.clone();
+        let mut next_summaries = summaries.clone();
+        for camp_id in &camp_ids {
+            next_campaigns.retain(|c| c.id != *camp_id);
+            next_instances.retain(|i| i.campaign_id != *camp_id);
+            next_knowledge.retain(|k| k.campaign_id != *camp_id);
+            next_tasks.retain(|t| t.campaign_id != *camp_id);
+            next_summaries.retain(|s| s.campaign_id != *camp_id);
+        }
+        let mut next_mvu = mvu.clone();
+        for source_id in &source_ids {
+            next_mvu.retain(|m| m.source_character_id != *source_id);
+        }
+
+        // ── 快照全部将被改写的路径（含每个 campaign 的本局世界书文件）──
+        // 任一中间写入失败时按快照逐文件恢复，保证「全部删除或全部保留」。
+        let mut paths: Vec<(PathBuf, PathSnapshot, Option<String>)> = Vec::new();
+        let mut snapshot_one = |path: &Path| -> Result<(), String> {
+            let snap = snapshot_path(path)?;
+            ensure_regular_or_missing(path, snap)?;
+            let raw = match snap {
+                PathSnapshot::RegularFile => Some(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("读取待删文件快照失败 {}: {e}", path.display()))?,
+                ),
+                _ => None,
+            };
+            paths.push((path.to_path_buf(), snap, raw));
+            Ok(())
+        };
+        snapshot_one(&self.cards_path)?;
+        snapshot_one(&self.campaigns_path)?;
+        snapshot_one(&self.instances_path)?;
+        snapshot_one(&self.knowledge_path)?;
+        snapshot_one(&self.tasks_path)?;
+        snapshot_one(&self.summaries_path)?;
+        snapshot_one(&self.mvu_path)?;
+        for camp_id in &camp_ids {
+            snapshot_one(&self.world_info_path(camp_id))?;
+        }
+
+        // ── 按依赖顺序写盘（候选副本）──
+        let write_result = (|| {
+            persist(&self.cards_path, &next_cards)?;
+            persist(&self.campaigns_path, &next_campaigns)?;
+            persist(&self.instances_path, &next_instances)?;
+            persist(&self.knowledge_path, &next_knowledge)?;
+            persist(&self.tasks_path, &next_tasks)?;
+            persist(&self.summaries_path, &next_summaries)?;
+            persist(&self.mvu_path, &next_mvu)?;
+            for camp_id in &camp_ids {
+                let path = self.world_info_path(camp_id);
+                match snapshot_path(&path)? {
+                    PathSnapshot::RegularFile => {
+                        std::fs::remove_file(&path)
+                            .map_err(|e| format!("删除本局世界书失败 {}: {e}", path.display()))?;
+                    }
+                    PathSnapshot::Missing => {}
+                    PathSnapshot::Other => {
+                        return Err(format!(
+                            "本局世界书路径不是普通文件，拒绝删除: {}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            Ok::<(), String>(())
+        })();
+
+        if let Err(error) = write_result {
+            // 逆序恢复全部已写入文件；恢复失败一并上报（与 delete_campaign 同款）。
+            let mut rollback_errors = Vec::new();
+            for (path, snap, raw) in paths.iter().rev() {
+                let restored = match (snap, raw) {
+                    (PathSnapshot::RegularFile, Some(raw)) => {
+                        storyforge_infra_util::atomic_write_json_str(path, raw)
+                            .map_err(|e| format!("恢复文件失败 {}: {e}", path.display()))
+                    }
+                    (PathSnapshot::Missing, None) => remove_created_file_if_present(path),
+                    _ => Err(format!(
+                        "拒绝回滚原本为非普通文件的路径: {}",
+                        path.display()
+                    )),
+                };
+                if let Err(rollback_error) = restored {
+                    rollback_errors.push(rollback_error);
+                }
+            }
+            return if rollback_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; 删除回滚也失败，数据需要恢复: {}",
+                    rollback_errors.join("; ")
+                ))
+            };
+        }
+
+        // ── 全部持久化成功：换入内存态 ──
+        *cards = next_cards;
+        *campaigns = next_campaigns;
+        *instances = next_instances;
+        *knowledge = next_knowledge;
+        *tasks = next_tasks;
+        *summaries = next_summaries;
+        *mvu = next_mvu;
+        for camp_id in &camp_ids {
+            world_info.remove(camp_id.as_str());
+        }
+        Ok(true)
     }
 
     // ─── Campaign CRUD ────────────────────────────────────────────────────
@@ -391,9 +500,13 @@ impl CampaignStore {
     pub fn save_campaign(&self, campaign: Campaign) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
-        campaigns.retain(|c| c.id != campaign.id);
-        campaigns.push(campaign);
-        persist(&self.campaigns_path, &campaigns)
+        let mut candidate = campaigns.clone();
+        candidate.retain(|c| c.id != campaign.id);
+        candidate.push(campaign);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.campaigns_path, &candidate)?;
+        *campaigns = candidate;
+        Ok(())
     }
 
     pub fn create_campaign_with_instances(
@@ -433,8 +546,14 @@ impl CampaignStore {
             persist(&self.instances_path, &next_instances)?;
         }
         if let Err(err) = persist(&self.campaigns_path, &next_campaigns) {
-            if instances_changed {
-                let _ = persist(&self.instances_path, &instances);
+            // 补偿：恢复已写入的 instances 文件；补偿失败必须一并上报
+            // （三.9：不得用 `let _ =` 掩蔽补偿错误）。
+            if instances_changed
+                && let Err(restore_error) = persist(&self.instances_path, &instances)
+            {
+                return Err(format!(
+                    "{err}; 回滚已写入的实例文件也失败: {restore_error}"
+                ));
             }
             return Err(err);
         }
@@ -830,18 +949,103 @@ impl CampaignStore {
     pub fn add_instance(&self, instance: CharacterInstance) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
-        instances.retain(|i| i.id != instance.id);
-        instances.push(instance);
-        persist(&self.instances_path, &instances)
+        let mut candidate = instances.clone();
+        candidate.retain(|i| i.id != instance.id);
+        candidate.push(instance);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.instances_path, &candidate)?;
+        *instances = candidate;
+        Ok(())
     }
 
     pub fn update_instance(&self, instance: CharacterInstance) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = instances.iter().position(|i| i.id == instance.id) {
-            instances[idx] = instance;
-            persist(&self.instances_path, &instances)?;
+            let mut candidate = instances.clone();
+            candidate[idx] = instance;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.instances_path, &candidate)?;
+            *instances = candidate;
         }
+        Ok(())
+    }
+
+    // ─── 三.5：活动 Turn 屏障下的原子读改写（候选 → 持久化 → 换入）────────
+
+    /// 持锁读取-修改-写入 Campaign。仅当 Campaign 存在时调用 `f`；
+    /// `f` 失败不写盘、内存不变；persist 失败内存回滚（三.9 同款）。
+    pub(crate) fn mutate_campaign_candidate<F>(
+        &self,
+        campaign_id: &Id,
+        f: F,
+    ) -> Result<Option<Campaign>, String>
+    where
+        F: FnOnce(&mut Campaign) -> Result<(), String>,
+    {
+        self.ensure_json_write_allowed()?;
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(idx) = campaigns.iter().position(|c| c.id == *campaign_id) else {
+            return Ok(None);
+        };
+        let mut candidate = campaigns.clone();
+        f(&mut candidate[idx])?;
+        persist(&self.campaigns_path, &candidate)?;
+        let updated = candidate[idx].clone();
+        *campaigns = candidate;
+        Ok(Some(updated))
+    }
+
+    /// 持锁读取-修改-写入角色实例（仅当实例存在时调用 `f`）。
+    pub(crate) fn mutate_instance_candidate<F>(
+        &self,
+        campaign_id: &Id,
+        instance_id: &Id,
+        f: F,
+    ) -> Result<Option<CharacterInstance>, String>
+    where
+        F: FnOnce(&mut CharacterInstance) -> Result<(), String>,
+    {
+        self.ensure_json_write_allowed()?;
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(idx) = instances
+            .iter()
+            .position(|i| i.campaign_id == *campaign_id && i.id == *instance_id)
+        else {
+            return Ok(None);
+        };
+        let mut candidate = instances.clone();
+        f(&mut candidate[idx])?;
+        persist(&self.instances_path, &candidate)?;
+        let updated = candidate[idx].clone();
+        *instances = candidate;
+        Ok(Some(updated))
+    }
+
+    /// 三.5：Campaign 存在性校验 + 实例写入在同一临界区完成（锁内检查、
+    /// 锁内写盘）。`validate` 在写盘前对既有实例列表做重复检查（同名 /
+    /// 同 definition），失败不写盘。
+    ///
+    /// 调用方（facade）负责先取 TurnStore 活动 Turn 守卫（turns 锁在外层，
+    /// 锁序 turns → campaigns → instances，与 `with_idle_turn_guard` 一致）。
+    pub(crate) fn add_instance_guarded(
+        &self,
+        campaign_id: &Id,
+        instance: &CharacterInstance,
+        validate: impl FnOnce(&[CharacterInstance]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
+        let campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        if !campaigns.iter().any(|c| c.id == *campaign_id) {
+            return Err(format!("找不到 campaign {campaign_id}"));
+        }
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        validate(&instances)?;
+        let mut candidate = instances.clone();
+        candidate.retain(|i| i.id != instance.id);
+        candidate.push(instance.clone());
+        persist(&self.instances_path, &candidate)?;
+        *instances = candidate;
         Ok(())
     }
 
@@ -896,8 +1100,12 @@ impl CampaignStore {
             return Ok(());
         }
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
-        knowledge.extend(entries);
-        persist(&self.knowledge_path, &knowledge)
+        let mut candidate = knowledge.clone();
+        candidate.extend(entries);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.knowledge_path, &candidate)?;
+        *knowledge = candidate;
+        Ok(())
     }
 
     /// 删除单条知识条目（按 id），返回是否找到并删除
@@ -905,10 +1113,13 @@ impl CampaignStore {
         self.ensure_json_write_allowed()?;
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
         let before = knowledge.len();
-        knowledge.retain(|k| k.id != *knowledge_id);
-        let changed = knowledge.len() != before;
+        let mut candidate = knowledge.clone();
+        candidate.retain(|k| k.id != *knowledge_id);
+        let changed = candidate.len() != before;
         if changed {
-            persist(&self.knowledge_path, &knowledge)?;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.knowledge_path, &candidate)?;
+            *knowledge = candidate;
         }
         Ok(changed)
     }
@@ -952,9 +1163,13 @@ impl CampaignStore {
     pub fn add_task(&self, task: StoryTask) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
-        tasks.retain(|t| t.id != task.id);
-        tasks.push(task);
-        persist(&self.tasks_path, &tasks)
+        let mut candidate = tasks.clone();
+        candidate.retain(|t| t.id != task.id);
+        candidate.push(task);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.tasks_path, &candidate)?;
+        *tasks = candidate;
+        Ok(())
     }
 
     /// 更新任务（状态变化 / 注入记录 / 标完成）
@@ -962,8 +1177,11 @@ impl CampaignStore {
         self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = tasks.iter().position(|t| t.id == task.id) {
-            tasks[idx] = task;
-            persist(&self.tasks_path, &tasks)?;
+            let mut candidate = tasks.clone();
+            candidate[idx] = task;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.tasks_path, &candidate)?;
+            *tasks = candidate;
         }
         Ok(())
     }
@@ -973,10 +1191,13 @@ impl CampaignStore {
         self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         let before = tasks.len();
-        tasks.retain(|t| t.id != *task_id);
-        let changed = tasks.len() != before;
+        let mut candidate = tasks.clone();
+        candidate.retain(|t| t.id != *task_id);
+        let changed = candidate.len() != before;
         if changed {
-            persist(&self.tasks_path, &tasks)?;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.tasks_path, &candidate)?;
+            *tasks = candidate;
         }
         Ok(changed)
     }
@@ -1014,9 +1235,13 @@ impl CampaignStore {
     pub fn add_summary(&self, summary: RoundSummary) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
-        summaries.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
-        summaries.push(summary);
-        persist(&self.summaries_path, &summaries)
+        let mut candidate = summaries.clone();
+        candidate.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
+        candidate.push(summary);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.summaries_path, &candidate)?;
+        *summaries = candidate;
+        Ok(())
     }
 
     // ─── Phase A: 三态 upsert（TurnCommit 幂等重放用）─────────────────────
@@ -1043,8 +1268,11 @@ impl CampaignStore {
                 entry.id
             )));
         }
-        knowledge.push(entry);
-        persist(&self.knowledge_path, &knowledge)?;
+        let mut candidate = knowledge.clone();
+        candidate.push(entry);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.knowledge_path, &candidate)?;
+        *knowledge = candidate;
         Ok(UpsertResult::Inserted)
     }
 
@@ -1061,8 +1289,11 @@ impl CampaignStore {
                 task.id
             )));
         }
-        tasks.push(task);
-        persist(&self.tasks_path, &tasks)?;
+        let mut candidate = tasks.clone();
+        candidate.push(task);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.tasks_path, &candidate)?;
+        *tasks = candidate;
         Ok(UpsertResult::Inserted)
     }
 
@@ -1082,8 +1313,11 @@ impl CampaignStore {
                 summary.campaign_id, summary.turn
             )));
         }
-        summaries.push(summary);
-        persist(&self.summaries_path, &summaries)?;
+        let mut candidate = summaries.clone();
+        candidate.push(summary);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.summaries_path, &candidate)?;
+        *summaries = candidate;
         Ok(UpsertResult::Inserted)
     }
 
@@ -1092,8 +1326,12 @@ impl CampaignStore {
         self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = summaries.iter().position(|s| s.id == summary.id) {
-            summaries[idx] = summary;
-            return persist(&self.summaries_path, &summaries);
+            let mut candidate = summaries.clone();
+            candidate[idx] = summary;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.summaries_path, &candidate)?;
+            *summaries = candidate;
+            return Ok(());
         }
         Err(format!("summary id={} 不存在", summary.id))
     }
@@ -1111,8 +1349,11 @@ impl CampaignStore {
                 summary.id
             )));
         }
-        summaries.push(summary);
-        persist(&self.summaries_path, &summaries)?;
+        let mut candidate = summaries.clone();
+        candidate.push(summary);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.summaries_path, &candidate)?;
+        *summaries = candidate;
         Ok(UpsertResult::Inserted)
     }
 
@@ -1314,9 +1555,13 @@ impl CampaignStore {
     pub fn save_mvu(&self, stored: StoredMvuTranslation) -> Result<(), String> {
         self.ensure_json_write_allowed()?;
         let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
-        mvu.retain(|m| m.source_character_id != stored.source_character_id);
-        mvu.push(stored);
-        persist(&self.mvu_path, &mvu)
+        let mut candidate = mvu.clone();
+        candidate.retain(|m| m.source_character_id != stored.source_character_id);
+        candidate.push(stored);
+        // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+        persist(&self.mvu_path, &candidate)?;
+        *mvu = candidate;
+        Ok(())
     }
 
     /// 删某角色卡的 MVU 翻译（删卡时级联）
@@ -1324,10 +1569,13 @@ impl CampaignStore {
         self.ensure_json_write_allowed()?;
         let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
         let before = mvu.len();
-        mvu.retain(|m| m.source_character_id != *source_character_id);
-        let changed = mvu.len() != before;
+        let mut candidate = mvu.clone();
+        candidate.retain(|m| m.source_character_id != *source_character_id);
+        let changed = candidate.len() != before;
         if changed {
-            persist(&self.mvu_path, &mvu)?;
+            // 候选 → 持久化 → 换入（三.9）：失败时内存保持原值。
+            persist(&self.mvu_path, &candidate)?;
+            *mvu = candidate;
         }
         Ok(changed)
     }

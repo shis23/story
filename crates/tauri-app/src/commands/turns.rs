@@ -343,17 +343,12 @@ pub(crate) async fn retry_active_turn_postprocess_impl(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
-        regex_scripts: collect_scoped_regex_scripts(
+        regex_scripts: collect_scoped_regex_scripts_for_backend(
             regex_character_id.as_deref(),
             &snapshot.characters,
-            state
-                .storage()
-                .json_character_store(
-                    crate::storage_backend::BackendCapability::CharacterCommands,
-                    "turn retry scoped regex context",
-                )
-                .ok(),
-        ),
+            Some(state.storage()),
+        )
+        .map_err(TauriCommandError::storage)?,
         campaign_runtime: None,
         agent_profile_config: None,
         recent_summaries: vec![],

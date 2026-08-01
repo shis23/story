@@ -1472,3 +1472,87 @@ export 产物。
 - 独立提交，未 amend `42edbc3`/`301164c`，未 push；提交后工作区干净。
 - 下一阶段仍为 Gate 6（真实模型与平台验收）；本审查跟进结果同样不作为 Gate 6 证据。
 
+
+## 33. Gate 5 二审整改（2026-08-02 独立审查，全部反例关闭）
+
+> 前置：二审审查结论 **Gate 5 仍是 INCOMPLETE / BLOCK**，逐项反例见下。
+> 本轮在 `90f9584` 之上完成全部整改；**§32 中"删除前快照 / 真重启恢复 / Pipeline 事件收集比较"
+> 等描述经二审判定为假阳性，已被本节的真实实现取代**（删除前快照顺序修正、真实子进程重启、
+> 真实 runtime helper 事件派生）。
+> 依据：审查原文四节（一、权威后端与 Cutover；二、Reverse Export / Rollback；三、真实双后端
+> 等价与恢复；四、修正 Gate 5 测试自身）——每条反例均配判别性测试，先验红后验绿。
+
+### 33.1 一、权威后端与 Cutover（最高优先级）
+
+| 反例 | 根因 | 修复 | 判别测试（先红后绿） |
+|---|---|---|---|
+| marker 不优先于环境变量/默认 JSON；env=json 与 marker 冲突不 fail closed；stale marker 不拒绝 | `resolve_backend_inner` 只做 env→config→默认 JSON，从不 consult marker | `storage_backend.rs` marker-first：`SqliteAuthoritative` 无 env 也选 SQLite；env=json + marker → `BackendWiringError`；`Stale` 无论 env 一律拒绝；`JsonAuthoritative` 仅由正式 rollback 写出；JSON 切回不得靠 env=json 实现 | `valid_sqlite_marker_wins_over_default_json_without_env`、`env_json_with_valid_sqlite_marker_fails_closed`、`stale_marker_refused_for_both_env_values`、`json_authoritative_marker_allows_json_and_fresh_sqlite_optin`（红：旧 resolve 4 失败 → 绿：12/12） |
+| marker 未与实际数据库绑定；A marker + B 数据库可能返回 AlreadyCutover | marker 无 authority_id；DB 侧无绑定校验 | `authority_binding` 表 + import_runs 扩展列（V008 迁移，增量）；cutover 派生确定性 `authority_id`（规范化 data_dir + manifest hash）+ 一次性 nonce，同时写入 DB 与 marker；`inspect_marker→verify_database_with_marker→validate_marker_db_binding`：completed import 的 source hash、authority_id、cutover_nonce 任一不符 → `Stale` → 拒绝（**不是** AlreadyCutover），字节不动；版本 >MARKER_VERSION → Stale | `marker_a_with_database_b_is_rejected_not_already_cutover`、`cutover_persists_authority_binding_in_db_and_marker`、`marker_version_newer_than_supported_is_stale`（红：绑定校验中性化 mutant → FAILED；绿：cutover.rs 22/22） |
+| 无跨进程 writer lease；cutover 期间旧 JSON 进程可继续写 | 只有 cutover 锁，writers 不参与 | 新增 `lease.rs`（`LeaseMode::{Shared,Exclusive}`，flock/share-mode + 同进程重入 registry）；cutover/rollback 全程 EXCLUSIVE；`resolve_backend_inner` 双分支按决议结果持 SHARED；`src/bin/lease_hold.rs` 供跨进程测试 spawn | `cross_process_shared_authority_lease_blocks_cutover_until_release`、`cross_process_exclusive_authority_lease_blocks_shared_writer`、`cross_process_shared_leases_coexist`（红：Windows 裸 os error 32 泄漏；绿：platform_locking 9/9） |
+| 所有权判断仅凭 schema_migrations；可能先破坏外部 WAL 库 | 探测只查迁移表 | 探测升级为只读三查：`PRAGMA application_id == 0x53544647`（connection.rs 幂等写入）+ migrations >=1 + 最近 completed import hash 匹配 + authority_id 匹配；探测通过**后**才允许删 sidecar/让位；`-wal/-shm` 删除错误除 NotFound 外全部传播 | `foreign_wal_database_with_live_connection_and_migrations_is_rejected_bytes_intact`（外部连接全程存活：WAL/SHM/主库字节不变、未 checkpoint 数据仍可读）、`other_storyforge_database_at_target_is_rejected_bytes_unchanged`、`plain_text_file_at_target_is_rejected`（红：旧探测误判覆盖；绿：gate5_fault_matrix 10/10） |
+| marker 不是最后一步；sidecar 删除吞错；无 durability flush | 顺序为 marker→audit；`let _ = remove_file` | 顺序改为 publish → audit（`audit_published_database`）→ **marker 最后**（之后仅纯内存 report 构造）；`CutoverFault::AfterAudit` 注入点；发布 DB/marker tmp/marker 文件均 fsync（Windows 写句柄），unix 父目录 fsync | `fault_after_audit_before_marker_leaves_json_authoritative`、`marker_write_failure_keeps_json_authoritative_and_recovers`、`sidecar_cleanup_failure_propagates_and_final_db_untouched`（红：旧顺序下 marker 已写；绿：cutover 22/22、gate5 10/10） |
+| importer 不严格：缺文件当空、畸形条目静默跳过、world-info hash 不含 campaign_id、遍历错误被吞 | `read_json_array(..., true)` 全可选；`optional_str/u64/bool` 静默强转；hash 只比 payload | 核心布局文件（cards/campaigns/instances/knowledge/tasks/round_summaries/turns）改为必需；新增 `strict_validate_entries`/`strict_validate_world_info`（字段类型/枚举/非负 revision/布尔类型/CharacterInfo 结构/会话时间戳，镜像 domain 契约）；world-info 校验 campaign 归属；`hash_world_info_pairs` 把 campaign_id 绑定进 hash（readiness/importer/cutover 三处同口径）；read_dir 错误全部传播 | `empty_but_valid_layout_imports_cleanly_with_zero_counts`、`missing_required_layout_file_fails_closed`、`negative_campaign_revision_is_rejected`、`unknown_turn_status_is_rejected`、`wrong_bool_type_is_rejected`、`malformed_character_info_is_rejected`、`conversations_dir_replaced_by_file_is_rejected`、`world_info_identical_payloads_distinct_campaigns_hash_differently`（红：8/8；绿：importer_diagnostics 13/13） |
+
+### 33.2 二、Reverse Export / Rollback 安全
+
+| 反例 | 修复 | 判别测试 |
+|---|---|---|
+| 导出目标不验证：DB/WAL/SHM/marker/lock/backup/JSON 权威文件/数据根/符号链接/普通文件均可被覆盖 | `validate_export_target`（写入与加锁**之前**执行）+ `canonicalize_loose`（不存在的路径也按父目录+文件名归一化）；junction 经 reparse 属性识别；任何拒绝均字节不变 | `reverse_export_rejects_every_forbidden_target_without_touching_bytes`（20 个禁止目标）、`reverse_export_rejects_plain_file_target_without_overwriting`、`reverse_export_rejects_symlink_or_junction_target`、`reverse_export_rejects_ancestor_of_live_data_root`（红：普通文件目标被覆盖 4 failed；绿：reverse_export 11/11） |
+| 路径穿越与文件名碰撞：sanitize 非注入式；写后无重读校验 | 会话文件名：安全单段名原样（向后兼容），否则注入式百分号编码（`%` 自编码）；`/`、`\`、绝对路径、`.`、`..` → Err；碰撞检测（小写+去尾点/空格）+ Windows 保留名防御；world-info 文件名严格校验；`verify_export_tree` 从磁盘重读校验每表 count + 内容 hash，发布前强制调用 | `conversation_ids_with_unsafe_chars_roundtrip_via_injective_encoding`、`conversation_case_collision_is_rejected_not_overwritten`、`world_info_campaign_ids_must_be_safe_raw_filenames`、`verify_export_tree_rejects_deleted_file`、`verify_export_tree_rejects_modified_content`（gate5_export_safety 24/24） |
+| rollback 与 diagnostic 不分：唯一路径无条件脱敏，不可恢复 | `ExportMode::{Rollback,Diagnostic}`；Rollback 绝不脱敏（正文/知识/WorldInfo 中合法 password/token/绝对路径逐字段不变）；Diagnostic 保持脱敏且 manifest 声明 `redacted`；`ReverseExportReport.redacted` | `rollback_mode_export_is_lossless_for_secret_shaped_content`、`diagnostic_mode_redacts_and_declares_redacted`、`rollback_manifest_declares_rollback_and_no_redaction`（变异：Rollback 也脱敏 → 红） |
+| mutation_commits / chronicle_publication_jobs 非空时"成功导出"+warning | 非空 → fail closed（`Err`，JSON 布局无法无损表达）；空台账保留 `:0 rows` 分类 | `export_fails_closed_when_mutation_commits_are_nonempty`、`export_fails_closed_when_chronicle_publication_jobs_are_nonempty` |
+| 导出前零校验；空库/旧 schema/缺表/坏 payload 也导出 | `validate_source_database`：schema_migrations 必须存在、`current_version == 8`、迁移 checksum 逐条比对、15 张必需表、`integrity_check==ok`、`foreign_key_check` 零行；查询错误全部传播；已迁移空库=合法零计数导出 | `export_refuses_unmigrated_empty_database`、`migrated_empty_database_exports_successfully_with_zero_counts`、`export_refuses_old_schema_version`、`export_refuses_tampered_migration_checksum`、`export_refuses_corrupt_payload_json`、`export_refuses_foreign_key_violations`、`export_refuses_missing_required_table` |
+| 发布非原子、无跨进程锁、失败不恢复 | 唯一 staging（`<parent>/.{name}.staging-<pid>-<nanos>`）→ 校验 → 旧目标唯一 aside 让位 → rename 发布；发布失败自动恢复旧目标；`ExportLockGuard`（目标兄弟锁文件）+ `src/bin/export_hold.rs` 跨进程持锁 | `export_fault_after_target_moved_aside_restores_old_target`、`export_fault_after_stage_verified_leaves_target_untouched`、`cross_process_export_lock_blocks_then_releases` |
+| 无生产 rollback 入口 | 新增 `rollback.rs`：`run_rollback` 精确序列 = EXCLUSIVE lease 全程 → 必须 SqliteAuthoritative → 校验+Rollback 无损导出到唯一 staging → 重导入自检（计数+hash+零脱敏）→ `confirm` 显式确认 → **最后**写 `BackendMarker::json_authoritative()`（tmp+fsync+rename+fsync）；任一步失败保持 SQLite 权威、清理 staging、DB 字节不变 | `rollback.rs` 10 测试：happy path（marker 翻转+DB 字节不变+可重导入）、confirm=false、AfterExport/AfterSelfCheck 故障、篡改 manifest 自检捕获、marker 写入失败保持 SqliteAuthoritative、shared 租约阻塞→释放后成功、二次 rollback 拒绝（变异：忽略 confirm → 红） |
+
+### 33.3 三、真实双后端等价与恢复
+
+| 反例 | 修复 | 判别测试 |
+|---|---|---|
+| Chronicle worker 未全守卫；发布前不重确认 Running；迟到终态化可改终态 job | `mark_job_failed/succeeded` 全走 guarded facade（真实布尔）；worker 发布前 `compress_job_is_running` 重确认，非 Running 丢弃；`let _ = mark_job_failed` 全部改为错误日志 | `json_worker_drops_late_publish_when_job_terminalized_mid_run`、`json_worker_late_finalize_does_not_corrupt_terminal_job`、`sqlite_compress_queue_threshold_claim_publish_rollback_and_recovery` 第 10 段（红：迟到批次新增 B 级 summary；绿：job 保持 Succeeded、无新增、covered_by 未变、revision 未推进） |
+| restart parity 非真实重启（只推字符串，无 AppState 重建） | 真实子进程重启：`restart_child_entry`（env 门控）执行生产 bootstrap（resolve_backend → StorageFacade → AppState → `recover_turns_on_startup`/`recover_compress_jobs_on_startup`）并输出 `STORYFORGE_RESTART_REPORT` 单行 JSON；父进程 `current_exe()` 真实 spawn，按各后端自身契约断言；二次恢复幂等；后续断言读 reopened 状态 | `backend_parity_equivalent_domain_snapshots` 内嵌重启断言（红：跳过 Turn 恢复 mutant → `turns_non_terminal: 1`；绿：`turns_failed=1, turns_non_terminal=0, compress_reset_first=1, compress_reset_second=0, outbox_pending=0`） |
+| PipelineEvent 手工拼串；runner 前取消不发 Skipped | `postprocess_pipeline_event(result, fail_reason, cancelled)` 唯一派生点；正常/runner 前取消/runner 后取消/落盘失败四路径各恰好一个正确事件；早期取消必须发 Skipped | `normal_path_derives_exactly_one_done_event`、`cancel_before_runner_derives_skipped_event`、`cancel_after_runner_derives_skipped_event`、`persist_failure_derives_failed_event`、`early_cancel_emits_single_skipped_event`（红：取消不发事件 mutant；绿：6/6） |
+| character-scoped regex 依赖 JSON store（`.ok()` 隐藏）；静态门禁 commands 是宽泛白名单 | 新增 `collect_scoped_regex_scripts_for_backend`（stored/source/card/name 经 facade 映射）；commands 全部 4 处调用点改走 resolver（`?` 传播或与 campaign-scoped 同款 warn+降级）；删除旧 JSON-only `collect_scoped_regex_scripts`；静态门禁收紧：`legacyAccessorAllowed` 移除 `commands/*`（主代理集成） | `scoped_regex_resolver_maps_stored_source_card_and_name_through_facade`、`test_collect_scoped_regex_scripts_is_limited_to_selected_character`（改真实 facade）、守卫测试 `character_commands_supported_must_never_touch_json_character_store`、门禁 `applicationLegacyStoreAccessorReferences == 0`（commands 0 引用） |
+| active-turn TOCTOU（Variables/plugin_set_variable/KnowledgeTask/add_campaign_instance） | SQLite：`with_active_turn_mutation` 在同一 BEGIN IMMEDIATE UoW 内检查+写入；JSON：`with_idle_turn_guard` 共享 Turn 写锁 + 候选→persist→swap；命令全部重接 | `json_idle_variable_write_rolls_back_on_persist_failure`、`json_idle_mutation_concurrent_no_lost_update`（80 轮）、`sqlite_idle_mutation_uow_rolls_back_on_failure`（command_atomicity 13 + sqlite_command_atomicity 5） |
+| create/fork campaign 非 bundle 原子；吞 conversation/world-info/opening 错误；JSON save_campaign 误用 update（fork/import 落新 Campaign 静默 no-op） | 两条 bundle 路径改错误传播+补偿闭包（删会话+删 Campaign，补偿失败一并上报）；`save_campaign` JSON 分支改回 upsert | `json_create_campaign_bundle_cleanup_on_campaign_persist_failure`、`json_fork_campaign_bundle_cleanup_on_save_failure`、`sqlite_create_campaign_bundle_cleanup_on_world_info_failure`（红：返回 Ok 的半成品/孤儿 fork 会话） |
+| delete_card 双后端不等价；JSON 无回滚不删世界书；SQLite 级联顺序错（conversations 先于 round_summaries） | JSON `delete_card`：快照全部文件→候选→按序写盘→失败逆序恢复；SQLite `delete_card_cascade_tx`：conversations 移至 round_summaries 之后；命令层前置清理 turns/会话/压缩任务 + 清活跃指针/缓存/tool_ctx；**集成修复**：`production.rs::delete_campaign_cascade` 同款 FK 顺序错误（主代理修复，mutant 验红 `FOREIGN KEY constraint failed` → 绿） | `json_delete_card_cascades_all_associated_data`、`json_delete_card_mid_delete_failure_rolls_back_everything`、`sqlite_delete_card_cascades_all_associated_data`、`delete_campaign_cascade_cleans_summaries_before_conversations`（production_uow） |
+| edit-stale 吞 update_turn_record 错误 | Attempt 更新先行：`mutate_turn_if`（谓词=attempt 仍存在）失败则编辑不提交、整体 Err；成功后才提交会话编辑 | `edit_variant_stale_mark_failure_aborts_before_conversation_edit`（红：吞错返回 Ok；绿：冻结路径 Err + 会话文件原样） |
+| JSON 写失败原子性（TurnStore/CompressJobStore/CampaignStore/CharacterStore 等全 mutator） | 全部改候选→持久化→换入，persist 失败回滚内存；补偿失败并入错误；`let _ = persist` 清零；`reset_running_to_pending` 失败返回 0+日志 | `json_campaign_store_mutators_rollback_on_persist_failure`、`json_character_store_mutators_rollback_on_persist_failure`、`json_turn_store_mutators_rollback_on_persist_failure`、compress_job_store 5 个冻结测试（红：内存脏改 5 例） |
+| MutationBatch JSON 最终状态与 SQLite 不等（prepared vs committed） | `finalize_committed_turn` 在终态标记的原子写内把 `pending_state_changes.status` 翻为 `Committed` | `json_accept_persists_mutation_batch_committed`、`sqlite_accept_persists_mutation_batch_committed`（红：变异恢复 prepared；绿：raw turns.json 为 "committed"） |
+
+### 33.4 四、修正 Gate 5 测试自身
+
+| 反例 | 修复 | 判别测试 |
+|---|---|---|
+| parity snapshot 非 Result，默认空集合掩盖缺失 | `snapshot() -> Result<Value, String>`，读取全部 `?` 传播；快照含 jobs/outbox/recovery/全部 Campaign；缺失实体报错 | 主测试内嵌"缺失 Turn 必须使 snapshot 失败"（红：容忍缺失 mutant → panic；绿：删除前/后快照双后端逐项相等） |
+| MutationBatch status 归一化掩盖真实差异 | 删除 `normalize_pending_batch_status`；JSON 侧已修正为 committed（§33.3），raw 持久化状态直接比较 | `turn1_raw_batch_status` op：双后端 raw 状态逐字节等价（红：JSON prepared mutant → outbox 计数分叉） |
+| ID 归一化把所有 turn/attempt 映射同一标签 | `IdRegistry` 每 uuid 唯一标签（`{base}:{N}` / `path:{child}#{seq}`）；集合数组先按后端无关语义键预排序再登记 | 主测试内嵌两个突变阶段：交换 `accepted_attempt_id` / 伪造 `variant_id` → 删除前快照**必须**不等（红：共享标签 mutant → 差异被掩盖；绿：`⟨attempt:1⟩ vs ⟨attempt:2⟩` 可见） |
+| WAL 测试未保持外部连接存活 | 见 §33.1 所有权判断行：外部连接全程存活，WAL/SHM/主库字节逐字节不变，未 checkpoint 数据仍可读 | `foreign_wal_database_with_live_connection_and_migrations_is_rejected_bytes_intact` |
+| big-data 重启计时方式错误 | infra：`gate5_bigdata_perf.rs` 关闭全部句柄后全新 `Database::open`+`current_version`+读查询测冷重开；tauri：`sqlite_bigdata_perf.rs` 同口径 | 实测（windows/x86_64 debug，fixture 2570 实体）：infra `reopen_restart=1ms`（migration/cutover 346–366ms、reverse_export 256–286ms、reimport 157–173ms）；tauri `cold_reopen=22ms`（cutover 332ms、restart_recovery 3ms、add_knowledge×200 23ms/5ms、add_task×100 500ms/32ms、update_campaign×50 36ms/19ms、draft×10 85ms/50ms、delete_knowledge×50 340ms/14ms）；无人工 sleep，确定性断言 |
+| 性能预算 | 按 §10.4"性能没有相对 JSON 出现不可接受退化"给出宽松真实预算：冷重开 ≤100ms（实测 1–22ms，OS 页缓存承接）；cutover（迁移+导入+校验+发布）≤2s（实测 ≤370ms）；reverse export（含 integrity_check+FK check）≤1s（实测 ≤290ms）；reimport ≤1s（实测 ≤175ms）；常规单操作 <100ms（实测 4–85ms）；上述均为 debug build 上界，release 只会更快。若某环境实测超预算，先查是否 OS 缓存/杀软/网络盘，再升级为缺陷 | 见上 |
+
+### 33.5 静态门禁（主代理集成）
+
+- `scripts/architecture/backend-baseline.mjs`：`legacyAccessorAllowed` 移除 `commands/*`（命令层不再白名单）；commands 中 4 处 `.ok()` 隐藏的 `json_character_store` 访问已全部改走 `collect_scoped_regex_scripts_for_backend`；现 `applicationLegacyStoreAccessorReferences = 0`，`legacyStoreAccessorReferencesByFile` 仅剩白名单文件（backend_workflows 29 / lib 3 / storage_backend 91）。
+- 既有命令层守卫测试 `character_commands_supported_must_never_touch_json_character_store` 继续全绿。
+
+### 33.6 验证（全部真实复跑，最终树）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| fmt | `cargo fmt --all -- --check` | exit 0 |
+| check | `cargo check --workspace` | exit 0 |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| 全量测试（最终树） | `cargo test --workspace` | exit 0；96 suites，**1897 passed / 0 failed**（lib 431 + 集成 1466） |
+| 跨进程/故障/重启套件 ×3 | `gate5_fault_matrix`、`platform_locking`、`rollback`、`migration_concurrency`、`production_uow`、`backend_parity_suite`、`sqlite_command_concurrency` | 3/3 轮全绿（10/10、9/9、10/10、30/30、10/10、2/2、1/1） |
+| 架构基线 | `node scripts/architecture/backend-baseline.mjs` | exit 0；`applicationMethodFlagReferences=0`、`applicationLegacyStoreAccessorReferences=0` |
+| 前端合同 | `node --test frontend/tests/tauri-command-contract.test.mjs` | 8/8 |
+| 前端测试 | `npm test`（frontend/） | 476/476 |
+| 前端构建 | `npm run build`（frontend/） | success |
+| 工作区 | `git diff --check` / `git status --short` | clean |
+
+### 33.7 提交
+
+- 独立提交（在 `90f9584` 之上），未 amend `42edbc3`/`301164c`/`90f9584`，未 push；提交后工作区干净。
+- 遗留说明（诚实）：① 三.1 的发布守卫为 worker 侧重确认 + guarded finalize 的组合（infra-sqlite 的发布 UoW 属上一轮所有权，未在 UoW 内再改）；② `delete_character`（JSON）的历史级联范围未扩（不在三.7 反例范围）；③ 诊断导出的 hash 投影与 cutover 的"非空才参与"口径不同（各自自洽，已文档化）；④ early-cancel 现在会发 PostProcessSkipped（评审要求的行为变更，前端需知晓）。
+- Gate 5 二审全部反例关闭，返回 **PASS**；Gate 6（真实模型与平台验收）仍是下一确定性门，按计划 §11 执行，本轮结果不作 Gate 6 证据，未自行启动。

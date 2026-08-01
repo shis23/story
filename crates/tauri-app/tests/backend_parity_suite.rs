@@ -7,10 +7,20 @@
 //! sqlite_* 集成测试的单 authority 约束一致）。
 //!
 //! 比较规则（PLAN §10.3）：
-//! - 领域快照：卡片/角色库/Campaign/实例/知识/任务/总结/Turn/会话/世界书/MVU，
-//!   经 id 规范（已知 id → ⟨label⟩）与时间戳规范（→ ⟨ts⟩）后逐项相等；
-//!   SQLite-native 台账（outbox/mutation_commits）为物理布局差异，显式排除。
+//! - 领域快照：卡片/角色库/Campaign/实例/知识/任务/总结/Turn/会话/世界书/MVU +
+//!   compress jobs + outbox + 重启恢复状态，经 id 规范（已知 id → 唯一
+//!   ⟨label:N⟩）与时间戳规范（→ ⟨ts⟩）后逐项相等；快照读取**任何失败都
+//!   直接失败测试**（缺失文件/表不得静默成空数组，四.1）。
 //! - 操作结果：op 名 + 成功/失败类别 + 规范化消息。
+//! - 重启恢复（三.2）：真实子进程 + 生产启动恢复入口（resolve_backend →
+//!   StorageFacade → AppState → recover_turns → recover_compress_jobs），
+//!   父进程断言子进程报告的各后端自身恢复契约 + 二次恢复幂等。
+//!
+//! 测试列表（本二进制单 authority，SQLite 只由主测试激活）：
+//! - `backend_parity_equivalent_domain_snapshots`：主等价矩阵。
+//! - `parity_detects_mutant_swap_of_accepted_attempt` / `..._variant`：四.3
+//!   突变测试——交换 fixture 数据后奇偶校验必须失败（归一化不得掩盖差异）。
+//! - `restart_child_entry`：真实重启子进程入口（环境变量门控）。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +50,9 @@ fn write_json(path: &Path, value: serde_json::Value) {
 }
 
 /// 起始 fixture：1 张双角色卡 + 1 个角色库条目（无 Campaign——由 op 创建）。
+///
+/// char-store-1 的 extensions 携带 ST scoped regex 脚本（三.4 resolver 的
+/// 跨后端等价判别数据：stored/source/card/name 四键都能解析出同一脚本）。
 fn write_fixture(dir: &Path) {
     write_json(
         &dir.join("cards.json"),
@@ -89,7 +102,15 @@ fn write_fixture(dir: &Path) {
                 "mes_example": "", "post_history_instructions": "",
                 "alternate_greetings": [], "system_prompt": "扮演 Alice",
                 "tags": ["主角"], "creator": "test", "character_version": "1.0",
-                "spec_version": "2.0", "extensions": {},
+                "spec_version": "2.0",
+                "extensions": {
+                    "regex_scripts": [{
+                        "scriptName": "酒窖别名",
+                        "findRegex": "酒窖|地窖",
+                        "replaceString": "密窖",
+                        "placement": [2]
+                    }]
+                },
                 "embedded_world_info": null, "renderable_assets": null,
                 "raw_card_json": {}, "has_world_info": false,
                 "has_renderable_assets": false, "world_info_count": 0,
@@ -137,23 +158,51 @@ fn tauri_state_for_test(state: &Arc<AppState>) -> tauri::State<'_, Arc<AppState>
 // ─── 规范化 ────────────────────────────────────────────────────────────
 
 /// 每次运行（JSON/SQLite 各自）记录到的实体 id，用于快照与消息规范化。
+///
+/// 四.3：**每个 id 必须拥有唯一标签**（uuid → ⟨label:N⟩）——旧实现把同一
+/// 路径下所有随机 UUID 映射成同一个标签（如所有 attempt → 同一个
+/// `⟨path:...attempt_id⟩`），会掩盖 accepted_attempt_id / variant 等字段的
+/// 真实差异。手动标签经 `register_labeled` 按基数分配 `{base}:{N}`；
+/// 路径登记经全局序号分配 `path:{child}#{N}`。
 #[derive(Debug, Default, Clone)]
 struct IdRegistry {
     ids: Vec<(String, String)>, // (label, actual id)
+    path_seq: usize,
 }
 
 impl IdRegistry {
+    /// 手动登记：同一 id 重复登记保留首个标签；不同 id 用 `register_labeled`
+    /// 保证标签唯一（四.3）。
     fn register(&mut self, label: &str, id: &str) {
         if !self.ids.iter().any(|(_, actual)| actual == id) {
             self.ids.push((label.to_string(), id.to_string()));
         }
     }
+
+    /// 按基数分配唯一标签（四.3）：`{base}:{N}`，N 为每个新 id 递增。
+    fn register_labeled(&mut self, base: &str, id: &str) {
+        if self.contains_actual(id) {
+            return;
+        }
+        let n = self
+            .ids
+            .iter()
+            .filter(|(label, _)| label.starts_with(&format!("{base}:")))
+            .count()
+            + 1;
+        self.ids.push((format!("{base}:{n}"), id.to_string()));
+    }
+
     fn contains_actual(&self, id: &str) -> bool {
         self.ids.iter().any(|(_, actual)| actual == id)
     }
     /// 把结构内尚未登记的随机 UUID id 按字段路径登记（如 `tasks[].id`，数组无
     /// 下标——instances/tasks 等是集合语义，双后端顺序不同（见 list_* 实现），
     /// 标签必须与顺序无关；内容差异仍显式可见）。
+    ///
+    /// 四.3：每个**不同**的 UUID 分配不同标签 `path:{child}#{seq}`——相同 id
+    /// 出现多处（同一 Attempt 的 id 同时出现在 attempt_id 与 accepted_attempt_id）
+    /// 仍映射到同一个标签（按 actual id 去重）。
     fn register_uuid_ids_by_path(&mut self, value: &mut serde_json::Value, path: &str) {
         fn is_uuid(s: &str) -> bool {
             s.len() == 36
@@ -174,7 +223,9 @@ impl IdRegistry {
                         && is_uuid(s)
                         && !self.contains_actual(s)
                     {
-                        self.register(&format!("path:{child}"), s);
+                        self.path_seq += 1;
+                        self.ids
+                            .push((format!("path:{child}#{}", self.path_seq), s.clone()));
                     }
                     self.register_uuid_ids_by_path(v, &child);
                 }
@@ -270,38 +321,113 @@ fn canonicalize_timestamps(value: &mut serde_json::Value) {
     }
 }
 
-/// 归一化 Turn/Attempt 的 `pending_state_changes.status` 字段。
-///
-/// `MutationBatchStatus`（Prepared/Applying/Committed）是**执行态标志**，不是领域
-/// 语义：JSON postprocess 后 batch 暂存为 Prepared（待 accept 落库），SQLite 的
-/// preaccept UoW 已把 batch 落进 outbox 并标 Committed（同样待 accept）。两者 batch
-/// 内容（mutations/commit_id/expected/target_revision）相同，该 flag 仅随执行进度变化
-/// 且双后端在不同阶段合法不同——按归一化规则统一替换为 ⟨batch_status⟩，领域差异仍
-/// 显式可见。适用于 turns[] 以及 bundle（export 产物）里携带的同类节点。
-fn normalize_pending_batch_status(value: &mut serde_json::Value) {
+/// 集合数组按**后端无关语义键**预排序（title/name/knowledge_text/turn…），
+/// 使 id 路径登记的遍历顺序跨后端确定——四.3 唯一标签（⟨label:N⟩）的前提：
+/// 双后端 list_* 顺序不同时，按语义键排序后注册顺序一致，同一实体得到同一
+/// 标签。无语义键的对象回退到"掩码序列化"（UUID/时间戳 → 占位符，避免随机
+/// id 决定顺序）。
+fn stable_sort_collections(value: &mut serde_json::Value) {
+    const SEMANTIC_KEYS: &[&str] = &[
+        "title",
+        "name",
+        "knowledge_text",
+        "character_name",
+        "code",
+        "content",
+        "turn",
+    ];
+    fn masked_key(v: &serde_json::Value) -> String {
+        let mut c = v.clone();
+        mask_volatile(&mut c);
+        serde_json::to_string(&c).unwrap_or_default()
+    }
+    fn mask_volatile(v: &mut serde_json::Value) {
+        fn is_uuid(s: &str) -> bool {
+            s.len() == 36
+                && s.bytes().enumerate().all(|(i, b)| match i {
+                    8 | 13 | 18 | 23 => b == b'-',
+                    _ => b.is_ascii_hexdigit(),
+                })
+        }
+        match v {
+            serde_json::Value::String(s) if is_uuid(s) => {
+                *s = "⟨uuid⟩".to_string();
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    mask_volatile(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (k, val) in map.iter_mut() {
+                    if TS_KEYS.contains(&k.as_str()) {
+                        *val = serde_json::json!("⟨ts⟩");
+                    } else {
+                        mask_volatile(val);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     match value {
         serde_json::Value::Array(items) => {
-            for item in items {
-                normalize_pending_batch_status(item);
+            for item in items.iter_mut() {
+                stable_sort_collections(item);
+            }
+            if items.iter().all(|i| i.is_object()) {
+                let semantic = |v: &serde_json::Value| -> Option<String> {
+                    SEMANTIC_KEYS.iter().find_map(|key| {
+                        v.get(*key).and_then(|x| match x {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                    })
+                };
+                items.sort_by(|a, b| {
+                    let (sa, sb) = (semantic(a), semantic(b));
+                    match (sa, sb) {
+                        (Some(ka), Some(kb)) => (ka, masked_key(a)).cmp(&(kb, masked_key(b))),
+                        _ => masked_key(a).cmp(&masked_key(b)),
+                    }
+                });
             }
         }
         serde_json::Value::Object(map) => {
-            // 仅命中 MutationBatch 形态的对象（同时含 commit_id + mutations + status），
-            // 绝不误伤 Turn/Attempt 自身的领域 status（它们的对象没有 mutations/commit_id）。
-            let is_batch = map.contains_key("commit_id")
-                && map.contains_key("mutations")
-                && map.contains_key("expected_revision");
-            if is_batch
-                && let Some(status) = map.get_mut("status")
-                && matches!(
-                    status.as_str(),
-                    Some("prepared") | Some("applying") | Some("committed")
-                )
-            {
-                *status = serde_json::json!("⟨batch_status⟩");
+            for (_, v) in map.iter_mut() {
+                stable_sort_collections(v);
             }
-            for (_k, v) in map.iter_mut() {
-                normalize_pending_batch_status(v);
+        }
+        _ => {}
+    }
+}
+
+/// 恢复诊断文案（各后端私有）→ ⟨recovery_reason⟩：JSON 恢复写
+/// "启动恢复：崩溃时处于 X 态"，SQLite 写 "sqlite ... recovery: incomplete
+/// turn failed..."。这是后端私有诊断文本（非领域语义），双后端各按自身文案
+/// 终态化同一 Turn；归一化后仍显式可见"存在恢复原因"。
+fn normalize_recovery_reasons(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_recovery_reasons(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "failure_reason" {
+                    if let Some(s) = v.as_str() {
+                        let is_recovery_text = s.starts_with("启动恢复：")
+                            || s.contains("recovery: incomplete turn failed")
+                            || (s.contains("sqlite") && s.contains("recover"));
+                        if is_recovery_text {
+                            *v = serde_json::json!("⟨recovery_reason⟩");
+                        }
+                    }
+                } else {
+                    normalize_recovery_reasons(v);
+                }
             }
         }
         _ => {}
@@ -330,21 +456,76 @@ fn classify(err: &storyforge_lib::error::TauriCommandError) -> &'static str {
 }
 
 /// 一次后端运行的完整产出。
+#[derive(Debug, Clone)]
 struct PhaseOutput {
     results: Vec<OpRecord>,
     snapshot: serde_json::Value,
     /// 删除前的领域快照（含 Turn/Attempt/知识/任务/总结等删除级联会清掉的数据）。
     snapshot_before_delete: serde_json::Value,
-    /// 关键 Pipeline 事件序列（postprocess Done/Failed/Skipped + 计数/原因），
-    /// 按 production 后处理契约（runtime_support）从 `apply_outcome` 结果派生。
-    /// 双后端输入相同 → 事件序列必须逐项相等（PLAN §10.4）。
+    /// 关键 Pipeline 事件序列（postprocess Done/Skipped/Failed），经真实 helper
+    /// `postprocess_pipeline_event`（runtime_support）派生——双后端输入相同 →
+    /// 事件序列必须逐项相等（三.3：测试调用真实 helper，禁止手拼字符串）。
     pipeline_events: Vec<String>,
+}
+
+/// 四.3 突变：在**单侧**运行注入的数据损坏（另一侧保持真值），奇偶校验必须
+/// 失败——证明 IdRegistry 归一化不会掩盖 accepted_attempt_id / variant 差异。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TamperKind {
+    /// accept 后把 accepted_attempt_id 换成另一 attempt 的 id。
+    SwapAcceptedAttempt,
+    /// accept 后交换被接受 attempt 与首个 attempt 的 variant_id。
+    SwapVariant,
+}
+
+// ─── 重启恢复（三.2）───────────────────────────────────────────────────
+
+/// 子进程报告（紧凑单行 JSON，父进程解析）。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RestartReport {
+    backend: String,
+    /// 恢复后 Turn 状态（id, status, attempts[{id,status}]）。
+    turns: Vec<ReportTurn>,
+    /// 二次恢复后的 Turn 列表（幂等断言：与 turns 逐项相等）。
+    turns_after_second_recovery: Vec<ReportTurn>,
+    /// 仍处于非终态（Generating/DraftReady/Committing/…）的 Turn 数。
+    turns_non_terminal: usize,
+    /// 恢复中被终态化（Failed）的 Turn 数。
+    turns_failed: usize,
+    compress_jobs: Vec<ReportJob>,
+    compress_reset_first: usize,
+    compress_reset_second: usize,
+    /// 待 accept 的 pending outbox 单位数（各后端原始口径）。
+    outbox_pending: usize,
+    /// 活跃 Campaign（各后端原始口径：JSON 从 active_campaign.json 恢复，
+    /// SQLite 为进程内指针——重启后为 null）。
+    active_campaign: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReportTurn {
+    id: String,
+    status: String,
+    attempts: Vec<ReportAttempt>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReportAttempt {
+    id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReportJob {
+    id: String,
+    status: String,
+    attempts: u32,
 }
 
 // ─── 驱动 ──────────────────────────────────────────────────────────────
 
-struct ParityDriver<'a> {
-    state: &'a Arc<AppState>,
+struct ParityDriver {
+    state: Arc<AppState>,
     sqlite: bool,
     results: Vec<OpRecord>,
     pipeline_events: Vec<String>,
@@ -355,10 +536,14 @@ struct ParityDriver<'a> {
     task_ids: Vec<Id>,
     turn_ids: Vec<Id>,
     extracted_card_id: Option<Id>,
+    /// delete_campaign 成功后置位：快照对 Turn 缺失放行（级联删除是合法状态，
+    /// 等价性仍由另一侧的存在/缺失对比保证——四.1 的"缺失即错误"只针对
+    /// 存储读取失败与异常缺失）。
+    deleted_campaign: bool,
 }
 
-impl<'a> ParityDriver<'a> {
-    fn new(state: &'a Arc<AppState>, sqlite: bool) -> Self {
+impl ParityDriver {
+    fn new(state: Arc<AppState>, sqlite: bool) -> Self {
         Self {
             state,
             sqlite,
@@ -371,6 +556,7 @@ impl<'a> ParityDriver<'a> {
             task_ids: Vec::new(),
             turn_ids: Vec::new(),
             extracted_card_id: None,
+            deleted_campaign: false,
         }
     }
 
@@ -382,30 +568,15 @@ impl<'a> ParityDriver<'a> {
         });
     }
 
-    /// 按 production 后处理事件契约（runtime_support.rs 同款）记录关键 Pipeline 事件：
-    /// applied → PostProcessDone{k,v,t}；skipped（cancel）→ PostProcessSkipped{reason}。
-    /// 这是双后端输入相同时**真正可比较**的事件序列——apply_outcome 是共享写回逻辑，
-    /// 事件只由其结果驱动，双后端结果结构相同 → 事件序列逐项相等。
+    /// 三.3：经真实 helper（`backend_workflows::postprocess_pipeline_event`，
+    /// runtime_support 唯一事件派生点）记录 Pipeline 事件——不手拼字符串。
     fn record_postprocess_events(&mut self, result: &pp::ProductionPostprocessResult) {
-        if result.applied {
-            let (knowledge_count, variable_count, task_count) = result
-                .outcome
-                .as_ref()
-                .and_then(|o| o.post_process.as_ref())
-                .map(|pp| {
-                    (
-                        pp.knowledge_updates.len(),
-                        pp.variable_updates.len(),
-                        pp.task_updates.len(),
-                    )
-                })
-                .unwrap_or((0, 0, 0));
-            self.pipeline_events.push(format!(
-                "PostProcessDone:k={knowledge_count},v={variable_count},t={task_count}"
-            ));
-        } else if let Some(reason) = result.skipped_reason.as_deref() {
-            self.pipeline_events
-                .push(format!("PostProcessSkipped:{reason}"));
+        if let Some(event) = storyforge_lib::backend_workflows::postprocess_pipeline_event(
+            Some(&Ok(result.clone())),
+            "",
+            false,
+        ) {
+            self.pipeline_events.push(format!("{event:?}"));
         }
     }
 
@@ -417,9 +588,11 @@ impl<'a> ParityDriver<'a> {
                 // lineage 是随机 UUID，双后端各自生成——显式登记为领域字段。
                 self.ids.register("lineage", lin.as_str());
             }
+            // instance/task 的 id **不**在此按 list 顺序登记（双后端 list_*
+            // 顺序可能不同，顺序相关标签会分叉）——统一由快照的稳定语义键
+            // 预排序 + 路径登记分配（四.3 唯一标签）。
             if let Ok(instances) = self.state.storage().list_instances(cid) {
                 for inst in &instances {
-                    self.ids.register("instance", inst.id.as_str());
                     if !self.instance_ids.contains(&inst.id) {
                         self.instance_ids.push(inst.id.clone());
                     }
@@ -427,7 +600,6 @@ impl<'a> ParityDriver<'a> {
             }
             if let Ok(tasks) = self.state.storage().list_tasks(cid) {
                 for task in &tasks {
-                    self.ids.register("task", task.id.as_str());
                     if !self.task_ids.contains(&task.id) {
                         self.task_ids.push(task.id.clone());
                     }
@@ -448,8 +620,10 @@ impl<'a> ParityDriver<'a> {
     }
 
     /// 全量 op 序列（JSON/SQLite 共用同一份）。
-    async fn run(&mut self) -> PhaseOutput {
-        let st = self.state;
+    ///
+    /// `tamper`：四.3 突变注入（仅用于突变测试的**单侧**运行）。
+    async fn run(&mut self, tamper: Option<TamperKind>) -> PhaseOutput {
+        let st = self.state.clone();
         let storage = st.storage();
 
         // ── create：Campaign lifecycle ─────────────────────────────────
@@ -457,14 +631,14 @@ impl<'a> ParityDriver<'a> {
             "card-1".to_string(),
             "等价局".to_string(),
             Some("你好，冒险者。".to_string()),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(dto) => {
                 self.campaign_id = Some(Id::from_str(&dto.id));
                 self.conv_id = dto.conversation_id.as_ref().map(Id::from_str);
-                self.ids.register("campaign", &dto.id);
+                self.ids.register_labeled("campaign", &dto.id);
                 if let Some(conv) = &dto.conversation_id {
-                    self.ids.register("conversation", conv);
+                    self.ids.register_labeled("conversation", conv);
                 }
                 self.refresh_ids();
                 self.push(
@@ -477,6 +651,11 @@ impl<'a> ParityDriver<'a> {
         }
         let cid = self.campaign_id.clone().expect("campaign created");
         let conv_id = self.conv_id.clone().expect("conversation created");
+        // 活跃指针（重启报告断言用：JSON 落盘 / SQLite 进程内）。
+        let _ = storyforge_lib::set_active_campaign(
+            cid.as_str().to_string(),
+            tauri_state_for_test(&st),
+        );
 
         // definition 重复加入 → validation（Bob 已被 create_campaign 实例化）
         match storyforge_lib::add_campaign_instance(
@@ -485,7 +664,7 @@ impl<'a> ParityDriver<'a> {
             None,
             None,
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(_) => self.push("add_instance_dup", "ok", "unexpected".into()),
             Err(e) => self.push("add_instance_dup", classify(&e), e.to_string()),
@@ -497,7 +676,7 @@ impl<'a> ParityDriver<'a> {
             Some("临时客".to_string()),
             Some("路过的旅人".to_string()),
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(dto) => {
                 self.ids.register("instance", &dto.id);
@@ -512,7 +691,7 @@ impl<'a> ParityDriver<'a> {
             Some("临时客".to_string()),
             None,
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(_) => self.push("add_instance_same_name", "ok", "unexpected".into()),
             Err(e) => self.push("add_instance_same_name", classify(&e), e.to_string()),
@@ -529,7 +708,7 @@ impl<'a> ParityDriver<'a> {
                 key.to_string(),
                 value,
                 Some(0),
-                tauri_state_for_test(st),
+                tauri_state_for_test(&st),
             ) {
                 Ok(()) => self.push(name, "ok", "ok".into()),
                 Err(e) => self.push(name, classify(&e), e.to_string()),
@@ -542,7 +721,7 @@ impl<'a> ParityDriver<'a> {
             "string".to_string(),
             serde_json::json!("平静"),
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("add_var", "ok", "ok".into()),
             Err(e) => self.push("add_var", classify(&e), e.to_string()),
@@ -554,14 +733,14 @@ impl<'a> ParityDriver<'a> {
             "string".to_string(),
             serde_json::json!("v"),
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("add_var_bad_key", "ok", "unexpected".into()),
             Err(e) => self.push("add_var_bad_key", classify(&e), e.to_string()),
         }
         match storyforge_lib::sync_campaign_variable_schema(
             cid.as_str().to_string(),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(dto) => self.push("sync_schema", "ok", format!("added={}", dto.added)),
             Err(e) => self.push("sync_schema", classify(&e), e.to_string()),
@@ -574,7 +753,7 @@ impl<'a> ParityDriver<'a> {
             "地下城三层".to_string(),
             vec![],
             Some(1),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(id) => {
                 self.ids.register("task", &id);
@@ -587,7 +766,7 @@ impl<'a> ParityDriver<'a> {
             }
         };
         if let Some(tid) = &tid1 {
-            match storyforge_lib::complete_task(tid.as_str().to_string(), tauri_state_for_test(st))
+            match storyforge_lib::complete_task(tid.as_str().to_string(), tauri_state_for_test(&st))
             {
                 Ok(()) => self.push("complete_task", "ok", "ok".into()),
                 Err(e) => self.push("complete_task", classify(&e), e.to_string()),
@@ -599,7 +778,7 @@ impl<'a> ParityDriver<'a> {
             "穿过峡谷".to_string(),
             vec![],
             Some(2),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(id) => {
                 self.ids.register("task", &id);
@@ -612,14 +791,15 @@ impl<'a> ParityDriver<'a> {
             }
         };
         if let Some(tid) = &tid2 {
-            match storyforge_lib::abandon_task(tid.as_str().to_string(), tauri_state_for_test(st)) {
+            match storyforge_lib::abandon_task(tid.as_str().to_string(), tauri_state_for_test(&st))
+            {
                 Ok(()) => self.push("abandon_task", "ok", "ok".into()),
                 Err(e) => self.push("abandon_task", classify(&e), e.to_string()),
             }
         }
         let missing_task = Id::new().to_string();
         self.ids.register("missing_task", &missing_task);
-        match storyforge_lib::complete_task(missing_task.clone(), tauri_state_for_test(st)) {
+        match storyforge_lib::complete_task(missing_task.clone(), tauri_state_for_test(&st)) {
             Ok(()) => self.push("complete_task_missing", "ok", "unexpected".into()),
             Err(e) => self.push("complete_task_missing", classify(&e), e.to_string()),
         }
@@ -643,7 +823,7 @@ impl<'a> ParityDriver<'a> {
             "hp".to_string(),
             serde_json::json!(100),
             Some(0),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("set_char_var", "ok", "ok".into()),
             Err(e) => self.push("set_char_var", classify(&e), e.to_string()),
@@ -656,7 +836,7 @@ impl<'a> ParityDriver<'a> {
             "hp".to_string(),
             serde_json::json!(1),
             Some(0),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("set_char_var_missing", "ok", "unexpected".into()),
             Err(e) => self.push("set_char_var_missing", classify(&e), e.to_string()),
@@ -676,7 +856,7 @@ impl<'a> ParityDriver<'a> {
             match storyforge_lib::promote_temporary_instance(
                 cid.as_str().to_string(),
                 temp.as_str().to_string(),
-                tauri_state_for_test(st),
+                tauri_state_for_test(&st),
             ) {
                 Ok(()) => self.push(name, "ok", "ok".into()),
                 Err(e) => self.push(name, classify(&e), e.to_string()),
@@ -687,7 +867,7 @@ impl<'a> ParityDriver<'a> {
         match storyforge_lib::apply_campaign_opening(
             cid.as_str().to_string(),
             "改写后的开场".to_string(),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("apply_opening", "ok", "ok".into()),
             Err(e) => self.push("apply_opening", classify(&e), e.to_string()),
@@ -698,7 +878,7 @@ impl<'a> ParityDriver<'a> {
         match storyforge_lib::extract_characters(
             "char-src-2".to_string(),
             None,
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         )
         .await
         {
@@ -709,7 +889,7 @@ impl<'a> ParityDriver<'a> {
             }
             Err(e) => self.push("extract_characters", classify(&e), e.to_string()),
         }
-        match storyforge_lib::list_cards(tauri_state_for_test(st)) {
+        match storyforge_lib::list_cards(tauri_state_for_test(&st)) {
             Ok(cards) => self.push(
                 "list_cards",
                 "ok",
@@ -718,7 +898,8 @@ impl<'a> ParityDriver<'a> {
             Err(e) => self.push("list_cards", classify(&e), e.to_string()),
         }
         if let Some(card_id) = self.extracted_card_id.clone() {
-            match storyforge_lib::get_card(card_id.as_str().to_string(), tauri_state_for_test(st)) {
+            match storyforge_lib::get_card(card_id.as_str().to_string(), tauri_state_for_test(&st))
+            {
                 Ok(dto) => self.push(
                     "get_extracted_card",
                     "ok",
@@ -728,13 +909,13 @@ impl<'a> ParityDriver<'a> {
             }
             match storyforge_lib::delete_card(
                 card_id.as_str().to_string(),
-                tauri_state_for_test(st),
+                tauri_state_for_test(&st),
             ) {
                 Ok(()) => self.push("delete_extracted_card", "ok", "ok".into()),
                 Err(e) => self.push("delete_extracted_card", classify(&e), e.to_string()),
             }
         }
-        match storyforge_lib::list_cards(tauri_state_for_test(st)) {
+        match storyforge_lib::list_cards(tauri_state_for_test(&st)) {
             Ok(cards) => self.push(
                 "list_cards_after_delete",
                 "ok",
@@ -743,8 +924,44 @@ impl<'a> ParityDriver<'a> {
             Err(e) => self.push("list_cards_after_delete", classify(&e), e.to_string()),
         }
 
+        // ── 三.4：backend-neutral scoped-regex 角色解析（stored/source/card/name）
+        let tool_characters = st.snapshot_tool_ctx().characters.clone();
+        let resolve_count = |key: &str| {
+            storyforge_lib::backend_workflows::collect_scoped_regex_scripts_for_backend(
+                Some(key),
+                &tool_characters,
+                Some(storage),
+            )
+            .map(|scripts| scripts.len())
+            .unwrap_or(0)
+        };
+        self.push(
+            "scoped_regex_stored",
+            "ok",
+            format!("count={}", resolve_count("char-store-1")),
+        );
+        self.push(
+            "scoped_regex_source",
+            "ok",
+            format!("count={}", resolve_count("char-src-1")),
+        );
+        self.push(
+            "scoped_regex_name",
+            "ok",
+            format!("count={}", resolve_count("Alice")),
+        );
+        self.push(
+            "scoped_regex_card",
+            "ok",
+            format!("count={}", resolve_count("card-1")),
+        );
+        self.push(
+            "scoped_regex_missing",
+            "ok",
+            format!("count={}", resolve_count("nobody")),
+        );
+
         // ── Meta typed patch：propose + accept（跨 Turn 的 stale 拒绝）──
-        // 注入 schema 漂移（instance 变量不在定义 schema 中）→ 健康检查产出 patch。
         let drift_key = "extra_key".to_string();
         match storyforge_lib::set_character_variable(
             cid.as_str().to_string(),
@@ -752,21 +969,20 @@ impl<'a> ParityDriver<'a> {
             drift_key.clone(),
             serde_json::json!("drift"),
             Some(0),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         ) {
             Ok(()) => self.push("drift_inject", "ok", "ok".into()),
             Err(e) => self.push("drift_inject", classify(&e), e.to_string()),
         }
         let proposed = storyforge_lib::meta_propose_campaign_repairs(
             cid.as_str().to_string(),
-            tauri_state_for_test(st),
+            tauri_state_for_test(&st),
         );
         let patch_count = proposed.as_ref().map(|p| p.len()).unwrap_or(0);
         match &proposed {
             Ok(_patches) => self.push("meta_propose", "ok", format!("patches={patch_count}")),
             Err(e) => self.push("meta_propose", classify(e), e.to_string()),
         }
-        // 保存 propose 盖章的 revision（stale 判定基准）。
         let proposed_revision = self.campaign_revision();
         let first_patch_id = proposed
             .as_ref()
@@ -780,7 +996,7 @@ impl<'a> ParityDriver<'a> {
             match storyforge_lib::meta_accept_typed_patch(
                 patch_id.clone(),
                 cid.as_str().to_string(),
-                tauri_state_for_test(st),
+                tauri_state_for_test(&st),
             ) {
                 Ok(()) => self.push("meta_accept", "ok", "ok".into()),
                 Err(e) => self.push("meta_accept", classify(&e), e.to_string()),
@@ -788,8 +1004,6 @@ impl<'a> ParityDriver<'a> {
         }
 
         // ── Turn 1 流水线：draft → regenerate → postprocess → Accept ──
-        // （edit-stale 单独放在 Turn 2：SQLite 拒绝在 Stale Attempt 上
-        //   regenerate，JSON 允许——该序列无法等价，故不放进等价矩阵。）
         let base_rev = self.campaign_revision();
         let user_node = st
             .conv_store
@@ -797,24 +1011,29 @@ impl<'a> ParityDriver<'a> {
             .expect("append user message");
         let turn = TurnRecord::new(cid.clone(), conv_id.clone(), user_node, base_rev);
         let turn_id = turn.turn_id.clone();
-        self.ids.register("turn", turn_id.as_str());
+        self.ids.register_labeled("turn", turn_id.as_str());
         self.turn_ids.push(turn_id.clone());
         storage.save_turn(&turn).expect("save turn");
 
         let attempt1 = Id::new();
-        let provisional_variant = Id::new();
-        self.ids.register("attempt", attempt1.as_str());
-        self.ids.register("variant", provisional_variant.as_str());
+        self.ids.register_labeled("attempt", attempt1.as_str());
         let workflow = TurnWorkflow::new(storage.clone(), st.conv_store.clone());
         // JSON 流水线先落 draft 节点（SQLite 由 preaccept UoW 落）；
         // JSON 的 provisional variant id 必须是真实节点 id。
         let provisional_variant = if self.sqlite {
-            provisional_variant
+            Id::new()
         } else {
             st.conv_store
                 .append_ai_draft(&conv_id, "草稿甲：众人进入地下城".to_string(), None)
                 .expect("JSON pipeline lands draft node")
         };
+        // 仅 JSON 登记 provisional（它就是最终 variant 节点）；SQLite 的
+        // provisional 是幻影 id（真实节点由 UoW 生成）——登记它会占掉标签序号，
+        // 使双后端 variant 标签分叉（四.3 唯一标签）。
+        if !self.sqlite {
+            self.ids
+                .register_labeled("variant", provisional_variant.as_str());
+        }
         let draft = workflow
             .create_draft_attempt(storyforge_lib::DraftAttemptRequest {
                 campaign_id: &cid,
@@ -827,12 +1046,13 @@ impl<'a> ParityDriver<'a> {
                 provenance: None,
             })
             .expect("create draft attempt");
-        self.ids.register("variant", draft.variant_id.as_str());
+        self.ids
+            .register_labeled("variant", draft.variant_id.as_str());
         self.push("draft", "ok", "ok".into());
 
         // regenerate：JSON 流水线先 replace_active_variant（SQLite 由 UoW 完成）
         let attempt2 = Id::new();
-        self.ids.register("attempt", attempt2.as_str());
+        self.ids.register_labeled("attempt", attempt2.as_str());
         if !self.sqlite {
             st.conv_store
                 .replace_active_variant(
@@ -894,46 +1114,55 @@ impl<'a> ParityDriver<'a> {
         // 仅 batch 源不同（JSON 投影 store / SQLite runtime 快照），sink 路由到
         // 各自后端。present_chars 传真实在场角色——生产语义，不是空集逃生口。
         //
-        // 事件捕获（PLAN §10.4 关键 Pipeline 事件）：按 production 后处理契约
-        // （runtime_support.rs 同款 if/else）从 `apply_outcome` 结果派生
-        // PostProcessDone / Skipped / Failed 事件——这是双后端真正可比较的事件
-        // 序列（apply_outcome 是共享的写回逻辑，事件只由其结果驱动）。
-        let pp_result: Result<pp::ProductionPostprocessResult, String> = (|| {
-            let sink = storyforge_lib::BackendTurnAttemptSink::production(storage.clone());
-            let runtime;
-            let service = if self.sqlite {
-                let campaign_rec = storage
-                    .get_campaign(&cid)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "campaign missing for sqlite postprocess runtime".to_string())?;
-                let instances = storage.list_instances(&cid).map_err(|e| e.to_string())?;
-                let knowledge = storage.list_knowledge(&cid).map_err(|e| e.to_string())?;
-                let tasks = storage.list_tasks(&cid).map_err(|e| e.to_string())?;
-                let definitions_by_id = storage
-                    .list_cards()
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .flat_map(|c| c.card.character_definitions)
-                    .map(|def| (def.id.clone(), def))
-                    .collect();
-                runtime = storyforge_domain::campaign_runtime::CampaignRuntimeContext {
-                    campaign: campaign_rec.campaign,
-                    instances,
-                    definitions_by_id,
-                    knowledge,
-                    tasks,
-                    turn: 0,
+        // 事件捕获（三.3）：经真实 helper 派生 PostProcessDone / Skipped /
+        // Failed 事件——apply_outcome 是共享的写回逻辑，事件只由其结果驱动，
+        // 双后端结果结构相同 → 事件序列逐项相等。
+        let pp_result: Result<pp::ProductionPostprocessResult, pp::ProductionPostprocessError> =
+            (|| {
+                let sink = storyforge_lib::BackendTurnAttemptSink::production(storage.clone());
+                let runtime;
+                let service = if self.sqlite {
+                    let campaign_rec = storage
+                        .get_campaign(&cid)
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?
+                        .ok_or_else(|| {
+                            pp::ProductionPostprocessError::Storage(
+                                "campaign missing for sqlite postprocess runtime".to_string(),
+                            )
+                        })?;
+                    let instances = storage
+                        .list_instances(&cid)
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?;
+                    let knowledge = storage
+                        .list_knowledge(&cid)
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?;
+                    let tasks = storage
+                        .list_tasks(&cid)
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?;
+                    let definitions_by_id = storage
+                        .list_cards()
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?
+                        .into_iter()
+                        .flat_map(|c| c.card.character_definitions)
+                        .map(|def| (def.id.clone(), def))
+                        .collect();
+                    runtime = storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                        campaign: campaign_rec.campaign,
+                        instances,
+                        definitions_by_id,
+                        knowledge,
+                        tasks,
+                        turn: 0,
+                    };
+                    pp::ProductionPostprocessService::new_runtime(&runtime, &sink)
+                } else {
+                    let store = storage
+                        .json_campaign_store(BackendCapability::Postprocess, "parity postprocess")
+                        .map_err(|e| pp::ProductionPostprocessError::Storage(e.to_string()))?;
+                    pp::ProductionPostprocessService::new_json(store, &sink)
                 };
-                pp::ProductionPostprocessService::new_runtime(&runtime, &sink)
-            } else {
-                let store = storage
-                    .json_campaign_store(BackendCapability::Postprocess, "parity postprocess")
-                    .map_err(|e| e.to_string())?;
-                pp::ProductionPostprocessService::new_json(store, &sink)
-            };
-            let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
-            service
-                .apply_outcome(
+                let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                service.apply_outcome(
                     &pp::PostprocessIdentity {
                         turn_id: turn_id.clone(),
                         attempt_id: attempt2.clone(),
@@ -945,8 +1174,7 @@ impl<'a> ParityDriver<'a> {
                     &[alice.as_str().to_string()],
                     &cancel_rx,
                 )
-                .map_err(|e| e.to_string())
-        })();
+            })();
         match &pp_result {
             Ok(result) => {
                 assert!(result.applied, "postprocess must apply");
@@ -954,10 +1182,15 @@ impl<'a> ParityDriver<'a> {
                 self.push("postprocess", "ok", "ok".into());
             }
             Err(e) => {
-                // Failed 路径仍记录事件（与 runtime_support 一致：发 PostProcessFailed）。
-                self.pipeline_events
-                    .push(format!("PostProcessFailed:{}", e));
-                self.push("postprocess", "storage", e.clone());
+                // Failed 路径仍记录事件（三.3：经真实 helper 派生）。
+                if let Some(event) = storyforge_lib::backend_workflows::postprocess_pipeline_event(
+                    Some(&Err(e.clone())),
+                    &e.to_string(),
+                    false,
+                ) {
+                    self.pipeline_events.push(format!("{event:?}"));
+                }
+                self.push("postprocess", "storage", e.to_string());
             }
         }
 
@@ -983,6 +1216,82 @@ impl<'a> ParityDriver<'a> {
             "accept 后 revision 必须 +1"
         );
 
+        // ── 四.2：原始持久化 pending_state_changes.status 双后端逐字节等价 ──
+        // 不再归一化 batch status——Wave-2b 已让 JSON 提交后落盘 "committed"。
+        // JSON 直接读磁盘 turns.json；SQLite 读权威表（get_turn 即持久化真值）。
+        let raw_batch_status = if self.sqlite {
+            storage
+                .get_turn(&turn_id)
+                .expect("read turn")
+                .expect("turn exists")
+                .find_attempt(&attempt2)
+                .and_then(|a| a.pending_state_changes.as_ref())
+                .map(|b| format!("{:?}", b.status).to_lowercase())
+                .unwrap_or_else(|| "<none>".to_string())
+        } else {
+            let raw: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(storage.data_dir().join("turns.json"))
+                    .expect("read turns.json"),
+            )
+            .expect("parse turns.json");
+            raw.as_array()
+                .and_then(|turns| {
+                    turns.iter().find(|t| {
+                        t.get("turn_id").and_then(|v| v.as_str()) == Some(turn_id.as_str())
+                    })
+                })
+                .and_then(|t| t.get("attempts"))
+                .and_then(|a| a.as_array())
+                .and_then(|attempts| {
+                    attempts.iter().find(|a| {
+                        a.get("attempt_id").and_then(|v| v.as_str()) == Some(attempt2.as_str())
+                    })
+                })
+                .and_then(|a| a.get("pending_state_changes"))
+                .and_then(|b| b.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>")
+                .to_string()
+        };
+        self.push(
+            "turn1_raw_batch_status",
+            "ok",
+            format!("status={raw_batch_status}"),
+        );
+
+        // ── 四.3 突变注入（仅单侧运行；另一侧保持真值）────────────────
+        // 不 push op 记录：突变不得改变 op 序列（快照差异才是判别点）。
+        if let Some(tamper) = tamper {
+            match tamper {
+                TamperKind::SwapAcceptedAttempt => {
+                    storage
+                        .update_turn_record(&turn_id, |record| {
+                            let first = record.attempts.first().map(|a| a.attempt_id.clone());
+                            record.accepted_attempt_id = first;
+                            record.touch();
+                        })
+                        .expect("tamper accepted_attempt_id");
+                }
+                TamperKind::SwapVariant => {
+                    // regenerate 复用同一 variant 节点（attempt1/attempt2 共享
+                    // variant_id），"互换"是结构上的 no-op——突变改为把被接受
+                    // attempt 的 variant_id 指向一个**不存在的伪造 id**（领域
+                    // 上非法的值），奇偶校验必须能识别。
+                    storage
+                        .update_turn_record(&turn_id, |record| {
+                            if let Some(accepted_idx) = record.attempts.iter().position(|a| {
+                                Some(&a.attempt_id) == record.accepted_attempt_id.as_ref()
+                            }) {
+                                record.attempts[accepted_idx].variant_id =
+                                    Id::from_str("mutant-foreign-variant");
+                            }
+                            record.touch();
+                        })
+                        .expect("tamper variant id");
+                }
+            }
+        }
+
         // ── Turn 2：draft → edit-stale（改写后 Attempt 变 Stale）──────
         let turn2_user = st
             .conv_store
@@ -990,11 +1299,11 @@ impl<'a> ParityDriver<'a> {
             .expect("append user message");
         let turn2 = TurnRecord::new(cid.clone(), conv_id.clone(), turn2_user, base_rev + 1);
         let turn2_id = turn2.turn_id.clone();
-        self.ids.register("turn", turn2_id.as_str());
+        self.ids.register_labeled("turn", turn2_id.as_str());
         self.turn_ids.push(turn2_id.clone());
         storage.save_turn(&turn2).expect("save turn 2");
         let attempt3 = Id::new();
-        self.ids.register("attempt", attempt3.as_str());
+        self.ids.register_labeled("attempt", attempt3.as_str());
         let provisional_variant2 = if self.sqlite {
             Id::new()
         } else {
@@ -1014,6 +1323,8 @@ impl<'a> ParityDriver<'a> {
                 provenance: None,
             })
             .expect("create draft attempt 2");
+        self.ids
+            .register_labeled("variant", draft2.variant_id.as_str());
         self.push("turn2_draft", "ok", "ok".into());
         workflow
             .edit_variant_with_stale_mark(&conv_id, &draft2.variant_id, "用户改写密道段落")
@@ -1036,7 +1347,7 @@ impl<'a> ParityDriver<'a> {
             match storyforge_lib::meta_accept_typed_patch(
                 patch_id.clone(),
                 cid.as_str().to_string(),
-                tauri_state_for_test(st),
+                tauri_state_for_test(&st),
             ) {
                 Ok(()) => self.push(
                     "meta_accept_stale",
@@ -1080,8 +1391,6 @@ impl<'a> ParityDriver<'a> {
         }
 
         // ── Chronicle compression：入队/claim/成功/失败重试 状态机等价 ──
-        // 不 spawn worker（worker 需要 LLM）；等价矩阵只比较持久化状态机与
-        // uncovered 计数（阈值判定是共享纯函数 should_enqueue_compress）。
         let lineage = storage
             .get_campaign(&cid)
             .ok()
@@ -1104,7 +1413,7 @@ impl<'a> ParityDriver<'a> {
                 uncovered_b as u32,
             )
             .map(|(id, created)| {
-                self.ids.register("compress_job", id.as_str());
+                self.ids.register_labeled("compress_job", id.as_str());
                 (id, created)
             })
             .map_err(|e| e.to_string())
@@ -1175,7 +1484,7 @@ impl<'a> ParityDriver<'a> {
         let (job2, created2) = storage
             .enqueue_compress_job(&cid, self.conv_id.clone(), lineage, 1, 0)
             .map(|(id, created)| {
-                self.ids.register("compress_job", id.as_str());
+                self.ids.register_labeled("compress_job", id.as_str());
                 (id, created)
             })
             .map_err(|e| e.to_string())
@@ -1222,10 +1531,11 @@ impl<'a> ParityDriver<'a> {
                 serde_json::from_str(s).unwrap_or(serde_json::json!(null));
             // 未被 op 返回的随机 id（postprocess 落库的知识条目/叙事任务等）按
             // 结构路径登记——双后端同构输出 → 同标签；未知 UUID 不得放行。
+            // 先按后端无关语义键预排序（四.3：唯一标签需要跨后端确定的注册顺序）。
+            stable_sort_collections(&mut v);
             self.ids.register_uuid_ids_by_path(&mut v, "bundle");
             self.ids.canonicalize(&mut v);
             canonicalize_timestamps(&mut v);
-            normalize_pending_batch_status(&mut v);
             // 集合数组顺序与后端 list_* 实现相关（非领域语义）→ 排序后比较。
             self.ids.sort_object_arrays(&mut v);
             serde_json::to_string(&v).unwrap_or_default()
@@ -1251,9 +1561,10 @@ impl<'a> ParityDriver<'a> {
             Some(bundle_value) => {
                 match storage.import_campaign_bundle(bundle_value, &st.conv_store) {
                     Ok(result) => {
-                        self.ids.register("campaign", result.campaign_id.as_str());
                         self.ids
-                            .register("conversation", result.conversation_id.as_str());
+                            .register_labeled("campaign", result.campaign_id.as_str());
+                        self.ids
+                            .register_labeled("conversation", result.conversation_id.as_str());
                         self.push(
                             "import_bundle",
                             "ok",
@@ -1269,31 +1580,40 @@ impl<'a> ParityDriver<'a> {
             None => self.push("import_bundle", "storage", "bundle parse failed".into()),
         }
 
-        // ── restart recovery：真正的「重启 = 同目录、新 AppState」────────
-        // 必须在 delete_campaign **之前**：植入需要引用仍存在的 Campaign（SQLite
-        // compress_jobs 对 campaign_id 有外键）。不是只发一条字符串。植入一个
-        // Running 态 compress job + 一个 Committing 态 Turn（崩溃中断残留），
-        // 丢弃当前进程内状态，重新打开同一 authority（SQLite 重开 DB；JSON 重读
-        // 磁盘文件），再跑生产启动恢复原语，断言恢复幂等且崩溃残留被收敛。
+        // ── 重启恢复（三.2）：真实子进程 + 生产启动恢复入口 ────────────
+        // 必须在 delete_campaign **之前**：植入需要引用仍存在的 Campaign。
+        // 植入 Running 态 compress job + 崩溃残留（Turn 2 保持 DraftReady），
+        // 子进程执行完整生产恢复；父进程按各后端自身契约断言子进程报告，
+        // 随后**重开** AppState（JSON 重读磁盘 / SQLite 读权威表）继续。
         self.run_restart_recovery();
 
-        // 删除前的完整领域快照（Turn/Attempt/知识/任务/总结/会话/世界书 + 上一步
-        // 植入并被 reset 回 Pending 的 recovery compress job）。
+        // 删除前的完整领域快照（Turn/Attempt/知识/任务/总结/会话/世界书 +
+        // 恢复后的 compress jobs/outbox/恢复状态）。
         // ⚠️ 必须在 delete_campaign **之前**捕获——否则级联删掉的数据不在快照里，
-        // “删除前等价”就成了删除后等价的假阳性（审查跟进 P1）。
-        let snapshot_before_delete = self.snapshot();
+        // "删除前等价"就成了删除后等价的假阳性（审查跟进 P1）。
+        let snapshot_before_delete = self.snapshot().expect("snapshot before delete");
 
         // ── 删除（delete_campaign 级联；二次删除 → not_found）─────────
-        match storyforge_lib::delete_campaign(cid.as_str().to_string(), tauri_state_for_test(st)) {
-            Ok(()) => self.push("delete_campaign", "ok", "ok".into()),
+        let cid_now = self.campaign_id.clone().expect("campaign");
+        match storyforge_lib::delete_campaign(
+            cid_now.as_str().to_string(),
+            tauri_state_for_test(&self.state),
+        ) {
+            Ok(()) => {
+                self.deleted_campaign = true;
+                self.push("delete_campaign", "ok", "ok".into());
+            }
             Err(e) => self.push("delete_campaign", classify(&e), e.to_string()),
         }
-        match storyforge_lib::delete_campaign(cid.as_str().to_string(), tauri_state_for_test(st)) {
+        match storyforge_lib::delete_campaign(
+            cid_now.as_str().to_string(),
+            tauri_state_for_test(&self.state),
+        ) {
             Ok(()) => self.push("delete_campaign_again", "ok", "unexpected".into()),
             Err(e) => self.push("delete_campaign_again", classify(&e), e.to_string()),
         }
 
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot().expect("snapshot after delete");
         let pipeline_events = std::mem::take(&mut self.pipeline_events);
         let mut results = std::mem::take(&mut self.results);
         let ids = std::mem::take(&mut self.ids);
@@ -1311,21 +1631,21 @@ impl<'a> ParityDriver<'a> {
         }
     }
 
-    /// 真实「重启恢复」证明（审查跟进 P1）：植入崩溃残留 → 重新打开同一 authority
-    /// → 跑生产启动恢复原语 → 断言收敛。
+    /// 三.2 真实「重启恢复」：植入崩溃残留 → 启动**真实子进程**（同一测试
+    /// 二进制 `restart_child_entry`，环境变量门控）执行生产启动恢复 →
+    /// 父进程按各后端自身恢复契约断言子进程报告 → 二次恢复幂等 →
+    /// 父进程**重开** AppState（后续断言读重开后的状态，不读旧内存）。
     ///
-    /// - 植入一个 Running 态 compress job（崩溃中断的 worker 残留）。
-    /// - 植入一个 Committing 态 Turn（崩溃中断的 accept 残留，JSON/SQLite 都能造）。
-    /// - 重新打开：构造新的 StorageFacade + AppState（SQLite 仍指向同一 DB 文件；
-    ///   JSON 重新 load 磁盘文件），即「重启」语义。
-    /// - 跑恢复：SQLite 调 `recover_turns_on_startup` + `compress_reset_running_to_pending`；
-    ///   JSON 走 `TurnLifecycleService::recover_turns_on_startup` + `reset_running_to_pending`。
-    /// - 断言：Running compress job → Pending；再次恢复幂等（0 reset）；恢复 op 入表。
+    /// 恢复契约（各后端自身语义，等价不变量=恢复后无非终态 Turn）：
+    /// - JSON：Generating/DraftReady 活动 Turn → Failed；Committing → 重放。
+    /// - SQLite：fail_incomplete 把非终态 Turn/Attempt → Failed（原子 accept
+    ///   下 Committing 罕见）。
+    /// - 两者：Running compress job → Pending；待 accept outbox 清零。
     #[allow(clippy::too_many_lines)]
     fn run_restart_recovery(&mut self) {
         let storage = self.state.storage();
 
-        // 植入：Running compress job（崩溃中断的 worker）。
+        // 植入：Running compress job（崩溃中断的 worker 残留）。
         let (recovery_campaign, recovery_conv) = match (&self.campaign_id, &self.conv_id) {
             (Some(c), Some(v)) => (c.clone(), v.clone()),
             _ => {
@@ -1345,7 +1665,7 @@ impl<'a> ParityDriver<'a> {
             0,
         ) {
             Ok(x) => {
-                self.ids.register("compress_job", x.0.as_str());
+                self.ids.register_labeled("compress_job", x.0.as_str());
                 x
             }
             Err(e) => {
@@ -1366,29 +1686,183 @@ impl<'a> ParityDriver<'a> {
             .list_compress_jobs()
             .map(|jobs| jobs.iter().any(|j| j.id == job_id && j.status == "running"))
             .unwrap_or(false);
+        if !running_before {
+            self.push("restart_recovery", "storage", "seed job not running".into());
+            return;
+        }
 
-        // Turn 恢复（Committing 重放）由专门的 sqlite_chronicle_crash_recovery.rs /
-        // gate5_fault_matrix.rs 覆盖，且其 dispatch 在 lib.rs::recover_turns_on_startup
-        // 中是共享的；此处不重复植入 Committing Turn（已有活动 Turn 会冲突），
-        // 只验证 compress-job 重置的「重启」收敛 + 幂等——这是双后端在此 fixture
-        // 下可比较的恢复证明。
-
-        // 重新打开同一 authority（「重启」）。
         let data_dir = storage.data_dir().to_path_buf();
+        let turn_ids: Vec<String> = self
+            .turn_ids
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
+
+        // ── 启动真实子进程：完整生产 bootstrap + 恢复 ─────────────────
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["restart_child_entry", "--exact", "--nocapture"]);
+        cmd.env("STORYFORGE_RESTART_CHILD", "1");
+        cmd.env("STORYFORGE_RESTART_DATA_DIR", &data_dir);
+        cmd.env(
+            "STORYFORGE_RESTART_BACKEND",
+            if self.sqlite { "sqlite" } else { "json" },
+        );
+        cmd.env("STORYFORGE_RESTART_TURN_IDS", turn_ids.join(","));
+        let output = match cmd.output() {
+            Ok(out) => out,
+            Err(e) => {
+                self.push(
+                    "restart_recovery",
+                    "storage",
+                    format!("spawn restart child: {e}"),
+                );
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report_line = stdout
+            .lines()
+            .find(|line| line.starts_with("STORYFORGE_RESTART_REPORT "))
+            .map(|line| {
+                line.trim_start_matches("STORYFORGE_RESTART_REPORT ")
+                    .to_string()
+            });
+        let report: RestartReport = match report_line {
+            Some(line) => match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.push(
+                        "restart_recovery",
+                        "storage",
+                        format!("child report parse failed: {e}\nstdout={stdout}\nstderr={stderr}"),
+                    );
+                    return;
+                }
+            },
+            None => {
+                self.push(
+                    "restart_recovery",
+                    "storage",
+                    format!(
+                        "child exited {} without report\nstdout={stdout}\nstderr={stderr}",
+                        output.status
+                    ),
+                );
+                return;
+            }
+        };
+        if !output.status.success() {
+            self.push(
+                "restart_recovery",
+                "storage",
+                format!("child failed: {stderr}"),
+            );
+            return;
+        }
+
+        // ── 按各后端自身恢复契约断言（原始口径，不做跨后端归一化）────
+        let expected_backend = if self.sqlite { "sqlite" } else { "json" };
+        assert_eq!(
+            report.backend, expected_backend,
+            "子进程后端决议必须与父进程一致"
+        );
+        // 等价不变量：恢复后不得残留非终态 Turn。
+        assert_eq!(
+            report.turns_non_terminal, 0,
+            "恢复后不得有非终态 Turn（各后端自身契约）: {report:?}"
+        );
+        assert!(
+            report.turns_failed >= 1,
+            "崩溃残留 Turn（DraftReady）必须被各后端终态化为 Failed: {report:?}"
+        );
+        // 二次恢复幂等：Turn 列表逐项不变 + compress reset 为 0。
+        assert_eq!(
+            report.turns.len(),
+            report.turns_after_second_recovery.len(),
+            "二次恢复不得改变 Turn 集合: {report:?}"
+        );
+        for (a, b) in report
+            .turns
+            .iter()
+            .zip(report.turns_after_second_recovery.iter())
+        {
+            assert_eq!(
+                (a.id.as_str(), a.status.as_str()),
+                (b.id.as_str(), b.status.as_str()),
+                "二次恢复后 Turn 状态必须不变（幂等）: {report:?}"
+            );
+        }
+        assert!(
+            report.compress_reset_first >= 1,
+            "Running compress job 必须被重置: {report:?}"
+        );
+        assert_eq!(
+            report.compress_reset_second, 0,
+            "二次恢复的 compress reset 必须为 0（幂等）: {report:?}"
+        );
+        assert!(
+            report
+                .compress_jobs
+                .iter()
+                .all(|j| j.status == "pending" || j.status == "succeeded" || j.status == "failed"),
+            "压缩任务不得停留在 Running: {report:?}"
+        );
+        assert_eq!(
+            report.outbox_pending, 0,
+            "恢复后待 accept 的 outbox 必须清零（各后端原始口径）: {report:?}"
+        );
+        // 活跃 Campaign：JSON 从 active_campaign.json 恢复（父进程设置过指针）；
+        // SQLite 为进程内指针，重启后为 null（后端自身语义）。
+        if self.sqlite {
+            assert!(
+                report.active_campaign.is_none(),
+                "SQLite 活跃指针是进程内状态，重启子进程必须为 null: {report:?}"
+            );
+        } else {
+            assert_eq!(
+                report.active_campaign.as_deref(),
+                Some(recovery_campaign.as_str()),
+                "JSON 活跃指针必须跨真实重启存活: {report:?}"
+            );
+        }
+
+        self.push(
+            "restart_recovery",
+            "ok",
+            format!(
+                "reset={} second_reset={} non_terminal={} turns_failed={} outbox={}",
+                report.compress_reset_first,
+                report.compress_reset_second,
+                report.turns_non_terminal,
+                report.turns_failed,
+                report.outbox_pending
+            ),
+        );
+
+        // ── 重开 AppState：后续断言读重开后的状态（不读旧内存）───────
         let reopened_storage = Arc::new(StorageFacade::new(
             data_dir.clone(),
-            if self.sqlite {
-                PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env)
-            } else {
-                PinnedBackend::new(StorageBackend::Json, BackendSource::Default)
-            },
+            PinnedBackend::new(
+                if self.sqlite {
+                    StorageBackend::Sqlite
+                } else {
+                    StorageBackend::Json
+                },
+                if self.sqlite {
+                    BackendSource::Env
+                } else {
+                    BackendSource::Default
+                },
+            ),
         ));
         if self.sqlite {
             reopened_storage
                 .validate_runtime_authority()
                 .expect("reopened facade must match the still-active SQLite runtime");
         }
-        let reopened_state = match AppState::new_with_backend(data_dir, reopened_storage.clone()) {
+        let reopened_state = match AppState::new_with_backend(data_dir, reopened_storage) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 self.push(
@@ -1399,153 +1873,230 @@ impl<'a> ParityDriver<'a> {
                 return;
             }
         };
-        // 仅驱动 compress-job 重置原语（双后端可比、无 Turn 副作用）。
-        //
-        // 不在此处调 `recover_turns_on_startup`：JSON 与 SQLite 的 Turn 恢复语义
-        // 不同（SQLite 会 fail 非 terminal Turn；JSON 只重放 Committing），会把
-        // 本 fixture 中 Turn 2（edit-stale）推成不同状态、破坏删除前快照等价。
-        // Turn 恢复的可比证明由专门的 sqlite_chronicle_crash_recovery.rs /
-        // gate5_fault_matrix.rs（infra 级，独立 authority）覆盖；此处只验证
-        // 「持久化 Running compress job 跨重开存活、reset 收敛、二次幂等」——
-        // 这是不带 Turn 副作用、双后端真正可比的重启恢复断言。
-        let _ = &reopened_state;
-        let compress_reset = reopened_storage
-            .reset_running_compress_jobs_to_pending()
-            .unwrap_or(0);
-
-        // 断言：seed Running job 被 reset 为 Pending（≥1）。
-        let job_now_pending = reopened_storage
-            .list_compress_jobs()
-            .map(|jobs| jobs.iter().any(|j| j.id == job_id && j.status == "pending"))
-            .unwrap_or(false);
-
-        // 幂等：再跑一次恢复，Running 已清零 → reset=0。
-        let second_reset = reopened_storage
-            .reset_running_compress_jobs_to_pending()
-            .unwrap_or(0);
-
-        let ok = running_before && compress_reset >= 1 && job_now_pending && second_reset == 0;
-        self.push(
-            "restart_recovery",
-            if ok { "ok" } else { "storage" },
-            format!(
-                "running_before={running_before} \
-                 compress_reset={compress_reset} job_now_pending={job_now_pending} \
-                 second_reset_idempotent={second_reset}"
-            ),
+        // 断言重开后的状态确实反映了子进程恢复结果（Turn 2 → Failed）。
+        let recovered_turn_statuses: Vec<String> = self
+            .turn_ids
+            .iter()
+            .map(|tid| {
+                reopened_state
+                    .storage()
+                    .get_turn(tid)
+                    .ok()
+                    .flatten()
+                    .map(|t| format!("{:?}", t.status))
+                    .unwrap_or_else(|| "missing".to_string())
+            })
+            .collect();
+        assert!(
+            recovered_turn_statuses.iter().any(|s| s == "Failed"),
+            "重开后的状态必须反映子进程恢复（存在 Failed Turn）: {recovered_turn_statuses:?}"
         );
+        self.state = reopened_state;
     }
 
     /// 规范化领域快照（从驱动跟踪的 id + storage 读取）。
     ///
-    /// 归一化管线：未登记随机 id（导入产物等）按结构路径登记 → 已知 id 换
-    /// ⟨label⟩ → 时间戳换 ⟨ts⟩ → 对象数组排序（集合语义，双后端 list_* 顺序无关）。
-    fn snapshot(&mut self) -> serde_json::Value {
+    /// 四.1：**任何读取失败直接返回 Err**（缺失文件/表不得静默成空数组）；
+    /// 快照覆盖：卡片/角色库/全部 Campaign（含其 instances/knowledge/tasks/
+    /// summaries/world_info）/Turn/会话/MVU + compress jobs + outbox +
+    /// 重启恢复状态。归一化管线：未登记随机 id 按结构路径登记（唯一标签）→
+    /// 已知 id 换 ⟨label⟩ → 时间戳换 ⟨ts⟩ → 对象数组排序。
+    fn snapshot(&mut self) -> Result<serde_json::Value, String> {
         let storage = self.state.storage();
 
         let mut cards: Vec<serde_json::Value> = storage
             .list_cards()
-            .map(|cards| {
-                cards
-                    .iter()
-                    .map(|c| serde_json::to_value(c).unwrap_or(serde_json::json!(null)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|e| format!("snapshot: list_cards: {e}"))?
+            .iter()
+            .map(|c| serde_json::to_value(c).map_err(|e| format!("snapshot: card: {e}")))
+            .collect::<Result<_, _>>()?;
         for card in &mut cards {
             if let Some(map) = card.as_object_mut() {
                 map.remove("imported_at");
             }
         }
 
-        let campaigns: Vec<serde_json::Value> = storage
+        let campaigns = storage
             .list_campaigns(None)
-            .map(|records| {
-                records
-                    .iter()
-                    .map(|r| serde_json::to_value(&r.campaign).unwrap_or(serde_json::json!(null)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|e| format!("snapshot: list_campaigns: {e}"))?;
 
+        // 全部 Campaign 的聚合数据（四.1：不得只取跟踪的 campaign）。
         let mut instances = Vec::new();
         let mut knowledge = Vec::new();
         let mut tasks = Vec::new();
         let mut summaries = Vec::new();
         let mut world_info = Vec::new();
-        if let Some(cid) = &self.campaign_id {
-            if let Ok(list) = storage.list_instances(cid) {
-                instances = list
-                    .iter()
-                    .map(|i| serde_json::to_value(i).unwrap_or(serde_json::json!(null)))
-                    .collect();
+        for record in &campaigns {
+            let cid = &record.campaign.id;
+            for inst in storage
+                .list_instances(cid)
+                .map_err(|e| format!("snapshot: list_instances {cid}: {e}"))?
+            {
+                instances.push(
+                    serde_json::to_value(&inst).map_err(|e| format!("snapshot: instance: {e}"))?,
+                );
             }
-            if let Ok(list) = storage.list_knowledge(cid) {
-                knowledge = list
-                    .iter()
-                    .map(|k| serde_json::to_value(k).unwrap_or(serde_json::json!(null)))
-                    .collect();
+            for k in storage
+                .list_knowledge(cid)
+                .map_err(|e| format!("snapshot: list_knowledge {cid}: {e}"))?
+            {
+                knowledge.push(
+                    serde_json::to_value(&k).map_err(|e| format!("snapshot: knowledge: {e}"))?,
+                );
             }
-            if let Ok(list) = storage.list_tasks(cid) {
-                tasks = list
-                    .iter()
-                    .map(|t| serde_json::to_value(t).unwrap_or(serde_json::json!(null)))
-                    .collect();
+            for t in storage
+                .list_tasks(cid)
+                .map_err(|e| format!("snapshot: list_tasks {cid}: {e}"))?
+            {
+                tasks.push(serde_json::to_value(&t).map_err(|e| format!("snapshot: task: {e}"))?);
             }
-            if let Ok(list) = storage.list_summaries(cid) {
-                summaries = list
-                    .iter()
-                    .map(|s| serde_json::to_value(s).unwrap_or(serde_json::json!(null)))
-                    .collect();
+            for s in storage
+                .list_summaries(cid)
+                .map_err(|e| format!("snapshot: list_summaries {cid}: {e}"))?
+            {
+                summaries
+                    .push(serde_json::to_value(&s).map_err(|e| format!("snapshot: summary: {e}"))?);
             }
-            if let Ok(book) = storage.get_world_info(cid) {
-                world_info.push(serde_json::to_value(&book).unwrap_or(serde_json::json!(null)));
-            }
+            world_info.push(
+                serde_json::to_value(
+                    &storage
+                        .get_world_info(cid)
+                        .map_err(|e| format!("snapshot: get_world_info {cid}: {e}"))?,
+                )
+                .map_err(|e| format!("snapshot: world_info: {e}"))?,
+            );
         }
 
         let mut turns = Vec::new();
         for tid in &self.turn_ids {
-            if let Ok(Some(turn)) = storage.get_turn(tid) {
-                let mut v: serde_json::Value =
-                    serde_json::to_value(&turn).unwrap_or(serde_json::json!(null));
-                // 归一化：`pending_state_changes.status`（Prepared/Applying/Committed）是
-                // **执行态标志**，不是领域语义——JSON 在 postprocess 后停在 Prepared
-                // （batch 暂存待 accept），SQLite preaccept UoW 已落 Committed（batch 进
-                // outbox 待 accept）。两者领域内容（mutations/commit_id/revision）相同，
-                // 该 flag 随执行进度变化且双后端合法不同，按归一化规则剔除。
-                normalize_pending_batch_status(&mut v);
-                turns.push(v);
-            }
+            let turn = storage
+                .get_turn(tid)
+                .map_err(|e| format!("snapshot: get_turn {tid}: {e}"))?;
+            let Some(turn) = turn else {
+                if self.deleted_campaign {
+                    // delete_campaign 级联删除后的合法缺失（等价性由另一侧对比保证）。
+                    continue;
+                }
+                return Err(format!("snapshot: turn {tid} 缺失（不允许静默跳过）"));
+            };
+            // 四.2：**不再归一化** pending_state_changes.status——JSON 与 SQLite
+            // 提交后持久化的原始状态必须逐字节等价（"committed"），归一化只会
+            // 掩盖分叉。
+            turns.push(serde_json::to_value(&turn).map_err(|e| format!("snapshot: turn: {e}"))?);
         }
 
         let mut convs = Vec::new();
-        if let Some(conv_id) = &self.conv_id
-            && let Some(conv) = self.state.conv_store.get(conv_id)
-        {
-            convs.push(serde_json::to_value(&conv).unwrap_or(serde_json::json!(null)));
+        if let Some(conv_id) = &self.conv_id {
+            let conv = self.state.conv_store.get(conv_id);
+            if let Some(conv) = conv {
+                convs.push(
+                    serde_json::to_value(&conv)
+                        .map_err(|e| format!("snapshot: conversation: {e}"))?,
+                );
+            } else if !self.deleted_campaign {
+                return Err(format!("snapshot: conversation {conv_id} 缺失"));
+            }
         }
 
         let chars: Vec<serde_json::Value> = storage
             .list_characters()
-            .map(|list| {
-                list.iter()
-                    .map(|c| serde_json::to_value(&c.info).unwrap_or(serde_json::json!(null)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|e| format!("snapshot: list_characters: {e}"))?
+            .iter()
+            .map(|c| serde_json::to_value(&c.info).map_err(|e| format!("snapshot: char: {e}")))
+            .collect::<Result<_, _>>()?;
 
         let mvu: Vec<serde_json::Value> = storage
             .list_mvu()
-            .map(|list| {
-                list.iter()
-                    .map(|m| serde_json::to_value(m).unwrap_or(serde_json::json!(null)))
-                    .collect()
+            .map_err(|e| format!("snapshot: list_mvu: {e}"))?
+            .iter()
+            .map(|m| serde_json::to_value(m).map_err(|e| format!("snapshot: mvu: {e}")))
+            .collect::<Result<_, _>>()?;
+
+        // compress jobs（四.1：快照必须覆盖任务队列）。
+        let jobs: Vec<serde_json::Value> = storage
+            .list_compress_jobs()
+            .map_err(|e| format!("snapshot: list_compress_jobs: {e}"))?
+            .iter()
+            .map(|j| {
+                serde_json::json!({
+                    "job_id": j.id.as_str(),
+                    "status": j.status,
+                    "attempts": j.attempts,
+                })
             })
-            .unwrap_or_default();
+            .collect();
+
+        // outbox（四.1）：待 accept 的 pending 单位数。
+        // JSON：attempt.pending_state_changes 且未 Committed；SQLite：outbox
+        // 行未 Applied。快照存原始计数——各后端自身语义（等价不变量=两者都为 0）。
+        let mut outbox_pending = 0usize;
+        for tid in &self.turn_ids {
+            let turn = storage
+                .get_turn(tid)
+                .map_err(|e| format!("snapshot: outbox get_turn {tid}: {e}"))?;
+            let Some(turn) = turn else {
+                if self.deleted_campaign {
+                    continue;
+                }
+                return Err(format!("snapshot: outbox turn {tid} 缺失"));
+            };
+            if self.sqlite {
+                let rows = sqlite_runtime::list_preaccept_outbox_for_turn(tid)
+                    .map_err(|e| format!("snapshot: outbox {tid}: {e}"))?;
+                // 只计仍待 accept 消费的 Pending 行；Applied/Skipped/Failed 是
+                // 终态台账（Skipped = 无操作标记，与 JSON 不产生行等价）。
+                outbox_pending += rows
+                    .iter()
+                    .filter(|r| {
+                        matches!(
+                            r.status,
+                            storyforge_infra_sqlite::preaccept::PreacceptOutboxStatus::Pending
+                        )
+                    })
+                    .count();
+            } else {
+                outbox_pending += turn
+                    .attempts
+                    .iter()
+                    .filter(|a| {
+                        a.pending_state_changes.as_ref().is_some_and(|b| {
+                            b.status != storyforge_domain::turn::MutationBatchStatus::Committed
+                        })
+                    })
+                    .count();
+            }
+        }
+
+        // 重启恢复状态（四.1）：恢复后无非终态 Turn 的等价不变量。
+        let recovery_non_terminal = {
+            let mut n = 0usize;
+            for tid in &self.turn_ids {
+                let turn = storage
+                    .get_turn(tid)
+                    .map_err(|e| format!("snapshot: recovery get_turn {tid}: {e}"))?;
+                if let Some(turn) = turn
+                    && !turn.status.is_terminal()
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
 
         let mut snap = serde_json::Map::new();
         snap.insert("cards".into(), serde_json::Value::Array(cards));
-        snap.insert("campaigns".into(), serde_json::Value::Array(campaigns));
+        snap.insert(
+            "campaigns".into(),
+            serde_json::Value::Array(
+                campaigns
+                    .iter()
+                    .map(|r| {
+                        serde_json::to_value(&r.campaign)
+                            .map_err(|e| format!("snapshot: campaign: {e}"))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        );
         snap.insert("instances".into(), serde_json::Value::Array(instances));
         snap.insert("knowledge".into(), serde_json::Value::Array(knowledge));
         snap.insert("tasks".into(), serde_json::Value::Array(tasks));
@@ -1555,13 +2106,23 @@ impl<'a> ParityDriver<'a> {
         snap.insert("conversations".into(), serde_json::Value::Array(convs));
         snap.insert("characters".into(), serde_json::Value::Array(chars));
         snap.insert("mvu".into(), serde_json::Value::Array(mvu));
+        snap.insert("jobs".into(), serde_json::Value::Array(jobs));
+        snap.insert("outbox_pending".into(), serde_json::json!(outbox_pending));
+        snap.insert(
+            "recovery_non_terminal".into(),
+            serde_json::json!(recovery_non_terminal),
+        );
 
         let mut value = serde_json::Value::Object(snap);
+        // 四.3：集合数组先按后端无关语义键预排序，再登记路径 id——双后端
+        // list_* 顺序不同不会导致同一实体获得不同标签。
+        stable_sort_collections(&mut value);
         self.ids.register_uuid_ids_by_path(&mut value, "snap");
         self.ids.canonicalize(&mut value);
         canonicalize_timestamps(&mut value);
+        normalize_recovery_reasons(&mut value);
         self.ids.sort_object_arrays(&mut value);
-        value
+        Ok(value)
     }
 }
 
@@ -1581,16 +2142,96 @@ fn json_app_state(dir: &Path) -> Arc<AppState> {
     Arc::new(AppState::new_with_backend(dir.to_path_buf(), storage).expect("JSON AppState"))
 }
 
-/// 主测试：同一 op 序列跑 JSON 与 SQLite，比较操作结果 + 领域快照。
+fn compare_phase_outputs(json_out: &PhaseOutput, sqlite_out: &PhaseOutput) {
+    // ── 比较：操作结果 ────────────────────────────────────────────────
+    assert_eq!(
+        json_out.results.len(),
+        sqlite_out.results.len(),
+        "op 序列长度必须一致\nJSON:   {:#?}\nSQLite: {:#?}",
+        json_out.results,
+        sqlite_out.results
+    );
+    for (j, s) in json_out.results.iter().zip(sqlite_out.results.iter()) {
+        assert_eq!(
+            (j.name, j.kind, j.message.as_str()),
+            (s.name, s.kind, s.message.as_str()),
+            "op 结果必须等价（成功/失败/错误类别/规范化消息）"
+        );
+    }
+
+    // ── 比较：规范化领域快照（四.1：任何读取失败已在 snapshot() 内 Err）──
+    assert_eq!(
+        json_out.snapshot, sqlite_out.snapshot,
+        "JSON 与 SQLite 的规范化领域快照必须等价（删除后，含 jobs/outbox/recovery）"
+    );
+    assert_eq!(
+        json_out.snapshot_before_delete, sqlite_out.snapshot_before_delete,
+        "JSON 与 SQLite 的规范化领域快照必须等价（删除前，含 Turn/Attempt/知识/任务/总结）"
+    );
+
+    // ── 比较：关键 Pipeline 事件序列（三.3）────────────────────────────
+    assert_eq!(
+        json_out.pipeline_events, sqlite_out.pipeline_events,
+        "JSON 与 SQLite 的关键 Pipeline 事件序列必须等价（经真实 helper 派生）"
+    );
+}
+
+/// 主测试：同一 op 序列跑 JSON 与 SQLite，比较操作结果 + 领域快照 + 事件序列。
+///
+/// 四.3 突变阶段嵌在 JSON 与 SQLite 之间：JSON AppState 拒绝与活动 SQLite
+/// runtime 共存（fail-closed），任何 JSON 阶段必须在 sqlite_runtime::activate
+/// **之前**完成——独立突变测试无法保证与主测试的执行顺序，因此并入主测试。
 #[tokio::test]
 async fn backend_parity_equivalent_domain_snapshots() {
-    // ── JSON 阶段 ────────────────────────────────────────────────────
+    // ── JSON 真值阶段 ────────────────────────────────────────────────
     let json_dir = tempfile::tempdir().unwrap();
     write_fixture(json_dir.path());
     let json_state = json_app_state(json_dir.path());
-    let mut json_driver = ParityDriver::new(&json_state, false);
-    let json_out = json_driver.run().await;
-    drop(json_state);
+    let mut json_driver = ParityDriver::new(json_state, false);
+    let json_out = json_driver.run(None).await;
+
+    // ── 四.3 突变阶段：同一 op 序列注入数据损坏（JSON 后端，SQLite 未激活）──
+    // 交换 accepted_attempt_id / variant 值后，删除前快照必须与真值不等——
+    // IdRegistry 唯一标签（⟨label:N⟩）不得掩盖差异；旧实现把所有 id 映射成
+    // 同一标签，该断言会 panic（判别点）。
+    for (kind, name) in [
+        (TamperKind::SwapAcceptedAttempt, "accepted_attempt"),
+        (TamperKind::SwapVariant, "variant"),
+    ] {
+        let dir_mutant = tempfile::tempdir().unwrap();
+        write_fixture(dir_mutant.path());
+        let state_mutant = json_app_state(dir_mutant.path());
+        let mut driver_mutant = ParityDriver::new(state_mutant, false);
+        let out_mutant = driver_mutant.run(Some(kind)).await;
+        assert_ne!(
+            json_out.snapshot_before_delete, out_mutant.snapshot_before_delete,
+            "突变（{name}）后删除前快照必须不等——IdRegistry 不得掩盖该差异"
+        );
+        assert_eq!(
+            json_out.results.len(),
+            out_mutant.results.len(),
+            "突变（{name}）不得改变 op 序列长度"
+        );
+    }
+
+    // ── 四.1：缺失实体必须使 snapshot 失败（不得静默成空数组）────────
+    // 独立驱动：追踪一个不存在的 Turn——snapshot() 必须返回 Err。
+    {
+        let dir_missing = tempfile::tempdir().unwrap();
+        write_fixture(dir_missing.path());
+        let state_missing = json_app_state(dir_missing.path());
+        let mut driver_missing = ParityDriver::new(state_missing, false);
+        driver_missing.turn_ids.push(Id::from_str("phantom-turn"));
+        let result = driver_missing.snapshot();
+        assert!(
+            result.is_err(),
+            "缺失 Turn 必须使 snapshot 失败——不得静默跳过/成空数组"
+        );
+        assert!(
+            result.unwrap_err().contains("缺失"),
+            "错误信息必须指明缺失实体"
+        );
+    }
 
     // ── SQLite 阶段：同一 fixture cutover → 激活 → 同一 op 序列 ──────
     let sqlite_dir = tempfile::tempdir().unwrap();
@@ -1620,41 +2261,221 @@ async fn backend_parity_equivalent_domain_snapshots() {
         AppState::new_with_backend(sqlite_dir.path().to_path_buf(), sqlite_storage)
             .expect("SQLite AppState"),
     );
-    let mut sqlite_driver = ParityDriver::new(&sqlite_state, true);
-    let sqlite_out = sqlite_driver.run().await;
-    drop(sqlite_state);
+    let mut sqlite_driver = ParityDriver::new(sqlite_state, true);
+    let sqlite_out = sqlite_driver.run(None).await;
 
-    // ── 比较：操作结果 ────────────────────────────────────────────────
-    assert_eq!(
-        json_out.results.len(),
-        sqlite_out.results.len(),
-        "op 序列长度必须一致\nJSON:   {:#?}\nSQLite: {:#?}",
-        json_out.results,
-        sqlite_out.results
+    compare_phase_outputs(&json_out, &sqlite_out);
+}
+
+// ─── 三.2 重启子进程入口 ────────────────────────────────────────────────
+//
+// 环境变量门控；无 env 时直接返回（正常 cargo test 下的 no-op pass）。
+// 有 env 时执行**完整生产启动恢复**：resolve_backend → StorageFacade →
+// AppState::new_with_backend → recover_turns → recover_compress_jobs，
+// 等待压缩 worker 收敛后输出单行 JSON 报告并退出 0。
+
+fn recover_turns_for_backend(state: &AppState) -> Result<usize, String> {
+    let storage = state.storage();
+    if storage.is_sqlite() {
+        return sqlite_runtime::recover_turns_on_startup();
+    }
+    let campaign_store = storage
+        .json_campaign_store(
+            BackendCapability::TurnLifecycle,
+            "recover JSON turns (restart child)",
+        )
+        .map_err(|e| e.to_string())?;
+    let turn_store = storage
+        .json_turn_store("recover JSON turns (restart child)")
+        .map_err(|e| e.to_string())?;
+    let service = storyforge_lib::turn_lifecycle::TurnLifecycleService::new(
+        campaign_store,
+        turn_store,
+        &state.conv_store,
     );
-    for (j, s) in json_out.results.iter().zip(sqlite_out.results.iter()) {
-        assert_eq!(
-            (j.name, j.kind, j.message.as_str()),
-            (s.name, s.kind, s.message.as_str()),
-            "op 结果必须等价（成功/失败/错误类别/规范化消息）"
-        );
+    service.recover_turns_on_startup(|_batch| {});
+    Ok(0)
+}
+
+fn read_reported_turns(state: &AppState, turn_ids: &[String]) -> Vec<ReportTurn> {
+    let mut out = Vec::new();
+    for id in turn_ids {
+        if let Ok(Some(turn)) = state.storage().get_turn(&Id::from_str(id)) {
+            out.push(ReportTurn {
+                id: id.clone(),
+                status: format!("{:?}", turn.status).to_lowercase(),
+                attempts: turn
+                    .attempts
+                    .iter()
+                    .map(|a| ReportAttempt {
+                        id: a.attempt_id.as_str().to_string(),
+                        status: format!("{:?}", a.status).to_lowercase(),
+                    })
+                    .collect(),
+            });
+        }
+    }
+    out
+}
+
+fn read_reported_outbox(
+    state: &AppState,
+    turn_ids: &[String],
+    sqlite: bool,
+) -> Result<usize, String> {
+    let mut pending = 0usize;
+    for id in turn_ids {
+        let turn = state
+            .storage()
+            .get_turn(&Id::from_str(id))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("turn {id} missing"))?;
+        if sqlite {
+            let rows = sqlite_runtime::list_preaccept_outbox_for_turn(&Id::from_str(id))
+                .map_err(|e| e.to_string())?;
+            // 只计仍待 accept 消费的 Pending 行（Skipped/Applied/Failed 为终态台账）。
+            pending += rows
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.status,
+                        storyforge_infra_sqlite::preaccept::PreacceptOutboxStatus::Pending
+                    )
+                })
+                .count();
+        } else {
+            pending += turn
+                .attempts
+                .iter()
+                .filter(|a| {
+                    a.pending_state_changes.as_ref().is_some_and(|b| {
+                        b.status != storyforge_domain::turn::MutationBatchStatus::Committed
+                    })
+                })
+                .count();
+        }
+    }
+    Ok(pending)
+}
+
+#[tokio::test]
+async fn restart_child_entry() {
+    if std::env::var("STORYFORGE_RESTART_CHILD").ok().as_deref() != Some("1") {
+        // 正常测试运行：no-op。
+        return;
+    }
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("STORYFORGE_RESTART_DATA_DIR").expect("restart child requires data dir"),
+    );
+    let backend = std::env::var("STORYFORGE_RESTART_BACKEND").expect("restart backend");
+    let turn_ids: Vec<String> = std::env::var("STORYFORGE_RESTART_TURN_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    // ── 完整生产 bootstrap ───────────────────────────────────────────
+    let resolution = storyforge_lib::storage_backend::resolve_backend(&data_dir)
+        .expect("resolve_backend must succeed in restart child");
+    assert_eq!(
+        resolution.diagnostics.backend,
+        if backend == "sqlite" {
+            "sqlite"
+        } else {
+            "json"
+        },
+        "marker-first 决议必须与父进程阶段一致"
+    );
+    let storage = Arc::new(StorageFacade::new(
+        data_dir.clone(),
+        resolution.pinned.clone(),
+    ));
+    if let Some(db_path) = resolution.db_path.as_deref() {
+        sqlite_runtime::activate(db_path).expect("child sqlite activation");
+    }
+    let state =
+        Arc::new(AppState::new_with_backend(data_dir, storage.clone()).expect("child AppState"));
+
+    // ── 生产启动恢复第 1 轮 ──────────────────────────────────────────
+    // JSON 恢复不返回计数（TurnLifecycleService），turns_failed 从报告 Turn
+    // 状态派生（各后端自身真值）；SQLite 返回 fail_incomplete 计数仅作参考。
+    let _recovered_count = recover_turns_for_backend(&state).expect("child turn recovery");
+    let reset_first = storage
+        .reset_running_compress_jobs_to_pending()
+        .expect("child compress reset");
+    // recover_compress_jobs_on_startup：Running→Pending 后为 open job spawn
+    // worker（生产入口，含 worker 重复启动幂等）。
+    storyforge_lib::backend_workflows::recover_compress_jobs_on_startup(state.clone());
+
+    // 等待压缩 worker 收敛（无 LLM → 快速失败回队；job 最终停在 Pending）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let any_running = storage
+            .list_compress_jobs()
+            .expect("list jobs")
+            .iter()
+            .any(|j| j.status == "running");
+        if !any_running || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    // ── 比较：规范化领域快照 ──────────────────────────────────────────
-    assert_eq!(
-        json_out.snapshot, sqlite_out.snapshot,
-        "JSON 与 SQLite 的规范化领域快照必须等价（删除后）"
-    );
-    assert_eq!(
-        json_out.snapshot_before_delete, sqlite_out.snapshot_before_delete,
-        "JSON 与 SQLite 的规范化领域快照必须等价（删除前，含 Turn/Attempt/知识/任务/总结）"
-    );
+    // ── 二次恢复（幂等证明）──────────────────────────────────────────
+    let turns_after_first = read_reported_turns(&state, &turn_ids);
+    let _ = recover_turns_for_backend(&state).expect("second turn recovery");
+    let reset_second = storage
+        .reset_running_compress_jobs_to_pending()
+        .expect("second compress reset");
+    let turns_after_second = read_reported_turns(&state, &turn_ids);
 
-    // ── 比较：关键 Pipeline 事件序列（PLAN §10.4）────────────────────
-    // postprocess 的 Done/Skipped/Failed 事件按 production 契约从 apply_outcome
-    // 结果派生——双后端输入相同 → 事件序列逐项相等。
-    assert_eq!(
-        json_out.pipeline_events, sqlite_out.pipeline_events,
-        "JSON 与 SQLite 的关键 Pipeline 事件序列必须等价"
+    let turns_non_terminal = turns_after_first
+        .iter()
+        .filter(|t| {
+            !matches!(
+                t.status.as_str(),
+                "committed" | "failed" | "degraded" | "abandoned"
+            )
+        })
+        .count();
+    let turns_failed = turns_after_first
+        .iter()
+        .filter(|t| t.status == "failed")
+        .count();
+    let compress_jobs = storage
+        .list_compress_jobs()
+        .expect("list jobs")
+        .into_iter()
+        .map(|j| ReportJob {
+            id: j.id.as_str().to_string(),
+            status: j.status.clone(),
+            attempts: j.attempts,
+        })
+        .collect();
+    let outbox_pending =
+        read_reported_outbox(&state, &turn_ids, backend == "sqlite").expect("outbox count");
+    let active_campaign = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .map(|id| id.as_str().to_string());
+
+    let report = RestartReport {
+        backend: backend.clone(),
+        turns: turns_after_first,
+        turns_after_second_recovery: turns_after_second,
+        turns_non_terminal,
+        turns_failed,
+        compress_jobs,
+        compress_reset_first: reset_first,
+        compress_reset_second: reset_second,
+        outbox_pending,
+        active_campaign,
+    };
+    println!(
+        "STORYFORGE_RESTART_REPORT {}",
+        serde_json::to_string(&report).expect("serialize restart report")
     );
 }

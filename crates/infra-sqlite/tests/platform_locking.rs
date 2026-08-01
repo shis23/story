@@ -6,7 +6,7 @@
 //! - Concurrent startup does not produce a corrupted database.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -392,4 +392,129 @@ fn cross_process_cutover_lock_fails_closed_and_recovers() {
         inspect_marker(&request.plan),
         MarkerStatus::SqliteAuthoritative { .. }
     ));
+}
+// ─── Gate 5 审查一.3：跨进程 authority 写者租约 ──────────────────────────
+//
+// lease_hold 是同一 crate 的 bin（src/bin/lease_hold.rs）：持有
+// <data_dir>/storyforge.authority.lock 租约，写 ready 信号后阻塞到 release 信号。
+// 集成测试通过 CARGO_BIN_EXE_lease_hold 拿到已编译的二进制路径（无需 cargo run）。
+
+fn spawn_lease_hold(dir: &Path, mode: &str) -> (std::process::Child, PathBuf, PathBuf) {
+    let exe = std::env::var("CARGO_BIN_EXE_lease_hold")
+        .expect("CARGO_BIN_EXE_lease_hold must point to the compiled helper binary");
+    let ready = dir.join(format!("lease-ready-{mode}.signal"));
+    let release = dir.join(format!("lease-release-{mode}.signal"));
+    let _ = fs::remove_file(&ready);
+    let _ = fs::remove_file(&release);
+    let child = std::process::Command::new(&exe)
+        .arg(dir)
+        .arg(mode)
+        .arg(&ready)
+        .arg(&release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lease_hold");
+    (child, ready, release)
+}
+
+fn wait_for_signal(path: &Path, seconds: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for signal {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn cross_process_shared_authority_lease_blocks_cutover_until_release() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let (mut child, ready, release) = spawn_lease_hold(dir.path(), "shared");
+    wait_for_signal(&ready, 60);
+
+    let request = CutoverRequest {
+        plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
+        label: "lease-test".into(),
+    };
+
+    // child 持有 SHARED 时：cutover 的 EXCLUSIVE 租约必须 fail closed（两平台
+    // 均非阻塞），不得出现 marker / 最终 DB。
+    let err = run_cutover(&request)
+        .expect_err("cutover must fail closed while another process holds a shared lease");
+    assert!(
+        err.to_string().contains("authority lease"),
+        "error must mention the authority lease, got: {err}"
+    );
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+
+    // 释放后 cutover 成功。
+    fs::write(&release, b"go").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "lease_hold must exit cleanly");
+    match run_cutover(&request).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("cutover must succeed after lease release, got {other:?}"),
+    }
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
+#[test]
+fn cross_process_exclusive_authority_lease_blocks_shared_writer() {
+    let dir = TempDir::new().unwrap();
+    let (mut child, ready, release) = spawn_lease_hold(dir.path(), "exclusive");
+    wait_for_signal(&ready, 60);
+
+    // child 持有 EXCLUSIVE：本进程（JSON 写者进程）的 SHARED 租约必须失败。
+    let err = storyforge_infra_sqlite::lease::AuthorityLeaseGuard::acquire(
+        dir.path()
+            .join(storyforge_infra_sqlite::lease::AUTHORITY_LEASE_FILENAME),
+        storyforge_infra_sqlite::lease::LeaseMode::Shared,
+    )
+    .expect_err("shared lease must fail while another process holds exclusive");
+    assert!(
+        err.to_string().contains("authority lease"),
+        "error must mention the authority lease, got: {err}"
+    );
+
+    fs::write(&release, b"go").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    // 释放后 SHARED 可获取。
+    let guard = storyforge_infra_sqlite::lease::AuthorityLeaseGuard::acquire(
+        dir.path()
+            .join(storyforge_infra_sqlite::lease::AUTHORITY_LEASE_FILENAME),
+        storyforge_infra_sqlite::lease::LeaseMode::Shared,
+    )
+    .expect("shared lease must be acquirable after exclusive release");
+    drop(guard);
+}
+
+#[test]
+fn cross_process_shared_leases_coexist() {
+    let dir = TempDir::new().unwrap();
+    let (mut child, ready, release) = spawn_lease_hold(dir.path(), "shared");
+    wait_for_signal(&ready, 60);
+
+    // child 持有 SHARED：本进程 SHARED 可共存（两个普通写者进程并行）。
+    let guard = storyforge_infra_sqlite::lease::AuthorityLeaseGuard::acquire(
+        dir.path()
+            .join(storyforge_infra_sqlite::lease::AUTHORITY_LEASE_FILENAME),
+        storyforge_infra_sqlite::lease::LeaseMode::Shared,
+    )
+    .expect("shared leases must coexist across processes");
+
+    fs::write(&release, b"go").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    drop(guard);
 }

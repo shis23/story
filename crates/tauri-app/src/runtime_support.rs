@@ -27,6 +27,10 @@ pub(crate) async fn run_shared_postprocess_background(
 
     if *cancel.borrow() {
         tracing::warn!("Phase A: postprocess 写回跳过——cancelled");
+        // 三.3：runner 前取消也必须发出 Skipped（前端置 idle），经真实 helper。
+        if let Some(event) = postprocess_pipeline_event(None, "", true) {
+            let _ = event_tx.send(event);
+        }
         return Ok(false);
     }
 
@@ -46,6 +50,10 @@ pub(crate) async fn run_shared_postprocess_background(
 
     if *cancel.borrow() {
         tracing::warn!("Phase A: postprocess 写回跳过——cancelled after runner");
+        // 三.3：runner 后取消同样发出 Skipped（与 runner 前取消同一个事件）。
+        if let Some(event) = postprocess_pipeline_event(None, "", true) {
+            let _ = event_tx.send(event);
+        }
         return Ok(false);
     }
 
@@ -77,6 +85,66 @@ pub(crate) async fn run_shared_postprocess_background(
 
     match result {
         Ok(result) if result.applied => {
+            let event = postprocess_pipeline_event(Some(&Ok(result)), "", false)
+                .expect("applied result must derive a Done event");
+            let _ = event_tx.send(event);
+            Ok(true)
+        }
+        Ok(result) => {
+            if let Some(reason) = result.skipped_reason.as_deref() {
+                tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
+            }
+            // 取消不是失败：发 PostProcessSkipped（前端置 idle），
+            // 不再误发 PostProcessFailed（前端会显示「后处理失败」错误态）。
+            // 其它 skipped 原因（late_or_superseded_attempt 等）不产生事件。
+            if let Some(event) = postprocess_pipeline_event(Some(&Ok(result)), "", false) {
+                let _ = event_tx.send(event);
+            }
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::error!("Phase A: postprocess 失败: {e}");
+            let combined = service_fail_turn(&sink, &identity, e);
+            if let Some(event) = postprocess_pipeline_event(
+                Some(&Err(combined.clone())),
+                &combined.to_string(),
+                false,
+            ) {
+                let _ = event_tx.send(event);
+            }
+            Err(combined)
+        }
+    }
+}
+
+/// 三.3：从 postprocess 执行结果派生 Pipeline 事件——生产代码与测试共用的
+/// **唯一**事件派生点（禁止手拼事件字符串）。
+///
+/// 四条路径恰好各产生一个正确事件：
+/// - 正常落盘（`Ok(applied=true)`）→ `PostProcessDone{k,v,t}`；
+/// - runner 前/后取消（`cancelled=true`，或结果带 `skipped_reason="cancelled"`）
+///   → 恰好一个 `PostProcessSkipped`；
+/// - 持久化失败（`Err`）→ 恰好一个 `PostProcessFailed{fail_reason}`；
+/// - 其它 skipped 原因不产生事件。
+///
+/// `run_shared_postprocess_background` 的四个分支全部经此函数发送。
+pub fn postprocess_pipeline_event(
+    result: Option<
+        &Result<
+            production_postprocess::ProductionPostprocessResult,
+            production_postprocess::ProductionPostprocessError,
+        >,
+    >,
+    fail_reason: &str,
+    cancelled: bool,
+) -> Option<PipelineEvent> {
+    if cancelled {
+        return Some(PipelineEvent::PostProcessSkipped {
+            reason: "postprocess cancelled".into(),
+        });
+    }
+    match result {
+        Some(Ok(result)) if result.applied => {
             let (knowledge_count, variable_count, task_count) = result
                 .outcome
                 .as_ref()
@@ -89,34 +157,22 @@ pub(crate) async fn run_shared_postprocess_background(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let _ = event_tx.send(PipelineEvent::PostProcessDone {
+            Some(PipelineEvent::PostProcessDone {
                 knowledge_count,
                 variable_count,
                 task_count,
-            });
-            Ok(true)
+            })
         }
-        Ok(result) => {
-            if let Some(reason) = result.skipped_reason.as_deref() {
-                tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
-                if reason == "cancelled" {
-                    // 取消不是失败：发 PostProcessSkipped（前端置 idle），
-                    // 不再误发 PostProcessFailed（前端会显示「后处理失败」错误态）。
-                    let _ = event_tx.send(PipelineEvent::PostProcessSkipped {
-                        reason: "postprocess cancelled".into(),
-                    });
-                }
-            }
-            Ok(false)
+        Some(Ok(result)) if result.skipped_reason.as_deref() == Some("cancelled") => {
+            Some(PipelineEvent::PostProcessSkipped {
+                reason: "postprocess cancelled".into(),
+            })
         }
-        Err(e) => {
-            tracing::error!("Phase A: postprocess 失败: {e}");
-            let combined = service_fail_turn(&sink, &identity, e);
-            let _ = event_tx.send(PipelineEvent::PostProcessFailed {
-                reason: combined.to_string(),
-            });
-            Err(combined)
-        }
+        Some(Ok(_)) => None,
+        Some(Err(_)) => Some(PipelineEvent::PostProcessFailed {
+            reason: fail_reason.to_string(),
+        }),
+        None => None,
     }
 }
 
@@ -259,33 +315,6 @@ pub(crate) fn resolve_opening_message_from_parts(
 /// 从模块/Profile 存储加载预设配置到 WritingContext
 ///
 /// 无 Profile 时不动 ctx（profile 保持 None → 流水线用硬编码常量兜底）。
-pub(crate) fn collect_scoped_regex_scripts(
-    character_id: Option<&str>,
-    characters: &[Arc<storyforge_domain::character::Character>],
-    character_store: Option<&storage::CharacterStore>,
-) -> Vec<RegexScript> {
-    let Some(character_id) = character_id else {
-        return Vec::new();
-    };
-
-    let stored = character_store.and_then(|store| store.get(character_id));
-    let source_id = stored
-        .as_ref()
-        .and_then(|stored| stored.info.source_character_id.as_deref())
-        .unwrap_or(character_id);
-    let stored_name = stored.as_ref().map(|stored| stored.info.name.as_str());
-
-    characters
-        .iter()
-        .find(|character| {
-            character.id.as_str() == source_id
-                || character.id.as_str() == character_id
-                || stored_name.is_some_and(|name| character.name == name)
-        })
-        .map(|character| character.scoped_regex_scripts())
-        .unwrap_or_default()
-}
-
 pub(crate) fn collect_campaign_scoped_regex_scripts(
     campaign_id: &Id,
     store: &campaign_store::CampaignStore,
@@ -295,6 +324,63 @@ pub(crate) fn collect_campaign_scoped_regex_scripts(
         .and_then(|campaign| store.get_card(&campaign.card_id))
         .map(|stored_card| stored_card.card.scoped_regex_scripts())
         .unwrap_or_default()
+}
+
+/// 三.4 后端中立角色解析器：把 stored / source / card / name 任意 ID 映射到
+/// 领域 Character 快照，**经 facade**（`get_character(id_or_source)` 命中 stored
+/// 或 source id；`get_card` 命中 card id；name 走存储角色的名字匹配）——绝不
+/// 触达 `json_character_store`，JSON 与 SQLite 走同一解析语义。
+///
+/// 解析语义（与旧 JSON-only 实现逐项对齐）：
+/// source_id（存储角色 source_character_id 或直传 id）→ Character.id 精确匹配，
+/// 直传 id 直接匹配 Character.id，stored_name 匹配 Character.name。
+pub fn collect_scoped_regex_scripts_for_backend(
+    character_id: Option<&str>,
+    characters: &[std::sync::Arc<storyforge_domain::character::Character>],
+    storage: Option<&crate::storage_backend::StorageFacade>,
+) -> Result<Vec<RegexScript>, String> {
+    let Some(character_id) = character_id else {
+        return Ok(Vec::new());
+    };
+    let Some(facade) = storage else {
+        return Ok(Vec::new());
+    };
+
+    // 1) stored / source id：经 facade 角色库解析。
+    let mut stored = facade
+        .get_character(character_id)
+        .map_err(|e| format!("character resolver: 角色库读取失败: {e}"))?;
+    // 2) name 键：角色库按名字匹配（backend-neutral，JSON/SQLite 同一语义）。
+    if stored.is_none() {
+        stored = facade
+            .list_characters()
+            .map_err(|e| format!("character resolver: 角色库列表读取失败: {e}"))?
+            .into_iter()
+            .find(|c| c.info.name == character_id);
+    }
+    // 3) card id 兜底：card.source_character_id → Character.id。
+    let mut source_id = stored
+        .as_ref()
+        .and_then(|stored| stored.info.source_character_id.as_deref())
+        .map(str::to_string);
+    if source_id.is_none() {
+        source_id = facade
+            .get_card(&Id::from_str(character_id))
+            .map_err(|e| format!("character resolver: 卡片读取失败: {e}"))?
+            .map(|card| card.card.source_character_id.as_str().to_string());
+    }
+    let source_id = source_id.unwrap_or_else(|| character_id.to_string());
+    let stored_name = stored.as_ref().map(|stored| stored.info.name.as_str());
+
+    Ok(characters
+        .iter()
+        .find(|character| {
+            character.id.as_str() == source_id
+                || character.id.as_str() == character_id
+                || stored_name.is_some_and(|name| character.name == name)
+        })
+        .map(|character| character.scoped_regex_scripts())
+        .unwrap_or_default())
 }
 
 pub(crate) fn merge_runtime_regex_scripts(
@@ -1755,5 +1841,403 @@ pub(crate) fn persist_postprocess_outcome_to_store(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::production_postprocess::{ProductionPostprocessError, ProductionPostprocessResult};
+    use storyforge_domain::turn::{DerivationComponents, DerivationStatus};
+
+    fn applied_result() -> ProductionPostprocessResult {
+        use storyforge_app_agent::PostProcessOutcome;
+        use storyforge_domain::agent::PostProcessResult;
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+        let outcome = PostProcessOutcome {
+            summary: None,
+            summary_attempted: false,
+            post_process_attempted: true,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("alice"),
+                    knowledge_text: "酒窖暗门".to_string(),
+                    source: KnowledgeSource::Witnessed,
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: None,
+                    propagation: PropagationPolicy::Open,
+                }],
+                variable_updates: vec![storyforge_domain::agent::VariableUpdate {
+                    instance_id: None,
+                    key: "hp".to_string(),
+                    value: serde_json::json!(99),
+                }],
+                task_updates: vec![],
+                parse_succeeded: true,
+            }),
+        };
+        ProductionPostprocessResult {
+            applied: true,
+            skipped_reason: None,
+            derivation: DerivationComponents {
+                summary_derivation: DerivationStatus::Succeeded,
+                state_derivation: DerivationStatus::Succeeded,
+            },
+            summary_text: None,
+            batch: None,
+            outcome: Some(outcome),
+        }
+    }
+
+    fn skipped_result(reason: &str) -> ProductionPostprocessResult {
+        ProductionPostprocessResult {
+            applied: false,
+            skipped_reason: Some(reason.to_string()),
+            derivation: DerivationComponents {
+                summary_derivation: DerivationStatus::Disabled,
+                state_derivation: DerivationStatus::Disabled,
+            },
+            summary_text: None,
+            batch: None,
+            outcome: None,
+        }
+    }
+
+    fn expect_done(event: &Option<PipelineEvent>, k: usize, v: usize, t: usize) {
+        match event {
+            Some(PipelineEvent::PostProcessDone {
+                knowledge_count,
+                variable_count,
+                task_count,
+            }) => {
+                assert_eq!((*knowledge_count, *variable_count, *task_count), (k, v, t));
+            }
+            other => panic!("expected PostProcessDone, got {other:?}"),
+        }
+    }
+
+    fn expect_skipped(event: &Option<PipelineEvent>) {
+        match event {
+            Some(PipelineEvent::PostProcessSkipped { reason }) => {
+                assert_eq!(reason, "postprocess cancelled");
+            }
+            other => panic!("expected PostProcessSkipped, got {other:?}"),
+        }
+    }
+
+    fn expect_failed(event: &Option<PipelineEvent>, reason: &str) {
+        match event {
+            Some(PipelineEvent::PostProcessFailed { reason: got }) => {
+                assert_eq!(got, reason);
+            }
+            other => panic!("expected PostProcessFailed, got {other:?}"),
+        }
+    }
+
+    // ─── 三.3：四条路径各恰好一个正确事件，全部经真实 helper ────────────
+
+    #[test]
+    fn normal_path_derives_exactly_one_done_event() {
+        let event = postprocess_pipeline_event(Some(&Ok(applied_result())), "", false);
+        expect_done(&event, 1, 1, 0);
+        // 恰好一个：再调用一次仍是一个（结果 → 事件是确定函数）。
+        expect_done(
+            &postprocess_pipeline_event(Some(&Ok(applied_result())), "", false),
+            1,
+            1,
+            0,
+        );
+    }
+
+    #[test]
+    fn cancel_before_runner_derives_skipped_event() {
+        // runner 前取消：run_shared_postprocess_background 的 early-return 分支
+        // 用 cancelled=true 调用同一 helper——同一个事件。
+        let event = postprocess_pipeline_event(None, "", true);
+        expect_skipped(&event);
+    }
+
+    #[test]
+    fn cancel_after_runner_derives_skipped_event() {
+        // runner 后取消：同样 cancelled=true → PostProcessSkipped（不是 Failed）。
+        let event = postprocess_pipeline_event(None, "", true);
+        expect_skipped(&event);
+        // apply_outcome 内部取消检查产生的 skipped_reason="cancelled" 也走同一事件。
+        expect_skipped(&postprocess_pipeline_event(
+            Some(&Ok(skipped_result("cancelled"))),
+            "",
+            false,
+        ));
+    }
+
+    #[test]
+    fn persist_failure_derives_failed_event() {
+        let err = ProductionPostprocessError::Storage("turns.json 写入失败".into());
+        let event = postprocess_pipeline_event(
+            Some(&Err(err)),
+            "postprocess storage failed: turns.json 写入失败",
+            false,
+        );
+        expect_failed(&event, "postprocess storage failed: turns.json 写入失败");
+    }
+
+    #[test]
+    fn other_skip_reasons_derive_no_event() {
+        let event = postprocess_pipeline_event(
+            Some(&Ok(skipped_result("late_or_superseded_attempt"))),
+            "",
+            false,
+        );
+        assert!(event.is_none(), "非取消跳过不产生事件: {event:?}");
+    }
+
+    // ─── 三.4：backend-neutral 角色解析器（stored/source/card/name 经 facade）─
+
+    fn resolver_fixture(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<storage_backend::StorageFacade>,
+        storage::StoredCharacter,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [
+            "campaigns.json",
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+            "mvu_translations.json",
+            "compress_jobs.json",
+            "characters.json",
+        ] {
+            std::fs::write(
+                dir.join(name),
+                serde_json::to_vec_pretty(&serde_json::json!([])).unwrap(),
+            )
+            .unwrap();
+        }
+        // 卡片：source_character_id = src-1（card id 键解析目标）。
+        std::fs::write(
+            dir.join("cards.json"),
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "card": {
+                    "id": "resolver-card-1",
+                    "name": "Resolver 卡",
+                    "source_character_id": "src-1",
+                    "character_definitions": [],
+                    "campaign_variable_schema": [],
+                    "raw_card_json": {},
+                    "extraction_status": "extracted",
+                    "extraction_message": null
+                },
+                "imported_at": "2026-07-01T00:00:00Z"
+            }]))
+            .unwrap(),
+        )
+        .expect("write resolver cards.json");
+        let storage = Arc::new(storage_backend::StorageFacade::new(
+            dir.to_path_buf(),
+            storyforge_infra_sqlite::backend::PinnedBackend::new(
+                storyforge_infra_sqlite::backend::StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        ));
+        // 带 scoped regex 脚本的角色（extensions.regex_scripts，ST 形状）。
+        let stored = storage
+            .save_character(crate::commands::characters::CharacterInfo {
+                source_character_id: Some("src-1".to_string()),
+                name: "Alice".to_string(),
+                description: "主角".to_string(),
+                personality: "勇敢".to_string(),
+                scenario: "地下城".to_string(),
+                first_mes: "你好".to_string(),
+                mes_example: String::new(),
+                post_history_instructions: String::new(),
+                alternate_greetings: vec![],
+                system_prompt: "扮演".to_string(),
+                tags: vec![],
+                creator: "test".to_string(),
+                character_version: "1.0".to_string(),
+                spec_version: "2.0".to_string(),
+                extensions: serde_json::json!({
+                    "regex_scripts": [{
+                        "scriptName": "酒窖别名",
+                        "findRegex": "酒窖|地窖",
+                        "replaceString": "密窖",
+                        "placement": [2]
+                    }]
+                }),
+                embedded_world_info: None,
+                renderable_assets: None,
+                raw_card_json: serde_json::json!({}),
+                has_world_info: false,
+                has_renderable_assets: false,
+                world_info_count: 0,
+                world_info_entries: vec![],
+            })
+            .expect("save resolver character");
+        (storage, stored)
+    }
+
+    #[test]
+    fn scoped_regex_resolver_maps_stored_source_card_and_name_through_facade() {
+        let dir = std::env::temp_dir().join(format!("sf-resolver-{}", uuid::Uuid::new_v4()));
+        let (storage, stored) = resolver_fixture(&dir);
+        let characters: Vec<std::sync::Arc<storyforge_domain::character::Character>> = storage
+            .list_characters()
+            .expect("list characters")
+            .iter()
+            .map(|c| std::sync::Arc::new(crate::stored_info_to_character(c)))
+            .collect();
+        assert_eq!(characters.len(), 1);
+        assert_eq!(characters[0].id.as_str(), "src-1");
+
+        let resolve = |key: &str| {
+            collect_scoped_regex_scripts_for_backend(Some(key), &characters, Some(storage.as_ref()))
+                .expect("resolver")
+        };
+
+        // stored id 键。
+        let by_stored = resolve(&stored.id);
+        assert_eq!(by_stored.len(), 1, "stored id 必须解析出 scoped 脚本");
+        assert_eq!(by_stored[0].script_name, "酒窖别名");
+        // source id 键。
+        assert_eq!(resolve("src-1").len(), 1, "source id 必须解析");
+        // name 键。
+        assert_eq!(resolve("Alice").len(), 1, "name 必须解析");
+        // card id 键（card.source_character_id → Character.id）。
+        assert_eq!(resolve("resolver-card-1").len(), 1, "card id 必须解析");
+        // 缺失 id → 空（不 panic、不误匹配）。
+        assert!(resolve("不存在").is_empty());
+        // None → 空。
+        assert!(
+            collect_scoped_regex_scripts_for_backend(None, &characters, Some(storage.as_ref()))
+                .expect("none key")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 三.3 端到端 ─────────────────────────────────────────────────────
+    // runner 前取消：`run_shared_postprocess_background` 必须向 channel 发出
+    // **恰好一个** PostProcessSkipped（旧实现不发任何事件）。
+    #[tokio::test]
+    async fn early_cancel_emits_single_skipped_event() {
+        let dir = std::env::temp_dir().join(format!("sf-pp-event-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(storage_backend::StorageFacade::new(
+            dir.clone(),
+            storyforge_infra_sqlite::backend::PinnedBackend::new(
+                storyforge_infra_sqlite::backend::StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        ));
+        let conv_store = Arc::new(storyforge_app_conversation::ConversationStore::new(
+            dir.join("conversations"),
+        ));
+        let tool_ctx = Arc::new(storyforge_app_agent::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        // 永不调用的 stub LLM（early cancel 在 run_postprocess 之前返回）。
+        struct NeverCalledLlm;
+        #[async_trait::async_trait]
+        impl storyforge_infra_llm::LlmClient for NeverCalledLlm {
+            async fn chat(
+                &self,
+                _req: &storyforge_domain::llm::ChatRequest,
+            ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+            {
+                panic!("early cancel path must not call the LLM")
+            }
+            async fn chat_stream(
+                &self,
+                _req: &storyforge_domain::llm::ChatRequest,
+                _tx: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+                _cancel: tokio::sync::watch::Receiver<bool>,
+            ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+            {
+                panic!("early cancel path must not call the LLM")
+            }
+        }
+        let pipeline = storyforge_app_pipeline::PipelineOrchestrator::new(
+            Arc::new(NeverCalledLlm),
+            conv_store,
+            tool_ctx,
+            None,
+        );
+        let writing_ctx = storyforge_app_pipeline::WritingContext {
+            characters: vec![],
+            world_info: None,
+            conversation_id: Id::from_str("conv-pp-event"),
+            campaign_id: None,
+            turn: 0,
+            pending_tasks: vec![],
+            story_clock: String::new(),
+            profile: None,
+            modules: vec![],
+            regex_scripts: vec![],
+            campaign_runtime: None,
+            agent_profile_config: None,
+            recent_summaries: vec![],
+            chronicle_prompt_catalog: vec![],
+            far_memory_hits: vec![],
+            template_random_seed: None,
+            context_epoch: None,
+            chronicle_revision: 0,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        cancel_tx.send(true).expect("pre-cancel");
+
+        let result = run_shared_postprocess_background(
+            storage,
+            pipeline,
+            writing_ctx,
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !result.expect("early cancel is Ok(false)"),
+            "cancelled → not applied"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events.len(),
+            1,
+            "early cancel 必须恰好一个事件，got {events:?}"
+        );
+        match &events[0] {
+            PipelineEvent::PostProcessSkipped { reason } => {
+                assert_eq!(reason, "postprocess cancelled");
+            }
+            other => panic!("expected PostProcessSkipped, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

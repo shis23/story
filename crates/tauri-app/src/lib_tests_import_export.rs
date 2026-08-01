@@ -1501,18 +1501,23 @@ fn import_campaign_bundle_rollback_is_verified_on_disk() {
     );
 
     // Reload store from disk x in-memory empty is not enough.
+    //
+    // Gate 5 三.7 语义：delete_card 快照预检拒绝「非普通文件」路径，不产生任何
+    // 部分删除——卡与 Campaign 原样保留在磁盘（旧实现先把卡从 cards.json 删
+    // 掉、再在 instances.json（已被测试替换成目录）处失败，留下「卡已删、
+    // 实例残留」的半删态；审查三.7 要求整体回滚或整体保留）。本测试注入的
+    // instances.json 目录使回滚无法验证完成，错误已如实上报
+    // 「回滚未完全验证」，但绝不允许出现半删的卡。
     let reloaded = campaign_store::CampaignStore::new(&dir);
-    assert!(
-        reloaded.list_cards().is_empty(),
-        "rollback must clear cards on disk"
+    assert_eq!(
+        reloaded.list_cards().len(),
+        1,
+        "rollback must not partially delete the card (card stays intact)"
     );
-    assert!(
-        reloaded.list_campaigns().is_empty(),
-        "rollback must clear campaigns on disk"
-    );
-    assert!(
-        reloaded.list_all_instances().is_empty(),
-        "rollback must clear instances on disk"
+    assert_eq!(
+        reloaded.list_campaigns().len(),
+        1,
+        "rollback must not partially delete the campaign"
     );
     assert_eq!(std::fs::read(&instances_sentinel).unwrap(), b"must survive");
 

@@ -276,19 +276,44 @@ struct SourceSnapshot {
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
-    let cards = read_json_array(data_dir.join("cards.json"), true)?;
-    let campaigns = read_json_array(data_dir.join("campaigns.json"), true)?;
-    let instances = read_json_array(data_dir.join("instances.json"), true)?;
-    let knowledge = read_json_array(data_dir.join("knowledge.json"), true)?;
-    let tasks = read_json_array(data_dir.join("tasks.json"), true)?;
-    let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
-    let turns = read_json_array(data_dir.join("turns.json"), true)?;
+    // 审查一.6：核心布局文件**必需**（缺失 → ImportSourceMissing，不得当作
+    // 空集合）；可选集合（mvu / compress_jobs / characters / world_info）保持可选。
+    let cards = read_json_array(data_dir.join("cards.json"), false)?;
+    let campaigns = read_json_array(data_dir.join("campaigns.json"), false)?;
+    let instances = read_json_array(data_dir.join("instances.json"), false)?;
+    let knowledge = read_json_array(data_dir.join("knowledge.json"), false)?;
+    let tasks = read_json_array(data_dir.join("tasks.json"), false)?;
+    let summaries = read_json_array(data_dir.join("round_summaries.json"), false)?;
+    let turns = read_json_array(data_dir.join("turns.json"), false)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
     // 与 readiness 共用读取 + 投影（hash 必须同口径）。
     let world_info = crate::readiness::read_world_info_dir(data_dir.join("campaign_world_info"))?;
     let compress_jobs = crate::readiness::read_compress_jobs_array(data_dir)?;
     let characters = crate::readiness::read_characters_array(data_dir)?;
+
+    // 审查一.6：严格校验（与 readiness 同口径）。任何畸形条目 → 整体拒绝，
+    // 绝不静默跳过/归一化。
+    let campaign_ids: std::collections::HashSet<String> = campaigns
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    crate::readiness::strict_validate_entries("cards", &cards, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("campaigns", &campaigns, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("instances", &instances, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("knowledge", &knowledge, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("tasks", &tasks, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("round_summaries", &summaries, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("turns", &turns, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("conversations", &conversations, &campaign_ids)?;
+    crate::readiness::strict_validate_entries(
+        "mvu_translations",
+        &mvu_translations,
+        &campaign_ids,
+    )?;
+    crate::readiness::strict_validate_entries("compress_jobs", &compress_jobs, &campaign_ids)?;
+    crate::readiness::strict_validate_entries("characters", &characters, &campaign_ids)?;
+    crate::readiness::strict_validate_world_info(&world_info, &campaign_ids)?;
 
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
@@ -304,9 +329,9 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     if !mvu_translations.is_empty() {
         hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
     }
+    // 审查一.6：世界书 hash 绑定 campaign_id（与 readiness / cutover 同投影）。
     if !world_info.is_empty() {
-        let payloads: Vec<Value> = world_info.iter().map(|(_, v)| v.clone()).collect();
-        hash_named_array(&mut hasher, "campaign_world_info", &payloads);
+        crate::readiness::hash_world_info_pairs(&mut hasher, &world_info);
     }
     if !compress_jobs.is_empty() {
         hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
@@ -353,11 +378,16 @@ fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
 }
 
 fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
+    // 审查一.6：conversations 目录沿用既有 manifest 逻辑（可选——目录缺失 =
+    // 无会话，应用运行时按需创建）；但目录**存在而不可读**（如被文件顶替）时
+    // read_dir 错误必须传播，绝不静默当作空。
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<PathBuf>>>()?
+        .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
     paths.sort();
@@ -1309,7 +1339,15 @@ mod tests {
     #[test]
     fn transaction_rollback_on_fk_violation_mid_import() {
         // campaigns 引用不存在的 card → FK 失败 → 整单回滚
+        // （布局文件齐全，缺失文件的场景已由 strict-layout 测试覆盖）
         let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("cards.json"),
+            &json!([{
+                "id": "card-1", "name": "Hero", "source_character_id": "char-1",
+                "character_definitions": []
+            }]),
+        );
         write_json(
             &dir.path().join("campaigns.json"),
             &json!([{
@@ -1321,6 +1359,16 @@ mod tests {
                 "variables": []
             }]),
         );
+        for name in [
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+        ] {
+            write_json(&dir.path().join(name), &json!([]));
+        }
+        std::fs::create_dir_all(dir.path().join("conversations")).unwrap();
 
         let mut db = Database::open_in_memory().unwrap();
         let err = JsonImporter::new(&mut db)

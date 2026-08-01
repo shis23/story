@@ -32,18 +32,24 @@ pub fn set_character_variable(
     turn: Option<u32>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    // P0-7：活动 Turn 期间拒绝直接写变量
-    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = state
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在**同一原子单元**内完成
+    // （JSON：turns 锁守卫内 candidate→persist→swap；SQLite：单 UoW 事务）。
+    // 旧实现先 `reject_if_active_turn` 再单独写盘，检查与写入之间存在
+    // Turn 插入窗口（TOCTOU）。
+    let campaign_id = Id::from_str(&campaign_id);
+    let instance_id = Id::from_str(&instance_id);
+    let applied = state
         .storage()
-        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
-    inst.set_variable(&key, value, turn.unwrap_or(0));
-    state
-        .storage()
-        .update_instance(&inst)
+        .mutate_idle_instance(&campaign_id, &instance_id, |inst| {
+            inst.set_variable(&key, value.clone(), turn.unwrap_or(0));
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("更新角色变量失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 instance {instance_id}"
+        )));
+    }
     Ok(())
 }
 
@@ -170,7 +176,6 @@ pub fn add_campaign_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    reject_if_active_turn(state.storage(), &campaign_id)?;
     let key = storyforge_domain::variables::normalize_mvu_key(&key);
     let label = label.trim();
     let description = description
@@ -192,19 +197,19 @@ pub fn add_campaign_variable(
         group: Some("全局".into()),
     };
 
-    let mut campaign = state
+    // 三.5：活动 Turn 屏障 + Campaign 读改写 + 写盘在同一原子单元内完成。
+    let applied = state
         .storage()
-        .get_campaign(&campaign_id)
-        .map_err(TauriCommandError::storage)?
-        .map(|record| record.campaign)
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
-    campaign
-        .add_variable_field(field)
-        .map_err(TauriCommandError::validation)?;
-    state
-        .storage()
-        .update_campaign(&campaign)
-        .map_err(|error| TauriCommandError::storage(format!("新增 Campaign 变量失败: {error}")))
+        .mutate_idle_campaign(&campaign_id, |campaign| {
+            campaign.add_variable_field(field.clone())
+        })
+        .map_err(|error| TauriCommandError::storage(format!("新增 Campaign 变量失败: {error}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,7 +224,6 @@ pub fn sync_campaign_variable_schema(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    reject_if_active_turn(state.storage(), &campaign_id)?;
     sync_campaign_variable_schema_for_backend(state.storage(), &campaign_id)
 }
 
@@ -248,20 +252,32 @@ pub(crate) fn sync_campaign_variable_schema_for_backend(
     storage: &crate::storage_backend::StorageFacade,
     campaign_id: &Id,
 ) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
-    let mut campaign = storage
+    let record = storage
         .get_campaign(campaign_id)
         .map_err(TauriCommandError::storage)?
-        .map(|record| record.campaign)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
     let card = storage
-        .get_card(&campaign.card_id)
+        .get_card(&record.campaign.card_id)
         .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id)))?;
-    let added = campaign.sync_variable_schema(&card.card.effective_campaign_variable_schema());
-    storage
-        .update_campaign(&campaign)
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("找不到 card {}", record.campaign.card_id))
+        })?;
+    let schema = card.card.effective_campaign_variable_schema();
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成。
+    let added = std::cell::Cell::new(0usize);
+    let applied = storage
+        .mutate_idle_campaign(campaign_id, |campaign| {
+            let n = campaign.sync_variable_schema(&schema);
+            added.set(n);
+            Ok(())
+        })
         .map_err(|error| TauriCommandError::storage(format!("同步 Campaign 变量失败: {error}")))?;
-    Ok(CampaignVariableSchemaSyncDto { added })
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
+    Ok(CampaignVariableSchemaSyncDto { added: added.get() })
 }
 
 /// 改 Campaign 全局变量
@@ -273,19 +289,20 @@ pub fn set_campaign_variable(
     turn: Option<u32>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    // P0-7：活动 Turn 期间拒绝直接写变量
-    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut camp = state
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成。
+    let campaign_id = Id::from_str(&campaign_id);
+    let applied = state
         .storage()
-        .get_campaign(&Id::from_str(&campaign_id))
-        .map_err(TauriCommandError::storage)?
-        .map(|record| record.campaign)
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
-    camp.set_variable(&key, value, turn.unwrap_or(0));
-    state
-        .storage()
-        .update_campaign(&camp)
+        .mutate_idle_campaign(&campaign_id, |camp| {
+            camp.set_variable(&key, value.clone(), turn.unwrap_or(0));
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("更新 Campaign 变量失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
     Ok(())
 }
 
@@ -296,20 +313,23 @@ pub fn promote_temporary_instance(
     instance_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    // P0-7：活动 Turn 期间拒绝直接改实例
-    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = state
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成。
+    let campaign_id = Id::from_str(&campaign_id);
+    let instance_id = Id::from_str(&instance_id);
+    let applied = state
         .storage()
-        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
-    if !inst.is_temporary {
-        return Err("该角色已是常驻".into());
-    }
-    inst.promote_to_permanent();
-    state
-        .storage()
-        .update_instance(&inst)
+        .mutate_idle_instance(&campaign_id, &instance_id, |inst| {
+            if !inst.is_temporary {
+                return Err("该角色已是常驻".into());
+            }
+            inst.promote_to_permanent();
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("升级临时角色失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 instance {instance_id}"
+        )));
+    }
     Ok(())
 }

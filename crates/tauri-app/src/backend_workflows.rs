@@ -35,6 +35,13 @@ use crate::storage_backend::{BackendCapability, StorageFacade};
 use crate::turn_lifecycle::{self, AcceptError, AcceptOutcome};
 use crate::turn_store::TurnStore;
 
+/// 三.3：postprocess Pipeline 事件派生点（runtime_support 私有模块内定义，
+/// 经 pub 模块 backend_workflows 再导出，供集成测试调用真实 helper）。
+pub use crate::runtime_support::postprocess_pipeline_event;
+
+/// 三.4：backend-neutral 角色解析器再导出（runtime_support 私有模块）。
+pub use crate::runtime_support::collect_scoped_regex_scripts_for_backend;
+
 // ─── Backend-neutral workflow DTOs ────────────────────────────────────────
 
 /// First-draft land request. Domain-only types: no infra-sqlite types leak
@@ -319,8 +326,8 @@ impl TurnWorkflow {
     /// Edit a variant and mark its Attempt Stale when one is linked.
     ///
     /// SQLite: atomic mark-stale preaccept UoW when an Attempt is linked (else
-    /// plain conversation edit). JSON: plain edit first, then best-effort
-    /// Stale mark (P0-3 draft_hash contract).
+    /// plain conversation edit). JSON: Attempt Stale 更新先于 conversation
+    /// 编辑——Attempt 更新失败时编辑不提交、整体返回 Err（三.8 原子语义）。
     pub fn edit_variant_with_stale_mark(
         &self,
         conversation_id: &Id,
@@ -348,24 +355,39 @@ impl TurnWorkflow {
                 .map_err(|e| e.to_string());
         }
 
-        self.conv_store
-            .edit_variant(conversation_id, node_id, new_content.to_string())
-            .map_err(|e| e.to_string())?;
-        // P0-3：编辑后 draft_hash 不再匹配 → 标记关联 Attempt 为 Stale
-        // commit_turn_attempt 会因 hash 不匹配拒绝 accept，Stale 是显式信号
+        // 三.8：conversation 编辑 + Attempt Stale 更新必须是**单一原子语义操作**。
+        // 顺序：先做 Attempt 更新（update_turn_record），失败则**不得**提交编辑
+        // 并整体返回 Err；成功后才提交会话编辑。绝不 `let _ =` 吞掉
+        // update_turn_record 错误（旧实现编辑先落盘、stale 标记静默失败，
+        // 调用方看到 Ok 但 Attempt 未标 Stale——三.8 审查点）。
         if let Some(turn) = crate::get_turn_by_variant_for_backend(self.storage.as_ref(), node_id)?
         {
             let turn_id = turn.turn_id.clone();
             if let Some(att) = turn.find_attempt_by_variant(node_id) {
                 let attempt_id = att.attempt_id.clone();
-                let _ = self.storage.update_turn_record(&turn_id, |record| {
-                    if let Some(a) = record.find_attempt_mut(&attempt_id) {
-                        a.status = storyforge_domain::turn::AttemptStatus::Stale;
+                match self.storage.mutate_turn_if(
+                    &turn_id,
+                    |record| record.find_attempt(&attempt_id).is_some(),
+                    |record| {
+                        if let Some(a) = record.find_attempt_mut(&attempt_id) {
+                            a.status = storyforge_domain::turn::AttemptStatus::Stale;
+                        }
+                        record.touch();
+                    },
+                ) {
+                    Ok(_) => {}
+                    Err(write_error) => {
+                        // 编辑尚未提交——整体失败，保持原子语义。
+                        return Err(format!(
+                            "编辑前标记 Attempt 为 Stale 失败（编辑未提交）: {write_error}"
+                        ));
                     }
-                    record.touch();
-                });
+                }
             }
         }
+        self.conv_store
+            .edit_variant(conversation_id, node_id, new_content.to_string())
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -1838,7 +1860,9 @@ pub fn spawn_compress_job_worker_with(
             {
                 Some(c) => c,
                 None => {
-                    let _ = mark_job_failed(&storage, &job_id, "campaign missing");
+                    if let Err(e) = mark_job_failed(&storage, &job_id, "campaign missing") {
+                        tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {e}");
+                    }
                     return;
                 }
             },
@@ -1853,7 +1877,9 @@ pub fn spawn_compress_job_worker_with(
             match crate::sqlite_runtime::list_summaries(&campaign_id) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    let _ = mark_job_failed(&storage, &job_id, &e);
+                    if let Err(me) = mark_job_failed(&storage, &job_id, &e) {
+                        tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
+                    }
                     return;
                 }
             }
@@ -1861,7 +1887,11 @@ pub fn spawn_compress_job_worker_with(
             match campaign_store.as_ref() {
                 Some(store) => store.list_summaries(&campaign_id),
                 None => {
-                    let _ = mark_job_failed(&storage, &job_id, "campaign store unavailable");
+                    if let Err(me) =
+                        mark_job_failed(&storage, &job_id, "campaign store unavailable")
+                    {
+                        tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");
+                    }
                     return;
                 }
             }
@@ -1881,6 +1911,27 @@ pub fn spawn_compress_job_worker_with(
             Ok(outcomes) => {
                 let mut publish_err: Option<String> = None;
                 for out in outcomes {
+                    // 三.1(b)：发布前重确认 job 仍 Running——已被终态化的 job 的
+                    // 迟到批次不得再改写 summary/coverage/revision。
+                    match compress_job_is_running(&storage, &job_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                target: "chronicle_compressor",
+                                job_id = %job_id,
+                                "compress job no longer running; late batches dropped (no publish)"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "chronicle_compressor",
+                                job_id = %job_id,
+                                "re-confirm compress job running failed; dropping late batches: {e}"
+                            );
+                            return;
+                        }
+                    }
                     // 批次键用稳定语义值：output_level（A→B=0、B→C=1）。若用数组
                     // 序号，第一批发布后崩溃、恢复只剩 B→C 时会重新编号 0，与已
                     // 发布批次冲突并反复重试（三轮评审 P1-1b）。
@@ -2014,20 +2065,439 @@ pub fn spawn_compress_job_worker_with(
     });
 }
 
+/// 终态化 worker 的 compress job——**必须**经 guarded facade（`fail_or_retry_compress_job`
+/// / `succeed_compress_job`，仅 Running 可迁移，返回真实布尔）。
+///
+/// 三.1(a)：旧实现 JSON 分支直连 `mark_failed_or_retry`/`mark_succeeded`（无条件
+/// 改写，且把真实布尔映射成恒 true）——迟到 worker 能把已终态化的 job 倒退回
+/// Pending。现在 JSON 与 SQLite 走同一 guarded 入口，`Ok(false)` = 未发生转换
+/// （job 已终态/不存在），调用方不得再改。
 fn mark_job_failed(storage: &StorageFacade, job_id: &Id, err: &str) -> Result<bool, String> {
-    if storage.is_sqlite() {
-        crate::sqlite_runtime::compress_mark_failed_or_retry(job_id, err)
-    } else {
-        let job_store = storage.json_compress_job_store("mark compress job failed")?;
-        job_store.mark_failed_or_retry(job_id, err).map(|_| true)
-    }
+    storage.fail_or_retry_compress_job(job_id, err)
 }
 
 fn mark_job_succeeded(storage: &StorageFacade, job_id: &Id) -> Result<bool, String> {
+    storage.succeed_compress_job(job_id)
+}
+
+/// 三.1(b)：发布批次前**重确认** job 仍处于 Running。
+///
+/// SQLite transition / JSON `_if_running` 的 `WHERE status='running'` 守卫只保护
+/// 终态迁移；发布 UoW 本身不校验 job 状态。若 job 已被其它 worker/恢复流程
+/// 终态化（Succeeded/Failed），迟到的发布会改写 summary/coverage/revision——
+/// 这里在每次批次发布前重确认，非 Running 一律丢弃并退出（不发布、不改状态）。
+fn compress_job_is_running(storage: &StorageFacade, job_id: &Id) -> Result<bool, String> {
     if storage.is_sqlite() {
-        crate::sqlite_runtime::compress_mark_succeeded(job_id)
+        Ok(crate::sqlite_runtime::compress_list_all()?
+            .into_iter()
+            .find(|j| j.id == *job_id)
+            .map(|j| j.status == crate::sqlite_compress_jobs::CompressJobStatus::Running)
+            .unwrap_or(false))
     } else {
-        let job_store = storage.json_compress_job_store("mark compress job succeeded")?;
-        job_store.mark_succeeded(job_id).map(|_| true)
+        Ok(storage
+            .json_compress_job_store("re-confirm compress job running")?
+            .list_all()
+            .into_iter()
+            .find(|j| j.id == *job_id)
+            .map(|j| j.status == crate::compress_job_store::CompressJobStatus::Running)
+            .unwrap_or(false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::turn::TurnRecord;
+    use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
+
+    fn write_json(path: &std::path::Path, value: serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn json_workflow(
+        dir: &std::path::Path,
+    ) -> (Arc<StorageFacade>, Arc<ConversationStore>, TurnWorkflow) {
+        let storage = Arc::new(StorageFacade::new(
+            dir.to_path_buf(),
+            PinnedBackend::new(StorageBackend::Json, BackendSource::Default),
+        ));
+        let conv_store = Arc::new(ConversationStore::new(dir.join("conversations")));
+        let workflow = TurnWorkflow::new(storage.clone(), conv_store.clone());
+        (storage, conv_store, workflow)
+    }
+
+    /// 三.8 判别测试：Attempt 更新（update_turn_record）失败时，conversation
+    /// 编辑**不得**被提交——编辑 + stale 标记必须是单一原子语义操作。
+    ///
+    /// write_fence 冻结 turns.json 注入 update_turn_record 失败；旧实现先编辑
+    /// 会话、再 `let _ =` 吞掉 update_turn_record 错误并返回 Ok——本测试断言
+    /// 返回 Err 且会话内容未变（判别点）。
+    #[test]
+    fn edit_variant_stale_mark_failure_aborts_before_conversation_edit() {
+        let dir = std::env::temp_dir().join(format!("sf-edit-stale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "campaigns.json",
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+            "mvu_translations.json",
+            "compress_jobs.json",
+        ] {
+            write_json(&dir.join(name), serde_json::json!([]));
+        }
+
+        let (storage, conv_store, workflow) = json_workflow(&dir);
+        let cid = Id::from_str("c-edit-stale");
+        let conv = conv_store.create(None, Some(cid.clone()));
+        let conv_id = conv.id.clone();
+        let user_node = conv_store
+            .append_user_message(&conv_id, "开门".into())
+            .expect("user node");
+        let draft_node = conv_store
+            .append_ai_draft(&conv_id, "草稿原稿".into(), None)
+            .expect("draft node");
+        let turn = TurnRecord::new(cid.clone(), conv_id.clone(), user_node, 0);
+        let turn_id = turn.turn_id.clone();
+        storage.save_turn(&turn).expect("save turn");
+        let outcome = workflow
+            .create_draft_attempt(DraftAttemptRequest {
+                campaign_id: &cid,
+                conversation_id: &conv_id,
+                turn_id: &turn_id,
+                attempt_id: &Id::new(),
+                draft_text: "草稿原稿",
+                pending_temporary_instances: vec![],
+                provisional_variant_id: Some(&draft_node),
+                provenance: None,
+            })
+            .expect("draft attempt");
+        assert_eq!(outcome.variant_id, draft_node);
+        let attempt_id = outcome.attempt_id;
+
+        // 编辑前会话持久化内容快照。
+        let conv_file = dir.join("conversations").join(format!("{conv_id}.json"));
+        let before = std::fs::read(&conv_file).unwrap();
+
+        // 冻结 turns.json：update_turn_record 必败。
+        storyforge_infra_util::write_fence::freeze(&dir.join("turns.json"));
+        let result = workflow.edit_variant_with_stale_mark(&conv_id, &draft_node, "改写正文");
+        assert!(
+            result.is_err(),
+            "Attempt 更新失败时编辑必须整体失败（不得吞错返回 Ok）"
+        );
+        assert!(
+            std::fs::read(&conv_file).unwrap() == before,
+            "conversation 编辑不得被提交（原子语义）"
+        );
+        storyforge_infra_util::write_fence::unfreeze(&dir.join("turns.json"));
+
+        // 解冻后正常路径仍可用：编辑 + stale 标记同时生效。
+        workflow
+            .edit_variant_with_stale_mark(&conv_id, &draft_node, "改写正文")
+            .expect("unfrozen edit succeeds");
+        let turn_after = storage.get_turn(&turn_id).expect("read turn").unwrap();
+        assert_eq!(
+            turn_after
+                .find_attempt(&attempt_id)
+                .expect("attempt")
+                .status,
+            storyforge_domain::turn::AttemptStatus::Stale,
+            "正常路径必须完成 stale 标记"
+        );
+        let conv_after = conv_store.get(&conv_id).expect("conversation");
+        assert_eq!(
+            conv_after
+                .find_node(&draft_node)
+                .and_then(|n| n.active())
+                .map(|v| v.content.as_str()),
+            Some("改写正文"),
+            "正常路径必须完成编辑"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 三.1 Chronicle worker 守卫（JSON 后端）───────────────────────────
+    //
+    // (a) worker 终态化必须经 guarded facade（仅 Running 可迁移）；
+    // (b) 发布前重确认 Running——job 已被终态化时迟到批次不得改写
+    //     summary/coverage/revision；
+    // (c) 迟到成功/失败不得修改终态 job 的 summary/coverage/revision。
+    // 注入 compress：先经 facade 把 job 终态化（模拟并发 worker/恢复流程），
+    // 再返回真实批次——worker 的发布步骤必须识别并丢弃。
+
+    fn seed_json_compress_campaign(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StorageFacade>,
+        Id,
+        Vec<storyforge_domain::agent::RoundSummary>,
+    ) {
+        let storage = Arc::new(StorageFacade::new(
+            dir.to_path_buf(),
+            PinnedBackend::new(StorageBackend::Json, BackendSource::Default),
+        ));
+        let cid = Id::from_str("worker-camp-json");
+        let lineage = Id::from_str("worker-lin-json");
+        let mut campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str("worker-card-json"),
+            "Worker Camp",
+        );
+        campaign.id = cid.clone();
+        campaign.lineage_id = Some(lineage.clone());
+        storage
+            .json_campaign_store(
+                crate::storage_backend::BackendCapability::ChronicleCompressor,
+                "seed worker campaign",
+            )
+            .unwrap()
+            .save_campaign(campaign)
+            .unwrap();
+        let leaves: Vec<storyforge_domain::agent::RoundSummary> = (1..=5)
+            .map(|turn| {
+                storyforge_domain::agent::RoundSummary::new(
+                    cid.clone(),
+                    Id::from_str("worker-conv-json"),
+                    turn,
+                    format!("事件{turn}的摘要正文"),
+                )
+                .with_code(format!("A{turn:04}"))
+                .with_headline(format!("头{turn}"))
+                .with_lineage(lineage.clone())
+            })
+            .collect();
+        for summary in &leaves {
+            storage
+                .json_campaign_store(
+                    crate::storage_backend::BackendCapability::ChronicleCompressor,
+                    "seed worker summary",
+                )
+                .unwrap()
+                .add_summary(summary.clone())
+                .unwrap();
+        }
+        (storage, cid, leaves)
+    }
+
+    /// worker 等待 helper：轮询直到 job 进入终态（成功/失败）或超时。
+    async fn await_job_terminal(storage: &StorageFacade, job_id: &Id) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let done = storage
+                .list_compress_jobs()
+                .map(|jobs| {
+                    jobs.iter()
+                        .find(|j| &j.id == job_id)
+                        .map(|j| j.status == "succeeded" || j.status == "failed")
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if done || std::time::Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    fn deterministic_outcome(
+        cid: &Id,
+        lineage: &Id,
+        conv_id: &Id,
+        entries: &[storyforge_domain::agent::RoundSummary],
+    ) -> Vec<storyforge_app_agent::CompressRunOutcome> {
+        use storyforge_app_agent::chronicle_compressor::{
+            plan_level_batch, publish_with_deterministic_texts,
+        };
+        use storyforge_domain::chronicle::ChronicleLevel;
+        let (ids, spans, groups) = plan_level_batch(entries, ChronicleLevel::A, 4, 2)
+            .expect("plan")
+            .expect("groups");
+        vec![
+            publish_with_deterministic_texts(
+                cid,
+                lineage,
+                conv_id,
+                entries,
+                &ids,
+                &spans,
+                &groups,
+                ChronicleLevel::B,
+            )
+            .expect("deterministic publish"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn json_worker_drops_late_publish_when_job_terminalized_mid_run() {
+        let dir = std::env::temp_dir().join(format!("sf-worker-json-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "campaigns.json",
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+            "mvu_translations.json",
+            "compress_jobs.json",
+        ] {
+            write_json(&dir.join(name), serde_json::json!([]));
+        }
+        let (storage, cid, leaves) = seed_json_compress_campaign(&dir);
+        let (job_id, created) = storage
+            .enqueue_compress_job(
+                &cid,
+                Some(Id::from_str("worker-conv-json")),
+                Some(Id::from_str("worker-lin-json")),
+                leaves.len() as u32,
+                0,
+            )
+            .expect("enqueue");
+        assert!(created);
+
+        let state = Arc::new(
+            crate::AppState::new_with_backend(dir.clone(), storage.clone()).expect("JSON AppState"),
+        );
+        let lineage = Id::from_str("worker-lin-json");
+        let conv_id = Id::from_str("worker-conv-json");
+        let outcome = deterministic_outcome(&cid, &lineage, &conv_id, &leaves);
+        let campaign_id = cid.clone();
+        let job_id_for_compress = job_id.clone();
+        let state_for_compress = state.clone();
+
+        spawn_compress_job_worker_with(
+            state.clone(),
+            job_id.clone(),
+            move |_st, _campaign_id, _lineage, _conv, _entries, _cancel| {
+                let outcome = outcome.clone();
+                let campaign_id = campaign_id.clone();
+                let job_id = job_id_for_compress.clone();
+                let state = state_for_compress.clone();
+                Box::pin(async move {
+                    // 模拟并发终态化：压缩执行期间 job 被其它 worker 标 Succeeded。
+                    let done = state
+                        .storage()
+                        .succeed_compress_job(&job_id)
+                        .expect("terminalize mid-run");
+                    assert!(done, "worker 已 claim，job 必须 Running");
+                    // job 已终态：worker 随后想发布批次 → 必须被丢弃。
+                    let _ = campaign_id;
+                    Ok(outcome)
+                })
+            },
+        );
+
+        await_job_terminal(&storage, &job_id).await;
+        // 让 worker 完整跑完（丢弃分支也在 poll 后落地）。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 终态 job 的 summary/coverage/revision 不得被迟到批次改写。
+        let job = storage
+            .list_compress_jobs()
+            .expect("list jobs")
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job");
+        assert_eq!(job.status, "succeeded", "job 保持终态");
+        let summaries_after = storage
+            .json_campaign_store(
+                crate::storage_backend::BackendCapability::ChronicleCompressor,
+                "read summaries",
+            )
+            .unwrap()
+            .list_summaries(&cid);
+        assert_eq!(
+            summaries_after.len(),
+            leaves.len(),
+            "迟到批次不得新增 B 级 summary"
+        );
+        assert!(
+            summaries_after.iter().all(|s| s.covered_by.is_none()),
+            "迟到批次不得改写 covered_by"
+        );
+        let campaign_after = storage
+            .get_campaign(&cid)
+            .expect("read campaign")
+            .expect("campaign");
+        assert_eq!(
+            campaign_after.campaign.chronicle_revision, 0,
+            "迟到批次不得推进 chronicle_revision"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn json_worker_late_finalize_does_not_corrupt_terminal_job() {
+        let dir = std::env::temp_dir().join(format!("sf-worker-finalize-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "campaigns.json",
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+            "mvu_translations.json",
+            "compress_jobs.json",
+        ] {
+            write_json(&dir.join(name), serde_json::json!([]));
+        }
+        let (storage, cid, leaves) = seed_json_compress_campaign(&dir);
+        let (job_id, _) = storage
+            .enqueue_compress_job(
+                &cid,
+                Some(Id::from_str("worker-conv-json")),
+                Some(Id::from_str("worker-lin-json")),
+                leaves.len() as u32,
+                0,
+            )
+            .expect("enqueue");
+        let state = Arc::new(
+            crate::AppState::new_with_backend(dir.clone(), storage.clone()).expect("JSON AppState"),
+        );
+        let job_id_for_compress = job_id.clone();
+        let state_for_compress = state.clone();
+
+        // 失败路径：compress 失败前 job 已被终态化 → mark_job_failed 必须 no-op
+        // （guarded facade 返回 false），job 保持 Succeeded、last_error 不变。
+        spawn_compress_job_worker_with(
+            state.clone(),
+            job_id.clone(),
+            move |_st, _campaign_id, _lineage, _conv, _entries, _cancel| {
+                let job_id = job_id_for_compress.clone();
+                let state = state_for_compress.clone();
+                Box::pin(async move {
+                    assert!(
+                        state
+                            .storage()
+                            .succeed_compress_job(&job_id)
+                            .expect("succeed"),
+                        "job 已被 claim（Running）"
+                    );
+                    Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress)
+                })
+            },
+        );
+
+        await_job_terminal(&storage, &job_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let job = storage
+            .list_compress_jobs()
+            .expect("list jobs")
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job");
+        assert_eq!(
+            job.status, "succeeded",
+            "迟到 NothingToCompress 不得把终态 job 倒退回 Pending"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

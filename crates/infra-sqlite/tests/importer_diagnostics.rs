@@ -34,8 +34,8 @@ fn base_source(dir: &std::path::Path) {
         &json!({
             "id": "conv-1",
             "campaign_id": "camp-1",
-            "created_at": "t",
-            "updated_at": "t",
+            "created_at": "2026-07-13T00:00:00Z",
+            "updated_at": "2026-07-13T00:00:00Z",
             "nodes": []
         }),
     );
@@ -43,6 +43,7 @@ fn base_source(dir: &std::path::Path) {
     write_json(&dir.join("knowledge.json"), &json!([]));
     write_json(&dir.join("tasks.json"), &json!([]));
     write_json(&dir.join("round_summaries.json"), &json!([]));
+    write_json(&dir.join("turns.json"), &json!([]));
 }
 
 #[test]
@@ -287,4 +288,322 @@ fn importer_rejects_covers_covered_by_mismatch_and_scope_drift() {
         .query_row("SELECT COUNT(*) FROM round_summaries", [], |r| r.get(0))
         .unwrap_or(0);
     assert_eq!(summaries, 0);
+}
+// ─── Gate 5 审查一.6：importer 严格验证 ──────────────────────────────────
+
+/// 完整但为空的合法布局：所有必需布局文件都是有效空数组 + 空 conversations 目录。
+fn empty_but_valid_layout(dir: &std::path::Path) {
+    for name in [
+        "cards.json",
+        "campaigns.json",
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+    ] {
+        write_json(&dir.join(name), &json!([]));
+    }
+    std::fs::create_dir_all(dir.join("conversations")).unwrap();
+}
+
+#[test]
+fn empty_but_valid_layout_imports_cleanly_with_zero_counts() {
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+
+    // 干跑同样接受（合法空目录 ≠ 缺失布局文件）。
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path()).unwrap();
+    assert_eq!(report.cards, 0);
+    assert_eq!(report.campaigns, 0);
+    assert!(report.issues.is_empty());
+
+    let mut db = Database::open_in_memory().unwrap();
+    let report = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .unwrap();
+    assert_eq!(report.status, ImportStatus::Completed);
+    assert_eq!(report.cards, 0);
+    assert_eq!(report.campaigns, 0);
+    assert_eq!(report.conversations, 0);
+    assert_eq!(report.turns, 0);
+}
+
+#[test]
+fn missing_required_layout_file_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+    // 删掉一个必需文件：不得当作空集合静默通过。
+    std::fs::remove_file(dir.path().join("cards.json")).unwrap();
+
+    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect_err("missing required layout file must fail the dry run");
+    assert!(
+        err.to_string().to_lowercase().contains("source") || err.to_string().contains("missing"),
+        "error must mention the missing file, got: {err}"
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("missing required layout file must fail the import");
+    assert!(
+        err.to_string().to_lowercase().contains("source") || err.to_string().contains("missing"),
+        "error must mention the missing file, got: {err}"
+    );
+}
+
+#[test]
+fn negative_campaign_revision_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-neg", "card_id": "card-1", "name": "负数局",
+            "created_at": "2026-07-13T00:00:00Z",
+            "revision": -1, "chronicle_revision": 0
+        }]),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("negative revision must be rejected, not clamped to 0");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("revision") || msg.contains("negative"),
+                "error must explain the negative revision, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+}
+#[test]
+fn unknown_turn_status_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    write_json(
+        &dir.path().join("turns.json"),
+        &json!([{
+            "turn_id": "turn-x", "campaign_id": "camp-1", "conversation_id": "conv-1",
+            "input_node_id": "n1", "base_campaign_revision": 0,
+            "status": "flying_pig", "created_at": "2026-07-13T00:00:00Z",
+            "updated_at": "2026-07-13T00:00:00Z", "attempts": []
+        }]),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("unknown enum value must be rejected");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("status") || msg.contains("flying_pig"),
+                "error must mention the invalid status, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+}
+
+#[test]
+fn wrong_bool_type_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    write_json(
+        &dir.path().join("instances.json"),
+        &json!([{
+            "id": "inst-x", "campaign_id": "camp-1", "name": "X",
+            "is_temporary": "yes"
+        }]),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("wrong bool type must be rejected, not coerced");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("is_temporary") || msg.contains("bool"),
+                "error must mention the invalid bool, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+}
+
+#[test]
+fn malformed_character_info_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    // info 缺 name（CharacterInfo 必需字段）且类型错误。
+    write_json(
+        &dir.path().join("characters.json"),
+        &json!([{
+            "id": "char-bad",
+            "info": { "name": 42, "tags": "not-an-array" },
+            "imported_at": "2026-07-01T00:00:00Z"
+        }]),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("malformed CharacterInfo must be rejected");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("name") || msg.contains("tags") || msg.contains("info"),
+                "error must explain the malformed CharacterInfo, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+}
+
+#[test]
+fn conversations_dir_replaced_by_file_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+    // conversations 必须是目录：替换成文件 → read_dir 错误必须传播。
+    std::fs::remove_dir_all(dir.path().join("conversations")).unwrap();
+    write_json(&dir.path().join("conversations"), &json!({}));
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("conversations-as-file must fail, not silently yield zero conversations");
+    assert!(
+        matches!(err, SqliteError::Io(_))
+            || err.to_string().to_lowercase().contains("not a directory")
+            || err.to_string().contains("conversations"),
+        "read_dir error must propagate, got: {err}"
+    );
+}
+#[test]
+fn world_info_identical_payloads_distinct_campaigns_hash_differently() {
+    // 同一份 book 载荷挂在两个 campaign 下：hash 必须绑定 campaign_id。
+    let book = json!({
+        "entries": [{
+            "keys": ["密道"], "content": "密道在酒窖",
+            "constant": true, "route": "Both",
+            "is_global": false, "depth": 2, "order": 100,
+            "extensions": {}
+        }],
+        "source": "native",
+        "metadata": {"seeded_from": "card"}
+    });
+
+    let dir_one = TempDir::new().unwrap();
+    empty_but_valid_layout(dir_one.path());
+    write_json(
+        &dir_one.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero", "source_character_id": "char-1",
+                  "character_definitions": [] }]),
+    );
+    write_json(
+        &dir_one.path().join("campaigns.json"),
+        &json!([{ "id": "camp-a", "card_id": "card-1", "name": "A",
+                  "created_at": "2026-07-13T00:00:00Z" }]),
+    );
+    write_json(
+        &dir_one
+            .path()
+            .join("campaign_world_info")
+            .join("camp-a.json"),
+        &book,
+    );
+
+    let dir_two = TempDir::new().unwrap();
+    empty_but_valid_layout(dir_two.path());
+    write_json(
+        &dir_two.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero", "source_character_id": "char-1",
+                  "character_definitions": [] }]),
+    );
+    write_json(
+        &dir_two.path().join("campaigns.json"),
+        &json!([
+            { "id": "camp-a", "card_id": "card-1", "name": "A",
+              "created_at": "2026-07-13T00:00:00Z" },
+            { "id": "camp-b", "card_id": "card-1", "name": "B",
+              "created_at": "2026-07-13T00:00:01Z" }
+        ]),
+    );
+    // 两个 campaign 挂同一份载荷（文件内容逐字节相同）。
+    write_json(
+        &dir_two
+            .path()
+            .join("campaign_world_info")
+            .join("camp-a.json"),
+        &book,
+    );
+    write_json(
+        &dir_two
+            .path()
+            .join("campaign_world_info")
+            .join("camp-b.json"),
+        &book,
+    );
+
+    let one = storyforge_infra_sqlite::readiness::validate_source_manifest(dir_one.path()).unwrap();
+    let two = storyforge_infra_sqlite::readiness::validate_source_manifest(dir_two.path()).unwrap();
+    assert_ne!(
+        one.manifest_hash, two.manifest_hash,
+        "world-info hash must bind campaign_id: identical payloads under different \
+         campaign ids must hash differently"
+    );
+
+    // 导入两侧后：DB 内容 hash 与源 manifest 一致（recompute 同口径绑定）。
+    for (dir, expected) in [
+        (dir_one.path(), one.manifest_hash.clone()),
+        (dir_two.path(), two.manifest_hash.clone()),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        let mut db = Database::open(&db_path).unwrap();
+        let report = JsonImporter::new(&mut db).import_data_dir(dir).unwrap();
+        assert_eq!(
+            report.world_info,
+            if expected == one.manifest_hash { 1 } else { 2 }
+        );
+        assert_eq!(report.source_manifest_hash, expected);
+        let recomputed =
+            storyforge_infra_sqlite::readiness::recompute_db_content_hash_for_test(&db).unwrap();
+        assert_eq!(recomputed, expected, "recompute must bind campaign_id too");
+    }
+}
+
+#[test]
+fn world_info_for_unknown_campaign_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{ "id": "camp-a", "card_id": "card-1", "name": "A",
+                  "created_at": "2026-07-13T00:00:00Z" }]),
+    );
+    // 幽灵 campaign 的世界书文件：campaign_id 无对应 Campaign → 拒绝。
+    write_json(
+        &dir.path().join("campaign_world_info").join("ghost.json"),
+        &json!({ "entries": [], "source": "native", "metadata": {} }),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("world-info for an unknown campaign must be rejected");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("ghost") || msg.contains("campaign"),
+                "error must mention the unknown campaign, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
 }

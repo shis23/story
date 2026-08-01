@@ -485,6 +485,34 @@ async fn bigdata_json_vs_sqlite_op_timings() {
     );
     drop(sqlite_state);
 
+    // ── 四.5：真实的冷重开计时（drop 全部句柄 → 全新 Database::open）──
+    // 不用已有 runtime 连接（OnceLock 全局句柄是热的）；这是对同一 DB 文件的
+    // 全新 OS 文件句柄：open + current_version + 真实读查询全流程计时。
+    // 无任何人工 sleep；断言全部确定性（成功 + 版本 + 计数）。
+    let cold: Option<(u64, u32, Duration)> = (|| {
+        let t_cold = Instant::now();
+        let fresh = storyforge_infra_sqlite::Database::open(&db_path).ok()?;
+        let version = storyforge_infra_sqlite::migrations::current_version(&fresh).ok()?;
+        let count: i64 = fresh
+            .connection()
+            .query_row("SELECT COUNT(*) FROM campaigns", [], |row| row.get(0))
+            .ok()?;
+        Some((version as u64, count as u32, t_cold.elapsed()))
+    })();
+    let (cold_version, cold_count, cold_elapsed) = cold.expect("cold reopen must succeed");
+    println!(
+        "[bigdata-ops] cold_reopen={}ms (version={cold_version}, campaigns={cold_count})",
+        cold_elapsed.as_millis()
+    );
+    assert!(
+        cold_version >= 4,
+        "cold reopen must read the current schema, got {cold_version}"
+    );
+    assert_eq!(
+        cold_count as usize, N_CAMPAIGNS,
+        "cold reopen read query must see all campaigns"
+    );
+
     // ── 对照打印 ──────────────────────────────────────────────────────
     println!("[bigdata-ops] op_timings (json_ms, sqlite_ms, ratio):");
     for (j, s) in json_phase.timings.iter().zip(sqlite_phase.timings.iter()) {

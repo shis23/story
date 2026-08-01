@@ -1958,12 +1958,57 @@ fn test_collect_scoped_regex_scripts_is_limited_to_selected_character() {
     });
     let characters = vec![Arc::new(selected), Arc::new(other)];
 
-    let scripts = collect_scoped_regex_scripts(Some("source-selected"), &characters, None);
+    // 三.4：经 backend-neutral 解析器 + 真实 JSON facade（stored/source/name
+    // 映射），不再直连 json_character_store。
+    let dir = tempfile::TempDir::new().unwrap();
+    let facade = crate::storage_backend::StorageFacade::new(
+        dir.path().to_path_buf(),
+        storyforge_infra_sqlite::backend::PinnedBackend::new(
+            storyforge_infra_sqlite::backend::StorageBackend::Json,
+            storyforge_infra_sqlite::backend::BackendSource::Default,
+        ),
+    );
+    // 保存的角色：id=随机 stored id、source_character_id="source-selected"、
+    // name="Selected"（CharacterInfo::from 以角色 id 作为 source id）。
+    facade
+        .save_character(crate::CharacterInfo::from(&{
+            let mut c = make_test_character("Selected");
+            c.id = Id::from_str("source-selected");
+            c
+        }))
+        .unwrap();
 
+    // stored/source id 命中：仅 selected 的脚本。
+    let scripts = collect_scoped_regex_scripts_for_backend(
+        Some("source-selected"),
+        &characters,
+        Some(&facade),
+    )
+    .unwrap();
     assert_eq!(scripts.len(), 1);
     assert_eq!(scripts[0].id, "selected-regex");
-    assert!(collect_scoped_regex_scripts(None, &characters, None).is_empty());
-    assert!(collect_scoped_regex_scripts(Some("missing"), &characters, None).is_empty());
+    // name 键命中：同样只解析 selected。
+    let by_name =
+        collect_scoped_regex_scripts_for_backend(Some("Selected"), &characters, Some(&facade))
+            .unwrap();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].id, "selected-regex");
+    // 无 id / 未知 id / 无 facade：均降级为空。
+    assert!(
+        collect_scoped_regex_scripts_for_backend(None, &characters, Some(&facade))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        collect_scoped_regex_scripts_for_backend(Some("missing"), &characters, Some(&facade))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        collect_scoped_regex_scripts_for_backend(Some("source-selected"), &characters, None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

@@ -1018,3 +1018,95 @@ fn mvu_payload_roundtrip_overwrite_and_delete() {
             .is_none()
     );
 }
+
+#[test]
+fn delete_campaign_cascade_cleans_summaries_before_conversations() {
+    let mut f = fixture();
+    // 先 accept，产生 round_summaries 行（conversation_id FK → conversations）。
+    let outcome = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap();
+    assert_eq!(outcome, AcceptOutcome::Applied);
+    assert_eq!(
+        SqliteProductionRepository::list_summaries(&f.db, &f.campaign_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 带摘要的 Campaign 删除必须成功：若先删 conversations 再删
+    // round_summaries，会撞 round_summaries.conversation_id → conversations
+    // FK（foreign_keys=ON），整个 UoW 回滚 → unwrap 必 panic。
+    let deleted =
+        SqliteProductionRepository::delete_campaign_cascade(&mut f.db, &f.campaign_id).unwrap();
+    assert!(deleted);
+
+    // 全部级联数据清零：campaign / conversation / turn / summaries / ledger。
+    assert!(
+        SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        SqliteProductionRepository::list_summaries(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        SqliteProductionRepository::count_commit_ledger(&f.db).unwrap(),
+        0
+    );
+    for (table, column) in [
+        ("mutation_commits", "campaign_id"),
+        ("chronicle_publication_jobs", "campaign_id"),
+        ("chronicle_compress_jobs", "campaign_id"),
+        ("preaccept_outbox", "campaign_id"),
+        ("turn_attempts", "turn_id"),
+        ("round_summary_covers", "parent_id"),
+        ("story_tasks", "campaign_id"),
+        ("character_knowledge", "campaign_id"),
+        ("character_instances", "campaign_id"),
+        ("campaign_world_info", "campaign_id"),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} IN \
+             (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1) \
+             OR {column} IN (SELECT turn_id FROM turns WHERE campaign_id = ?1) \
+             OR {column} = ?1"
+        );
+        let leftovers: i64 =
+            f.db.connection()
+                .query_row(&sql, [f.campaign_id.as_str()], |row| row.get(0))
+                .unwrap_or(0);
+        assert_eq!(
+            leftovers, 0,
+            "{table} 应无 {column} 遗留（campaign 已删干净）"
+        );
+    }
+    let campaigns_left: i64 =
+        f.db.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM campaigns WHERE campaign_id = ?1",
+                [f.campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(campaigns_left, 0);
+
+    // 幂等：再删返回 false（已不存在）。
+    assert!(
+        !SqliteProductionRepository::delete_campaign_cascade(&mut f.db, &f.campaign_id).unwrap()
+    );
+}

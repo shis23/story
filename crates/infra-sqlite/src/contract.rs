@@ -170,6 +170,17 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // 必需布局文件（Gate 5 审查一.6：核心文件缺失必须报错，测试夹具补齐）。
+        for name in [
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+        ] {
+            std::fs::write(root.join(name), b"[]").unwrap();
+        }
+        std::fs::create_dir_all(root.join("conversations")).unwrap();
 
         let mut db = Database::open_in_memory().unwrap();
         JsonImporter::new(&mut db).import_data_dir(root).unwrap();

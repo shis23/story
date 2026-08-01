@@ -141,10 +141,15 @@ impl CompressJobStore {
     }
 
     /// 启动时：Running → Pending（崩溃中断），便于重放。
+    ///
+    /// 三.9 原子性：候选 → 持久化 → 换入。持久化失败时内存保持 Running、
+    /// 返回 0（计入的是**落盘成功**的 reset 数）——绝不在 persist 失败后
+    /// 静默把内存改成 Pending（旧实现 `let _ = persist` 正是三.9 审查点）。
     pub fn reset_running_to_pending(&self) -> usize {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidate = jobs.clone();
         let mut n = 0;
-        for j in jobs.iter_mut() {
+        for j in candidate.iter_mut() {
             if j.status == CompressJobStatus::Running {
                 j.status = CompressJobStatus::Pending;
                 j.updated_at = now_iso();
@@ -152,12 +157,22 @@ impl CompressJobStore {
             }
         }
         if n > 0 {
-            let _ = persist(&self.path, &jobs);
+            if let Err(error) = persist(&self.path, &candidate) {
+                tracing::error!(
+                    target: "chronicle_compressor",
+                    "reset_running_to_pending persist failed; in-memory jobs kept Running: {error}"
+                );
+                return 0;
+            }
+            *jobs = candidate;
         }
         n
     }
 
     /// 若该 campaign 已有 open job 则返回已有；否则新建 Pending。
+    ///
+    /// 三.9 原子性：候选副本上 push → persist 成功 → 换入；写盘失败时内存
+    /// 不残留未持久化的 job（旧实现先 push 再 persist，失败后内存已脏）。
     pub fn enqueue_or_get_open(
         &self,
         campaign_id: &Id,
@@ -180,27 +195,37 @@ impl CompressJobStore {
             uncovered_a,
             uncovered_b,
         );
-        jobs.push(job.clone());
-        persist(&self.path, &jobs)?;
+        let mut candidate = jobs.clone();
+        candidate.push(job.clone());
+        persist(&self.path, &candidate)?;
+        *jobs = candidate;
         Ok((job, true))
     }
 
     /// 原子领取：仅 `Pending → Running` 成功。已 Running/终态返回 Ok(false)。
     ///
     /// 防止同一 open job 被多个 worker 重复消费。
+    ///
+    /// 三.9 原子性：候选 → 持久化 → 换入；写盘失败时内存保持 Pending。
     pub fn try_claim_pending(&self, job_id: &Id) -> Result<bool, String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+        let Some(j) = jobs.iter().find(|j| &j.id == job_id) else {
             return Err(format!("compress job {job_id} not found"));
         };
         if j.status != CompressJobStatus::Pending {
             return Ok(false);
         }
+        let mut candidate = jobs.clone();
+        let j = candidate
+            .iter_mut()
+            .find(|j| &j.id == job_id)
+            .expect("candidate mirrors jobs");
         j.status = CompressJobStatus::Running;
         j.attempts = j.attempts.saturating_add(1);
         j.last_error = None;
         j.updated_at = now_iso();
-        persist(&self.path, &jobs)?;
+        persist(&self.path, &candidate)?;
+        *jobs = candidate;
         Ok(true)
     }
 
@@ -214,6 +239,9 @@ impl CompressJobStore {
         })
     }
 
+    /// 无条件标 Succeeded。仅测试用——生产 worker 必须走
+    /// `mark_succeeded_if_running`（经 guarded facade，三.1(a)）。
+    #[cfg(test)]
     pub fn mark_succeeded(&self, job_id: &Id) -> Result<(), String> {
         self.update_job(job_id, |j| {
             j.status = CompressJobStatus::Succeeded;
@@ -221,6 +249,9 @@ impl CompressJobStore {
         })
     }
 
+    /// 无条件失败回队。仅测试用——生产 worker 必须走
+    /// `mark_failed_or_retry_if_running`（经 guarded facade，三.1(a)）。
+    #[cfg(test)]
     pub fn mark_failed_or_retry(&self, job_id: &Id, err: impl Into<String>) -> Result<(), String> {
         let err = err.into();
         self.update_job(job_id, |j| {
@@ -239,23 +270,33 @@ impl CompressJobStore {
     ///
     /// 返回 `Ok(true)` 表示发生了转换；`Ok(false)` 表示 job 不在 Running
     /// （已被终态化或不存在/状态不匹配），调用方不得再改。
+    ///
+    /// 三.9 原子性：候选 → 持久化 → 换入；写盘失败时内存保持 Running。
     pub fn mark_succeeded_if_running(&self, job_id: &Id) -> Result<bool, String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+        let Some(j) = jobs.iter().find(|j| &j.id == job_id) else {
             return Ok(false);
         };
         if j.status != CompressJobStatus::Running {
             return Ok(false);
         }
+        let mut candidate = jobs.clone();
+        let j = candidate
+            .iter_mut()
+            .find(|j| &j.id == job_id)
+            .expect("candidate mirrors jobs");
         j.status = CompressJobStatus::Succeeded;
         j.last_error = None;
         j.updated_at = now_iso();
-        persist(&self.path, &jobs)?;
+        persist(&self.path, &candidate)?;
+        *jobs = candidate;
         Ok(true)
     }
 
     /// 失败回队，**仅当 job 仍处于 Running**（与 SQLite 一致）。迟到结果不得
     /// 把已 Succeeded/Failed 的 job 倒退回 Pending。返回是否发生转换。
+    ///
+    /// 三.9 原子性：候选 → 持久化 → 换入；写盘失败时内存保持 Running。
     pub fn mark_failed_or_retry_if_running(
         &self,
         job_id: &Id,
@@ -263,12 +304,17 @@ impl CompressJobStore {
     ) -> Result<bool, String> {
         let err = err.into();
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+        let Some(j) = jobs.iter().find(|j| &j.id == job_id) else {
             return Ok(false);
         };
         if j.status != CompressJobStatus::Running {
             return Ok(false);
         }
+        let mut candidate = jobs.clone();
+        let j = candidate
+            .iter_mut()
+            .find(|j| &j.id == job_id)
+            .expect("candidate mirrors jobs");
         j.last_error = Some(err);
         if j.attempts >= j.max_attempts {
             j.status = CompressJobStatus::Failed;
@@ -276,18 +322,44 @@ impl CompressJobStore {
             j.status = CompressJobStatus::Pending;
         }
         j.updated_at = now_iso();
-        persist(&self.path, &jobs)?;
+        persist(&self.path, &candidate)?;
+        *jobs = candidate;
         Ok(true)
     }
 
+    #[cfg(test)]
     fn update_job(&self, job_id: &Id, f: impl FnOnce(&mut CompressJob)) -> Result<(), String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+        let Some(_) = jobs.iter().find(|j| &j.id == job_id) else {
             return Err(format!("compress job {job_id} not found"));
         };
+        let mut candidate = jobs.clone();
+        let j = candidate
+            .iter_mut()
+            .find(|j| &j.id == job_id)
+            .expect("candidate mirrors jobs");
         f(j);
         j.updated_at = now_iso();
-        persist(&self.path, &jobs)
+        persist(&self.path, &candidate)?;
+        *jobs = candidate;
+        Ok(())
+    }
+
+    /// 删除某 campaign 的全部压缩任务（delete_card 级联用；Gate 5 三.7）。
+    ///
+    /// 候选 → 持久化 → 换入：写盘失败时内存保持原值（与其它 mutator 同款，
+    /// 三.9 原子性约定）。返回删除条数；无任务时不写盘（幂等 no-op）。
+    pub(crate) fn delete_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let before = jobs.len();
+        let mut candidate = jobs.clone();
+        candidate.retain(|j| &j.campaign_id != campaign_id);
+        let deleted = before - candidate.len();
+        if deleted > 0 {
+            persist(&self.path, &candidate)?;
+            *jobs = candidate;
+        }
+        Ok(deleted)
     }
 }
 
@@ -473,6 +545,120 @@ mod tests {
                 .mark_failed_or_retry_if_running(&unknown, "x")
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ─── 三.9 原子性：候选 → 持久化 → 换入，persist 失败回滚内存 ────────
+    //
+    // write_fence 冻结 compress_jobs.json 让 persist（atomic_write）失败；
+    // mutator 必须：返回 Err / 不改内存 / 磁盘原样。旧实现先改内存再
+    // persist，失败后内存已脏（判别测试的断言会抓住它）。
+
+    #[test]
+    fn try_claim_rolls_back_memory_when_persist_fails() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store
+            .enqueue_or_get_open(&camp, None, None, 200, 0)
+            .unwrap();
+        let jobs_path = dir.join("compress_jobs.json");
+        let before = std::fs::read(&jobs_path).unwrap();
+        storyforge_infra_util::write_fence::freeze(&jobs_path);
+
+        let result = store.try_claim_pending(&job.id);
+        assert!(result.is_err(), "persist 被冻结时 claim 必须失败");
+        assert_eq!(
+            store.list_all()[0].status,
+            CompressJobStatus::Pending,
+            "persist 失败后内存 job 必须保持 Pending（不得脏改）"
+        );
+        assert_eq!(store.list_all()[0].attempts, 0);
+        assert!(
+            std::fs::read(&jobs_path).unwrap() == before,
+            "磁盘必须原样（冻结期间无任何写入）"
+        );
+        storyforge_infra_util::write_fence::unfreeze(&jobs_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn enqueue_rolls_back_memory_when_persist_fails() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let jobs_path = dir.join("compress_jobs.json");
+        // 首次 persist 前文件尚不存在（store 构造只加载不写盘）。
+        let before = std::fs::read(&jobs_path).ok();
+        storyforge_infra_util::write_fence::freeze(&jobs_path);
+
+        let result = store.enqueue_or_get_open(&camp, None, None, 1, 0);
+        assert!(result.is_err(), "persist 被冻结时 enqueue 必须失败");
+        assert!(
+            store.list_all().is_empty(),
+            "persist 失败后内存不得残留未持久化 job"
+        );
+        let after = std::fs::read(&jobs_path).ok();
+        assert!(after == before, "磁盘必须原样（冻结期间无任何写入）");
+        storyforge_infra_util::write_fence::unfreeze(&jobs_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn succeed_rolls_back_memory_when_persist_fails() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store.enqueue_or_get_open(&camp, None, None, 1, 0).unwrap();
+        store.mark_running(&job.id).unwrap();
+        let jobs_path = dir.join("compress_jobs.json");
+        storyforge_infra_util::write_fence::freeze(&jobs_path);
+
+        let result = store.mark_succeeded_if_running(&job.id);
+        assert!(result.is_err());
+        assert_eq!(
+            store.list_all()[0].status,
+            CompressJobStatus::Running,
+            "persist 失败后不得脏改状态"
+        );
+        storyforge_infra_util::write_fence::unfreeze(&jobs_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fail_retry_rolls_back_memory_when_persist_fails() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store.enqueue_or_get_open(&camp, None, None, 1, 0).unwrap();
+        store.mark_running(&job.id).unwrap();
+        let jobs_path = dir.join("compress_jobs.json");
+        storyforge_infra_util::write_fence::freeze(&jobs_path);
+
+        let result = store.mark_failed_or_retry_if_running(&job.id, "boom");
+        assert!(result.is_err());
+        let j = &store.list_all()[0];
+        assert_eq!(j.status, CompressJobStatus::Running);
+        assert!(j.last_error.is_none());
+        storyforge_infra_util::write_fence::unfreeze(&jobs_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reset_running_to_pending_rolls_back_memory_when_persist_fails() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store.enqueue_or_get_open(&camp, None, None, 1, 0).unwrap();
+        store.mark_running(&job.id).unwrap();
+        let jobs_path = dir.join("compress_jobs.json");
+        storyforge_infra_util::write_fence::freeze(&jobs_path);
+
+        // reset 的公开签名是 usize（存储 facade 依赖）；持久化失败必须返回 0
+        // 且内存保持 Running——绝不能一边报 0 一边把内存改成 Pending。
+        let reset = store.reset_running_to_pending();
+        assert_eq!(reset, 0, "persist 失败时 reset 不得计入");
+        assert_eq!(
+            store.list_all()[0].status,
+            CompressJobStatus::Running,
+            "persist 失败后内存 job 必须保持 Running"
+        );
+        storyforge_infra_util::write_fence::unfreeze(&jobs_path);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

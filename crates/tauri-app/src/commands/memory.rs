@@ -277,10 +277,10 @@ pub fn create_task(
     if title.trim().is_empty() {
         return Err("任务标题不能为空".into());
     }
-    // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
+    // 三.5：活动 Turn 屏障 + 任务写入在同一原子单元内完成。
+    let campaign_id = Id::from_str(&campaign_id);
     let task = storyforge_domain::story_task::StoryTask::user_planned(
-        Id::from_str(&campaign_id),
+        campaign_id.clone(),
         title,
         description,
         triggers,
@@ -289,7 +289,7 @@ pub fn create_task(
     let id = task.id.to_string();
     state
         .storage()
-        .add_task(&task)
+        .add_idle_task(&campaign_id, &task)
         .map_err(|e| TauriCommandError::storage(format!("创建任务失败: {e}")))?;
     Ok(id)
 }
@@ -300,18 +300,20 @@ pub fn complete_task(
     task_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let mut task = state
+    // 三.5：活动 Turn 屏障（按任务所属 campaign）+ 读改写在同一原子单元内。
+    let task_id = Id::from_str(&task_id);
+    let applied = state
         .storage()
-        .get_task(&Id::from_str(&task_id))
-        .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
-    // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(state.storage(), &task.campaign_id)?;
-    task.complete();
-    state
-        .storage()
-        .update_task(&task)
+        .mutate_idle_task(&task_id, |task| {
+            task.complete();
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("完成任务失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到任务 {task_id}"
+        )));
+    }
     Ok(())
 }
 
@@ -321,18 +323,20 @@ pub fn abandon_task(
     task_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let mut task = state
+    // 三.5：活动 Turn 屏障（按任务所属 campaign）+ 读改写在同一原子单元内。
+    let task_id = Id::from_str(&task_id);
+    let applied = state
         .storage()
-        .get_task(&Id::from_str(&task_id))
-        .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
-    // P0-7：活动 Turn 期间拒绝直接写任务
-    reject_if_active_turn(state.storage(), &task.campaign_id)?;
-    task.abandon();
-    state
-        .storage()
-        .update_task(&task)
+        .mutate_idle_task(&task_id, |task| {
+            task.abandon();
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("放弃任务失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到任务 {task_id}"
+        )));
+    }
     Ok(())
 }
 

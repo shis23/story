@@ -149,6 +149,16 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         )));
     }
 
+    // 三.9 级联等价：SQLite `delete_campaign_cascade` 在同一事务内删除
+    // chronicle_compress_jobs；JSON 的 CompressJobStore 是独立文件，必须在此
+    // 补齐同语义级联（`delete_compress_jobs_for_campaign` 对 SQLite 为 Ok(0)
+    // no-op）。放在 Campaign 删除**之前**：失败时活动仍保留可重试，不会留下
+    // 孤儿压缩任务在重启时反复重放。失败必须传播，绝不吞错。
+    state
+        .storage()
+        .delete_compress_jobs_for_campaign(campaign_id)
+        .map_err(|error| TauriCommandError::storage(format!("删除活动的压缩任务失败: {error}")))?;
+
     if campaign_present {
         let deleted = match source.delete_campaign(campaign_id) {
             Ok(deleted) => deleted,

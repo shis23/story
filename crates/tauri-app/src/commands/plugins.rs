@@ -215,18 +215,22 @@ pub(crate) fn plugin_set_variable(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::WriteVariables)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
-    // P0-7：活动 Turn 期间拒绝直接写变量，避免绕过 Coordinator
-    reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = state
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成
+    // （旧实现先 `reject_if_active_turn` 再单独写盘，存在 TOCTOU 窗口）。
+    let campaign_id = Id::from_str(&campaign_id);
+    let instance_id = Id::from_str(&instance_id);
+    let applied = state
         .storage()
-        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .map_err(TauriCommandError::storage)?
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))?;
-    inst.set_variable(&key, value, 0);
-    state
-        .storage()
-        .update_instance(&inst)
+        .mutate_idle_instance(&campaign_id, &instance_id, |inst| {
+            inst.set_variable(&key, value.clone(), 0);
+            Ok(())
+        })
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到实例 {instance_id}"
+        )));
+    }
     Ok(())
 }
 #[tauri::command]
