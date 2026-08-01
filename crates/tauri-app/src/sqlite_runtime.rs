@@ -1177,6 +1177,65 @@ pub fn mutate_character<T>(
     })
 }
 
+/// 原子批量替换多个角色的 world_info_entries（Gate 4 七审 P1）。
+///
+/// 无活动 Campaign 时 `meta_accept_patch` 需把 patch 后的全局世界书写回所有
+/// 角色卡。旧实现逐角色 `mutate_character`（各自独立事务），第二个角色失败
+/// 时第一个已永久更新——部分提交。本方法在**单个 UoW 事务**内更新全部角色，
+/// 任一步失败整体回滚。
+///
+/// `entries`：`(id_or_source, 该角色替换后的 world_info_entries)` 对列表。
+pub fn update_world_info_entries_bulk_multi(
+    entries: &[(String, Vec<crate::WorldInfoEntryInfo>)],
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        let tx = db
+            .connection_mut()
+            .transaction()
+            .map_err(|e| e.to_string())?;
+        for (id_or_source, new_entries) in entries {
+            let character_id: Option<String> = tx
+                .query_row(
+                    "SELECT character_id FROM characters \
+                     WHERE character_id = ?1 OR source_character_id = ?1 LIMIT 1",
+                    [id_or_source],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let character_id =
+                character_id.ok_or_else(|| format!("角色卡不存在: {id_or_source}"))?;
+            // 读取现有 info，替换 entries 后整体写回（与 mutate_character 同语义）。
+            let info_json: String = tx
+                .query_row(
+                    "SELECT info_json FROM characters WHERE character_id = ?1",
+                    [&character_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let mut info: CharacterInfo =
+                serde_json::from_str(&info_json).map_err(|e| format!("解析角色卡失败: {e}"))?;
+            crate::commands::characters::apply_update_world_info_entries_bulk(
+                &mut info,
+                new_entries.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            info.world_info_count = info.world_info_entries.len();
+            info.has_world_info = !info.world_info_entries.is_empty();
+            let new_json =
+                serde_json::to_string(&info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
+            tx.execute(
+                "UPDATE characters SET info_json = ?1, name = ?2, source_character_id = ?3 \
+                 WHERE character_id = ?4",
+                rusqlite::params![new_json, info.name, info.source_character_id, character_id],
+            )
+            .map_err(|e| format!("更新角色卡失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
 /// Delete one card payload row (character delete cascade). Mirrors the JSON
 /// `CampaignStore::delete_card` scope: the card's campaigns cascade into
 /// instances / knowledge / tasks / summaries / world info / MVU rows.

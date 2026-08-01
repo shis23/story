@@ -1090,5 +1090,53 @@ character` 收集受影响 Campaign/会话时用 `if let Ok` / `.ok()` 忽略错
 `unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
 `npm test` 476/476 / `npm run build` / `git diff --check`。
 
+### 30.15 Gate 4 八审修复（2026-07-31）
+
+> 七审判定 INCOMPLETE（2 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 没有世界书时仍会假成功（属实）**：`meta_accept_patch` 把结果建模为
+`Option<WorldInfoBook>`，`tool_ctx.world_info=None` 时 patch 不执行、无持久化，
+函数末尾仍把 patch 标成 `applied=true`。
+- 修复：`patched_book` 改为非 Option；`tool_ctx.world_info` 为空时直接返回
+  `not_found("缺少可修改的世界书…")`，Patch 不执行、不标 applied。
+- 测试：`sqlite_meta_multi_role_atomic.rs` 开头显式清空 `tool_ctx.world_info` →
+  `meta_accept_patch` 必须失败、`applied` 保持 false（判别力：模拟旧 Option
+  语义会静默跳过 → 测试红）。
+
+**P1 无活动 Campaign 时仍会部分提交（属实）**：角色库维护路径逐角色调用
+`update_character_world_info_entries_bulk`（SQLite 每次独立 UPDATE、JSON 每次
+独立 persist），第二个角色失败时第一个已永久更新——部分提交。
+- 修复：新增 backend-neutral facade 方法
+  `update_character_world_info_entries_bulk_multi`（一次替换多个角色的全部
+  entries，原子）：
+  - SQLite：`sqlite_runtime::update_world_info_entries_bulk_multi`——单 UoW
+    事务内逐角色 UPDATE，任一步失败 `tx.commit()` 不执行 → 整体回滚；
+  - JSON：`CharacterStore::update_world_info_entries_bulk_multi`——先校验全部
+    角色存在、再统一修改、单次 `persist`，任一步失败不写盘。
+  `meta_accept_patch` 角色库维护路径改为收集全部角色新值后一次调用。
+- 测试：`sqlite_meta_multi_role_atomic.rs`——种子两角色（Alpha 早、Beta 晚，
+  控制 `list_characters` 排序），对 Beta 的 UPDATE 注入触发器 RAISE(ABORT) →
+  `meta_accept_patch` 失败 → 断言 Alpha、Beta 世界书条目均保持原值（整体回滚
+  无部分提交）。**已验红**（模拟旧逐角色路径 → Alpha 被部分提交、测试失败），
+  判别力成立。
+
+**P2 静态门禁并非递归扫描（属实）**：旧门禁固定 `include_str` 5 个文件，新增
+命令文件可绕过。
+- 修复：`collect_command_rust_files` 递归遍历 `commands/` 目录全部 .rs（基于
+  `env!("CARGO_MANIFEST_DIR")`）。规则细化：任何非 `.ok()` / 非 `_owned` 容错
+  形态的 `json_character_store` 调用，所在函数体必须含 **Unsupported 能力
+  fail-closed 守卫**（`json_campaign_store` 调用或 `!= CapabilityStatus::Supported`
+  + return Err）——`require_supported(CharacterCommands)` 在 SQLite 下 Supported、
+  不构成守卫（会通过后落到直连）。**已验红**（模拟向 world_info.rs 注入
+  `json_character_store` 直连 → 门禁抓出违规），判别力成立。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings`（0 警告）/ `cargo test --workspace`
+（全绿）/ **12 个 sqlite 集成测试**（含新 `sqlite_meta_multi_role_atomic`）全过 /
+`backend-baseline.mjs`（`commandAttributes=175`、`registered=175`、
+`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
+`npm test` 476/476 / `npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

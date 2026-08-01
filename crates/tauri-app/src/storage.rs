@@ -220,6 +220,35 @@ impl CharacterStore {
         Ok(())
     }
 
+    /// 原子批量替换多个角色的 world_info_entries（Gate 4 七审 P1）。
+    ///
+    /// 与 `update_world_info_entries_bulk` 不同，本方法在**一次持久化**内修改
+    /// 全部目标角色——任一步失败（角色不存在）不改任何角色、不写盘，杜绝
+    /// “前几个角色已更新、后一个失败”的部分提交。
+    pub fn update_world_info_entries_bulk_multi(
+        &self,
+        entries: &[(String, Vec<crate::WorldInfoEntryInfo>)],
+    ) -> Result<(), String> {
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // 先校验全部角色存在（失败则整体不改），再统一修改。
+        for (id, _) in entries.iter() {
+            if !chars.iter().any(|c| c.id == *id) {
+                return Err(format!("角色卡不存在: {id}"));
+            }
+        }
+        for (id, new_entries) in entries.iter() {
+            let char = chars
+                .iter_mut()
+                .find(|c| c.id == *id)
+                .expect("existence pre-checked");
+            char.info.world_info_entries = new_entries.clone();
+            char.info.world_info_count = char.info.world_info_entries.len();
+            char.info.has_world_info = !char.info.world_info_entries.is_empty();
+        }
+        self.persist(&chars)?;
+        Ok(())
+    }
+
     /// 持久化到文件（原子写入：委托 infra-util）
     fn persist(&self, chars: &[StoredCharacter]) -> Result<(), String> {
         storyforge_infra_util::atomic_write_json(&self.path, chars).map_err(|e| {

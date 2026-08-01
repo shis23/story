@@ -34,6 +34,9 @@ use storyforge_domain::campaign::Campaign;
 /// Gate 4 P1-4: the character library DTO re-exported through the facade so
 /// both backends expose one application-level character contract.
 pub use crate::commands::characters::CharacterInfo;
+/// Gate 4 七审 P1: world-info entry DTO (multi-role atomic write-back tests
+/// construct per-role `world_info_entries` values).
+pub use crate::commands::characters::WorldInfoEntryInfo;
 /// Gate 4 P1-4: the stored-character DTO shared by the JSON and SQLite
 /// character libraries.
 pub use crate::storage::StoredCharacter;
@@ -812,6 +815,28 @@ impl StorageFacade {
                 "replace character world info entries",
             )?
             .update_world_info_entries_bulk(id_or_source, entries)
+        }
+    }
+
+    /// 原子批量替换多个角色的 world_info_entries（Gate 4 七审 P1）。
+    ///
+    /// 无活动 Campaign 时 `meta_accept_patch` 把 patch 后的全局世界书写回所有
+    /// 角色卡。逐角色 `update_character_world_info_entries_bulk` 各自独立事务，
+    /// 第二个角色失败时第一个已永久更新——部分提交。本方法在**单一原子操作**
+    /// 内更新全部角色：SQLite 走单 UoW 事务、JSON 走单次 persist，任一步失败
+    /// 整体回滚。
+    pub fn update_character_world_info_entries_bulk_multi(
+        &self,
+        entries: &[(String, Vec<crate::WorldInfoEntryInfo>)],
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::update_world_info_entries_bulk_multi(entries)
+        } else {
+            self.json_character_store(
+                BackendCapability::CharacterCommands,
+                "replace multiple characters' world info entries atomically",
+            )?
+            .update_world_info_entries_bulk_multi(entries)
         }
     }
 

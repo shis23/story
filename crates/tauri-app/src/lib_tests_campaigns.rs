@@ -1688,34 +1688,118 @@ fn delete_character_command_clears_active_pointer_and_conversation_cache() {
 /// Supported，命令层**不得**在 Supported 能力路径下直连 JSON CharacterStore
 /// ——SQLite facade 不构造该 store，直连必然失败。
 ///
-/// 静态扫描所有 CharacterCommands 命令文件：`json_character_store` 只允许以
-/// 容错形态 `.ok()` 出现（SQLite 下取 None 走降级，不构造 writer）；任何非
-/// 容错调用（`?` / 直接使用返回值）都是违规。逐个文件检查，防止新增回归。
-#[test]
-fn character_commands_supported_must_never_touch_json_character_store() {
-    // 这些文件里的命令都经 CharacterCommands capability 门控（SQLite Supported）。
-    // 门禁：不得出现非容错形态的 json_character_store 调用。
-    let files = [
-        ("characters", include_str!("commands/characters.rs")),
-        ("world_info", include_str!("commands/world_info.rs")),
-        ("card_shell", include_str!("commands/card_shell.rs")),
-        ("plugins", include_str!("commands/plugins.rs")),
-        ("import_export", include_str!("commands/import_export.rs")),
-    ];
-    for (name, source) in files {
-        // 逐行找 json_character_store 调用；.ok() 容错形态允许（降级路径）。
-        let mut line_no = 0;
-        for line in source.lines() {
-            line_no += 1;
-            if line.contains("json_character_store")
-                && !line.contains(".ok()")
-                && !line.contains("json_character_store_owned")
-            {
-                panic!(
-                    "{name}.rs:{line_no}: CharacterCommands 在 SQLite 下 Supported，\
-                     命令层不得直连 json_character_store（应经 storage facade 读取）：{line}"
-                );
+/// Gate 4 七审 P2：改为**递归扫描 `commands/` 目录全部 .rs 文件**（而非固定
+/// 清单），新增命令文件自动纳入。规则：任何非容错形态（非 `.ok()` / 非
+/// `_owned`）的 `json_character_store` 调用，其所在函数体必须存在
+/// `require_supported(..., CharacterCommands, ...)` 守卫——即该路径在 SQLite
+/// 下 fail-closed 而非静默读 JSON。
+fn collect_command_rust_files() -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+    let mut stack = vec![base];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let name = path
+                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let source = std::fs::read_to_string(&path).unwrap_or_default();
+                    files.push((name, source));
+                }
             }
         }
     }
+    files.sort();
+    files
+}
+
+/// 定位 `json_character_store` 调用行所在函数体（向上回溯到最近的函数/命令
+/// 起点），返回函数体文本（用于守卫检查）。
+fn enclosing_command_fn(source: &str, call_line_start: usize) -> Option<&str> {
+    // 向上找最近的 `fn ` 起始行或 tauri command 属性起始行。
+    let before = &source[..call_line_start];
+    let last_fn = before
+        .rfind("\nfn ")
+        .or_else(|| before.rfind("\n    fn "))?;
+    let fn_start = before[..last_fn].rfind("\n").map(|i| i + 1).unwrap_or(0);
+    let fn_line_start = fn_start;
+    // 函数体从 fn 行到下一个顶层 fn / 下一个 tauri command 属性 / 测试 mod。
+    // 注：`tauri` 与 `command` 分开拼接，避免本文件出现会被架构基线
+    // （backend-baseline.mjs 的 extractCommandAttributes）计数的字面属性文本。
+    let command_attr = format!("#[{}]", "tauri::command");
+    let rest = &source[call_line_start..];
+    let next_fn = rest.find("\nfn ").or_else(|| rest.find("\n    fn "));
+    let next_command = rest.find(&command_attr);
+    let end = match (next_fn, next_command) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => rest.len(),
+    };
+    Some(&source[fn_line_start..call_line_start + end])
+}
+
+#[test]
+fn character_commands_supported_must_never_touch_json_character_store() {
+    let mut violations: Vec<String> = Vec::new();
+    for (name, source) in collect_command_rust_files() {
+        // 找每个 json_character_store 调用起点。
+        let mut call_starts: Vec<usize> = Vec::new();
+        let mut search_from = 0;
+        while let Some(rel) = source[search_from..].find("json_character_store") {
+            let abs = search_from + rel;
+            search_from = abs + 1;
+            if source[abs..].starts_with("json_character_store_owned") {
+                continue; // 构造 writer 的 facade 方法，非命令层直连。
+            }
+            call_starts.push(abs);
+        }
+        for call_start in call_starts {
+            // 向后扫到语句结束：若在 `;` 前遇到 `.ok()`（跨行容错），放行。
+            let stmt_end = source[call_start..]
+                .find(';')
+                .map(|i| call_start + i)
+                .unwrap_or(source.len());
+            let stmt = &source[call_start..stmt_end];
+            if stmt.contains(".ok()") || stmt.contains(".expect(") {
+                continue; // 容错/测试形态，SQLite 下取 None 走降级或显式处理。
+            }
+            // 所在函数体必须有能力 fail-closed 守卫。判定（Gate 4 七审 P2）：
+            // `require_supported(CharacterCommands)` **不算**守卫——CharacterCommands
+            // 在 SQLite 下 Supported，require_supported 通过后仍会落到 json_
+            // character_store 直连。真正的守卫是函数体含 `json_campaign_store`
+            // 调用（内部对 CardCommands/CampaignLifecycle 等 Unsupported 能力
+            // fail-closed，SQLite 下命令整体不可用、不会静默读 JSON），或显式
+            // `!= CapabilityStatus::Supported` + return Err。
+            let has_guard = enclosing_command_fn(&source, call_start)
+                .map(|body| {
+                    body.contains("json_campaign_store")
+                        || (body.contains("!= CapabilityStatus::Supported")
+                            && body.contains("return Err(TauriCommandError::validation"))
+                })
+                .unwrap_or(false);
+            if !has_guard {
+                let line_no = source[..call_start].matches('\n').count() + 1;
+                let line = source[call_start..]
+                    .find('\n')
+                    .map(|i| source[call_start..call_start + i].to_string())
+                    .unwrap_or_else(|| source[call_start..].to_string());
+                violations.push(format!(
+                    "{name} (line {line_no}): json_character_store 直连无能力守卫——\
+                     SQLite 下 Supported 能力或未 fail-closed 的路径直连 JSON store 必失败: {line}"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "命令层直连 JSON CharacterStore 违规：\n{}",
+        violations.join("\n")
+    );
 }
