@@ -377,13 +377,14 @@ pub(crate) fn get_character_world_info(
             "get character world info",
         )
         .map_err(TauriCommandError::validation)?;
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "get character world info",
-    )?;
-    let stored =
-        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
-            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    // Gate 4 六审 P1：SQLite 下 CharacterCommands 标为 Supported，但 facade
+    // 不构造 JSON CharacterStore——必须经 backend-neutral `get_character`
+    // 读取（SQLite 走 V007 characters 表），否则前端角色世界书命令必然失败。
+    let stored = state
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let book = stored
         .info
         .embedded_world_info
@@ -413,13 +414,12 @@ pub(crate) fn get_character_world_info_entry(
             "get character world info entry",
         )
         .map_err(TauriCommandError::validation)?;
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "get character world info entry",
-    )?;
-    let stored =
-        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
-            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    // Gate 4 六审 P1：同上，经 backend-neutral `get_character` 读取。
+    let stored = state
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let book = stored
         .info
         .embedded_world_info

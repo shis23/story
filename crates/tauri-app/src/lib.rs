@@ -45,7 +45,9 @@ pub use commands::writing::{
 // 这里仅向 crate 外暴露这两个命令名——无任何 backend 分派逻辑（gate3 源码级测试
 // 仍锚定 tauri command 属性标记的原函数，分派全部经 AppState::storage() facade）。
 pub use commands::campaigns::set_active_campaign;
+pub use commands::campaigns::set_active_campaign_in_state;
 pub use commands::characters::delete_character;
+pub use commands::meta::meta_accept_patch;
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 use production_postprocess::TurnAttemptSink;

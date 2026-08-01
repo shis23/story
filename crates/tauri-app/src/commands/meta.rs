@@ -25,7 +25,7 @@ impl MetaStreamEvent {
 
 /// 接受并执行 Patch（修改世界书条目或角色字段）
 #[tauri::command]
-pub(crate) fn meta_accept_patch(
+pub fn meta_accept_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
@@ -49,44 +49,50 @@ pub(crate) fn meta_accept_patch(
             .ok_or_else(|| TauriCommandError::not_found(format!("Patch 不存在: {patch_id}")))?
     };
 
-    // 执行 patch：clone 世界书 → 修改 → 写回
-    {
-        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(ref world_info) = ctx.world_info {
-            let mut entries_json: Vec<serde_json::Value> = world_info
-                .entries
-                .iter()
-                .map(|e| to_json_value(e, "world info entry"))
-                .collect::<Result<_, _>>()?;
+    // 执行 patch：先克隆世界书 → 在临时副本上应用 patch（纯计算，不改内存）。
+    // Gate 4 六审 P1：持久化成功后才提交内存态与 applied——避免“前端显示采纳
+    // 成功、权威数据库未更新”的假成功。写盘失败必须返回错误，不得仅 warning。
+    let patched_book: Option<storyforge_domain::world_info::WorldInfoBook> = {
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        ctx.world_info
+            .as_ref()
+            .map(|world_info| {
+                let mut entries_json: Vec<serde_json::Value> = world_info
+                    .entries
+                    .iter()
+                    .map(|e| to_json_value(e, "world info entry"))
+                    .collect::<Result<_, _>>()?;
 
-            let mut patch_ctx = storyforge_app_meta::PatchContext {
-                world_info_entries: Some(&mut entries_json),
-                character_fields: None,
-            };
+                let mut patch_ctx = storyforge_app_meta::PatchContext {
+                    world_info_entries: Some(&mut entries_json),
+                    character_fields: None,
+                };
 
-            storyforge_app_meta::execute_patch(&patch, &mut patch_ctx)
-                .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+                storyforge_app_meta::execute_patch(&patch, &mut patch_ctx)
+                    .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
-            // 反序列化回 WorldInfoEntry 并替换
-            let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
-                .into_iter()
-                .map(|v| {
-                    serde_json::from_value(v.clone()).map_err(|e| {
+                // 反序列化回 WorldInfoEntry 并替换
+                let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::from_value(v.clone()).map_err(|e| {
                         TauriCommandError::internal(format!(
                             "Patch entry failed to deserialize as WorldInfoEntry: {e}, value: {v}"
                         ))
                     })
-                })
-                .collect::<Result<_, _>>()?;
+                    })
+                    .collect::<Result<_, _>>()?;
 
-            let mut new_book = (**world_info).clone();
-            new_book.entries = new_entries;
-            ctx.world_info = Some(Arc::new(new_book));
-        }
-    }
+                let mut new_book = (**world_info).clone();
+                new_book.entries = new_entries;
+                Ok::<_, TauriCommandError>(new_book)
+            })
+            .transpose()?
+    };
 
     // 游玩态：世界书真相源是 Campaign 书，不写回角色卡模板。
     // 无活跃活动时保留库维护路径（写回 CharacterStore 合并视图分流）。
+    // 持久化（写盘）先行——全部成功后才更新内存世界书与 applied。
     let active_campaign_id = state
         .active_campaign
         .lock()
@@ -94,76 +100,86 @@ pub(crate) fn meta_accept_patch(
         .clone();
     if let Some(campaign_id) = active_campaign_id {
         // Gate 4：本局世界书写回经 facade 分派（SQLite 走 V006 表，JSON 走
-        // campaign_world_info 目录），两条路径同一语义。
-        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(ref world_info) = ctx.world_info {
-            if let Err(e) = state.storage().set_world_info(&campaign_id, world_info) {
-                tracing::warn!(
-                    "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
-                    campaign_id
-                );
-            } else {
-                tracing::info!(
-                    "meta_accept_patch 已写回本局世界书 campaign={} entries={}",
-                    campaign_id,
-                    world_info.entries.len()
-                );
-            }
+        // campaign_world_info 目录），两条路径同一语义。失败传播。
+        if let Some(ref world_info) = patched_book {
+            state
+                .storage()
+                .set_world_info(&campaign_id, world_info)
+                .map_err(|e| {
+                    TauriCommandError::storage(format!(
+                        "meta_accept_patch 写回活动世界书失败 campaign={campaign_id}: {e}"
+                    ))
+                })?;
+            tracing::info!(
+                "meta_accept_patch 已写回本局世界书 campaign={} entries={}",
+                campaign_id,
+                world_info.entries.len()
+            );
         }
-    } else {
+    } else if let Some(ref world_info) = patched_book {
         // 持久化到 CharacterStore（同步 world_info_entries）——仅库维护 / 无活动
-        // 从 tool_ctx 取最新的世界书，按 is_global 分流回写：
+        // 从 patch 后的世界书，按 is_global 分流回写：
         //   - 全局条目：写回所有角色卡（跨卡共享语义）
         //   - 非全局条目：只保留在各卡原有的非全局条目里
         //
         // 历史 bug：曾用 `all_stored.last()` 把整个合并视图（全局+多卡 merge）
         // 全部写回最后一张卡，并把 is_global 硬编码 false，导致数据污染与全局标记丢失。
-        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(ref world_info) = ctx.world_info {
-            let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
-                .entries
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e.route,
-                        storyforge_domain::world_info::LoreRoute::Constant
-                            | storyforge_domain::world_info::LoreRoute::Both
-                    )
-                })
-                .map(|e| crate::WorldInfoEntryInfo {
-                    keys: e.keys.clone(),
-                    content: e.content.clone(),
-                    constant: e.constant,
-                    route: format!("{:?}", e.route),
-                    is_global: true,
-                    depth: e.depth,
-                    order: e.order,
-                })
-                .collect();
-            let global_keys_set: std::collections::HashSet<String> =
-                global_entries.iter().map(|e| e.keys.join(",")).collect();
+        let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.route,
+                    storyforge_domain::world_info::LoreRoute::Constant
+                        | storyforge_domain::world_info::LoreRoute::Both
+                )
+            })
+            .map(|e| crate::WorldInfoEntryInfo {
+                keys: e.keys.clone(),
+                content: e.content.clone(),
+                constant: e.constant,
+                route: format!("{:?}", e.route),
+                is_global: true,
+                depth: e.depth,
+                order: e.order,
+            })
+            .collect();
+        let global_keys_set: std::collections::HashSet<String> =
+            global_entries.iter().map(|e| e.keys.join(",")).collect();
 
-            // P1-4 闭环：角色库维护路径经 facade 分派（SQLite 走 V007
-            // characters 表，JSON 走既有 CharacterStore），不再直连 JSON store。
-            let storage = state.storage().clone();
-            let all_stored = storage
-                .list_characters()
-                .map_err(|e| TauriCommandError::storage(format!("角色库读取失败: {e}")))?;
-            for stored in &all_stored {
-                let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
-                    .info
-                    .world_info_entries
-                    .iter()
-                    .filter(|e| !e.is_global && !global_keys_set.contains(&e.keys.join(",")))
-                    .cloned()
-                    .collect();
-                let mut new_entries = preserved_private;
-                new_entries.extend(global_entries.clone());
-                let _ = storage.update_character_world_info_entries_bulk(&stored.id, new_entries);
-            }
+        // P1-4 闭环：角色库维护路径经 facade 分派（SQLite 走 V007
+        // characters 表，JSON 走既有 CharacterStore），不再直连 JSON store。
+        // Gate 4 六审 P1：写盘失败传播，不再 `let _ =` 丢弃。
+        let storage = state.storage().clone();
+        let all_stored = storage
+            .list_characters()
+            .map_err(|e| TauriCommandError::storage(format!("角色库读取失败: {e}")))?;
+        for stored in &all_stored {
+            let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
+                .info
+                .world_info_entries
+                .iter()
+                .filter(|e| !e.is_global && !global_keys_set.contains(&e.keys.join(",")))
+                .cloned()
+                .collect();
+            let mut new_entries = preserved_private;
+            new_entries.extend(global_entries.clone());
+            storage
+                .update_character_world_info_entries_bulk(&stored.id, new_entries)
+                .map_err(|e| {
+                    TauriCommandError::storage(format!(
+                        "meta_accept_patch 写回角色库失败 character={}: {e}",
+                        stored.id
+                    ))
+                })?;
         }
     }
 
+    // 持久化已全部成功——此刻才提交内存世界书与 applied（失败原子性）。
+    if let Some(new_book) = patched_book {
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        ctx.world_info = Some(Arc::new(new_book));
+    }
     // 标记为已执行
     if let Some(p) = state
         .meta_patches

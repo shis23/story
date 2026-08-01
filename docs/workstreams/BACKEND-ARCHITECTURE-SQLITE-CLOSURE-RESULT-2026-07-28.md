@@ -1040,5 +1040,55 @@ character` 收集受影响 Campaign/会话时用 `if let Ok` / `.ok()` 忽略错
 `applicationMethodFlagReferences=0`）/ 前端契约 8/8 / `npm test` 476/476 /
 `npm run build` / `git diff --check`。
 
+### 30.14 Gate 4 七审修复（2026-07-31）
+
+> 六审判定 INCOMPLETE（2 P1 + 1 P2），本段逐项记录修复与证据。独立提交，
+> 未 amend，未 push。
+
+**P1 CharacterCommands“显示支持，实际仍走 JSON”（属实）**：SQLite 能力矩阵把
+`CharacterCommands` 标为 Supported，但 7 条命令仍直接获取 JSON CharacterStore
+（SQLite facade 不构造该 store，前端调用必然失败）：
+- 角色世界书读取 `get_character_world_info` / 世界书单条 `get_character_world_
+  info_entry`（world_info.rs）；
+- Card Shell manifest `get_card_shell_manifest` / inline JS `get_card_shell_inline_js`
+  （card_shell.rs）；
+- 插件角色读取 `plugin_list_characters` / `plugin_read_character` /
+  `plugin_read_world_info`（plugins.rs）。
+- 修复：全部改经 backend-neutral facade——`storage().get_character`（id/source
+  查询）与 `storage().list_characters()`。SQLite 走 V007 角色库，JSON 走既有
+  CharacterStore，同一语义。
+- 门禁：新增递归静态测试 `character_commands_supported_must_never_touch_json_
+  character_store`——扫描 5 个 CharacterCommands 命令文件（characters/world_
+  info/card_shell/plugins/import_export），任何非 `.ok()` 容错形态的
+  `json_character_store` 调用即失败，防止回归。
+
+**P1 legacy Meta Patch 仍会报告假成功（属实）**：`meta_accept_patch` 先改内存
+`tool_ctx.world_info`，活动 Campaign 写盘失败只记 warning、多角色写回 `let _ =`
+丢弃、最后仍把 patch 标为 applied——前端显示采纳成功、权威数据库未更新。
+- 修复：先在**临时副本**上应用 patch（纯计算）→ 持久化（活动 Campaign 走
+  `set_world_info`，无活动走 `update_character_world_info_entries_bulk`），全部
+  成功后才一次性提交内存世界书 + applied；写盘失败 `map_err` 传播返回错误。
+- 测试：新增独立二进制 `sqlite_meta_accept_fault.rs`——触发器（BEFORE
+  INSERT/UPDATE，针对目标 campaign 抛 RAISE(ABORT)）使世界书 UPSERT 失败 →
+  `meta_accept_patch` 必须失败，且 applied 保持 false、tool_ctx 世界书未被改写；
+  撤触发器后成功路径 applied 置 true、落库内容携带 patch。**已验红**（模拟旧
+  实现吞错误 → 测试失败），判别力成立。
+
+**P2 并发测试没有判别力（属实）**：旧测试删 Campaign 后重新激活已删 Campaign
+（存在性校验即失败），旧实现同样失败，无法证明锁内 `after_commit`。
+- 修复：`set_active_campaign_in_state` 提升为 `pub`（lib root `pub use`），测试
+  直接调用并传自定义 `after_commit` 闭包。判别手段：闭包内对
+  `active_campaign_update` 做 `try_lock()`——std::sync::Mutex **非重入**，若命令
+  在锁内调用 after_commit（修复后）`try_lock` 失败、锁外（旧实现）成功。断言
+  `lock_held_during_commit` 为 true。**已验红**（模拟旧实现 after_commit 移出锁
+  外 → 测试失败），确定性判别。
+
+**验证证据（全部通过）**：`cargo fmt --check` / `cargo check --workspace` /
+`clippy --workspace --all-targets -D warnings`（0 警告）/ `cargo test --workspace`
+（全绿，406 lib）/ **11 个 sqlite 集成测试**（含新 `sqlite_meta_accept_fault`）
+全过 / `backend-baseline.mjs`（`commandAttributes=175`、`registered=175`、
+`unsupported: []`、`applicationMethodFlagReferences=0`）/ 前端契约 8/8 /
+`npm test` 476/476 / `npm run build` / `git diff --check`。
+
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。

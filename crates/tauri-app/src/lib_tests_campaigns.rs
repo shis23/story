@@ -1683,3 +1683,39 @@ fn delete_character_command_clears_active_pointer_and_conversation_cache() {
         "tool_ctx characters must drop the deleted character"
     );
 }
+
+/// Gate 4 六审 P1 递归门禁：CharacterCommands 在 SQLite 能力矩阵中为
+/// Supported，命令层**不得**在 Supported 能力路径下直连 JSON CharacterStore
+/// ——SQLite facade 不构造该 store，直连必然失败。
+///
+/// 静态扫描所有 CharacterCommands 命令文件：`json_character_store` 只允许以
+/// 容错形态 `.ok()` 出现（SQLite 下取 None 走降级，不构造 writer）；任何非
+/// 容错调用（`?` / 直接使用返回值）都是违规。逐个文件检查，防止新增回归。
+#[test]
+fn character_commands_supported_must_never_touch_json_character_store() {
+    // 这些文件里的命令都经 CharacterCommands capability 门控（SQLite Supported）。
+    // 门禁：不得出现非容错形态的 json_character_store 调用。
+    let files = [
+        ("characters", include_str!("commands/characters.rs")),
+        ("world_info", include_str!("commands/world_info.rs")),
+        ("card_shell", include_str!("commands/card_shell.rs")),
+        ("plugins", include_str!("commands/plugins.rs")),
+        ("import_export", include_str!("commands/import_export.rs")),
+    ];
+    for (name, source) in files {
+        // 逐行找 json_character_store 调用；.ok() 容错形态允许（降级路径）。
+        let mut line_no = 0;
+        for line in source.lines() {
+            line_no += 1;
+            if line.contains("json_character_store")
+                && !line.contains(".ok()")
+                && !line.contains("json_character_store_owned")
+            {
+                panic!(
+                    "{name}.rs:{line_no}: CharacterCommands 在 SQLite 下 Supported，\
+                     命令层不得直连 json_character_store（应经 storage facade 读取）：{line}"
+                );
+            }
+        }
+    }
+}

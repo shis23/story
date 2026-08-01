@@ -25,13 +25,13 @@ pub(crate) fn get_card_shell_manifest(
             "get card shell manifest",
         )
         .map_err(TauriCommandError::validation)?;
-    let character_store = state.json_character_store(
-        storage_backend::BackendCapability::CharacterCommands,
-        "get card shell manifest",
-    )?;
-    let stored =
-        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
-            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    // Gate 4 六审 P1：经 backend-neutral `get_character` 读取（SQLite 下
+    // facade 不构造 JSON CharacterStore）。
+    let stored = state
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let character = stored_info_to_character(&stored);
     let manifest = storyforge_domain::card_shell::extract_card_shell_manifest(&character);
     // 大 inline TH（创意工坊 60KB+）不整包塞进 manifest，避免 IPC/前端一次反序列化撑爆 WebView。
@@ -81,13 +81,12 @@ pub(crate) fn get_card_shell_inline_js(
             "get card shell inline JavaScript",
         )
         .map_err(TauriCommandError::validation)?;
-    let character_store = state.json_character_store(
-        storage_backend::BackendCapability::CharacterCommands,
-        "get card shell inline JavaScript",
-    )?;
-    let stored =
-        stored_character_for_id_or_source_in_store(character_store, &Id::from_str(&character_id))
-            .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    // Gate 4 六审 P1：经 backend-neutral `get_character` 读取。
+    let stored = state
+        .storage()
+        .get_character(&character_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let character = stored_info_to_character(&stored);
     let manifest = storyforge_domain::card_shell::extract_card_shell_manifest(&character);
     for s in manifest.tavern_helper_modules() {

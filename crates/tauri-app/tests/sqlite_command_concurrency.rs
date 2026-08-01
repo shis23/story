@@ -5,20 +5,24 @@
 //! 写回 tool_ctx”。修复后世界书写入作为 `after_commit` 钩子在 `active_campaign_
 //! update` 锁内执行，与指针提交原子。
 //!
-//! 本测试用 `active_campaign_update` 锁作**可控屏障**，确定性复现危险窗口：
-//! 1. 主线程持有锁；
-//! 2. 删除线程先删数据库（角色级联删掉 Campaign A），随后阻塞在锁上——这正是
-//!    旧实现里“数据库已删、指针尚在、世界书待写”的窗口；
-//! 3. 激活线程对已删除的 A 重新激活，同样阻塞在锁上；
-//! 4. 释放锁后两个线程串行完成。
+//! **判别力设计**：`set_active_campaign_in_state` 的 `validate` 闭包在锁内执行。
+//! 测试用它在锁内作可控屏障：
+//! 1. 删除线程先删数据库（级联删 Campaign A），随后调 `delete_character` 阻塞在
+//!    `active_campaign_update` 锁上；
+//! 2. 激活线程调 `set_active_campaign_in_state`（目标 B），其 `validate` 在锁内
+//!    `wait()` 暂停——此时锁被激活持有，删除线程不可能完成清理；
+//! 3. 放行 validate → 激活写指针 + `after_commit`（置 `world_committed`）→ 释放锁；
+//! 4. 删除线程拿到锁完成清理（置 `delete_done`）。
 //!
-//! 断言最终状态一致：指针绝不指向已删除的 A，tool_ctx.world_info 绝不残留 A
-//! 的书，A 的 Campaign 行已删除。
+//! 断言：`delete_done` 必须晚于 `world_committed`。若 `after_commit` 在锁外（旧
+//! 实现），激活释放锁后删除线程先完成清理、after_commit 后执行 → 时序颠倒 →
+//! 测试变红。因此本测试能区分修复前后。
 //!
 //! `sqlite_runtime::activate` 是进程全局的，因此独立成文件（与既有 sqlite_*
 //! 集成测试同模式）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use storyforge_domain::Id;
@@ -95,18 +99,18 @@ fn tauri_state_for_test(
 }
 
 #[test]
-fn concurrent_delete_and_reactivate_never_leave_stale_world_info() {
+fn activation_world_commit_holds_lock_before_delete_proceeds() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate SQLite authority");
 
-    // ─── 种子：角色 X（含 embedded 书 "active"）+ 卡 X + Campaign A ───────
-    // 只有一套卡/Campaign：delete_character 的级联只影响 A，删掉即没有其它
-    // Campaign 可切——这让“对已删 A 重新激活”必然失败（not_found），最终指针
-    // 只能为 None，世界书只能为空，从而唯一确定地暴露旧窗口。
+    // ─── 种子：角色 X（embedded 书）+ 卡 X + Campaign A + Campaign B ────
+    // 两张卡各自独立 Campaign：删除角色 X 只级联删 A；B 由激活线程切过去。
     let source_id = Id::new();
     let card_id = Id::new();
+    let card_b_id = Id::new();
     let campaign_a = Id::new();
+    let campaign_b = Id::new();
     {
         let info = sample_character_info(
             "Race Hero",
@@ -142,6 +146,11 @@ fn concurrent_delete_and_reactivate_never_leave_stale_world_info() {
         let mut camp_a = Campaign::new(card_id.clone(), "Camp A");
         camp_a.id = campaign_a.clone();
         sqlite_runtime::save_campaign(&camp_a).expect("save campaign A");
+
+        // Campaign B 用独立卡（不随角色 X 级联删除）。
+        let mut camp_b = Campaign::new(card_b_id.clone(), "Camp B");
+        camp_b.id = campaign_b.clone();
+        sqlite_runtime::save_campaign(&camp_b).expect("save campaign B");
     }
 
     let data_dir = temp.path().to_path_buf();
@@ -163,78 +172,103 @@ fn concurrent_delete_and_reactivate_never_leave_stale_world_info() {
         tauri_state_for_test(&state),
     )
     .expect("activate campaign A");
-    assert!(
-        state
-            .tool_ctx
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .world_info
-            .as_ref()
-            .is_some(),
-        "world_info must be injected after activating A"
-    );
 
-    // ─── 可控屏障：主线程持有 update 锁，编排删除→激活 ─────────────────
-    let lock_guard = state
-        .active_campaign_update
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    // ─── 判别力编排 ─────────────────────────────────────────────────────
+    // 判别手段：after_commit 闭包内检查 `active_campaign_update` 锁是否仍被
+    // 本线程持有。Rust 的 std::sync::Mutex **非重入**——若命令在锁内调用
+    // after_commit（修复后），`try_lock()` 返回 Err(WouldBlock)；若命令在锁外
+    // 调用（旧实现 drop(_update) 后），`try_lock()` 返回 Ok。这是确定性判别。
+    let lock_held_during_commit = Arc::new(AtomicBool::new(false));
+    let delete_done = Arc::new(AtomicBool::new(false));
+    // validate 闭包在锁内执行；屏障钉住「激活持有锁、删除等锁」。
+    let validate_entered = Arc::new(std::sync::Barrier::new(2));
+    let release_validate = Arc::new(std::sync::Barrier::new(2));
 
-    // 删除线程：先删数据库（级联删 A），然后阻塞在 update 锁上。
+    // 删除线程：先删库（级联删 A），随后 delete_character 尝试拿锁——若
+    // after_commit 在锁外（旧实现），删除能在激活写世界书前完成清理。
     let delete_thread = {
         let state = Arc::clone(&state);
+        let delete_done = Arc::clone(&delete_done);
         let source = source_id.as_str().to_string();
         std::thread::spawn(move || {
-            // 先删库——此时锁仍被主线程持有，删除在库已删、指针待清的状态阻塞。
             storyforge_lib::delete_character(source, tauri_state_for_test(&state))
+                .expect("delete character");
+            delete_done.store(true, Ordering::SeqCst);
         })
     };
 
-    // 激活线程：对已删除的 A 重新激活（会 not_found），同样阻塞在锁上。
+    // 激活线程：set_active_campaign_in_state(B)。validate 在锁内暂停；after_commit
+    // 闭包检查锁是否仍被持有（锁内调用 → try_lock 失败；锁外调用 → try_lock 成功）。
     let activate_thread = {
         let state = Arc::clone(&state);
-        let id = campaign_a.as_str().to_string();
+        let validate_entered = Arc::clone(&validate_entered);
+        let release_validate = Arc::clone(&release_validate);
+        let lock_held_during_commit = Arc::clone(&lock_held_during_commit);
+        let id = campaign_b.clone();
         std::thread::spawn(move || {
-            storyforge_lib::set_active_campaign(id, tauri_state_for_test(&state))
+            storyforge_lib::set_active_campaign_in_state(
+                state.as_ref(),
+                id,
+                move || {
+                    validate_entered.wait();
+                    release_validate.wait();
+                    Ok(())
+                },
+                move |state, _id| {
+                    // 非重入 Mutex：若锁仍被本线程持有，try_lock 失败。
+                    let lock_held = state.active_campaign_update.try_lock().is_err();
+                    lock_held_during_commit.store(lock_held, Ordering::SeqCst);
+                },
+            )
+            .expect("activate campaign B in state");
         })
     };
 
-    // 给删除线程足够时间完成数据库级联（删 A）并到达锁。
-    // 轮询 DB 直到 A 行消失（证明删除线程已过了“删库”阶段、正阻塞在锁上）。
+    // 等激活线程进入 validate（锁内）。
+    validate_entered.wait();
+    // 此刻激活持有锁、暂停在 validate；删除线程删库后阻塞在锁上。
+    // 给删除线程时间删库（级联删 A）。
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let a_gone = state
+        if state
             .storage()
             .get_campaign(&campaign_a)
             .expect("read campaign A")
-            .is_none();
-        if a_gone {
+            .is_none()
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "delete thread must delete campaign A from the DB within timeout"
+            "delete thread must delete campaign A within timeout"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-
-    // 危险窗口此刻被钉死：DB 已删 A，指针仍指向 A，世界书仍是 A 的书。
-    // 释放锁——删除与激活串行完成。修复后二者都在锁内原子提交，绝不出现
-    // “指针清空、世界书残留 A 的书”。
-    drop(lock_guard);
-
-    let delete_result = delete_thread.join().expect("delete thread join");
-    let activate_result = activate_thread.join().expect("activate thread join");
-
-    // ─── 最终一致性断言 ─────────────────────────────────────────────────
-    delete_result.expect("delete must succeed");
-    // 对已删 A 重新激活必须失败（campaign 不存在）。
+    // 删除线程已删库、正阻塞在锁上（世界书尚未提交）。
     assert!(
-        activate_result.is_err(),
-        "re-activating a deleted campaign must fail"
+        !delete_done.load(Ordering::SeqCst),
+        "delete must be blocked while activation holds the lock"
     );
 
-    // 指针绝不能指向已删除的 A。
+    // 放行 validate → 激活写指针 + after_commit（锁内 try_lock 检查）→ 释放锁。
+    release_validate.wait();
+    activate_thread.join().expect("activate thread join");
+    delete_thread.join().expect("delete thread join");
+
+    // ─── 判别力断言 ─────────────────────────────────────────────────────
+    // 修复后 after_commit 在锁内执行 → try_lock 失败 → lock_held=true。
+    // 旧实现（after_commit 在锁外）→ try_lock 成功 → lock_held=false → 断言红。
+    assert!(
+        lock_held_during_commit.load(Ordering::SeqCst),
+        "after_commit (world-info write) must run while active_campaign_update \
+         is still held: proves the lock wraps the commit"
+    );
+    assert!(
+        delete_done.load(Ordering::SeqCst),
+        "delete must complete after activation commits"
+    );
+
+    // 最终一致性：指针不指向已删 A；世界书不残留 A 的 "active" 书。
     let active = state
         .active_campaign
         .lock()
@@ -245,8 +279,6 @@ fn concurrent_delete_and_reactivate_never_leave_stale_world_info() {
         Some(&campaign_a),
         "active pointer must never point at the deleted campaign A"
     );
-
-    // tool_ctx.world_info 绝不残留 A 的 "active" 书（删除已重建/清空世界书）。
     let world_keys: Vec<String> = state
         .tool_ctx
         .read()
@@ -264,8 +296,7 @@ fn concurrent_delete_and_reactivate_never_leave_stale_world_info() {
         !world_keys.iter().any(|k| k == "active"),
         "tool_ctx.world_info must not carry the deleted campaign A's book, got {world_keys:?}"
     );
-
-    // Campaign 行已删除。
+    // Campaign A 行已删。
     assert!(
         state
             .storage()

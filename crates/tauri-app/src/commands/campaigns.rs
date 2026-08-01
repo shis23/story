@@ -774,7 +774,11 @@ pub fn set_active_campaign(
 /// Gate 4 六审 P1：`after_commit` 在锁内执行——激活命令写指针与写 tool_ctx
 /// 世界书成为一个原子单元，删除线程清指针必须等待整个提交完成，杜绝
 /// “指针已清空、旧 Campaign 世界书又被写回 tool_ctx”的悬挂状态。
-pub(crate) fn set_active_campaign_in_state<F, G>(
+///
+/// Gate 4 七审 P2：提升为 `pub` 供独立并发测试直接调用——测试用 validate
+/// 闭包（锁内执行）作可控屏障，在 after_commit（世界书写入）与删除线程
+/// 之间确定性编排，证明删除线程被锁阻挡。
+pub fn set_active_campaign_in_state<F, G>(
     state: &AppState,
     campaign_id: Id,
     validate: F,

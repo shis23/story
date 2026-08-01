@@ -102,12 +102,12 @@ pub(crate) fn plugin_list_characters(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    // Gate 4 六审 P1：经 backend-neutral facade 读取角色库（SQLite 下
+    // facade 不构造 JSON CharacterStore）。
     Ok(state
-        .json_character_store(
-            crate::storage_backend::BackendCapability::CharacterCommands,
-            "plugin list characters",
-        )?
-        .list()
+        .storage()
+        .list_characters()
+        .map_err(|e| TauriCommandError::storage(format!("角色库读取失败: {e}")))?
         .into_iter()
         .map(CharacterSummary::from)
         .collect())
@@ -124,12 +124,11 @@ pub(crate) fn plugin_read_character(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    // Gate 4 六审 P1：经 backend-neutral facade 读取角色。
     state
-        .json_character_store(
-            crate::storage_backend::BackendCapability::CharacterCommands,
-            "plugin read character",
-        )?
-        .get(&character_id)
+        .storage()
+        .get_character(&character_id)
+        .map_err(|e| TauriCommandError::storage(format!("角色读取失败: {e}")))?
         .map(|s| s.info)
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
 }
@@ -145,12 +144,11 @@ pub(crate) fn plugin_read_world_info(
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadWorldInfo)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    // Gate 4 六审 P1：经 backend-neutral facade 读取角色（含世界书）。
     state
-        .json_character_store(
-            crate::storage_backend::BackendCapability::CharacterCommands,
-            "plugin read character world info",
-        )?
-        .get(&character_id)
+        .storage()
+        .get_character(&character_id)
+        .map_err(|e| TauriCommandError::storage(format!("角色读取失败: {e}")))?
         .map(|s| s.info)
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
 }
