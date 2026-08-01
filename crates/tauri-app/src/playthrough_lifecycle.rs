@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use storyforge_app_conversation::ConversationStore;
 use storyforge_domain::Id;
+use storyforge_domain::campaign::Campaign;
 
 use crate::AppState;
 use crate::campaign_store::CampaignStore;
@@ -19,15 +20,46 @@ impl ConversationDeleter for ConversationStoreDeleter<'_> {
     }
 }
 
+/// Gate 5：Campaign 删除源的 backend-neutral 端口——JSON `CampaignStore` 与
+/// `StorageFacade`（SQLite 单事务级联）都实现它，删除一局活动的编排逻辑只依赖
+/// 该端口，不再直连 JSON store。
+pub(crate) trait CampaignDeleter {
+    fn get_campaign(&self, id: &Id) -> Result<Option<Campaign>, String>;
+    fn delete_campaign(&self, id: &Id) -> Result<bool, String>;
+}
+
+impl CampaignDeleter for CampaignStore {
+    fn get_campaign(&self, id: &Id) -> Result<Option<Campaign>, String> {
+        Ok(CampaignStore::get_campaign(self, id))
+    }
+    fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
+        CampaignStore::delete_campaign(self, id)
+    }
+}
+
+impl CampaignDeleter for crate::storage_backend::StorageFacade {
+    fn get_campaign(&self, id: &Id) -> Result<Option<Campaign>, String> {
+        crate::storage_backend::StorageFacade::get_campaign(self, id)
+            .map(|record| record.map(|record| record.campaign))
+    }
+    fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
+        crate::storage_backend::StorageFacade::delete_campaign(self, id)
+    }
+}
+
 /// 删除一局活动的全部权威数据：Campaign 聚合、绑定会话和活跃指针。
+/// `source` 是 backend-neutral 端口（JSON store 或 StorageFacade）。
 pub(crate) fn delete_campaign_playthrough_in_store(
-    store: &CampaignStore,
+    source: &dyn CampaignDeleter,
     conv_store: &ConversationStore,
     state: &AppState,
     campaign_id: &Id,
 ) -> Result<(), TauriCommandError> {
     let mut conversation_ids = HashSet::new();
-    let campaign_present = if let Some(campaign) = store.get_campaign(campaign_id) {
+    let campaign_present = if let Some(campaign) = source
+        .get_campaign(campaign_id)
+        .map_err(|error| TauriCommandError::storage(format!("读取 campaign 失败: {error}")))?
+    {
         // 同时检查正向绑定与反向 campaign_id，兼容历史上的半绑定数据。
         if let Some(conversation_id) = campaign.conversation_id {
             conversation_ids.insert(conversation_id);
@@ -49,17 +81,21 @@ pub(crate) fn delete_campaign_playthrough_in_store(
 
     let deleter = ConversationStoreDeleter(conv_store);
     delete_campaign_playthrough_with_deleter(
-        store,
+        source,
         state,
         campaign_id,
         campaign_present,
         &conversation_ids,
         &deleter,
-    )
+    )?;
+    // SQLite 级联直接删除 conversations 行（不经 ConversationStore），缓存若不
+    // 失效，后续 find_by_campaign 会命中已删会话 → 二次 delete 行为与 JSON 分叉。
+    conv_store.invalidate();
+    Ok(())
 }
 
 fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
-    store: &CampaignStore,
+    source: &dyn CampaignDeleter,
     state: &AppState,
     campaign_id: &Id,
     campaign_present: bool,
@@ -88,32 +124,33 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         })?;
     }
 
-    // 先删会话。失败时 Campaign 仍存在，用户可以安全重试；
-    // 这是跨 JSON 文件删除无法使用单一事务时的补偿顺序。
-    for conversation_id in conversation_ids {
-        if let Err(error) = deleter.delete(conversation_id) {
-            let restore_error = if pointer_cleared {
-                crate::backend_workflows::save_active_pointer(state.storage(), Some(campaign_id))
-                    .err()
-            } else {
-                None
-            };
-            tracing::warn!(
-                "删除活动 {} 的会话 {} 失败: {error}",
-                campaign_id.as_str(),
-                conversation_id.as_str()
-            );
-            let suffix = restore_error
-                .map(|restore| format!("；恢复活跃活动指针也失败: {restore}"))
-                .unwrap_or_default();
-            return Err(TauriCommandError::storage(format!(
-                "清理会话失败，活动仍保留可重试: {error}{suffix}"
-            )));
-        }
+    // 先删会话 + Turn。失败时 Campaign 仍存在，用户可以安全重试；
+    // 这是跨 JSON 文件删除无法使用单一事务时的补偿顺序。SQLite 由
+    // delete_campaign_cascade 单事务级联删除（facade 内 backend 策略）。
+    if let Err(error) = state.storage().delete_campaign_precursors(
+        campaign_id,
+        conversation_ids,
+        |conversation_id| deleter.delete(conversation_id),
+    ) {
+        let restore_error = if pointer_cleared {
+            crate::backend_workflows::save_active_pointer(state.storage(), Some(campaign_id)).err()
+        } else {
+            None
+        };
+        tracing::warn!(
+            "删除活动 {} 的前置数据（会话/Turn）失败: {error}",
+            campaign_id.as_str()
+        );
+        let suffix = restore_error
+            .map(|restore| format!("；恢复活跃活动指针也失败: {restore}"))
+            .unwrap_or_default();
+        return Err(TauriCommandError::storage(format!(
+            "清理活动前置数据失败，活动仍保留可重试: {error}{suffix}"
+        )));
     }
 
     if campaign_present {
-        let deleted = match store.delete_campaign(campaign_id) {
+        let deleted = match source.delete_campaign(campaign_id) {
             Ok(deleted) => deleted,
             Err(error) => {
                 let restore_error = if pointer_cleared {
@@ -335,7 +372,7 @@ mod tests {
             let delete = std::thread::spawn(move || {
                 delete_start_for_thread.wait();
                 delete_campaign_playthrough_in_store(
-                    &delete_store,
+                    delete_store.as_ref(),
                     &delete_conv_store,
                     &delete_state,
                     &delete_id,
@@ -446,7 +483,7 @@ mod tests {
             let delete = std::thread::spawn(move || {
                 delete_start_for_thread.wait();
                 delete_campaign_playthrough_in_store(
-                    &delete_store,
+                    delete_store.as_ref(),
                     &delete_conv_store,
                     &delete_state,
                     &delete_id,

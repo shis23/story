@@ -53,16 +53,15 @@ fn sqlite_meta_and_world_info_capabilities_are_supported_and_remaining_gaps_fail
             .require_supported(capability, operation)
             .expect("SQLite capability must be supported");
     }
-    // 仍显式 unsupported 的剩余缺口（Campaign lifecycle）必须带 operation
-    // 名 fail closed，不能静默空列表。
-    let error = storage
+    // Gate 5：Campaign lifecycle 由 Unsupported 补齐为 Supported（等价矩阵
+    // 需要 create/update/delete 在 SQLite 下可运行）；ActiveCampaignPersistence
+    // 仍为 Degraded（进程内选择，文档化）。
+    storage
         .require_supported(
             storage_backend::BackendCapability::CampaignLifecycle,
             "campaign lifecycle",
         )
-        .expect_err("SQLite capability must fail closed before a JSON store is consulted");
-    assert!(error.contains("campaign lifecycle"));
-    assert!(error.contains("Unsupported"));
+        .expect("SQLite campaign lifecycle must be supported after Gate 5");
     storage
         .require_supported(
             storage_backend::BackendCapability::MvuTranslation,

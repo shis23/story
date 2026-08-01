@@ -193,6 +193,22 @@ impl TurnStore {
         Ok(())
     }
 
+    /// 删除某 Campaign 的全部 Turn，返回删除条数。
+    ///
+    /// JSON 路径 campaign 删除级联用：turns.json 与 CampaignStore 分开持久化，
+    /// SQLite 由 `delete_campaign_cascade` 单事务级联删除，本方法仅 JSON 使用。
+    /// 无 Turn 时不写盘（幂等 no-op）。
+    pub fn delete_turns_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
+        let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        let before = turns.len();
+        turns.retain(|t| &t.campaign_id != campaign_id);
+        let deleted = before - turns.len();
+        if deleted > 0 {
+            persist_turns(&self.turns_path, &turns)?;
+        }
+        Ok(deleted)
+    }
+
     // ─── 测试辅助 ──────────────────────────────────────────────────────────
 
     /// 列全部 Turn（测试和调试用）

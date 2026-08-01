@@ -178,11 +178,18 @@ fn activation_world_commit_holds_lock_before_delete_proceeds() {
     // 本线程持有。Rust 的 std::sync::Mutex **非重入**——若命令在锁内调用
     // after_commit（修复后），`try_lock()` 返回 Err(WouldBlock)；若命令在锁外
     // 调用（旧实现 drop(_update) 后），`try_lock()` 返回 Ok。这是确定性判别。
+    //
+    // Gate 5 注（既有 flake 修复，仅测试编排）：删除线程必须先等
+    // `delete_start` 屏障——主线程确认激活线程已进入 validate（锁内）后才
+    // 放行删除。否则删除线程可能在激活线程取锁前整体完成，`!delete_done`
+    // 断言在无竞态缺陷时也会偶发失败（基线 HEAD 301164c 复现，与生产代码
+    // 无关）。放行后删除必被锁阻塞，`!delete_done` 成为确定性断言。
     let lock_held_during_commit = Arc::new(AtomicBool::new(false));
     let delete_done = Arc::new(AtomicBool::new(false));
     // validate 闭包在锁内执行；屏障钉住「激活持有锁、删除等锁」。
     let validate_entered = Arc::new(std::sync::Barrier::new(2));
     let release_validate = Arc::new(std::sync::Barrier::new(2));
+    let delete_start = Arc::new(std::sync::Barrier::new(2));
 
     // 删除线程：先删库（级联删 A），随后 delete_character 尝试拿锁——若
     // after_commit 在锁外（旧实现），删除能在激活写世界书前完成清理。
@@ -190,7 +197,9 @@ fn activation_world_commit_holds_lock_before_delete_proceeds() {
         let state = Arc::clone(&state);
         let delete_done = Arc::clone(&delete_done);
         let source = source_id.as_str().to_string();
+        let delete_start = Arc::clone(&delete_start);
         std::thread::spawn(move || {
+            delete_start.wait();
             storyforge_lib::delete_character(source, tauri_state_for_test(&state))
                 .expect("delete character");
             delete_done.store(true, Ordering::SeqCst);
@@ -226,7 +235,8 @@ fn activation_world_commit_holds_lock_before_delete_proceeds() {
 
     // 等激活线程进入 validate（锁内）。
     validate_entered.wait();
-    // 此刻激活持有锁、暂停在 validate；删除线程删库后阻塞在锁上。
+    // 此刻激活持有锁、暂停在 validate；放行删除线程（删库后必阻塞在锁上）。
+    delete_start.wait();
     // 给删除线程时间删库（级联删 A）。
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

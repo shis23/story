@@ -47,7 +47,22 @@ pub use commands::writing::{
 pub use commands::campaigns::set_active_campaign;
 pub use commands::campaigns::set_active_campaign_in_state;
 pub use commands::characters::delete_character;
+pub use commands::import_export::CampaignBundle;
 pub use commands::meta::meta_accept_patch;
+pub use commands::meta_typed::{meta_accept_typed_patch, meta_propose_campaign_repairs};
+// Gate 5：后端等价套件（tests/backend_parity_suite.rs）以真实命令驱动 JSON 与
+// SQLite 两套 AppState。命令函数本体提升为 `pub`（签名不变），此处仅暴露命令
+// 名——无任何 backend 分派逻辑。
+pub use commands::campaigns::{
+    add_campaign_instance, apply_campaign_opening, create_campaign, delete_campaign,
+    extract_characters, fork_campaign,
+};
+pub use commands::cards::{delete_card, get_card, list_cards};
+pub use commands::memory::{abandon_task, complete_task, create_task};
+pub use commands::variables::{
+    add_campaign_variable, promote_temporary_instance, set_campaign_variable,
+    set_character_variable, sync_campaign_variable_schema,
+};
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 use production_postprocess::TurnAttemptSink;
@@ -978,16 +993,6 @@ impl AppState {
     /// （读取断言/种子），签名不变。
     pub fn storage(&self) -> &Arc<storage_backend::StorageFacade> {
         &self.storage
-    }
-
-    pub(crate) fn json_campaign_store(
-        &self,
-        capability: storage_backend::BackendCapability,
-        operation: &str,
-    ) -> Result<&campaign_store::CampaignStore, TauriCommandError> {
-        self.storage
-            .json_campaign_store(capability, operation)
-            .map_err(TauriCommandError::validation)
     }
 
     pub(crate) fn json_character_store(

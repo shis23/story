@@ -60,6 +60,16 @@ pub enum SqliteError {
     #[error("production repository record not found: {0}")]
     RecordNotFound(String),
 
+    /// 领域层 NotFound 的镜像（JSON 路径经 TauriCommandError::not_found 渲染
+    /// "Not found: {0}"）；等价矩阵要求同一领域错误双后端文本一致，不能把
+    /// 领域校验错误包装成存储层 RecordNotFound。
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    /// 领域层校验错误的镜像（JSON 路径渲染 "Validation error: {0}"）。
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("{0}")]
     Other(String),
 }

@@ -29,7 +29,10 @@ use crate::storage::CharacterStore;
 use crate::stored_character_for_id_or_source_in_store;
 use crate::turn_store::TurnStore;
 use storyforge_domain::Id;
-use storyforge_domain::campaign::Campaign;
+use storyforge_domain::campaign::{Campaign, CharacterInstance};
+use storyforge_domain::character::CharacterCard;
+use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+use storyforge_domain::story_task::StoryTask;
 
 /// Gate 4 P1-4: the character library DTO re-exported through the facade so
 /// both backends expose one application-level character contract.
@@ -160,6 +163,17 @@ pub struct CampaignRecord {
     pub instance_count: usize,
 }
 
+/// 跨后端 compress job 状态 DTO（id + 状态 + 尝试次数）。
+/// Gate 5 等价矩阵：JSON CompressJobStore 与 SQLite compress_jobs 表经同一
+/// facade 契约暴露，调用方无需感知物理布局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressJobState {
+    pub id: Id,
+    pub campaign_id: Id,
+    pub status: String,
+    pub attempts: u32,
+}
+
 impl StorageFacade {
     pub fn new(data_dir: PathBuf, pinned: PinnedBackend) -> Self {
         let (json_campaign_store, json_character_store, json_turn_store, json_compress_job_store) =
@@ -229,12 +243,14 @@ impl StorageFacade {
             | BackendCapability::ChronicleCompressor
             | BackendCapability::StoryClock
             | BackendCapability::CharacterCommands
-            | BackendCapability::ImportExport => CapabilityStatus::Supported,
-            BackendCapability::ActiveCampaignPersistence => CapabilityStatus::Degraded,
-            BackendCapability::CampaignLifecycle
+            | BackendCapability::ImportExport
+            // Gate 5：create/update/delete 等价矩阵所需的四族能力补齐为
+            // SQLite-native（facade 分派 + sqlite_runtime UoW）。
+            | BackendCapability::CampaignLifecycle
             | BackendCapability::CardCommands
             | BackendCapability::KnowledgeTaskCommands
-            | BackendCapability::VariableCommands => CapabilityStatus::Unsupported,
+            | BackendCapability::VariableCommands => CapabilityStatus::Supported,
+            BackendCapability::ActiveCampaignPersistence => CapabilityStatus::Degraded,
         }
     }
 
@@ -345,6 +361,97 @@ impl StorageFacade {
         })
     }
 
+    /// 入队（或返回既有 open job）。返回 (job_id, created)。
+    pub fn enqueue_compress_job(
+        &self,
+        campaign_id: &Id,
+        conversation_id: Option<Id>,
+        lineage_id: Option<Id>,
+        uncovered_a: u32,
+        uncovered_b: u32,
+    ) -> Result<(Id, bool), String> {
+        if self.is_sqlite() {
+            let (job, created) = sqlite_runtime::compress_enqueue_or_get_open(
+                campaign_id,
+                conversation_id,
+                lineage_id,
+                uncovered_a,
+                uncovered_b,
+            )?;
+            Ok((job.id, created))
+        } else {
+            let store = self.json_compress_job_store("enqueue chronicle compression")?;
+            let (job, created) = store.enqueue_or_get_open(
+                campaign_id,
+                conversation_id,
+                lineage_id,
+                uncovered_a,
+                uncovered_b,
+            )?;
+            Ok((job.id, created))
+        }
+    }
+
+    /// 原子 claim：Pending → Running；已被 claim/终态返回 false。
+    pub fn claim_compress_job(&self, job_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::compress_try_claim_pending(job_id)
+        } else {
+            self.json_compress_job_store("claim chronicle compression")?
+                .try_claim_pending(job_id)
+        }
+    }
+
+    /// 成功完成：Running → Succeeded。返回是否发生了转换。
+    pub fn succeed_compress_job(&self, job_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::compress_mark_succeeded(job_id)
+        } else {
+            let store = self.json_compress_job_store("succeed chronicle compression")?;
+            store.mark_succeeded(job_id)?;
+            Ok(true)
+        }
+    }
+
+    /// 失败：未达 max_attempts 回 Pending（可重试），否则 Failed。
+    pub fn fail_or_retry_compress_job(&self, job_id: &Id, err: &str) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::compress_mark_failed_or_retry(job_id, err)
+        } else {
+            let store = self.json_compress_job_store("fail chronicle compression")?;
+            store.mark_failed_or_retry(job_id, err)?;
+            Ok(true)
+        }
+    }
+
+    /// 全部 compress job 的当前状态（等价矩阵比较用）。
+    pub fn list_compress_jobs(&self) -> Result<Vec<CompressJobState>, String> {
+        let mut jobs: Vec<CompressJobState> = if self.is_sqlite() {
+            sqlite_runtime::compress_list_all()?
+                .into_iter()
+                .map(|job| CompressJobState {
+                    id: job.id,
+                    campaign_id: job.campaign_id,
+                    status: format!("{:?}", job.status).to_lowercase(),
+                    attempts: job.attempts,
+                })
+                .collect()
+        } else {
+            self.json_compress_job_store("list chronicle compression")?
+                .list_all()
+                .into_iter()
+                .map(|job| CompressJobState {
+                    id: job.id,
+                    campaign_id: job.campaign_id,
+                    status: format!("{:?}", job.status).to_lowercase(),
+                    attempts: job.attempts,
+                })
+                .collect()
+        };
+        jobs.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        Ok(jobs)
+    }
+
     pub fn get_active_turn(
         &self,
         campaign_id: &Id,
@@ -426,6 +533,191 @@ impl StorageFacade {
         } else {
             self.json_campaign_store(BackendCapability::CampaignLifecycle, "save campaign")?
                 .update_campaign(campaign.clone())
+        }
+    }
+
+    // ─── Gate 5: CRUD parity 分派（等价 JSON CampaignStore 语义）───────────
+
+    /// JSON `CampaignStore::update_campaign` 语义：仅更新既有 Campaign。
+    pub fn update_campaign(&self, campaign: &Campaign) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::update_campaign(campaign).map(|_| ())
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "update campaign")?
+                .update_campaign(campaign.clone())
+        }
+    }
+
+    /// JSON `CampaignStore::add_instance` 语义：追加/替换实例。
+    pub fn add_instance(&self, instance: &CharacterInstance) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_instance(instance)
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "add instance")?
+                .add_instance(instance.clone())
+        }
+    }
+
+    /// JSON `CampaignStore::update_instance` 语义：仅更新既有实例。
+    pub fn update_instance(&self, instance: &CharacterInstance) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::update_instance(instance).map(|_| ())
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "update instance")?
+                .update_instance(instance.clone())
+        }
+    }
+
+    /// JSON `CampaignStore::create_campaign_with_instances` 语义：Campaign +
+    /// Protagonist/Supporting 实例原子写入，返回 (StoredCard, Campaign, count)。
+    pub fn create_campaign_with_instances(
+        &self,
+        campaign: Campaign,
+    ) -> Result<(StoredCard, Campaign, usize), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::create_campaign_with_instances(&campaign)
+        } else {
+            self.json_campaign_store(
+                BackendCapability::CampaignLifecycle,
+                "create campaign with instances",
+            )?
+            .create_campaign_with_instances(campaign)
+        }
+    }
+
+    /// JSON `CampaignStore::delete_campaign` 语义：级联删除一局活动。
+    pub fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_campaign_cascade(id)
+        } else {
+            self.json_campaign_store(BackendCapability::CampaignLifecycle, "delete campaign")?
+                .delete_campaign(id)
+        }
+    }
+
+    /// 删除一局活动的前置产物（会话 + Turn），供 playthrough 删除在删除
+    /// Campaign **之前**调用：JSON 多文件无事务，先删会话/Turn、失败时
+    /// Campaign 仍在可重试；SQLite 的 `delete_campaign_cascade` 在同一事务内
+    /// 级联删除 conversations + turns，前置清理是 no-op（单独的会话删除会
+    /// 撞上「有 turn history 拒绝删除」的孤儿守卫，合法级联被误伤）。
+    pub fn delete_campaign_precursors(
+        &self,
+        campaign_id: &Id,
+        conversation_ids: &std::collections::HashSet<Id>,
+        mut delete_conversation: impl FnMut(&Id) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.is_sqlite() {
+            return Ok(());
+        }
+        for conversation_id in conversation_ids {
+            delete_conversation(conversation_id)?;
+        }
+        // turns.json 与 CampaignStore 分开持久化：删除本局 Turn。
+        self.json_turn_store("delete campaign turns")?
+            .delete_turns_for_campaign(campaign_id)
+            .map(|_| ())
+    }
+
+    /// JSON `CampaignStore::get_task` 语义。
+    pub fn get_task(&self, task_id: &Id) -> Result<Option<StoryTask>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::get_task(task_id)
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::KnowledgeTaskRead, "get task")?
+                .get_task(task_id))
+        }
+    }
+
+    /// JSON `CampaignStore::add_task` 语义。
+    pub fn add_task(&self, task: &StoryTask) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_task(task)
+        } else {
+            self.json_campaign_store(BackendCapability::KnowledgeTaskCommands, "add task")?
+                .add_task(task.clone())
+        }
+    }
+
+    /// JSON `CampaignStore::update_task` 语义：仅更新既有任务。
+    pub fn update_task(&self, task: &StoryTask) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::update_task(task).map(|_| ())
+        } else {
+            self.json_campaign_store(BackendCapability::KnowledgeTaskCommands, "update task")?
+                .update_task(task.clone())
+        }
+    }
+
+    /// JSON `CampaignStore::delete_task` 语义。
+    pub fn delete_task(&self, task_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_task(task_id)
+        } else {
+            self.json_campaign_store(BackendCapability::KnowledgeTaskCommands, "delete task")?
+                .delete_task(task_id)
+        }
+    }
+
+    /// JSON `CampaignStore::add_knowledge` 语义：批量追加知识条目。
+    pub fn add_knowledge(&self, entries: &[CharacterKnowledgeEntry]) -> Result<(), String> {
+        if self.is_sqlite() {
+            sqlite_runtime::add_knowledge_batch(entries)
+        } else {
+            self.json_campaign_store(BackendCapability::KnowledgeTaskCommands, "add knowledge")?
+                .add_knowledge(entries.to_vec())
+        }
+    }
+
+    /// JSON `CampaignStore::delete_knowledge` 语义。
+    pub fn delete_knowledge(&self, knowledge_id: &Id) -> Result<bool, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::delete_knowledge(knowledge_id)
+        } else {
+            self.json_campaign_store(BackendCapability::KnowledgeTaskCommands, "delete knowledge")?
+                .delete_knowledge(knowledge_id)
+        }
+    }
+
+    /// 列出全部角色卡（StoredCard 形态）。
+    pub fn list_cards(&self) -> Result<Vec<StoredCard>, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::list_card_payloads()?
+                .into_iter()
+                .map(|payload| {
+                    serde_json::from_value(payload)
+                        .map_err(|e| format!("解析角色卡 payload 失败: {e}"))
+                })
+                .collect()
+        } else {
+            Ok(self
+                .json_campaign_store(BackendCapability::CardCommands, "list cards")?
+                .list_cards())
+        }
+    }
+
+    /// JSON `CampaignStore::save_card` 语义：按 source_character_id 去重覆盖。
+    ///
+    /// SQLite 差异（fail-closed，已记录）：JSON 会静默移除被 Campaign 引用的
+    /// 旧卡（留下孤儿引用）；SQLite 的 `campaigns.card_id` FK 拒绝删除被引用
+    /// 的卡行，返回错误而非静默孤儿化。不触发该分支的路径两后端行为一致。
+    pub fn save_card(&self, card: CharacterCard) -> Result<StoredCard, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_card_with_dedupe(card)
+        } else {
+            self.json_campaign_store(BackendCapability::CardCommands, "save card")?
+                .save_card(card)
+        }
+    }
+
+    /// JSON `CampaignStore::save_card_if_no_campaigns` 语义：被 Campaign 引用的
+    /// 卡拒绝覆盖（`FORCE_RERUN_BLOCKED_BY_CAMPAIGN`）。
+    pub fn save_card_if_no_campaigns(&self, card: CharacterCard) -> Result<StoredCard, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::save_card_with_dedupe(card)
+        } else {
+            self.json_campaign_store(BackendCapability::CardCommands, "save card")?
+                .save_card_if_no_campaigns(card)
         }
     }
 
@@ -1532,7 +1824,7 @@ mod tests {
         );
         assert_eq!(
             facade.capability(BackendCapability::CardCommands),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::CharacterCommands),
@@ -1548,11 +1840,15 @@ mod tests {
         );
         assert_eq!(
             facade.capability(BackendCapability::VariableCommands),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::KnowledgeTaskCommands),
-            CapabilityStatus::Unsupported
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            facade.capability(BackendCapability::CampaignLifecycle),
+            CapabilityStatus::Supported
         );
         assert_eq!(
             facade.capability(BackendCapability::WorldInfo),
@@ -1599,14 +1895,14 @@ mod tests {
             BackendCapability::StoryClock,
             BackendCapability::CharacterCommands,
             BackendCapability::ImportExport,
-        ];
-        let degraded = [BackendCapability::ActiveCampaignPersistence];
-        let unsupported = [
+            // Gate 5：四族 create/update/delete 补齐为 SQLite-native。
             BackendCapability::CampaignLifecycle,
             BackendCapability::CardCommands,
             BackendCapability::KnowledgeTaskCommands,
             BackendCapability::VariableCommands,
         ];
+        let degraded = [BackendCapability::ActiveCampaignPersistence];
+        let unsupported: [BackendCapability; 0] = [];
         assert_eq!(
             supported.len() + degraded.len() + unsupported.len(),
             BackendCapability::ALL.len()

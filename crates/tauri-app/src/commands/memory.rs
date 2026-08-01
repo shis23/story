@@ -266,7 +266,7 @@ pub(crate) fn list_tasks(
 
 /// 创建任务（前端 UI：用户手动规划伏笔/目标）
 #[tauri::command]
-pub(crate) fn create_task(
+pub fn create_task(
     campaign_id: String,
     title: String,
     description: String,
@@ -278,10 +278,6 @@ pub(crate) fn create_task(
         return Err("任务标题不能为空".into());
     }
     // P0-7：活动 Turn 期间拒绝直接写任务
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::KnowledgeTaskCommands,
-        "create story task",
-    )?;
     reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
     let task = storyforge_domain::story_task::StoryTask::user_planned(
         Id::from_str(&campaign_id),
@@ -291,52 +287,51 @@ pub(crate) fn create_task(
         created_turn.unwrap_or(0),
     );
     let id = task.id.to_string();
-    store
-        .add_task(task)
+    state
+        .storage()
+        .add_task(&task)
         .map_err(|e| TauriCommandError::storage(format!("创建任务失败: {e}")))?;
     Ok(id)
 }
 
 /// 标记任务完成（用户确认）
 #[tauri::command]
-pub(crate) fn complete_task(
+pub fn complete_task(
     task_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::KnowledgeTaskCommands,
-        "complete story task",
-    )?;
-    let mut task = store
+    let mut task = state
+        .storage()
         .get_task(&Id::from_str(&task_id))
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     // P0-7：活动 Turn 期间拒绝直接写任务
     reject_if_active_turn(state.storage(), &task.campaign_id)?;
     task.complete();
-    store
-        .update_task(task)
+    state
+        .storage()
+        .update_task(&task)
         .map_err(|e| TauriCommandError::storage(format!("完成任务失败: {e}")))?;
     Ok(())
 }
 
 /// 放弃任务
 #[tauri::command]
-pub(crate) fn abandon_task(
+pub fn abandon_task(
     task_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::KnowledgeTaskCommands,
-        "abandon story task",
-    )?;
-    let mut task = store
+    let mut task = state
+        .storage()
         .get_task(&Id::from_str(&task_id))
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     // P0-7：活动 Turn 期间拒绝直接写任务
     reject_if_active_turn(state.storage(), &task.campaign_id)?;
     task.abandon();
-    store
-        .update_task(task)
+    state
+        .storage()
+        .update_task(&task)
         .map_err(|e| TauriCommandError::storage(format!("放弃任务失败: {e}")))?;
     Ok(())
 }

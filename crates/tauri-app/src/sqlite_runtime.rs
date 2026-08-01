@@ -333,6 +333,166 @@ pub fn save_task(task: &storyforge_domain::story_task::StoryTask) -> Result<(), 
     with_db_mut(|db| SqliteProductionRepository::save_task(db, task).map_err(|e| e.to_string()))
 }
 
+// ─── Gate 5: CRUD parity primitives（等价 JSON CampaignStore 语义）────────
+
+/// JSON `CampaignStore::get_task` 等价：读取单条任务（缺失 → Ok(None)）。
+pub fn get_task(task_id: &Id) -> Result<Option<StoryTask>, String> {
+    with_db(|db| SqliteProductionRepository::get_task(db, task_id).map_err(|e| e.to_string()))
+}
+
+/// JSON `CampaignStore::update_task` 等价：仅当行存在时更新。
+pub fn update_task(task: &StoryTask) -> Result<bool, String> {
+    with_db_mut(|db| SqliteProductionRepository::update_task(db, task).map_err(|e| e.to_string()))
+}
+
+/// JSON `CampaignStore::delete_task` 等价：删除任务行，返回是否删除。
+pub fn delete_task(task_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::delete_task(db, task_id).map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::update_campaign` 等价：仅当行存在时更新
+/// （缺失 → Ok(false)，不创建）。
+pub fn update_campaign(campaign: &Campaign) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::update_campaign(db, campaign).map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::update_instance` 等价：仅当行存在时更新。
+pub fn update_instance(instance: &CharacterInstance) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::update_instance(db, instance).map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::add_knowledge` 等价：单事务批量 upsert 知识条目。
+pub fn add_knowledge_batch(entries: &[CharacterKnowledgeEntry]) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::add_knowledge_batch(db, entries).map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::create_campaign_with_instances` 等价：从卡 payload 构建
+/// Protagonist/Supporting 实例并单事务写入（清空既有实例 → Campaign → 实例）。
+/// 返回 (StoredCard, Campaign, instance_count)，与 JSON 语义一致。
+pub fn create_campaign_with_instances(
+    campaign: &Campaign,
+) -> Result<(crate::campaign_store::StoredCard, Campaign, usize), String> {
+    use storyforge_domain::character::RoleType;
+    with_db_mut(|db| {
+        let card_payload = SqliteProductionRepository::get_card_payload(db, &campaign.card_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("card not found: {}", campaign.card_id))?;
+        let stored: crate::campaign_store::StoredCard = serde_json::from_value(card_payload)
+            .map_err(|e| format!("解析角色卡 payload 失败: {e}"))?;
+        let mut instances: Vec<CharacterInstance> = Vec::new();
+        let mut instance_count = 0usize;
+        for def in &stored.card.character_definitions {
+            if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
+                instances.push(CharacterInstance::from_definition(campaign.id.clone(), def));
+                instance_count += 1;
+            }
+        }
+        SqliteProductionRepository::create_campaign_with_instances(db, campaign, &instances)
+            .map_err(|e| e.to_string())?;
+        Ok((stored, campaign.clone(), instance_count))
+    })
+}
+
+/// JSON `CampaignStore::delete_knowledge` 等价：删除知识条目行，返回是否删除。
+pub fn delete_knowledge(knowledge_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::delete_knowledge(db, knowledge_id).map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::delete_campaign` 等价：单事务级联删除一局活动
+/// （含会话/任务/知识/实例/世界书/总结/台账），返回是否删除。
+pub fn delete_campaign_cascade(campaign_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::delete_campaign_cascade(db, campaign_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// JSON `CampaignStore::save_card` / `save_card_if_no_campaigns` 等价：按
+/// source_character_id 去重覆盖，事务内完成。被替换的卡（含新卡自身 id）若被
+/// Campaign 引用则返回 `FORCE_RERUN_BLOCKED_BY_CAMPAIGN`——JSON `save_card`
+/// 会静默移除旧卡留下孤儿引用，SQLite 的 `campaigns.card_id` FK 无法表达孤儿
+/// 引用，统一 fail-closed 拒绝（差异已记录，不影响正常路径）。
+pub fn save_card_with_dedupe(
+    card: CharacterCard,
+) -> Result<crate::campaign_store::StoredCard, String> {
+    let imported_at = chrono::Utc::now().to_rfc3339();
+    let stored = crate::campaign_store::StoredCard {
+        card: card.clone(),
+        imported_at: imported_at.clone(),
+    };
+    let payload = serde_json::to_value(&stored).map_err(|e| format!("序列化角色卡失败: {e}"))?;
+    with_db_mut(|db| {
+        let tx = db
+            .connection_mut()
+            .transaction()
+            .map_err(|e| e.to_string())?;
+        let replaced_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT card_id FROM character_cards WHERE source_character_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([card.source_character_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !replaced_ids.is_empty() {
+            // 与 JSON `save_card_if_no_campaigns` 同口径：被替换的卡（含新卡
+            // 自身 id）若被 Campaign 引用则拒绝覆盖，绝不静默孤儿化。
+            let campaigns: i64 = {
+                let placeholders = replaced_ids
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql =
+                    format!("SELECT COUNT(*) FROM campaigns WHERE card_id IN ({placeholders})");
+                let params = rusqlite::params_from_iter(replaced_ids.iter());
+                tx.query_row(&sql, params, |row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?
+            };
+            if campaigns > 0 {
+                return Err(crate::campaign_store::FORCE_RERUN_BLOCKED_BY_CAMPAIGN.to_string());
+            }
+            for replaced_id in &replaced_ids {
+                tx.execute(
+                    "DELETE FROM character_cards WHERE card_id = ?1",
+                    [replaced_id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute(
+            r#"
+            INSERT INTO character_cards (card_id, source_character_id, name, imported_at, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            rusqlite::params![
+                card.id.as_str(),
+                card.source_character_id.as_str(),
+                card.name,
+                imported_at,
+                serde_json::to_string(&payload).map_err(|e| e.to_string())?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(stored)
+    })
+}
+
 // ─── MVU 翻译缓存（V005；#22 SQLite 权威補齐）────────────────────────────
 
 pub fn save_mvu(stored: &crate::campaign_store::StoredMvuTranslation) -> Result<(), String> {

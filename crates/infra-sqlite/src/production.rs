@@ -429,6 +429,224 @@ impl SqliteProductionRepository {
         Ok(removed > 0)
     }
 
+    // ─── Gate 5: CRUD parity primitives（等价 JSON CampaignStore 语义）──────
+
+    /// JSON `CampaignStore::update_campaign` 等价：仅当行存在时整体更新
+    /// （缺失 → 返回 false，不报错，不创建）。Gate 5 变量/任务命令 RMW 落盘。
+    pub fn update_campaign(db: &mut Database, campaign: &Campaign) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let updated = tx.execute(
+            r#"
+            UPDATE campaigns SET
+                card_id=?2, name=?3, conversation_id=?4, revision=?5,
+                chronicle_revision=?6, lineage_id=?7, story_clock=?8,
+                created_at=?9, payload_json=?10
+            WHERE campaign_id=?1
+            "#,
+            rusqlite::params![
+                campaign.id.as_str(),
+                campaign.card_id.as_str(),
+                campaign.name,
+                campaign.conversation_id.as_ref().map(Id::as_str),
+                campaign.revision,
+                campaign.chronicle_revision,
+                campaign.lineage_id.as_ref().map(Id::as_str),
+                campaign.current_story_clock(),
+                campaign.created_at,
+                json(campaign)?,
+            ],
+        )?;
+        uow.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// JSON `CampaignStore::update_instance` 等价：仅当行存在时更新。
+    pub fn update_instance(db: &mut Database, instance: &CharacterInstance) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let updated = tx.execute(
+            r#"
+            UPDATE character_instances SET
+                campaign_id=?2, definition_id=?3, name=?4, is_temporary=?5,
+                payload_json=?6
+            WHERE instance_id=?1
+            "#,
+            rusqlite::params![
+                instance.id.as_str(),
+                instance.campaign_id.as_str(),
+                instance.definition_id.as_ref().map(Id::as_str),
+                instance.name,
+                instance.is_temporary,
+                json(instance)?,
+            ],
+        )?;
+        uow.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// JSON `CampaignStore::update_task` 等价：仅当行存在时更新。
+    pub fn update_task(db: &mut Database, task: &StoryTask) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let updated = tx.execute(
+            r#"
+            UPDATE story_tasks SET campaign_id=?2, payload_json=?3
+            WHERE task_id=?1
+            "#,
+            rusqlite::params![task.id.as_str(), task.campaign_id.as_str(), json(task)?],
+        )?;
+        uow.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// JSON `CampaignStore::delete_task` 等价：删除任务行，返回是否删除。
+    pub fn delete_task(db: &mut Database, task_id: &Id) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM story_tasks WHERE task_id = ?1",
+            [task_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// JSON `CampaignStore::add_knowledge` 等价：单事务批量 upsert 知识条目
+    /// （任一失败整体回滚，无部分写入）。
+    pub fn add_knowledge_batch(
+        db: &mut Database,
+        entries: &[CharacterKnowledgeEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        for entry in entries {
+            tx.execute(
+                r#"
+                INSERT INTO character_knowledge (knowledge_id, campaign_id, payload_json)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(knowledge_id) DO UPDATE SET
+                    campaign_id=excluded.campaign_id, payload_json=excluded.payload_json
+                "#,
+                rusqlite::params![entry.id.as_str(), entry.campaign_id.as_str(), json(entry)?],
+            )?;
+        }
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// JSON `CampaignStore::create_campaign_with_instances` 等价：单事务内
+    /// 先清空该 campaign 的既有实例（幂等重开档），再写 Campaign 聚合与
+    /// 全部实例——任一失败整体回滚。
+    pub fn create_campaign_with_instances(
+        db: &mut Database,
+        campaign: &Campaign,
+        instances: &[CharacterInstance],
+    ) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        tx.execute(
+            "DELETE FROM character_instances WHERE campaign_id = ?1",
+            [campaign.id.as_str()],
+        )?;
+        write_campaign(tx, campaign)?;
+        for instance in instances {
+            write_instance(tx, instance)?;
+        }
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// JSON `CampaignStore::delete_campaign` 等价：单事务内按依赖序级联清理
+    /// 一局活动的全部 SQLite 行（mutation_commits → chronicle jobs →
+    /// preaccept_outbox → attempts → turns → conversations → summaries/covers →
+    /// tasks/knowledge/instances/world_info → campaign）。FK 失败整体回滚。
+    /// 返回是否实际删除。
+    pub fn delete_campaign_cascade(db: &mut Database, campaign_id: &Id) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM campaigns WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            uow.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM mutation_commits WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM chronicle_publication_jobs WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM chronicle_compress_jobs WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM preaccept_outbox WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM turn_attempts WHERE turn_id IN \
+             (SELECT turn_id FROM turns WHERE campaign_id = ?1)",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM turns WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM conversations WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM round_summary_covers WHERE parent_id IN \
+             (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1) \
+             OR child_id IN (SELECT summary_id FROM round_summaries WHERE campaign_id = ?1)",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM round_summaries WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM story_tasks WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM character_knowledge WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM character_instances WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM campaigns WHERE campaign_id = ?1",
+            [campaign_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(true)
+    }
+
     /// List every instance across all campaigns (MVU apply backfill scans all
     /// campaigns that reference a definition).
     pub fn list_all_instances(db: &Database) -> Result<Vec<CharacterInstance>> {

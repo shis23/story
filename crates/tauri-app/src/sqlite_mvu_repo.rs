@@ -64,7 +64,7 @@ impl SqliteMvuRepository {
             )
             .optional()?;
         let mvu_payload = mvu_payload.ok_or_else(|| {
-            SqliteError::RecordNotFound(format!(
+            SqliteError::NotFound(format!(
                 "{}",
                 MvuApplyError::TranslationNotFound(source_character_id.as_str().to_string())
             ))
@@ -81,7 +81,7 @@ impl SqliteMvuRepository {
             )
             .optional()?;
         let card_payload = card_payload.ok_or_else(|| {
-            SqliteError::RecordNotFound(format!(
+            SqliteError::NotFound(format!(
                 "找不到 source_character_id={source_character_id} 的 card"
             ))
         })?;
@@ -95,7 +95,7 @@ impl SqliteMvuRepository {
             .iter()
             .find(|d| d.id == *definition_id)
             .ok_or_else(|| {
-                SqliteError::RecordNotFound(format!(
+                SqliteError::NotFound(format!(
                     "{}",
                     MvuApplyError::DefinitionNotFound(definition_id.as_str().to_string())
                 ))
@@ -119,10 +119,9 @@ impl SqliteMvuRepository {
             source_character_id.as_str(),
         );
         if !preview.has_changes {
-            return Err(SqliteError::RecordNotFound(format!(
-                "{}",
-                MvuApplyError::NoChanges
-            )));
+            return Err(SqliteError::Validation(
+                MvuApplyError::NoChanges.to_string(),
+            ));
         }
 
         // 5. card payload 更新（definition.variable_schema = merged）。

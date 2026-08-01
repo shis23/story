@@ -157,6 +157,8 @@ pub struct CutoverReport {
     pub summaries: usize,
     pub conversations: usize,
     pub turns: usize,
+    /// 导入/审计的角色库条目数（Gate 5）。
+    pub characters: usize,
     pub schema_version: i64,
     pub import_skipped_duplicate: bool,
     pub backup_label: String,
@@ -179,6 +181,7 @@ impl CutoverReport {
             summaries: manifest.summaries,
             conversations: manifest.conversations,
             turns: manifest.turns,
+            characters: manifest.characters,
             schema_version,
             import_skipped_duplicate,
             backup_label: backup_label.to_string(),
@@ -556,6 +559,7 @@ fn verify_imported_database(
         manifest.conversations,
     )?;
     check_count(db, "turns", "turn_id", manifest.turns)?;
+    check_count(db, "characters", "character_id", manifest.characters)?;
 
     // Recompute a content hash from the live database payloads and compare it
     // to the source manifest. Do not trust the importer's self-written row alone.
@@ -614,6 +618,7 @@ fn audit_sqlite_authoritative(
         summaries: table_count(&db, "round_summaries")?,
         conversations: table_count(&db, "conversations")?,
         turns: table_count(&db, "turns")?,
+        characters: table_count(&db, "characters")?,
         schema_version,
         import_skipped_duplicate: false,
         backup_label: String::new(),
@@ -671,6 +676,103 @@ fn recompute_db_content_hash(db: &Database) -> Result<String> {
     let summaries = load_payloads(db, "round_summaries")?;
     let turns = load_payloads(db, "turns")?;
     let conversations = load_payloads(db, "conversations")?;
+    // Gate 4/5 可选集合：与 importer 相同的重建投影（非空才参与 hash）。
+    let mvu_translations = load_payloads(db, "mvu_translations")?;
+    let world_info = load_payloads(db, "campaign_world_info")?;
+    let compress_jobs = {
+        let mut stmt = db.connection().prepare(
+            "SELECT job_id, campaign_id, conversation_id, lineage_id, kind, status, attempts, \
+                 max_attempts, last_error, uncovered_a_at_enqueue, uncovered_b_at_enqueue, \
+                 created_at, updated_at FROM chronicle_compress_jobs",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                job_id,
+                campaign_id,
+                conversation_id,
+                lineage_id,
+                kind,
+                status,
+                attempts,
+                max_attempts,
+                last_error,
+                uncovered_a,
+                uncovered_b,
+                created_at,
+                updated_at,
+            ) = row?;
+            let mut v = serde_json::json!({
+                "id": job_id,
+                "campaign_id": campaign_id,
+                "kind": kind,
+                "status": status,
+                "attempts": attempts,
+                "max_attempts": max_attempts,
+                "uncovered_a_at_enqueue": uncovered_a,
+                "uncovered_b_at_enqueue": uncovered_b,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            });
+            let obj = v.as_object_mut().expect("json! object");
+            if let Some(x) = conversation_id {
+                obj.insert("conversation_id".into(), Value::String(x));
+            }
+            if let Some(x) = lineage_id {
+                obj.insert("lineage_id".into(), Value::String(x));
+            }
+            if let Some(x) = last_error {
+                obj.insert("last_error".into(), Value::String(x));
+            }
+            out.push(v);
+        }
+        out
+    };
+    // 角色库按 StoredCharacter 契约形态重建（与 importer 归一化一致）。
+    let characters = {
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT character_id, info_json, imported_at FROM characters")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (character_id, info_json, imported_at) = row?;
+            let info: Value = serde_json::from_str(&info_json).map_err(|e| {
+                SqliteError::Other(format!(
+                    "corrupt info_json in characters id={character_id}: {e}"
+                ))
+            })?;
+            out.push(serde_json::json!({
+                "id": character_id,
+                "info": info,
+                "imported_at": imported_at,
+            }));
+        }
+        out
+    };
 
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
@@ -681,6 +783,18 @@ fn recompute_db_content_hash(db: &Database) -> Result<String> {
     hash_named_array(&mut hasher, "round_summaries", &summaries);
     hash_named_array(&mut hasher, "turns", &turns);
     hash_named_array(&mut hasher, "conversations", &conversations);
+    if !mvu_translations.is_empty() {
+        hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
+    }
+    if !world_info.is_empty() {
+        hash_named_array(&mut hasher, "campaign_world_info", &world_info);
+    }
+    if !compress_jobs.is_empty() {
+        hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
+    }
+    if !characters.is_empty() {
+        hash_named_array(&mut hasher, "characters", &characters);
+    }
     Ok(hex_encode(hasher.finalize()))
 }
 
@@ -722,6 +836,21 @@ fn atomic_publish_db(plan: &CutoverPlan) -> Result<()> {
     // If a final DB already exists (re-publish after partial failure),
     // move it aside. JSON is still authoritative at this point.
     if final_path.exists() {
+        // 只允许让位「上次中断发布的自身产物」（带 storyforge schema 迁移）；
+        // 无关/损坏的既有数据库必须 fail closed——绝不静默让新 authority 顶替
+        // 用户数据（无 marker 不意味着目标文件可以被覆盖）。
+        let ours = Database::open(final_path)
+            .ok()
+            .and_then(|db| crate::migrations::current_version(&db).ok())
+            .unwrap_or(0)
+            >= 1;
+        if !ours {
+            return Err(SqliteError::Other(format!(
+                "refusing to overwrite existing non-StoryForge database at {}; \
+                 move or delete it to proceed",
+                final_path.display()
+            )));
+        }
         let backup_name = format!(
             "{}.pre-publish-{}.sqlite3",
             final_path

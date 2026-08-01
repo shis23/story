@@ -216,17 +216,16 @@ pub(crate) fn plugin_set_variable(
         .ensure_permission(&plugin_id, &Permission::WriteVariables)
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     // P0-7：活动 Turn 期间拒绝直接写变量，避免绕过 Coordinator
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "plugin set variable",
-    )?;
     reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = store
+    let mut inst = state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))?;
     inst.set_variable(&key, value, 0);
-    store
-        .update_instance(inst)
+    state
+        .storage()
+        .update_instance(&inst)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
     Ok(())
 }

@@ -79,7 +79,7 @@ impl CharacterInstanceDto {
 ///
 /// 失败时降级：建单角色 Protagonist definition（卡仍可用）。
 #[tauri::command]
-pub(crate) async fn extract_characters(
+pub async fn extract_characters(
     source_character_id: String,
     force: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
@@ -90,10 +90,7 @@ pub(crate) async fn extract_characters(
         extract_campaign_variable_schema_from_extensions, extract_mvu_schema_from_extensions,
     };
 
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "extract characters from imported character card",
-    )?;
+    let character_store = state.storage();
 
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
     let character = {
@@ -108,9 +105,11 @@ pub(crate) async fn extract_characters(
             Some(c) => Some(c),
             None => {
                 // 2. 回退：前端可能传了存储 id（import_character 返回的 StoredCharacter.id，
-                //    与 Character.id 无关）。用存储 id 查 CharacterStore 拿到 name，再按 name 查 tool_ctx。
+                //    与 Character.id 无关）。用存储 id 查角色库拿到 name，再按 name 查 tool_ctx。
                 character_store
-                    .get(&source_character_id)
+                    .get_character(&source_character_id)
+                    .ok()
+                    .flatten()
                     .and_then(|stored| {
                         ctx.characters
                             .iter()
@@ -127,17 +126,14 @@ pub(crate) async fn extract_characters(
     })?;
 
     // 已存在则直接返回
-    let store = state
-        .storage()
-        .json_campaign_store_owned(BackendCapability::CardCommands, "extract characters")
-        .map_err(TauriCommandError::validation)?;
     let force = force.unwrap_or(false);
-    let mut card = match prepare_character_extraction_card(store.as_ref(), &character, force)? {
-        CharacterExtractionDecision::ReturnExisting(existing) => {
-            return Ok(CardSummaryDto::from(&existing));
-        }
-        CharacterExtractionDecision::Run(card) => card,
-    };
+    let mut card =
+        match prepare_character_extraction_card_for_backend(state.storage(), &character, force)? {
+            CharacterExtractionDecision::ReturnExisting(existing) => {
+                return Ok(CardSummaryDto::from(&existing));
+            }
+            CharacterExtractionDecision::Run(card) => card,
+        };
 
     // MVU schema 探测
     let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
@@ -188,14 +184,48 @@ pub(crate) async fn extract_characters(
     card.extraction_status = extraction_status;
     card.extraction_message = extraction_message;
     let stored = if force {
-        save_character_card_force_rerun_async(store, card).await?
+        save_character_card_force_rerun_for_backend(state.storage().clone(), card).await?
     } else {
-        save_character_card_async(store, card).await?
+        save_character_card_for_backend(state.storage().clone(), card).await?
     };
 
     Ok(CardSummaryDto::from(&stored))
 }
 
+/// backend-neutral 卡保存（spawn_blocking 包裹磁盘/DB 写）。
+pub(crate) async fn save_character_card_for_backend(
+    storage: Arc<crate::storage_backend::StorageFacade>,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    tokio::task::spawn_blocking(move || {
+        storage
+            .save_card(card)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
+}
+
+/// backend-neutral 卡覆盖保存（force rerun 语义：被 Campaign 引用的卡拒绝）。
+pub(crate) async fn save_character_card_force_rerun_for_backend(
+    storage: Arc<crate::storage_backend::StorageFacade>,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    tokio::task::spawn_blocking(move || {
+        storage.save_card_if_no_campaigns(card).map_err(|e| {
+            if e == campaign_store::FORCE_RERUN_BLOCKED_BY_CAMPAIGN {
+                TauriCommandError::validation(e)
+            } else {
+                TauriCommandError::storage(format!("存储写入失败: {e}"))
+            }
+        })
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
+}
+
+/// 测试用 JSON 直连保存（等价 `CampaignStore::save_card` 语义，仅测试夹具）。
+#[cfg(test)]
 pub(crate) async fn save_character_card_async(
     store: Arc<campaign_store::CampaignStore>,
     card: storyforge_domain::character::CharacterCard,
@@ -205,6 +235,8 @@ pub(crate) async fn save_character_card_async(
         .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
 }
 
+/// 测试用 JSON 直连保存（等价 `CampaignStore::save_card` 语义，仅测试夹具）。
+#[cfg(test)]
 pub(crate) fn save_character_card_to_store(
     store: &campaign_store::CampaignStore,
     card: storyforge_domain::character::CharacterCard,
@@ -214,6 +246,9 @@ pub(crate) fn save_character_card_to_store(
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
 }
 
+/// 测试用 JSON 直连覆盖保存（等价 `CampaignStore::save_card_if_no_campaigns`）。
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) async fn save_character_card_force_rerun_async(
     store: Arc<campaign_store::CampaignStore>,
     card: storyforge_domain::character::CharacterCard,
@@ -225,6 +260,8 @@ pub(crate) async fn save_character_card_force_rerun_async(
     .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
 }
 
+/// 测试用 JSON 直连覆盖保存（等价 `CampaignStore::save_card_if_no_campaigns`）。
+#[cfg(test)]
 pub(crate) fn save_character_card_force_rerun_to_store(
     store: &campaign_store::CampaignStore,
     card: storyforge_domain::character::CharacterCard,
@@ -238,33 +275,47 @@ pub(crate) fn save_character_card_force_rerun_to_store(
     })
 }
 
+/// backend-neutral 版本的 `prepare_character_extraction_card`：经 facade 读
+/// 卡（JSON/SQLite 同一 `get_card_by_source` 契约）与 Campaign 计数。
+pub(crate) fn prepare_character_extraction_card_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    character: &storyforge_domain::character::Character,
+    force: bool,
+) -> Result<CharacterExtractionDecision, TauriCommandError> {
+    match storage
+        .get_card_by_source(&character.id)
+        .map_err(TauriCommandError::storage)?
+    {
+        Some(existing) if !force => Ok(CharacterExtractionDecision::ReturnExisting(existing)),
+        Some(existing) => {
+            if !storage
+                .list_campaigns(Some(&existing.card.id))
+                .map_err(TauriCommandError::storage)?
+                .is_empty()
+            {
+                return Err(TauriCommandError::validation(
+                    campaign_store::FORCE_RERUN_BLOCKED_BY_CAMPAIGN,
+                ));
+            }
+            Ok(CharacterExtractionDecision::Run(existing.card))
+        }
+        None => Ok(CharacterExtractionDecision::Run(
+            storyforge_domain::character::CharacterCard::from_character(character),
+        )),
+    }
+}
+
 /// 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化；
 /// 一 Campaign 一对话模型：同时自动建对话、存开场白、双向绑定 conversation_id
 #[tauri::command]
-pub(crate) fn create_campaign(
+pub fn create_campaign(
     card_id: String,
     name: String,
     opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
-    if state
-        .storage()
-        .capability(BackendCapability::CampaignLifecycle)
-        != CapabilityStatus::Supported
-    {
-        return Err(TauriCommandError::validation(
-            "campaign creation is not available in the SQLite opt-in backend yet".to_string(),
-        ));
-    }
-    let store =
-        state.json_campaign_store(BackendCapability::CampaignLifecycle, "create campaign")?;
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "create campaign from character card",
-    )?;
-    create_campaign_in_store(
-        store,
-        character_store,
+    create_campaign_for_backend(
+        state.storage(),
         state.conv_store.as_ref(),
         card_id,
         name,
@@ -272,6 +323,65 @@ pub(crate) fn create_campaign(
     )
 }
 
+/// backend-neutral 开档：经 facade 读卡（JSON/SQLite 同一 StoredCard 契约）、
+/// 建对话、单事务落 Campaign + 实例、追加开场白、种子本局世界书。
+/// SQLite 的 `create_campaign_with_instances` 是单 UoW；JSON 保持既有语义。
+pub(crate) fn create_campaign_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    conv_store: &ConversationStore,
+    card_id: String,
+    name: String,
+    opening_message: Option<String>,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    use storyforge_domain::conversation::Role as ConvRole;
+
+    let card_id_value = Id::from_str(&card_id);
+    let stored_card = storage
+        .get_card(&card_id_value)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={card_id}")))?;
+    let campaign_schema = stored_card.card.effective_campaign_variable_schema();
+    let mut campaign = storyforge_domain::campaign::Campaign::new_with_variable_schema(
+        card_id_value,
+        name,
+        &campaign_schema,
+    );
+
+    // 自动建对话并绑定到 Campaign
+    let conv = conv_store.create(Some(card_id.clone()), Some(campaign.id.clone()));
+    campaign.conversation_id = Some(conv.id.clone());
+    let (stored, campaign, instance_count) = match storage.create_campaign_with_instances(campaign)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(delete_err) = conv_store.delete(&conv.id) {
+                tracing::warn!("创建 Campaign 失败后清理对话失败: {delete_err}");
+            }
+            return Err(TauriCommandError::storage(format!("存储写入失败: {e}")));
+        }
+    };
+
+    // 存开场白（按 source_character_id 查角色库 greeting，facade 双后端）
+    if let Some(opening) = resolve_campaign_opening_message_for_backend(
+        storage,
+        &stored.card.source_character_id,
+        opening_message,
+    ) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
+    {
+        tracing::warn!("建 Campaign 时追加开场白失败: {e}");
+    }
+
+    // 本局世界书：从卡模板（+ 其它卡 is_global）拷贝，活动侧可写、卡侧只读
+    if let Err(e) = seed_campaign_world_info_from_card_for_backend(storage, &campaign, &stored) {
+        tracing::warn!("开档拷贝世界书失败 campaign={}: {e}", campaign.id);
+    }
+
+    let mut dto = CampaignSummaryDto::from(&campaign);
+    dto.instance_count = instance_count;
+    Ok(dto)
+}
+
+#[cfg(test)]
 pub(crate) fn create_campaign_in_store(
     store: &campaign_store::CampaignStore,
     character_store: &storage::CharacterStore,
@@ -330,23 +440,21 @@ pub(crate) fn create_campaign_in_store(
 /// 仅当会话仍处于开场态（唯一一条消息且为 assistant）时允许改写；
 /// 已有后续消息时返回校验错误，避免壳选择覆盖真实写作历史。
 #[tauri::command]
-pub(crate) fn apply_campaign_opening(
+pub fn apply_campaign_opening(
     campaign_id: String,
     content: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let store = state.json_campaign_store(
-        BackendCapability::CampaignLifecycle,
-        "apply campaign opening",
-    )?;
-    apply_campaign_opening_in_store(
-        store,
+    apply_campaign_opening_for_backend(
+        state.storage(),
         state.conv_store.as_ref(),
         &Id::from_str(&campaign_id),
         content,
     )
 }
 
+/// 测试用 JSON 直连开场白改写（等价 JSON `CampaignStore` 语义，仅测试夹具）。
+#[cfg(test)]
 pub(crate) fn apply_campaign_opening_in_store(
     store: &campaign_store::CampaignStore,
     conv_store: &ConversationStore,
@@ -392,7 +500,57 @@ pub(crate) fn apply_campaign_opening_in_store(
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
 }
 
+/// backend-neutral 开场白改写：Campaign 读取经 facade，会话改写走
+/// ConversationStore（双后端同一实现）。
+pub(crate) fn apply_campaign_opening_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    conv_store: &ConversationStore,
+    campaign_id: &Id,
+    content: String,
+) -> Result<(), TauriCommandError> {
+    use storyforge_domain::conversation::Role as ConvRole;
+
+    if content.trim().is_empty() {
+        return Err(TauriCommandError::validation("开场内容不能为空"));
+    }
+    let campaign = storage
+        .get_campaign(campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}")))?;
+    let conv_id = campaign
+        .conversation_id
+        .clone()
+        .or_else(|| conv_store.find_by_campaign(&campaign.id).map(|c| c.id))
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("campaign 未绑定会话: {campaign_id}"))
+        })?;
+    let conv = conv_store
+        .get(&conv_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到会话 id={conv_id}")))?;
+    if conv.nodes.len() != 1 {
+        return Err(TauriCommandError::validation(
+            "会话已有后续消息，开场选择不可再改写",
+        ));
+    }
+    let node = &conv.nodes[0];
+    let is_assistant_opening = node
+        .active()
+        .map(|v| v.role == ConvRole::Assistant)
+        .unwrap_or(false);
+    if !is_assistant_opening {
+        return Err(TauriCommandError::validation(
+            "会话首条消息不是开场白，拒绝改写",
+        ));
+    }
+    let node_id = node.id.clone();
+    conv_store
+        .edit_variant(&conv_id, &node_id, content)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+}
+
 /// 开档时将卡内嵌世界书（及其它卡 is_global 条目）写入 Campaign 旁路世界书文件。
+#[cfg(test)]
 pub(crate) fn seed_campaign_world_info_from_card(
     store: &campaign_store::CampaignStore,
     character_store: &storage::CharacterStore,
@@ -483,6 +641,45 @@ pub(crate) fn merge_global_entries_into_book_facade(
     Ok(book)
 }
 
+/// backend-neutral 开场白解析：经 facade 查角色库（id-or-source），
+/// JSON/SQLite 同一 StoredCharacter 契约。
+pub(crate) fn resolve_campaign_opening_message_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    source_character_id: &Id,
+    requested: Option<String>,
+) -> Option<String> {
+    let stored = storage.get_character(source_character_id.as_str()).ok()??;
+    crate::runtime_support::resolve_opening_message_from_parts(
+        &stored.info.first_mes,
+        &stored.info.alternate_greetings,
+        requested,
+        "campaign",
+    )
+}
+
+/// backend-neutral 开档世界书种子：经 facade 解析卡模板（含全局条目 merge），
+/// 再 ensure 到本局世界书。
+pub(crate) fn seed_campaign_world_info_from_card_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign: &storyforge_domain::campaign::Campaign,
+    stored_card: &campaign_store::StoredCard,
+) -> Result<(), String> {
+    let template = storage
+        .resolve_character_world_info_template(&stored_card.card.source_character_id)?
+        .unwrap_or_else(|| {
+            // 角色库无书时回退空书（与 JSON `resolve_template_world_info_for_card`
+            // 的兜底一致：空 entries 书由 ensure 判定无需种子）。
+            storyforge_domain::world_info::WorldInfoBook {
+                entries: Vec::new(),
+                source: storyforge_domain::Source::Native,
+                metadata: Default::default(),
+            }
+        });
+    storage.ensure_world_info_from_book(&campaign.id, &template)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn fork_campaign_in_store(
     store: &campaign_store::CampaignStore,
     character_store: &storage::CharacterStore,
@@ -570,22 +767,12 @@ pub(crate) fn fork_campaign_in_store(
 }
 
 #[tauri::command]
-pub(crate) fn fork_campaign(
+pub fn fork_campaign(
     source_campaign_id: String,
     fork_node_id: String,
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
-    if state
-        .storage()
-        .capability(BackendCapability::CampaignLifecycle)
-        != CapabilityStatus::Supported
-    {
-        return Err(TauriCommandError::validation(
-            "SQLite opt-in currently rejects campaign fork rather than writing a JSON shadow copy"
-                .to_string(),
-        ));
-    }
     let source_cid = Id::from_str(&source_campaign_id);
 
     // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
@@ -600,19 +787,109 @@ pub(crate) fn fork_campaign(
         ));
     }
 
-    let store = state.json_campaign_store(BackendCapability::CampaignLifecycle, "fork campaign")?;
-    let character_store = state.json_character_store(
-        BackendCapability::CharacterCommands,
-        "fork campaign character templates",
-    )?;
-    fork_campaign_in_store(
-        store,
-        character_store,
-        &state.conv_store,
+    fork_campaign_for_backend(
+        state.storage(),
+        state.conv_store.as_ref(),
         source_cid,
         Id::from_str(&fork_node_id),
         name,
     )
+}
+
+/// backend-neutral fork：经 facade 读源 Campaign/卡、fork 会话、落 Campaign、
+/// 拷贝实例与世界书（JSON/SQLite 同一语义）。
+pub(crate) fn fork_campaign_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    conv_store: &ConversationStore,
+    source_campaign_id: Id,
+    fork_node_id: Id,
+    name: String,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(TauriCommandError::validation("fork campaign name is empty"));
+    }
+
+    let source = storage
+        .get_campaign(&source_campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("campaign not found: {source_campaign_id}"))
+        })?;
+    if storage
+        .get_card(&source.card_id)
+        .map_err(TauriCommandError::storage)?
+        .is_none()
+    {
+        return Err(TauriCommandError::not_found(format!(
+            "card not found: {}",
+            source.card_id
+        )));
+    }
+
+    let source_conversation_id = source
+        .conversation_id
+        .clone()
+        .or_else(|| conv_store.find_by_campaign(&source.id).map(|c| c.id))
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!(
+                "source campaign has no conversation: {}",
+                source.id
+            ))
+        })?;
+
+    let mut campaign = storyforge_domain::campaign::Campaign::fork(
+        source.card_id.clone(),
+        name.to_string(),
+        source.id.clone(),
+        fork_node_id.clone(),
+    );
+    campaign.variables = source.variables.clone();
+    campaign.variable_schema = source.variable_schema.clone();
+    // Gate 4：story_clock 唯一权威 = variables；fork 时随 variables 拷贝，
+    // 顶层字段从权威同步，避免双表示残留。
+    campaign.story_clock = source.current_story_clock().to_string();
+
+    let forked_conversation = conv_store
+        .fork_at(&source_conversation_id, campaign.id.clone(), &fork_node_id)
+        .map_err(|e| TauriCommandError::storage(format!("fork conversation failed: {e}")))?;
+    campaign.conversation_id = Some(forked_conversation.id);
+
+    storage
+        .save_campaign(&campaign)
+        .map_err(|e| TauriCommandError::storage(format!("save fork campaign failed: {e}")))?;
+
+    let mut instance_count = 0;
+    for mut instance in storage
+        .list_instances(&source.id)
+        .map_err(TauriCommandError::storage)?
+    {
+        instance.id = Id::new();
+        instance.campaign_id = campaign.id.clone();
+        storage
+            .add_instance(&instance)
+            .map_err(|e| TauriCommandError::storage(format!("copy fork instance failed: {e}")))?;
+        instance_count += 1;
+    }
+
+    // 本局世界书：fork 时深拷贝源活动书（没有则从卡模板 ensure）
+    let source_book = storage
+        .get_world_info(&source.id)
+        .map_err(TauriCommandError::storage)?;
+    if !source_book.entries.is_empty() {
+        if let Err(e) = storage.set_world_info(&campaign.id, &source_book) {
+            tracing::warn!("fork 拷贝世界书失败: {e}");
+        }
+    } else if let Ok(Some(card)) = storage.get_card(&campaign.card_id)
+        && let Err(e) = seed_campaign_world_info_from_card_for_backend(storage, &campaign, &card)
+    {
+        tracing::warn!("fork 惰性种子世界书失败: {e}");
+    }
+
+    let mut dto = CampaignSummaryDto::from(&campaign);
+    dto.instance_count = instance_count;
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -652,24 +929,12 @@ pub(crate) fn get_campaign(
 
 /// 删除整局活动及其绑定会话；活跃活动被删除时同步清除活跃指针。
 #[tauri::command]
-pub(crate) fn delete_campaign(
+pub fn delete_campaign(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if state
-        .storage()
-        .capability(BackendCapability::CampaignLifecycle)
-        != CapabilityStatus::Supported
-    {
-        return Err(TauriCommandError::validation(
-            "campaign deletion is not available in the SQLite opt-in backend yet".to_string(),
-        ));
-    }
-
-    let store =
-        state.json_campaign_store(BackendCapability::CampaignLifecycle, "delete campaign")?;
     crate::playthrough_lifecycle::delete_campaign_playthrough_in_store(
-        store,
+        state.storage().as_ref(),
         state.conv_store.as_ref(),
         state.inner().as_ref(),
         &Id::from_str(&id),
@@ -896,6 +1161,7 @@ pub(crate) fn validate_custom_character_text(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn add_campaign_instance_to_store(
     store: &campaign_store::CampaignStore,
     campaign_id: &Id,
@@ -960,7 +1226,7 @@ pub(crate) fn add_campaign_instance_to_store(
 
 /// Add a card-defined character or an ad-hoc temporary character to a Campaign.
 #[tauri::command]
-pub(crate) fn add_campaign_instance(
+pub fn add_campaign_instance(
     campaign_id: String,
     definition_id: Option<String>,
     name: Option<String>,
@@ -969,21 +1235,89 @@ pub(crate) fn add_campaign_instance(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterInstanceDto, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    let store = state.json_campaign_store(
-        BackendCapability::CampaignLifecycle,
-        "add campaign instance",
-    )?;
     reject_if_active_turn(state.storage(), &campaign_id)?;
     let definition_id = definition_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(Id::from_str);
-    add_campaign_instance_to_store(
-        store,
+    add_campaign_instance_for_backend(
+        state.storage(),
         &campaign_id,
         definition_id.as_ref(),
         name,
         persona,
         behavior,
     )
+}
+
+/// backend-neutral 加角色：读 Campaign/卡/既有实例经 facade，落盘经
+/// `StorageFacade::add_instance`（JSON 追加实例文件 / SQLite 单行 upsert）。
+pub(crate) fn add_campaign_instance_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+    definition_id: Option<&Id>,
+    name: Option<String>,
+    persona: Option<String>,
+    behavior: Option<String>,
+) -> Result<CharacterInstanceDto, TauriCommandError> {
+    use storyforge_domain::campaign::CharacterInstance;
+
+    let campaign = storage
+        .get_campaign(campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let existing = storage
+        .list_instances(campaign_id)
+        .map_err(TauriCommandError::storage)?;
+
+    let instance = if let Some(definition_id) = definition_id {
+        let card = storage
+            .get_card(&campaign.card_id)
+            .map_err(TauriCommandError::storage)?
+            .ok_or_else(|| {
+                TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id))
+            })?;
+        let definition = card
+            .card
+            .character_definitions
+            .iter()
+            .find(|definition| definition.id == *definition_id)
+            .ok_or_else(|| TauriCommandError::validation("该角色定义不属于当前活动的角色卡"))?;
+        if existing.iter().any(|instance| {
+            instance.definition_id.as_ref() == Some(definition_id)
+                || instance.name.eq_ignore_ascii_case(&definition.name)
+        }) {
+            return Err(TauriCommandError::validation(format!(
+                "角色「{}」已加入本局",
+                definition.name
+            )));
+        }
+        CharacterInstance::from_definition(campaign.id.clone(), definition)
+    } else {
+        let name = name.unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            return Err(TauriCommandError::validation("角色名称不能为空"));
+        }
+        validate_custom_character_text("角色名称", Some(&name), 80)?;
+        let persona = trimmed_optional(persona);
+        let behavior = trimmed_optional(behavior);
+        validate_custom_character_text("角色人设", persona.as_deref(), 10_000)?;
+        validate_custom_character_text("行为规则", behavior.as_deref(), 10_000)?;
+        if existing
+            .iter()
+            .any(|instance| instance.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(TauriCommandError::validation(format!(
+                "本局已有同名角色「{name}」"
+            )));
+        }
+        CharacterInstance::temporary_with_overrides(campaign.id.clone(), name, persona, behavior)
+    };
+
+    storage
+        .add_instance(&instance)
+        .map_err(|error| TauriCommandError::storage(format!("添加角色失败: {error}")))?;
+    crate::backend_workflows::character_instance_dto_for_backend(storage, &instance)
+        .map_err(TauriCommandError::storage)
 }

@@ -60,7 +60,7 @@ pub(crate) fn build_preview_input<'a>(
 
 /// 对 Campaign 做健康检查并生成类型化修复建议
 #[tauri::command]
-pub(crate) fn meta_propose_campaign_repairs(
+pub fn meta_propose_campaign_repairs(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
@@ -277,7 +277,7 @@ pub(crate) fn meta_preview_typed_patch_with_snapshot(
 
 /// 接受一条类型化 patch：纯函数预演 → 写盘
 #[tauri::command]
-pub(crate) fn meta_accept_typed_patch(
+pub fn meta_accept_typed_patch(
     patch_id: String,
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,

@@ -14,7 +14,7 @@ use storyforge_infra_regex::{
 
 use crate::AppState;
 use crate::error::TauriCommandError;
-use crate::storage_backend::{BackendCapability, CapabilityStatus};
+use crate::storage_backend::BackendCapability;
 use crate::{
     collect_scoped_regex_scripts, get_conn_store, get_global_regex_store, get_preset_store,
     merge_runtime_regex_scripts,
@@ -349,21 +349,7 @@ pub(crate) fn delete_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    if state
-        .storage()
-        .capability(BackendCapability::CampaignLifecycle)
-        != CapabilityStatus::Supported
-    {
-        return Err(TauriCommandError::validation(
-            "conversation/campaign deletion is not available in the SQLite opt-in backend yet"
-                .to_string(),
-        ));
-    }
     let conv_id = Id::from_str(&conversation_id);
-    let store = state.json_campaign_store(
-        BackendCapability::CampaignLifecycle,
-        "delete conversation campaign",
-    )?;
 
     // 优先：会话自己记录的 campaign_id
     let campaign_id = state
@@ -372,16 +358,21 @@ pub(crate) fn delete_conversation(
         .and_then(|c| c.campaign_id.clone())
         // 兜底：Campaign.conversation_id 反向指向（悬空/半绑定时）
         .or_else(|| {
-            store
-                .list_campaigns()
-                .into_iter()
-                .find(|c| c.conversation_id.as_ref() == Some(&conv_id))
-                .map(|c| c.id)
+            state
+                .storage()
+                .list_campaigns(None)
+                .ok()
+                .and_then(|records| {
+                    records
+                        .into_iter()
+                        .find(|record| record.campaign.conversation_id.as_ref() == Some(&conv_id))
+                        .map(|record| record.campaign.id)
+                })
         });
 
     if let Some(campaign_id) = campaign_id {
         return crate::playthrough_lifecycle::delete_campaign_playthrough_in_store(
-            store,
+            state.storage().as_ref(),
             state.conv_store.as_ref(),
             state.inner().as_ref(),
             &campaign_id,

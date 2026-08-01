@@ -43,6 +43,8 @@ pub struct SourceManifestReport {
     pub summaries: usize,
     pub conversations: usize,
     pub turns: usize,
+    /// characters.json 角色库条目数（Gate 5）。
+    pub characters: usize,
     pub issues: Vec<String>,
 }
 
@@ -77,6 +79,10 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
     let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
+    let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
+    let world_info = read_world_info_dir(data_dir.join("campaign_world_info"))?;
+    let compress_jobs = read_compress_jobs_array(data_dir)?;
+    let characters = read_characters_array(data_dir)?;
 
     // Keep labels/order identical to the importer so hashes are comparable.
     let mut hasher = Sha256::new();
@@ -88,6 +94,20 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     hash_named_array(&mut hasher, "round_summaries", &summaries);
     hash_named_array(&mut hasher, "turns", &turns);
     hash_named_array(&mut hasher, "conversations", &conversations);
+    // Gate 4/5 可选集合：与 importer 完全同序、同投影、仅非空参与。
+    if !mvu_translations.is_empty() {
+        hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
+    }
+    if !world_info.is_empty() {
+        let payloads: Vec<Value> = world_info.iter().map(|(_, v)| v.clone()).collect();
+        hash_named_array(&mut hasher, "campaign_world_info", &payloads);
+    }
+    if !compress_jobs.is_empty() {
+        hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
+    }
+    if !characters.is_empty() {
+        hash_named_array(&mut hasher, "characters", &characters);
+    }
     let manifest_hash = hex_encode(hasher.finalize());
 
     let mut issues = Vec::new();
@@ -104,8 +124,143 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
         summaries: summaries.len(),
         conversations: conversations.len(),
         turns: turns.len(),
+        characters: characters.len(),
         issues,
     })
+}
+
+/// 读 `campaign_world_info/{campaign_id}.json` 目录；文件名即 campaign_id。
+/// importer 与 readiness 共用（hash 必须同投影）。
+pub(crate) fn read_world_info_dir(dir: PathBuf) -> Result<Vec<(String, Value)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let campaign_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                SqliteError::CorruptImportInput(format!(
+                    "{}: world info file must have a file stem",
+                    path.display()
+                ))
+            })?
+            .to_string();
+        let text = fs::read_to_string(&path)?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
+        out.push((campaign_id, value));
+    }
+    Ok(out)
+}
+
+/// 读 compress_jobs.json（可选）并投影到 `chronicle_compress_jobs` 列形态
+/// （与 `upsert_compress_job` / reverse exporter 完全一致：缺省值、null 可选
+/// 字段省略）。importer 与 readiness 共用，保证 hash 可比较。
+pub(crate) fn read_compress_jobs_array(data_dir: &Path) -> Result<Vec<Value>> {
+    let raw = read_json_array(data_dir.join("compress_jobs.json"), true)?;
+    raw.into_iter().map(project_compress_job).collect()
+}
+
+fn project_compress_job(job: Value) -> Result<Value> {
+    let job_id = job.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+        SqliteError::CorruptImportInput("compress_job missing string field 'id'".into())
+    })?;
+    let campaign_id = job
+        .get("campaign_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            SqliteError::CorruptImportInput(
+                "compress_job missing string field 'campaign_id'".into(),
+            )
+        })?;
+    let conversation_id = optional_str(&job, "conversation_id");
+    let lineage_id = optional_str(&job, "lineage_id");
+    let kind = optional_str(&job, "kind").unwrap_or_else(|| "auto".to_string());
+    let status = optional_str(&job, "status").unwrap_or_else(|| "pending".to_string());
+    let attempts = optional_u64(&job, "attempts").unwrap_or(0);
+    let max_attempts = optional_u64(&job, "max_attempts").unwrap_or(5);
+    let last_error = optional_str(&job, "last_error");
+    let uncovered_a = optional_u64(&job, "uncovered_a_at_enqueue").unwrap_or(0);
+    let uncovered_b = optional_u64(&job, "uncovered_b_at_enqueue").unwrap_or(0);
+    let created_at = optional_str(&job, "created_at").unwrap_or_default();
+    let updated_at = optional_str(&job, "updated_at").unwrap_or_default();
+    let mut v = serde_json::json!({
+        "id": job_id,
+        "campaign_id": campaign_id,
+        "kind": kind,
+        "status": status,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "uncovered_a_at_enqueue": uncovered_a,
+        "uncovered_b_at_enqueue": uncovered_b,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    });
+    let obj = v.as_object_mut().expect("json! object");
+    if let Some(x) = conversation_id {
+        obj.insert("conversation_id".into(), Value::String(x));
+    }
+    if let Some(x) = lineage_id {
+        obj.insert("lineage_id".into(), Value::String(x));
+    }
+    if let Some(x) = last_error {
+        obj.insert("last_error".into(), Value::String(x));
+    }
+    Ok(v)
+}
+
+fn optional_str(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    })
+}
+
+fn optional_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().map(|i| i.max(0) as u64))
+            .or_else(|| v.as_str()?.parse().ok())
+    })
+}
+
+/// 读 characters.json（可选）并归一化为 `StoredCharacter` 契约形态
+/// `{id, info, imported_at}`——丢弃未知顶层键（CharacterStore 反序列化同样
+/// 忽略），保证与 importer 的 hash 及 reverse export 重建形态完全一致。
+pub(crate) fn read_characters_array(data_dir: &Path) -> Result<Vec<Value>> {
+    let raw = read_json_array(data_dir.join("characters.json"), true)?;
+    raw.into_iter().map(normalize_character_entry).collect()
+}
+
+fn normalize_character_entry(entry: Value) -> Result<Value> {
+    let id = entry.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+        SqliteError::CorruptImportInput("character entry missing string field 'id'".into())
+    })?;
+    let info = entry.get("info").ok_or_else(|| {
+        SqliteError::CorruptImportInput("character entry missing field 'info'".into())
+    })?;
+    if !info.is_object() {
+        return Err(SqliteError::CorruptImportInput(
+            "character entry 'info' must be an object".into(),
+        ));
+    }
+    let imported_at = entry
+        .get("imported_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "id": id,
+        "info": info.clone(),
+        "imported_at": imported_at,
+    }))
 }
 
 /// Create a SQLite backup checkpoint + manifest without mutating the live DB contents.

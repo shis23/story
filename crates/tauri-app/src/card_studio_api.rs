@@ -728,10 +728,6 @@ pub fn cardstudio_import_compiled(
             "import compiled Card Studio character",
         )
         .map_err(TauriCommandError::validation)?;
-    let campaign_store = state.json_campaign_store(
-        crate::storage_backend::BackendCapability::CardCommands,
-        "import compiled Card Studio card",
-    )?;
     let store = get_card_studio_store();
     let mut project = store
         .get(&id)
@@ -748,11 +744,8 @@ pub fn cardstudio_import_compiled(
     );
     let info = CharacterInfo::from(&character);
     let stored = state
-        .json_character_store(
-            crate::storage_backend::BackendCapability::CharacterCommands,
-            "import compiled Card Studio character",
-        )?
-        .save(info)
+        .storage()
+        .save_character(info)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // Sync tool_ctx so extract_characters / campaign can see the card.
@@ -781,7 +774,8 @@ pub fn cardstudio_import_compiled(
     } else {
         "Card Studio 从零导入，已生成单主角定义，可稍后重新识别。".into()
     });
-    let stored_card = campaign_store
+    let stored_card = state
+        .storage()
         .save_card(card)
         .map_err(|e| TauriCommandError::storage(format!("保存 CharacterCard 失败: {e}")))?;
 

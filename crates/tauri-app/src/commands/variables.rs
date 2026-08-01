@@ -24,7 +24,7 @@ pub(crate) fn get_character_variables(
 
 /// 手动改角色实例变量值（调试/纠错用，turn 用 0 占位）
 #[tauri::command]
-pub(crate) fn set_character_variable(
+pub fn set_character_variable(
     campaign_id: String,
     instance_id: String,
     key: String,
@@ -33,17 +33,16 @@ pub(crate) fn set_character_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接写变量
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "set character variable",
-    )?;
     reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = store
+    let mut inst = state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
     inst.set_variable(&key, value, turn.unwrap_or(0));
-    store
-        .update_instance(inst)
+    state
+        .storage()
+        .update_instance(&inst)
         .map_err(|e| TauriCommandError::storage(format!("更新角色变量失败: {e}")))?;
     Ok(())
 }
@@ -161,7 +160,7 @@ pub(crate) fn validate_campaign_variable_input(
 
 /// 新增一个 Campaign 全局变量定义与初始值。
 #[tauri::command]
-pub(crate) fn add_campaign_variable(
+pub fn add_campaign_variable(
     campaign_id: String,
     key: String,
     label: String,
@@ -171,10 +170,6 @@ pub(crate) fn add_campaign_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "add campaign variable",
-    )?;
     reject_if_active_turn(state.storage(), &campaign_id)?;
     let key = storyforge_domain::variables::normalize_mvu_key(&key);
     let label = label.trim();
@@ -197,39 +192,41 @@ pub(crate) fn add_campaign_variable(
         group: Some("全局".into()),
     };
 
-    let mut campaign = store
+    let mut campaign = state
+        .storage()
         .get_campaign(&campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
     campaign
         .add_variable_field(field)
         .map_err(TauriCommandError::validation)?;
-    store
-        .update_campaign(campaign)
+    state
+        .storage()
+        .update_campaign(&campaign)
         .map_err(|error| TauriCommandError::storage(format!("新增 Campaign 变量失败: {error}")))
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct CampaignVariableSchemaSyncDto {
-    pub(crate) added: usize,
+pub struct CampaignVariableSchemaSyncDto {
+    pub added: usize,
 }
 
 /// 把卡模板后来新增的全局 schema 显式同步进旧 Campaign。
 #[tauri::command]
-pub(crate) fn sync_campaign_variable_schema(
+pub fn sync_campaign_variable_schema(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
     let campaign_id = Id::from_str(&campaign_id);
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "sync campaign variable schema",
-    )?;
     reject_if_active_turn(state.storage(), &campaign_id)?;
-    sync_campaign_variable_schema_in_store(store, &campaign_id)
+    sync_campaign_variable_schema_for_backend(state.storage(), &campaign_id)
 }
 
+/// 测试用 JSON 直连同步（等价 JSON `CampaignStore` 语义，仅测试夹具）。
+#[cfg(test)]
 pub(crate) fn sync_campaign_variable_schema_in_store(
-    store: &campaign_store::CampaignStore,
+    store: &crate::campaign_store::CampaignStore,
     campaign_id: &Id,
 ) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
     let mut campaign = store
@@ -245,9 +242,31 @@ pub(crate) fn sync_campaign_variable_schema_in_store(
     Ok(CampaignVariableSchemaSyncDto { added })
 }
 
+/// backend-neutral 版本：读 Campaign/卡经 facade，同步后经
+/// `StorageFacade::update_campaign` 落盘（JSON 文件 / SQLite 行）。
+pub(crate) fn sync_campaign_variable_schema_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
+    let mut campaign = storage
+        .get_campaign(campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let card = storage
+        .get_card(&campaign.card_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id)))?;
+    let added = campaign.sync_variable_schema(&card.card.effective_campaign_variable_schema());
+    storage
+        .update_campaign(&campaign)
+        .map_err(|error| TauriCommandError::storage(format!("同步 Campaign 变量失败: {error}")))?;
+    Ok(CampaignVariableSchemaSyncDto { added })
+}
+
 /// 改 Campaign 全局变量
 #[tauri::command]
-pub(crate) fn set_campaign_variable(
+pub fn set_campaign_variable(
     campaign_id: String,
     key: String,
     value: serde_json::Value,
@@ -255,43 +274,42 @@ pub(crate) fn set_campaign_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接写变量
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "set campaign variable",
-    )?;
     reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut camp = store
+    let mut camp = state
+        .storage()
         .get_campaign(&Id::from_str(&campaign_id))
+        .map_err(TauriCommandError::storage)?
+        .map(|record| record.campaign)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
     camp.set_variable(&key, value, turn.unwrap_or(0));
-    store
-        .update_campaign(camp)
+    state
+        .storage()
+        .update_campaign(&camp)
         .map_err(|e| TauriCommandError::storage(format!("更新 Campaign 变量失败: {e}")))?;
     Ok(())
 }
 
 /// 把临场角色升级为常驻（仅翻 is_temporary flag）
 #[tauri::command]
-pub(crate) fn promote_temporary_instance(
+pub fn promote_temporary_instance(
     campaign_id: String,
     instance_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // P0-7：活动 Turn 期间拒绝直接改实例
-    let store = state.json_campaign_store(
-        storage_backend::BackendCapability::VariableCommands,
-        "promote temporary instance",
-    )?;
     reject_if_active_turn(state.storage(), &Id::from_str(&campaign_id))?;
-    let mut inst = store
+    let mut inst = state
+        .storage()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
     if !inst.is_temporary {
         return Err("该角色已是常驻".into());
     }
     inst.promote_to_permanent();
-    store
-        .update_instance(inst)
+    state
+        .storage()
+        .update_instance(&inst)
         .map_err(|e| TauriCommandError::storage(format!("升级临时角色失败: {e}")))?;
     Ok(())
 }

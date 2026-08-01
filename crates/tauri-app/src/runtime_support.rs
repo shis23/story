@@ -191,6 +191,7 @@ pub(crate) fn resolve_legacy_opening_message(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_campaign_opening_message(
     store: &storage::CharacterStore,
     source_character_id: &Id,

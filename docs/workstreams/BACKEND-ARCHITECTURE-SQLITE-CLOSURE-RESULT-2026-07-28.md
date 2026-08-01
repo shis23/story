@@ -1190,3 +1190,209 @@ update_world_info_entries_bulk_multi` 直接锁内修改 `self.inner` 的 `Vec`�
 
 Gate 5（迁移、等价与恢复）：对 Gate 4 新增的 world info / compress jobs / MVU 导出
 回读路径做大数据与等价矩阵；随后 Gate 6 真实模型与平台证据。
+
+## 31. Gate 5 完成：数据迁移、后端等价与恢复（2026-08-01）
+
+> 独立提交（不 amend 任何历史提交，未 push；提交后工作区干净）。计划 §10 四
+> 项通过条件逐项核对见 §31.8；结论 **PASS**。
+
+### 31.1 交付内容
+
+**新测试（按类别）**
+
+- 迁移矩阵 `crates/infra-sqlite/tests/gate5_migration_matrix.rs`（6）：
+  `json_to_sqlite_full_matrix_snapshot_is_equivalent`、
+  `migration_retry_is_idempotent`、`marker_last_and_failure_retention_for_every_stage`
+  （6 个 CutoverFault 阶段逐一断言 marker 最后写/失败保留/可重试）、
+  `previous_schema_v6_migrates_to_v7_preserving_data`、
+  `corrupt_and_missing_sources_fail_closed`、`disk_write_failure_leaves_json_authoritative`。
+- Reverse-export 往返 `crates/infra-sqlite/tests/gate5_reverse_export_roundtrip.rs`（3）：
+  `reverse_export_full_data_roundtrip_restores_equivalent_final_state`（含角色库）、
+  `reverse_export_refuses_when_pending_preaccept_outbox_exists`、
+  `reverse_export_classifies_readonly_ledgers_explicitly`。
+- 等价套件 `crates/tauri-app/tests/backend_parity_suite.rs`（1，全 op 序列）：
+  同一输入跑 JSON 与 SQLite，比较 op 结果（成功/失败/错误类别/规范化消息）与
+  规范化领域快照（id/时间戳/集合顺序显式归一化规则，未知 UUID 按结构路径登记）。
+- 恢复与故障矩阵 `crates/infra-sqlite/tests/gate5_fault_matrix.rs`（4）：
+  `corrupt_published_db_fails_closed_and_requires_manual_resolution`（DB 文件损坏 →
+  marker Stale → startup fail closed，不自愈改写；清理后可恢复）、
+  `foreign_database_at_cutover_target_is_never_silently_overwritten`、
+  `empty_file_at_cutover_target_is_refused_not_silently_replaced`、
+  `preaccept_outbox_journal_survives_reopen_and_recovery_refails_turn`
+  （outbox 跨重启存活；恢复 fail 未完成 Turn、Pending→failed、RecoveryFail 审计行；
+  恢复幂等）。
+- 真实多进程锁 `platform_locking.rs::cross_process_cutover_lock_fails_closed_and_recovers`（1）：
+  子进程持有 cutover lock（Windows share-deny-write / Unix flock），父进程 cutover
+  fail closed（Windows 干净报错 / Unix 串行化），锁释放后重试成功；全程无 marker、
+  无半发布、无损坏。
+- 大数据/性能 `crates/infra-sqlite/tests/gate5_bigdata_perf.rs`（2）与
+  `crates/tauri-app/tests/sqlite_bigdata_perf.rs`（1）：2570 实体确定性 fixture，
+  迁移/导出/重导入/恢复/JSON vs SQLite 操作计时 + 计数等价硬断言。
+
+**生产代码修复（等价矩阵暴露的真实后端差异）**
+
+1. **cutover 目标路径的「无关数据库」守卫**（`infra-sqlite/src/cutover.rs`）：
+   `atomic_publish_db` 只允许让位「上次中断发布的自身产物」（storyforge schema
+   version ≥ 1）；无关/损坏/空文件在目标路径时拒绝覆盖（`refusing to overwrite
+   existing non-StoryForge database`）——兑现「不会静默创建 empty authority
+   覆盖用户数据」。
+2. **delete_campaign 级联补齐 JSON 侧 Turn 清理 + SQLite 孤儿守卫误伤修复**：
+   - `TurnStore::delete_turns_for_campaign`（turns.json 与 CampaignStore 分开持久化，
+     删除活动时 JSON 侧此前遗留孤儿 Turn；SQLite 级联本就删除）；
+   - `StorageFacade::delete_campaign_precursors`（facade 内 backend 策略：JSON 先删
+     会话+Turn 可重试；SQLite 跳过——单独删会话会撞「有 turn history 拒绝删除」
+     的孤儿守卫，合法级联被误伤）；
+   - `delete_campaign_playthrough_in_store` 成功后 `conv_store.invalidate()`
+     （SQLite 级联直删行，缓存不失效 → 二次 delete 行为与 JSON 分叉）。
+3. **MVU 领域错误分类**（`infra-sqlite/src/error.rs` + `tauri-app/src/sqlite_mvu_repo.rs`）：
+   新增 `NotFound`/`Validation` 变体；`NoChanges` 不再被包装成存储层
+   `RecordNotFound`（"production repository record not found: 合并后无变化" vs
+   "Validation error: 合并后无变化"），TranslationNotFound/DefinitionNotFound 同理
+   ——与 JSON 路径错误文本/类别逐字对齐。
+4. **Chronicle compress job 状态机 facade 契约**（`StorageFacade::enqueue_compress_job` /
+   `claim_compress_job` / `succeed_compress_job` / `fail_or_retry_compress_job` /
+   `list_compress_jobs` + `CompressJobState` DTO）：JSON CompressJobStore 与 SQLite
+   compress_jobs 表经同一后端无关契约暴露（不 spawn worker），供等价矩阵比较
+   enqueue/claim/成功/失败重试状态机。未改动任何命令名/参数/DTO/IPC 合同。
+
+### 31.2 数据矩阵（§10.1）
+
+| 场景 | fixture/测试 |
+|---|---|
+| 空白新用户 | 等价套件起始 fixture（无 campaign，全部由 op 创建） |
+| 单角色旧 JSON | `migration_retry_is_idempotent`（最小源） |
+| 多角色多轮 Campaign | `json_to_sqlite_full_matrix_snapshot_is_equivalent`（2 卡 2 局多轮） |
+| 同名角色与临时角色 | 等价套件 add_instance 同名拒绝 + 临时角色 promote |
+| 全非空（summaries/knowledge/variables/tasks/worldbook） | 迁移矩阵 + 大数据 fixture |
+| pending/failed/committed Turn | 恢复矩阵（recovery 只 fail 非终态） |
+| Attempt + pre-accept outbox + mutation commit | `preaccept_outbox_journal_survives_reopen...` + 既有 production_uow/preaccept_lifecycle |
+| MVU translation + schema | 等价套件 mvu_save/preview/apply + 既有 sqlite_mvu_translations |
+| Chronicle compress Pending/Running/Failed/Succeeded | 等价套件 chronicle_* 段 + 既有 sqlite_chronicle_* |
+| Gate 4 角色库/WorldInfo/MVU/compress 数据 | 迁移矩阵（characters 入库/哈希）+ 大数据（unsupported 仅 3 台账且 0 行） |
+| 大数据目录 | gate5_bigdata_perf（2570 实体） |
+| 旧 schema | `previous_schema_v6_migrates_to_v7_preserving_data` |
+| 损坏/缺文件/锁冲突/磁盘写失败 | `corrupt_and_missing_sources_fail_closed`、`corrupt_published_db_fails_closed...`、`cross_process_cutover_lock_fails_closed_and_recovers`、`disk_write_failure_leaves_json_authoritative` |
+
+全部使用独立 temp dir / 独立 Database 句柄；不依赖测试顺序、全局 OnceLock 残留或
+开发机数据。
+
+### 31.3 迁移与 reverse-export 证据（§10.2.1–6）
+
+- 迁移前后领域快照等价（§10.2.1）：迁移矩阵全量快照逐表/逐 payload 等价。
+- 同一 migration 可重试且幂等（§10.2.2）：`migration_retry_is_idempotent`；
+  重跑报 AlreadyCutover，不重复导入、不 bump。
+- marker 只在完整成功后写入（§10.2.3）：`marker_last_and_failure_retention_for_every_stage`
+  覆盖 6 个 CutoverFault 阶段。
+- 失败保留原 JSON 和备份（§10.2.4）：同测试逐阶段断言 JSON 字节不变、backup 保留、
+  无半迁移状态、可安全重试。
+- reverse export 可重新导入并恢复等价终态（§10.2.5）：`reverse_export_full_data_roundtrip...`
+  全数据（含 characters/WorldInfo/MVU/compress/story_clock）往返等价。
+- 活跃 pre-accept 阻止导出而非丢弃（§10.2.6）：`reverse_export_refuses_when_pending_...`；
+  `reverse_export_classifies_readonly_ledgers_explicitly`（SQLite-native 台账 0 行时
+  显式分类，不静默丢）。
+- 已有 migrations 未被修改（`git diff` 无 migrations.rs）。
+
+### 31.4 等价矩阵（§10.3）
+
+等价套件 op 序列（JSON 与 SQLite 各跑一遍，结果逐条相等）：
+
+create/update/delete（campaign、instance、变量、任务、卡片 extract/list/delete）→
+变量 schema sync → typed patch propose/accept + stale 拒绝 → Turn 1
+draft→regenerate→postprocess→Accept（revision +1、Turn Committed）→ Turn 2
+draft→edit-stale（Attempt Stale）→ MVU save/preview/apply → **Chronicle
+enqueue/claim/成功/失败重试状态机 + uncovered 计数** → export/import bundle 往返 →
+delete_campaign 级联 + 二次删除 not_found → restart recovery。
+
+比较维度：op 成功/失败/错误类别/规范化消息；领域快照（卡片/角色库/Campaign/
+实例/知识/任务/总结/Turn/会话/世界书/MVU）逐项相等；revision；Turn/Attempt 状态；
+终态持久化结果。规范化规则显式声明：已知 id→⟨label⟩、时间戳→⟨ts⟩、集合数组
+排序（双后端 list_* 顺序无关）、未登记随机 UUID 按结构路径登记——无整体静默忽略。
+
+等价比对直接暴露并修复了 4 处真实后端差异（§31.1 修复 1–4）；修复后双后端
+行为一致。
+
+### 31.5 恢复与故障矩阵（§10.2.7–8 及任务书 Phase 6）
+
+| 场景 | 证据 |
+|---|---|
+| 重启恢复 Turn/Attempt | 既有 `sqlite_preaccept_production_lifecycle`、`sqlite_optin_lifecycle`、`preaccept_lifecycle` + 大数据恢复计时 |
+| 重启恢复 outbox | 新增 `preaccept_outbox_journal_survives_reopen_and_recovery_refails_turn`（跨 reopen 存活、Pending→failed、审计行、幂等） |
+| Running compress job 可恢复 | 既有 `sqlite_chronicle_crash_recovery`（reset_running_to_pending 后重领、稳定 batch key）+ `sqlite_compress_jobs` 单测；启动接线 `recover_compress_jobs_on_startup`（lib.rs setup 调用） |
+| committed-batch 重放幂等 | 既有 `production_uow.rs`（同 commit_id 重放不 bump、并发恰好一 apply 一 replay、revision conflict 零副作用） |
+| migration/import/export 故障整体回滚 | 迁移矩阵逐阶段 + `cutover.rs` 既有 5 故障测试 + `reverse_export` 原子发布 |
+| marker/backup/DB 一致 | `marker_last_and_failure_retention_for_every_stage` + 新增 corrupt-DB 测试 |
+| DB 损坏/缺文件 fail closed | 新增 `corrupt_published_db_fails_closed...`（字节损坏 → Stale → 拒绝恢复，不静默自愈）；既有 `stale_marker_with_missing_db_is_rejected`、`corrupt_json_source_is_rejected` |
+| 多进程/文件锁 fail closed | 新增**真实子进程** `cross_process_cutover_lock_fails_closed_and_recovers`；既有 `windows_file_lock_prevents_concurrent_cutover`、`concurrent_startups_converge_to_valid_database` |
+| 磁盘写失败无半状态 | `disk_write_failure_leaves_json_authoritative`（JSON 权威、marker 不写、可重试） |
+| 不静默覆盖用户数据 | 新增 foreign/empty DB 守卫测试 + 代码修复（§31.1.1）；既有 `chronicle_publication` 系列 |
+| 故障注入到达目标阶段并断言 | 既有 CutoverFault/PreacceptFault/AcceptFault/PublishFault/MetaPatchFault/DeleteCascadeFault/BundleImportFault + 各阶段注入点断言 |
+
+### 31.6 性能数据（§10.4）
+
+机器：`windows/x86_64 debug build`（本机，2026-08-01）；fixture 2570 实体
+（40 卡/120 defs、40 角色、15 局、15 会话×30 节点、180 实例、1080 知识、
+600 任务、450 摘要、150 Turn）。两次运行实测：
+
+- 迁移（JSON→SQLite cutover）：**332ms / 459ms**（两次独立运行）。
+- reverse export：**197ms**；导出→新库 reimport：**160ms**。
+- 重启恢复：fail_incomplete **约 2ms**（5 Turn）；recover_turns + compress reset
+  **4ms**（10 draft Turn）。
+- 操作耗时（JSON vs SQLite，ms）：
+
+| 操作 | JSON | SQLite | 比值 |
+|---|---|---|---|
+| read list_cards+characters+campaigns | <1 | 2 | — |
+| read campaign aggregates | <1 | <1 | — |
+| get_campaign ×15 | <1 | 1 | — |
+| add_knowledge ×200 | 15 | 6 | 0.40× |
+| add_task ×100 | 556 | 37 | 0.07× |
+| update_campaign ×50 | 63 | 22 | 0.35× |
+| draft attempt ×10 | 98 | 60 | 0.61× |
+| delete_knowledge ×50 | 383 | 20 | 0.05× |
+
+SQLite 全部不慢于 JSON；JSON 的 add_task/delete_knowledge 显著更慢是整文件重写
+（每次 op 重写 tasks.json/knowledge.json）的已知物理差异，非退化。计数等价：
+知识 222、任务 140（双后端一致）。
+
+### 31.7 验证命令与真实结果
+
+```
+cargo fmt --all -- --check                 ✅
+cargo check --workspace                    ✅
+cargo clippy --workspace --all-targets -- -D warnings   ✅ 0 警告
+cargo test --workspace                     ✅ 1782 passed / 0 failed
+node scripts/architecture/backend-baseline.mjs          ✅ exit 0；
+    sqlite.unsupported=[]、facadeFlagReferences=2、
+    applicationFlagReferences=0、ambientCharacterStoreReferences=0、
+    applicationMethodFlagReferences=0、commandAttributes=175、
+    registeredCommandCount=175
+node --test frontend/tests/tauri-command-contract.test.mjs ✅ 8/8
+npm test                                   ✅ 476/476
+npm run build                              ✅
+git diff --check                           ✅
+```
+
+稳定性：新增/改动测试多次重跑（等价套件 3×、故障矩阵 3×、跨进程锁 3×、
+大数据 2×、`sqlite_command_concurrency` 5×）全绿；此前唯一 pre-existing flake
+（`sqlite_command_concurrency`，约 40% 失败）已用 test-only barrier 修复并在
+独立 worktree 复现证明为编排竞态（见测试内注释）。
+
+### 31.8 Gate 5 通过条件逐项核对（§10.4）
+
+1. 等价套件全绿 — **通过**（backend_parity_suite 含 Chronicle 段，1/1）。
+2. migration/reverse export/fault tests 全绿 — **通过**（迁移矩阵 6 + reverse
+   export 3 + 故障矩阵 4 + 跨进程锁 1 + 大数据 3，全部新增且全绿）。
+3. 没有无法解释的 backend-specific 产品行为 — **通过**：等价矩阵暴露的 4 处
+   差异全部定位根因并修复（§31.1）；保留差异均为物理布局（SQLite-native 台账、
+   list_* 顺序）并显式规范化/分类；`save_card` 被 Campaign 引用时的既有
+   fail-closed 差异（SQLite 拒绝、JSON 静默孤儿化）不触发正常路径，保留原样
+   并记录于 facade 注释。
+4. 性能无不可接受退化且记录规模/机器/耗时 — **通过**（§31.6）。
+
+**结论：PASS。**
+
+### 31.9 提交
+
+- 单提交，未 amend 任何历史提交，未 push；提交后工作区干净。
+- 下一阶段：Gate 6（真实模型与平台验收）——Gate 5 结果不作为 Gate 6 证据，
+  确定性门按计划 §11 执行。

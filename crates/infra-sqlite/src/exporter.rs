@@ -39,6 +39,8 @@ pub struct ReverseExportReport {
     pub summaries: usize,
     pub conversations: usize,
     pub turns: usize,
+    /// 导出的角色库条目数（Gate 5）。
+    pub characters: usize,
     pub unsupported_fields: Vec<String>,
 }
 
@@ -199,6 +201,9 @@ pub fn export_sqlite_to_json(
     // Chronicle 压缩任务：JSON 布局 compress_jobs.json（可无损表达）。
     let compress_jobs = export_compress_jobs(&tx, &mut unsupported)?;
 
+    // 角色库：JSON 布局 characters.json（StoredCharacter 契约形态，可无损表达）。
+    let characters = export_characters(&tx, &mut unsupported)?;
+
     // Write array files into the staging tree only.
     write_array_file(&stage_dir, "cards.json", &cards)?;
     write_array_file(&stage_dir, "campaigns.json", &campaigns)?;
@@ -209,6 +214,7 @@ pub fn export_sqlite_to_json(
     write_array_file(&stage_dir, "turns.json", &turns)?;
     write_array_file(&stage_dir, "mvu_translations.json", &mvu)?;
     write_array_file(&stage_dir, "compress_jobs.json", &compress_jobs)?;
+    write_array_file(&stage_dir, "characters.json", &characters)?;
 
     tx.commit()?;
 
@@ -225,6 +231,7 @@ pub fn export_sqlite_to_json(
         &mvu,
         &world_info,
         &compress_jobs,
+        &characters,
     );
 
     let report = ReverseExportReport {
@@ -238,6 +245,7 @@ pub fn export_sqlite_to_json(
         summaries: summaries.len(),
         conversations: conversations.len(),
         turns: turns.len(),
+        characters: characters.len(),
         unsupported_fields: unsupported,
     };
 
@@ -263,6 +271,7 @@ pub fn export_sqlite_to_json(
             "mvu_translations": mvu.len(),
             "campaign_world_info": world_info.len(),
             "compress_jobs": compress_jobs.len(),
+            "characters": characters.len(),
         },
         "unsupported_fields": report.unsupported_fields,
         "note": "Import this directory via the JSON importer to roll back to JSON backend.",
@@ -520,6 +529,48 @@ fn export_compress_jobs(
         if let Some(v) = last_error {
             obj.insert("last_error".to_string(), Value::String(v));
         }
+        redact_secret_values(&mut value, unsupported);
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// 导出角色库为 characters.json（`StoredCharacter` 契约形态
+/// `{id, info, imported_at}`，与 importer 归一化及 CharacterStore 反序列化一致）。
+fn export_characters(
+    tx: &rusqlite::Transaction<'_>,
+    unsupported: &mut Vec<String>,
+) -> Result<Vec<Value>> {
+    if !table_exists(tx, "characters")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT character_id, info_json, imported_at
+        FROM characters ORDER BY character_id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (character_id, info_json, imported_at) = row?;
+        let info: Value = serde_json::from_str(&info_json).map_err(|e| {
+            SqliteError::Other(format!(
+                "corrupt info_json in characters id={character_id}: {e}"
+            ))
+        })?;
+        let mut value = serde_json::json!({
+            "id": character_id,
+            "info": info,
+            "imported_at": imported_at,
+        });
         redact_secret_values(&mut value, unsupported);
         out.push(value);
     }
@@ -791,6 +842,7 @@ fn collect_export_hash(
     mvu: &[Value],
     world_info: &[Value],
     compress_jobs: &[Value],
+    characters: &[Value],
 ) -> String {
     compute_export_hash(&[
         ("cards", cards),
@@ -804,6 +856,7 @@ fn collect_export_hash(
         ("mvu_translations", mvu),
         ("campaign_world_info", world_info),
         ("compress_jobs", compress_jobs),
+        ("characters", characters),
     ])
 }
 

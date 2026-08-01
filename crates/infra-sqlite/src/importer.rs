@@ -29,6 +29,8 @@ pub struct ImportReport {
     pub world_info: usize,
     /// 导入的 Chronicle 压缩任务数（Gate 4）。
     pub compress_jobs: usize,
+    /// 导入的角色库条目数（V007 characters，Gate 5）。
+    pub characters: usize,
     pub skipped_as_duplicate: bool,
 }
 
@@ -195,6 +197,9 @@ impl<'a> JsonImporter<'a> {
             for job in &snapshot.compress_jobs {
                 upsert_compress_job(tx, job)?;
             }
+            for character in &snapshot.characters {
+                upsert_character(tx, character)?;
+            }
 
             tx.execute(
                 r#"
@@ -222,6 +227,7 @@ impl<'a> JsonImporter<'a> {
             mvu_translations: snapshot.mvu_translations.len(),
             world_info: snapshot.world_info.len(),
             compress_jobs: snapshot.compress_jobs.len(),
+            characters: snapshot.characters.len(),
             skipped_as_duplicate: false,
         })
     }
@@ -243,6 +249,7 @@ fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
         mvu_translations: snapshot.mvu_translations.len(),
         world_info: snapshot.world_info.len(),
         compress_jobs: snapshot.compress_jobs.len(),
+        characters: snapshot.characters.len(),
         skipped_as_duplicate: true,
     }
 }
@@ -263,6 +270,9 @@ struct SourceSnapshot {
     world_info: Vec<(String, Value)>,
     /// compress_jobs.json 中的 CompressJob 条目（Gate 4）。
     compress_jobs: Vec<Value>,
+    /// characters.json 中的 StoredCharacter 条目（Gate 5，归一化为
+    /// `{id, info, imported_at}` 三字段契约形态）。
+    characters: Vec<Value>,
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
@@ -275,8 +285,10 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
-    let world_info = read_world_info_dir(data_dir.join("campaign_world_info"))?;
-    let compress_jobs = read_json_array(data_dir.join("compress_jobs.json"), true)?;
+    // 与 readiness 共用读取 + 投影（hash 必须同口径）。
+    let world_info = crate::readiness::read_world_info_dir(data_dir.join("campaign_world_info"))?;
+    let compress_jobs = crate::readiness::read_compress_jobs_array(data_dir)?;
+    let characters = crate::readiness::read_characters_array(data_dir)?;
 
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
@@ -299,6 +311,9 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     if !compress_jobs.is_empty() {
         hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
     }
+    if !characters.is_empty() {
+        hash_named_array(&mut hasher, "characters", &characters);
+    }
     let manifest_hash = hex_encode(hasher.finalize());
 
     Ok(SourceSnapshot {
@@ -314,37 +329,8 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
         mvu_translations,
         world_info,
         compress_jobs,
+        characters,
     })
-}
-
-/// 读 `campaign_world_info/{campaign_id}.json` 目录；文件名即 campaign_id。
-fn read_world_info_dir(dir: PathBuf) -> Result<Vec<(String, Value)>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
-    let mut out = Vec::new();
-    for path in paths {
-        let campaign_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                SqliteError::CorruptImportInput(format!(
-                    "{}: world info file must have a file stem",
-                    path.display()
-                ))
-            })?
-            .to_string();
-        let text = fs::read_to_string(&path)?;
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
-        out.push((campaign_id, value));
-    }
-    Ok(out)
 }
 
 fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
@@ -534,6 +520,49 @@ fn upsert_compress_job(tx: &rusqlite::Transaction<'_>, job: &Value) -> Result<()
             uncovered_b,
             created_at,
             updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Gate 5：角色库（V007 characters 表，JSON 布局 characters.json 的
+/// `StoredCharacter` 条目）。条目在 readiness 归一化为 `{id, info, imported_at}`
+/// 契约形态；此处从归一化条目拆列，info_json 保持 info 对象原样。
+fn upsert_character(tx: &rusqlite::Transaction<'_>, entry: &Value) -> Result<()> {
+    let character_id = required_str(entry, "id", "character")?;
+    let info = entry
+        .get("info")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            SqliteError::CorruptImportInput("character entry missing object field 'info'".into())
+        })?;
+    let source_character_id = info
+        .get("source_character_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let name = info
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let imported_at = optional_str(entry, "imported_at").unwrap_or_default();
+    let info_json = stable_json(&Value::Object(info.clone()));
+    tx.execute(
+        r#"
+        INSERT INTO characters (character_id, source_character_id, name, info_json, imported_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(character_id) DO UPDATE SET
+            source_character_id = excluded.source_character_id,
+            name = excluded.name,
+            info_json = excluded.info_json,
+            imported_at = excluded.imported_at
+        "#,
+        rusqlite::params![
+            character_id,
+            source_character_id,
+            name,
+            info_json,
+            imported_at,
         ],
     )?;
     Ok(())
