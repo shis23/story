@@ -389,7 +389,9 @@ fn bigdata_migration_export_reimport_and_recovery_timings() {
     }
 
     // ── 2. SQLite → JSON reverse export ──────────────────────────────
-    let export_dir = dir.path().join("export-out");
+    // 三审7：导出目标必须在活动数据根**之外**（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export-out");
     let t1 = Instant::now();
     let exported = export_sqlite_to_json(&db, &export_dir).unwrap();
     println!("[bigdata] reverse_export={}ms", t1.elapsed().as_millis());

@@ -343,9 +343,12 @@ fn rollback_requires_sqlite_authoritative_marker_when_absent() {
         confirm: true,
     })
     .unwrap_err();
+    // 三审3：marker 被删后，cutover 完成的 DB（带 authority_binding）成为孤儿 →
+    // inspect_marker 判 Stale（ambiguous），rollback 据此拒绝。不论 Stale 还是
+    // Absent，rollback 都不得在非 SqliteAuthoritative 状态下继续。
     assert!(
-        err.to_string().contains("Absent"),
-        "rollback must refuse an absent marker, got: {err}"
+        err.to_string().contains("Stale") || err.to_string().contains("Absent"),
+        "rollback must refuse a non-sqlite-authoritative marker, got: {err}"
     );
     assert!(!matches!(
         inspect_marker(&plan),
@@ -434,4 +437,307 @@ fn second_rollback_after_success_is_rejected() {
         inspect_marker(&plan),
         MarkerStatus::JsonAuthoritative
     ));
+}
+
+// ─── 三审1：rollback 必须原子安装 JSON 进 data_dir，新进程读到回滚后数据 ───
+//
+// 判别性：cutover 后把 SQLite 里 campaign.name 改成「Main-POST-CUTOVER」，
+// 使 SQLite 内容与迁移前 JSON（name="Main"）显式不同。rollback 后 data_dir
+// 里的 campaigns.json 必须含 POST-CUTOVER 值——否则旧实现（只写 marker、
+// 不装 JSON）会让新进程读到迁移前的 "Main"，判定失败。
+
+/// cutover 后直接 UPDATE campaigns.name，制造 SQLite 与迁移前 JSON 的可识别差异。
+fn mutate_sqlite_campaign_name(db_path: &Path, new_name: &str) {
+    let mut db = Database::open(db_path).unwrap();
+    let conn = db.connection_mut();
+    // campaigns.payload_json 里 name 字段更名 + 顶层 name 列更名（双写保证导出覆盖）。
+    let row: String = conn
+        .query_row(
+            "SELECT payload_json FROM campaigns WHERE campaign_id = 'camp-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&row).unwrap();
+    payload["name"] = json!(new_name);
+    let new_payload = serde_json::to_string(&payload).unwrap();
+    conn.execute(
+        "UPDATE campaigns SET name = ?1, payload_json = ?2 WHERE campaign_id = 'camp-1'",
+        rusqlite::params![new_name, new_payload],
+    )
+    .unwrap();
+}
+
+#[test]
+fn rollback_installs_json_so_new_process_reads_rolled_back_data() {
+    let (_dir, db_path) = sqlite_fixture();
+    let data_dir = db_path.parent().unwrap();
+    let plan = CutoverPlan::new(data_dir, &db_path);
+
+    // 1) 迁移前 JSON 的 campaign.name = "Main"。cutover 后改 SQLite 制造差异。
+    let original_campaigns = fs::read_to_string(data_dir.join("campaigns.json")).unwrap();
+    assert!(
+        original_campaigns.contains("\"Main\""),
+        "迁移前 JSON 应含 Main: {original_campaigns}"
+    );
+    mutate_sqlite_campaign_name(&db_path, "Main-POST-CUTOVER");
+
+    // 2) rollback：必须把 SQLite 最新数据装回 data_dir。
+    let report = run_rollback(&RollbackRequest {
+        plan: plan.clone(),
+        confirm: true,
+    })
+    .unwrap();
+    assert_eq!(report.campaigns, 1);
+    assert!(
+        matches!(inspect_marker(&plan), MarkerStatus::JsonAuthoritative),
+        "marker must flip to JSON"
+    );
+
+    // 3) 判别点：data_dir 的 campaigns.json 现在必须含 POST-CUTOVER（SQLite 值）。
+    //    旧实现（只写 marker 不装 JSON）会让这里仍是迁移前的 "Main" → 失败。
+    let installed = fs::read_to_string(data_dir.join("campaigns.json"))
+        .expect("data_dir/campaigns.json must exist after rollback (json installed)");
+    assert!(
+        installed.contains("Main-POST-CUTOVER"),
+        "data_dir JSON must reflect rolled-back SQLite data, got: {installed}"
+    );
+    assert!(
+        !installed.contains("\"Main\"") || installed.contains("Main-POST-CUTOVER"),
+        "迁移前的 Main 不应残留为唯一值"
+    );
+
+    // 4) 真实新进程读取：用 JSON importer 重新加载 data_dir（模拟新进程冷启动），
+    //    必须看到 POST-CUTOVER（证明新进程读到回滚后权威数据）。
+    let mut fresh = Database::open_in_memory().unwrap();
+    let import = JsonImporter::new(&mut fresh)
+        .import_data_dir(data_dir)
+        .expect("new process must be able to import rolled-back data_dir");
+    assert_eq!(import.campaigns, 1);
+    // 验证导入的 campaign 名字是 POST-CUTOVER：查内存库。
+    let name: String = fresh
+        .connection()
+        .query_row(
+            "SELECT name FROM campaigns WHERE campaign_id = 'camp-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        name, "Main-POST-CUTOVER",
+        "新进程读取的 campaign 名必须是回滚后 SQLite 值"
+    );
+}
+
+#[test]
+fn rollback_fault_after_json_install_is_idempotent_rerunnable() {
+    let (dir, db_path) = sqlite_fixture();
+    let data_dir = db_path.parent().unwrap();
+    let plan = CutoverPlan::new(data_dir, &db_path);
+    mutate_sqlite_campaign_name(&db_path, "Main-POST-CUTOVER");
+
+    // 第一次：装完 JSON、写 marker 前注入故障 → 失败，但 data_dir JSON 已装。
+    let err = run_rollback_with_fault(
+        &RollbackRequest {
+            plan: plan.clone(),
+            confirm: true,
+        },
+        RollbackFault::AfterJsonInstall,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("injected fault"), "got: {err}");
+    // marker 仍是 SQLite 权威（提交点未到）。
+    assert!(
+        matches!(
+            inspect_marker(&plan),
+            MarkerStatus::SqliteAuthoritative { .. }
+        ),
+        "marker must remain sqlite (commit point not reached)"
+    );
+    // 但 data_dir JSON 已被装成 POST-CUTOVER（装步骤幂等）。
+    let installed = fs::read_to_string(data_dir.join("campaigns.json")).unwrap();
+    assert!(
+        installed.contains("Main-POST-CUTOVER"),
+        "json install is idempotent; data_dir already reflects rolled-back data: {installed}"
+    );
+
+    // 第二次：无故障重跑 → 必须成功（幂等：装步骤用同一 staging 覆盖，内容一致）。
+    let report = run_rollback(&RollbackRequest {
+        plan: plan.clone(),
+        confirm: true,
+    })
+    .unwrap();
+    assert_eq!(report.campaigns, 1);
+    assert!(
+        matches!(inspect_marker(&plan), MarkerStatus::JsonAuthoritative),
+        "rerun must commit marker"
+    );
+    // DB 字节不变。
+    let _ = dir; // keep tempdir alive
+}
+
+#[test]
+fn rollback_install_replaces_old_conversations_in_data_dir() {
+    // 回滚掉某个在迁移前存在、但 SQLite 里已删除的会话：data_dir 的
+    // conversations/ 必须反映 SQLite 视图（旧会话文件被移除），而非残留。
+    let (dir, db_path) = sqlite_fixture();
+    let data_dir = db_path.parent().unwrap();
+    let plan = CutoverPlan::new(data_dir, &db_path);
+
+    // 迁移前 data_dir 有 conversations/conv-1.json。cutover 后从 SQLite 删除该会话。
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        let conn = db.connection_mut();
+        conn.execute(
+            "DELETE FROM conversations WHERE conversation_id = 'conv-1'",
+            [],
+        )
+        .unwrap();
+        // 同时清掉 campaign 的 conversation_id 引用（列 + payload_json 里的嵌入字段），
+        // 避免回滚导出后 campaign 仍引用已删会话（三审6：引用缺失会话必须拒绝）。
+        conn.execute(
+            "UPDATE campaigns SET conversation_id = NULL WHERE campaign_id = 'camp-1'",
+            [],
+        )
+        .unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM campaigns WHERE campaign_id = 'camp-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut payload_value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        if let Some(obj) = payload_value.as_object_mut() {
+            obj.remove("conversation_id");
+        }
+        let new_payload = serde_json::to_string(&payload_value).unwrap();
+        conn.execute(
+            "UPDATE campaigns SET payload_json = ?1 WHERE campaign_id = 'camp-1'",
+            [new_payload],
+        )
+        .unwrap();
+    }
+
+    run_rollback(&RollbackRequest {
+        plan: plan.clone(),
+        confirm: true,
+    })
+    .unwrap();
+    assert!(matches!(
+        inspect_marker(&plan),
+        MarkerStatus::JsonAuthoritative
+    ));
+    // data_dir/conversations/conv-1.json 必须已被移除（SQLite 里已无该会话）。
+    assert!(
+        !data_dir.join("conversations").join("conv-1.json").exists(),
+        "rolled-back data_dir must not retain pre-cutover conversation deleted in SQLite"
+    );
+    let _ = dir;
+}
+
+// ─── 三审8：真实 operator rollback CLI（storyforge_rollback bin）────────────
+
+#[test]
+fn rollback_cli_dry_run_does_not_write_marker() {
+    // 无 --confirm：dry-run 必须通过校验但不写 marker、不装 JSON。
+    let (dir, db_path) = sqlite_fixture();
+    let data_dir = db_path.parent().unwrap();
+    let exe = std::env::var("CARGO_BIN_EXE_storyforge_rollback")
+        .expect("CARGO_BIN_EXE_storyforge_rollback must point to the compiled CLI binary");
+    let output = std::process::Command::new(&exe)
+        .arg(data_dir)
+        .output()
+        .expect("run storyforge_rollback dry-run");
+    assert!(
+        output.status.success(),
+        "dry-run must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dry-run OK"),
+        "dry-run must report OK: {stderr}"
+    );
+    assert!(
+        stderr.contains("re-run with --confirm"),
+        "dry-run must hint confirm: {stderr}"
+    );
+    // marker 仍是 SQLite 权威（dry-run 未改任何状态）。
+    let plan = CutoverPlan::new(data_dir, &db_path);
+    assert!(
+        matches!(
+            inspect_marker(&plan),
+            MarkerStatus::SqliteAuthoritative { .. }
+        ),
+        "dry-run must not flip the marker"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn rollback_cli_confirm_performs_rollback_and_installs_json() {
+    // --confirm：真实执行 rollback → marker 翻 JSON + data_dir 装回滚后 JSON。
+    let (dir, db_path) = sqlite_fixture();
+    let data_dir = db_path.parent().unwrap();
+    let plan = CutoverPlan::new(data_dir, &db_path);
+    // 制造 SQLite 与迁移前 JSON 的差异，证明 CLI 装的是 SQLite 数据。
+    mutate_sqlite_campaign_name(&db_path, "Main-CLI-POST-CUTOVER");
+
+    let exe = std::env::var("CARGO_BIN_EXE_storyforge_rollback")
+        .expect("CARGO_BIN_EXE_storyforge_rollback must point to the compiled CLI binary");
+    let output = std::process::Command::new(&exe)
+        .arg(data_dir)
+        .arg("--confirm")
+        .output()
+        .expect("run storyforge_rollback --confirm");
+    assert!(
+        output.status.success(),
+        "confirm must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SUCCESS"),
+        "confirm must report SUCCESS: {stderr}"
+    );
+    assert!(
+        stderr.contains("JsonAuthoritative"),
+        "confirm must verify marker: {stderr}"
+    );
+    // marker 翻成 JSON 权威。
+    assert!(
+        matches!(inspect_marker(&plan), MarkerStatus::JsonAuthoritative),
+        "marker must flip to JSON after CLI confirm"
+    );
+    // data_dir JSON 含 POST-CUTOVER（CLI 装了 SQLite 数据）。
+    let installed = fs::read_to_string(data_dir.join("campaigns.json")).unwrap();
+    assert!(
+        installed.contains("Main-CLI-POST-CUTOVER"),
+        "CLI must install rolled-back SQLite data into data_dir: {installed}"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn rollback_cli_refuses_non_sqlite_authority() {
+    // 无 SQLite 权威（marker JsonAuthoritative 或 Absent）→ CLI 必须 fail closed。
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    // 空目录：无 marker、无 DB → inspect_marker Absent → CLI 应失败（dry-run 校验）。
+    let exe = std::env::var("CARGO_BIN_EXE_storyforge_rollback").unwrap();
+    let output = std::process::Command::new(&exe)
+        .arg(&data_dir)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "CLI must fail when marker is not SqliteAuthoritative"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SqliteAuthoritative") || stderr.contains("FAILED"),
+        "CLI must report the authority refusal: {stderr}"
+    );
 }

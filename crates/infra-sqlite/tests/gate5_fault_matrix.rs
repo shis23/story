@@ -558,16 +558,19 @@ fn other_storyforge_database_at_target_is_rejected_bytes_unchanged() {
     let other_db_bytes = fs::read(other.path().join("storyforge.sqlite3")).unwrap();
     fs::copy(other.path().join("storyforge.sqlite3"), &db_path).unwrap();
 
-    // 无 marker；run_cutover 必须拒绝（非本次 cutover 的自身产物）。
-    assert!(matches!(
-        inspect_marker(&request(dir.path()).plan),
-        MarkerStatus::Absent
-    ));
+    // 三审3：无 marker + 另一份 StoryForge DB（带 authority_binding，不同身份）→
+    // inspect_marker 必须判 Stale（ambiguous），而非 Absent（旧实现会把孤儿 DB
+    // 当作空白新用户，可能在后续 cutover 中静默覆盖）。run_cutover 必须 fail closed。
+    let status = inspect_marker(&request(dir.path()).plan);
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "mismatched orphan StoryForge DB must be Stale, not Absent; got {status:?}"
+    );
     let err = run_cutover(&request(dir.path()))
         .expect_err("another StoryForge DB at the target must be refused");
     assert!(
-        err.to_string().contains("non-StoryForge"),
-        "error must explain the refusal, got: {err}"
+        err.to_string().contains("stale backend marker") || err.to_string().contains("refusing"),
+        "error must explain the fail-closed refusal, got: {err}"
     );
 
     // 字节不变；无 marker；JSON 权威。

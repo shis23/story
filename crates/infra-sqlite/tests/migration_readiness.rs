@@ -211,7 +211,9 @@ fn readonly_export_contains_no_secrets_and_does_not_mutate_live_db() {
         .unwrap();
     assert!(live_payload.contains("super-secret-key"));
 
-    let export_dir = dir.path().join("export");
+    // 三审7：导出目标必须在活动数据根之外（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export");
     let snapshot: ExportSnapshot = export_readonly_snapshot(&db, &export_dir).unwrap();
     assert!(snapshot.root_dir.exists());
     assert!(snapshot.manifest_path.exists());
@@ -461,7 +463,9 @@ fn export_includes_jobs_ledger_and_redacts_extended_secrets() {
         )
         .unwrap();
 
-    let export_dir = dir.path().join("export");
+    // 三审7：导出目标必须在活动数据根之外（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export");
     let snapshot = export_readonly_snapshot(&db, &export_dir).unwrap();
     assert!(export_dir.join("chronicle_publication_jobs.json").exists());
     assert!(export_dir.join("mutation_commits.json").exists());
@@ -513,7 +517,9 @@ fn export_does_not_return_hostile_field_names_and_redacts_android_paths() {
         )
         .unwrap();
 
-    let export_dir = dir.path().join("export");
+    // 三审7：导出目标必须在活动数据根之外（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export");
     let snapshot = export_readonly_snapshot(&db, &export_dir).unwrap();
     assert!(
         snapshot
@@ -579,7 +585,9 @@ fn export_redacts_secret_shaped_payload_ids_and_cover_edges() {
         )
         .unwrap();
 
-    let export_dir = dir.path().join("export");
+    // 三审7：导出目标必须在活动数据根之外（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export");
     export_readonly_snapshot(&db, &export_dir).unwrap();
     for entry in walkdir_files(&export_dir) {
         let text = fs::read_to_string(entry).unwrap_or_default();
@@ -639,7 +647,9 @@ fn export_redacts_operational_rows_and_omits_absolute_source_paths() {
         )
         .unwrap();
 
-    let export_dir = dir.path().join("export");
+    // 三审7：导出目标必须在活动数据根之外（data_dir 内部任意子路径都被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export");
     export_readonly_snapshot(&db, &export_dir).unwrap();
     assert!(export_dir.join("schema_migrations.json").exists());
 

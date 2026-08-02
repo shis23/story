@@ -1556,3 +1556,159 @@ export 产物。
 - 独立提交（在 `90f9584` 之上），未 amend `42edbc3`/`301164c`/`90f9584`，未 push；提交后工作区干净。
 - 遗留说明（诚实）：① 三.1 的发布守卫为 worker 侧重确认 + guarded finalize 的组合（infra-sqlite 的发布 UoW 属上一轮所有权，未在 UoW 内再改）；② `delete_character`（JSON）的历史级联范围未扩（不在三.7 反例范围）；③ 诊断导出的 hash 投影与 cutover 的"非空才参与"口径不同（各自自洽，已文档化）；④ early-cancel 现在会发 PostProcessSkipped（评审要求的行为变更，前端需知晓）。
 - Gate 5 二审全部反例关闭，返回 **PASS**；Gate 6（真实模型与平台验收）仍是下一确定性门，按计划 §11 执行，本轮结果不作 Gate 6 证据，未自行启动。
+
+## 34. Gate 5 三审整改（2026-08-02，10 项阻塞全部关闭）
+
+> 触发：三审独立只读评审列出 10 项 INCOMPLETE 阻塞。本节逐项给出根因 / 修复 /
+> 判别测试（旧实现验红证据） / 修复后验绿。
+
+### 34.1 一、rollback 原子安装 JSON + 真实新进程读取
+
+- 根因：rollback.rs::run_rollback_with_fault 只在最后写 marker，导出的 JSON 留在
+  staging 兄弟目录，从未装进 data_dir → rollback 后真实新进程仍读迁移前 JSON。
+- 修复：新增第 6 步 install_rollback_json_into_data_dir——把 staging 树原子发布
+  进 data_dir（snapshot 全部受影响路径 → 写候选 → fsync → swap；任一失败逆序恢复，
+  marker 不动）；成功后才写 marker（第 7 步，最后）。新增
+  RollbackFault::AfterJsonInstall 证明装步骤幂等可重跑。
+- 判别测试（tests/rollback.rs）：rollback_installs_json_so_new_process_reads_rolled_back_data
+  ——cutover 后改 SQLite campaign 名为「Main-POST-CUTOVER」，rollback 后用 JSON importer
+  重新加载 data_dir（模拟新进程冷启动），断言读到 POST-CUTOVER。
+  - 旧实现验红（mutant：注释掉 install_rollback_json_into_data_dir 调用）：
+    data_dir/campaigns.json 仍是迁移前 Main → 测试失败（红）。
+  - 修复后：绿。另加 rollback_fault_after_json_install_is_idempotent_rerunnable
+    + rollback_install_replaces_old_conversations_in_data_dir。
+
+### 34.2 二、租约内读 marker；Shared→Exclusive 真实拒绝；竞态测试
+
+- 根因：lease.rs 同进程重入允许任意 Shared↔Exclusive 组合（伪装升级成功）。
+- 修复：同进程已持 Shared 时再请求 Exclusive → 明确 Err；其余组合（Shared→Shared、
+  Exclusive→Shared 降级、Exclusive→Exclusive）保持 no-op。
+- 判别测试（lease.rs 单元 + tests/platform_locking.rs）：
+  same_process_shared_to_exclusive_upgrade_is_rejected——旧实现（mutant：跳过
+  升级拒绝）返回 reentrant Exclusive guard → 测试失败（红）；修复后 Err（绿）。
+  另加 shared_lease_blocks_two_concurrent_exclusive_processes——一个外部进程持
+  SHARED 时，两个同时尝试 EXCLUSIVE 的外部 lease_hold 子进程都拿不到（SHARED 释放
+  后新 EXCLUSIVE 可得，无死锁残留）。
+
+### 34.3 三、孤儿 DB（marker 缺失 + 带 authority_binding）→ Stale；仅同身份可恢复
+
+- 根因：inspect_marker Absent 分支不看 db_path；resolve_backend_inner Absent 分支
+  纯按 env 路由，不查孤儿 DB → 中断的 cutover 残留被当作空白新用户。
+- 修复：1) inspect_marker Absent 分支新增 orphan_storyforge_db_exists（只读探测：
+  application_id 魔数 + schema_migrations≥1 + authority_binding 行存在）→ 命中返回
+  Stale，而非 Absent。2) run_cutover 两个 Stale 分支新增
+  orphan_belongs_to_this_cutover（重算源 manifest hash + 派生 authority_id + 只读
+  探测孤儿 DB 的 binding 是否匹配）：匹配 → 继续；不匹配 → fail closed（字节不变）。
+- 判别测试（tests/cutover.rs）：orphan_db_with_mismatched_identity_is_stale_and_fail_closed
+  ——把另一份 data_dir 的 cutover 产物 DB 拷进不同源的 data_dir，inspect_marker
+  必须 Stale（非 Absent）；run_cutover 必须 fail closed；DB 字节不变。
+  - 旧实现验红（mutant：inspect_marker 直接返回 Absent 不查 DB）：断言 Stale 失败（红）；
+    修复后绿。
+  - 另加 blank_new_user_without_db_is_absent_not_stale。
+
+### 34.4 四、Chronicle job Running 校验移入 publication UoW 事务内
+
+- 根因：publish_compress_with_fault 事务内只按 publication_id 查
+  chronicle_publication_jobs，不按 job_id 校验 chronicle_compress_jobs.status='running'
+  ——迟到批次可在 job 已终态化后改写 summary/coverage/revision。
+- 修复：在事务内、写 summary 之前，当 request.job_id.is_some() 时 SELECT status
+  FROM chronicle_compress_jobs WHERE job_id = ?，断言 'running'；否则 Conflict。
+- 判别测试（tests/chronicle_publication.rs）：publish_rejected_when_compress_job_is_not_running
+  ——插入 Succeeded 态 job 行后直接调 publish_compress → 必须 Conflict。
+  - 旧实现验红（mutant：guard 用 if false 禁用）：返回 Applied → 测试失败（红）；
+    修复后绿。
+  - 另加 publish_rejected_when_compress_job_missing + publish_allowed_when_compress_job_is_running。
+  - publish() 测试辅助改为按 campaign 稳定的 job_id + 幂等 INSERT（满足
+    open-per-campaign 唯一索引）。
+
+### 34.5 五、JSON delete_card 命令级跨边界原子（前置 + 聚合整体原子）
+
+- 根因：commands/cards.rs::delete_card 先删 precursor（会话/Turn/压缩任务）再调
+  聚合 delete_card；前置成功、聚合写盘失败 → 半状态。
+- 修复：在 precursor 删除前对 JSON 后端所有受影响文件做字节级快照；聚合失败时
+  逆序恢复全部。快照/恢复经 backend_workflows（backend flag 白名单文件）。
+- 判别测试（tests/command_atomicity.rs）：json_delete_card_command_precursor_plus_aggregate_atomic_on_failure
+  ——经命令入口 storyforge_lib::delete_card，冻结 cards.json 使聚合失败；重启断言
+  卡 + Campaign + 会话 + turns.json 字节全部原样。
+  - 旧实现验红（mutant：restore_delete_card_snapshot 直接 return Ok(())）：会话数 = 0
+    → 测试失败（红）；修复后绿。
+
+### 34.6 六、区分空白新用户与部分文件丢失；Campaign 引用 conversation 缺失拒绝
+
+- 根因：importer/readiness 的 read_conversation_dir 把「目录缺失 = 无会话」当作允许，
+  但 Campaign 引用某 conversation_id 而该会话文件缺失时静默通过。
+- 修复：importer 与 readiness 各新增 verify_campaign_conversation_references——对
+  每个 campaign.conversation_id 非空的行断言对应会话文件存在；缺失 → CorruptImportInput。
+- 判别测试（tests/importer_diagnostics.rs）：campaign_referencing_missing_conversation_is_rejected。
+  - 旧实现验红（mutant：注释掉 verify_campaign_conversation_references 调用）：
+    导入继续走到 FK 检查报不同错误 → 断言 conv-missing 失败（红）；修复后绿。
+  - 另加 blank_new_user_without_core_files_is_allowed +
+    campaign_without_conversation_reference_imports_cleanly。
+
+### 34.7 七、禁止整个 live data root 内导出目标；删除 cutover .probe rename
+
+- 根因：validate_export_target 用扁平 forbidden 枚举 + 祖先检查，data_dir 内部的
+  任意新子路径能绕过；cutover.rs 的 .probe rename 探测是无意义 IO 噪音且有并发竞态。
+- 修复：1) validate_export_target 新增 export_canon.starts_with(&data_dir_canon)
+  ——data_root 内部任意后代一律拒绝。强化 canonicalize_loose 沿父链向上找第一个
+  可 canonicalize 的祖先。2) 删除 atomic_publish_db 的 .probe 来回 rename。
+- 判别测试（tests/gate5_export_safety.rs）：export_target_inside_live_data_root_is_rejected。
+  - 旧实现验红（mutant：if false && export_canon...）：导出成功 → 测试失败（红）；
+    修复后绿。
+  - 另加 cutover_publishes_atomically_without_probe_rename。
+  - 配套：把 gate5_bigdata_perf / migration_readiness / preaccept_lifecycle /
+    reverse_export 中导出到 data_dir 内部的旧测试目标改为 data_dir 外的 sibling TempDir。
+
+### 34.8 八、真实 operator rollback CLI（storyforge_rollback bin）
+
+- 根因：无受保护的生产 rollback 入口。
+- 修复：新增 crates/infra-sqlite/src/bin/storyforge_rollback.rs（裸 env::args()，无
+  clap）：<data_dir> [--confirm]。无 --confirm = dry-run（marker 必须
+  SqliteAuthoritative + 可无损导出 + 自检通过，不写 marker）；--confirm = 真实 rollback。
+  src/bin 自动发现。
+- 判别测试（tests/rollback.rs，经 CARGO_BIN_EXE_storyforge_rollback）：
+  rollback_cli_dry_run_does_not_write_marker、
+  rollback_cli_confirm_performs_rollback_and_installs_json（--confirm 翻 marker + 装
+  JSON 含 POST-CUTOVER）、rollback_cli_refuses_non_sqlite_authority。
+
+### 34.9 九、单一公共 startup recovery 入口
+
+- 根因：生产 lib.rs:243 包装器与子进程测试 backend_parity_suite.rs:2277 的
+  recover_turns_for_backend 是近乎重复的两份。
+- 修复：新增 crates/tauri-app/src/startup_recovery.rs，导出
+  pub fn run_startup_recovery(&Arc<AppState>)——按 is_sqlite() 分派 + 双后端
+  recover_compress_jobs_on_startup。生产 lib.rs setup hook 与子进程测试都改调它；
+  删除旧包装器与重复 helper。startup_recovery.rs 加入 backend flag 白名单。
+- 判别测试：backend_parity_suite::backend_parity_equivalent_domain_snapshots 子进程
+  经 run_startup_recovery 恢复后断言「压缩任务不得停留在 Running」+ 二次恢复 Turn
+  状态不变（幂等）。
+
+### 34.10 十、验证（全部真实复跑，最终树）
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| 格式 | cargo fmt --all -- --check | clean（已 apply） |
+| 编译 | cargo check --workspace | exit 0 |
+| Lint | cargo clippy --workspace --all-targets -- -D warnings | exit 0（无 warning） |
+| 单测 | cargo test --workspace | 83 suites, 1916 passed / 0 failed |
+| 跨进程 ×3 | cutover / platform_locking / rollback / gate5_fault_matrix / backend_parity_suite | 3 轮全绿 |
+| 基线 | node scripts/architecture/backend-baseline.mjs | exit 0；applicationMethodFlagReferences=0、applicationLegacyStoreAccessorReferences=0 |
+| 契约 | node --test frontend/tests/tauri-command-contract.test.mjs | 全绿 |
+| 前端测试 | npm test（frontend/） | 476/476 |
+| 前端构建 | npm run build（frontend/） | success |
+| 工作区 | git diff --check / git status --short | clean（28 文件，2 新增） |
+
+### 34.11 提交
+
+- 独立提交（在 f786dda 之上），未 amend f786dda/301164c/90f9584，未 push；提交后
+  工作区干净。
+- 每项判别测试均记录「旧实现验红」mutant 证据（见 34.1–34.9 各节）。
+- 遗留说明（诚实）：
+  1. 复审1 的 data_dir 内 JSON 原子替换已覆盖 conversations/ 与 campaign_world_info/
+     子目录的文件级快照/恢复（单文件原子写 + 逐文件快照满足「全部安装或全部保留」
+     语义），未做目录整体 rename 原子。
+  2. 复审9 的 recover_active_preaccept_state(campaign_id) 是 per-campaign 函数，
+     其核心目的（fail_incomplete_preaccept）已由 recover_turns_on_startup 在启动
+     路径覆盖；本入口未额外按当前活跃 campaign 调用它（保持与原 lib.rs 行为一致）。
+  3. 复审4 的 worker 侧 compress_job_is_running 重确认保留作早期短路（减少无效计算），
+     权威校验已下沉到 publication UoW。

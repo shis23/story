@@ -517,7 +517,9 @@ fn reverse_export_allows_nonexistent_nested_target() {
     let db_path = cutover_setup(&dir);
 
     let db = Database::open(&db_path).unwrap();
-    let target = dir.path().join("nested").join("a").join("b");
+    // 三审7：嵌套不存在的目标仍须在活动数据根**之外**（data_dir 内部被拒绝）。
+    let export_root = TempDir::new().unwrap();
+    let target = export_root.path().join("nested").join("a").join("b");
     let result = export_sqlite_to_json(&db, &target).unwrap();
     assert!(result.manifest_path.exists());
     assert!(target.join("cards.json").exists());

@@ -130,6 +130,9 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
     'storage_backend.rs',
     'sqlite_runtime.rs',
     'backend_workflows.rs',
+    // 三审9：启动恢复协调模块（按 is_sqlite 分派 + JSON 路径 facade stores），
+    // 与 backend_workflows 同性质——原 lib.rs:243 包装器抽取而来。
+    'startup_recovery.rs',
   ]
   sqlite.applicationMethodFlagReferences = [...methodFlagFiles.entries()]
     .filter(([name]) => !methodFlagWhitelist.includes(name))

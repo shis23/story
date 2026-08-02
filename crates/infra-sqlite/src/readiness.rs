@@ -93,6 +93,9 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     let compress_jobs = read_compress_jobs_array(data_dir)?;
     let characters = read_characters_array(data_dir)?;
 
+    // 三审6：Campaign 引用的 conversation_id 必须有对应会话文件（与 importer 同口径）。
+    verify_campaign_conversation_references(&campaigns, &conversations)?;
+
     // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝。
     let campaign_ids: HashSet<String> = campaigns
         .iter()
@@ -1663,6 +1666,35 @@ fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
         items.push(value);
     }
     Ok(items)
+}
+
+/// 三审6：校验 Campaign 引用的 conversation_id 在已读会话集合中存在（与 importer 同口径）。
+fn verify_campaign_conversation_references(
+    campaigns: &[Value],
+    conversations: &[Value],
+) -> Result<()> {
+    let conversation_ids: HashSet<&str> = conversations
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+        .collect();
+    for campaign in campaigns {
+        let Some(conv_id) = campaign.get("conversation_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if conv_id.is_empty() {
+            continue;
+        }
+        if !conversation_ids.contains(conv_id) {
+            let camp_id = campaign
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            return Err(SqliteError::CorruptImportInput(format!(
+                "campaign {camp_id} references conversation {conv_id} but the conversation file is missing"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn hash_named_array(hasher: &mut Sha256, name: &str, items: &[Value]) {

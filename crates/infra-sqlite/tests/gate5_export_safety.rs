@@ -800,3 +800,59 @@ fn cross_process_export_lock_blocks_then_releases() {
     assert!(status.success(), "export_hold must exit cleanly");
     export_sqlite_to_json(&db, &target).unwrap();
 }
+
+// ─── 三审7：禁止整个 live data root 内的导出目标 + 删除 .probe rename ────
+
+#[test]
+fn export_target_inside_live_data_root_is_rejected() {
+    // 三审7：data_dir 内部的任意后代子路径（data_dir/sub/export）必须被拒绝。
+    // 旧实现只在扁平 forbidden 列表里枚举已知文件名 + 祖先检查，data_dir 内部
+    // 任意新子路径都能绕过——可能把导出写进活动数据根里污染权威树。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = cutover(&dir);
+    let db = Database::open(&db_path).unwrap();
+
+    // data_dir 内部的任意子路径。
+    for inside in [
+        dir.path().join("subdir").join("export"),
+        dir.path().join("nested").join("deep").join("out"),
+        dir.path().join("export-directly-named"),
+    ] {
+        let err = export_sqlite_to_json(&db, &inside).unwrap_err();
+        assert!(
+            err.to_string().contains("inside the live data root"),
+            "target {} must be rejected as inside the live data root, got: {err}",
+            inside.display()
+        );
+        assert!(
+            !inside.exists(),
+            "no partial target must be created inside data_dir: {}",
+            inside.display()
+        );
+    }
+    drop(db);
+}
+
+#[test]
+fn cutover_publishes_atomically_without_probe_rename() {
+    // 三审7：删除 .probe rename 后，cutover 仍原子发布（temp → final 直接 rename）。
+    // 回归证明：成功 cutover 后 DB 存在、marker 写入、无 .probe 残留。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let db_path = dir.path().join("storyforge.sqlite3");
+    let request = CutoverRequest {
+        plan: CutoverPlan::new(dir.path(), &db_path),
+        label: "no-probe".into(),
+    };
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(db_path.exists(), "DB must be published");
+    assert!(
+        dir.path().join("storyforge.backend.json").exists(),
+        "marker must be written"
+    );
+    // 无 .probe 残留（旧实现来回 rename 的中间产物）。
+    let probe = db_path.with_extension("probe");
+    assert!(!probe.exists(), "no .probe rename leftover must remain");
+}

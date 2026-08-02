@@ -209,8 +209,39 @@ fn publish(
     parents: &[RoundSummary],
     child_covered_by: &[(Id, Id)],
 ) -> storyforge_infra_sqlite::Result<PublishOutcome> {
-    // job_id is optional and unique when present; default to publication_id for isolation.
+    // 三审4：publish_compress_with_fault 现在要求 job_id 对应的
+    // chronicle_compress_jobs 行存在且 status='running'。
+    //
+    // 幂等保证该 running job 行存在：
+    // - 若该 job_id 行已存在（replay 场景，同 publication_id 二次调用）→ 保持；
+    // - 否则终态化本 campaign 残留的 open job（满足 open-per-campaign 唯一索引）
+    //   再插入本次 running job。
     let job = format!("job-{}", publication_id.as_str());
+    let exists: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM chronicle_compress_jobs WHERE job_id = ?1",
+            [&job],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        db.connection()
+            .execute(
+                "UPDATE chronicle_compress_jobs SET status = 'succeeded' \
+                 WHERE campaign_id = ?1 AND status IN ('pending','running')",
+                [campaign_id.as_str()],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO chronicle_compress_jobs \
+                 (job_id, campaign_id, kind, status, attempts, max_attempts, created_at, updated_at) \
+                 VALUES (?1, ?2, 'auto', 'running', 0, 5, 'now', 'now')",
+                rusqlite::params![job, campaign_id.as_str()],
+            )
+            .unwrap();
+    }
     SqliteChronicleRepository::publish_compress(
         db,
         PublishRequest {
@@ -583,6 +614,15 @@ fn same_parent_identity_with_different_payload_is_rejected() {
 fn fault_leaves_zero_side_effects(fault: PublishFault) {
     let mut f = fixture_with_leaves(4);
     let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    // 三审4：publish UoW 现在要求 job_id 对应的 running compress job 行存在。
+    f.db.connection()
+        .execute(
+            "INSERT INTO chronicle_compress_jobs \
+             (job_id, campaign_id, kind, status, attempts, max_attempts, created_at, updated_at) \
+             VALUES ('job-fault', ?1, 'auto', 'running', 0, 5, 'now', 'now')",
+            [f.campaign_id.as_str()],
+        )
+        .unwrap();
     let err = SqliteChronicleRepository::publish_compress_with_fault(
         &mut f.db,
         PublishRequest {
@@ -1072,4 +1112,104 @@ fn existing_pending_marker_is_not_silently_overwritten() {
         err.to_string().contains("pending") || err.to_string().contains("marker"),
         "{err}"
     );
+}
+
+// ─── 三审4：compress job Running 校验下沉到 publication UoW 事务内 ────────
+//
+// 判别性：把 job 行状态手动改成 Succeeded（不再 running），用全新 publication_id +
+// 未占用 batch 直接调 publish_compress → 必须被 UoW 拒绝（"not running"）。
+// 旧实现（UoW 不校验 compress_jobs.status）会放行这次发布 → 测试失败。
+
+#[test]
+fn publish_rejected_when_compress_job_is_not_running() {
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    // 插入一个 Succeeded 态 job（模拟 worker 已完成、但迟到批次仍试图发布）。
+    let job_id = "job-succeeded-late";
+    f.db.connection()
+        .execute(
+            "INSERT INTO chronicle_compress_jobs \
+             (job_id, campaign_id, kind, status, attempts, max_attempts, created_at, updated_at) \
+             VALUES (?1, ?2, 'auto', 'succeeded', 1, 5, 'now', 'now')",
+            rusqlite::params![job_id, f.campaign_id.as_str()],
+        )
+        .unwrap();
+
+    let err = SqliteChronicleRepository::publish_compress(
+        &mut f.db,
+        PublishRequest {
+            campaign_id: &f.campaign_id,
+            publication_id: &publication_id,
+            parents: &parents,
+            child_covered_by: &child_covered_by,
+            job_id: Some(job_id),
+            batch_index: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not running"),
+        "publish must be refused when compress job is not running, got: {err}"
+    );
+    // 发布未发生：summary 未写入。
+    let summaries = SqliteProductionRepository::list_summaries(&f.db, &f.campaign_id).unwrap();
+    assert!(
+        summaries
+            .iter()
+            .all(|s| !s.id.as_str().starts_with("parent")),
+        "no parent summary must be persisted after refused publish"
+    );
+}
+
+#[test]
+fn publish_rejected_when_compress_job_missing() {
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    // 不插入任何 compress_jobs 行 → job_id 指向不存在的 job。
+    let job_id = "job-nonexistent";
+    let err = SqliteChronicleRepository::publish_compress(
+        &mut f.db,
+        PublishRequest {
+            campaign_id: &f.campaign_id,
+            publication_id: &publication_id,
+            parents: &parents,
+            child_covered_by: &child_covered_by,
+            job_id: Some(job_id),
+            batch_index: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "publish must be refused when compress job row is missing, got: {err}"
+    );
+}
+
+#[test]
+fn publish_allowed_when_compress_job_is_running() {
+    // 正向：running job + 全新 publication_id/batch → 发布成功（证明 guard 不误伤）。
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    let job_id = "job-running-ok";
+    f.db.connection()
+        .execute(
+            "INSERT INTO chronicle_compress_jobs \
+             (job_id, campaign_id, kind, status, attempts, max_attempts, created_at, updated_at) \
+             VALUES (?1, ?2, 'auto', 'running', 0, 5, 'now', 'now')",
+            rusqlite::params![job_id, f.campaign_id.as_str()],
+        )
+        .unwrap();
+    let outcome = SqliteChronicleRepository::publish_compress(
+        &mut f.db,
+        PublishRequest {
+            campaign_id: &f.campaign_id,
+            publication_id: &publication_id,
+            parents: &parents,
+            child_covered_by: &child_covered_by,
+            job_id: Some(job_id),
+            batch_index: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, PublishOutcome::Applied);
 }

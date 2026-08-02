@@ -130,6 +130,35 @@ impl SqliteChronicleRepository {
             )));
         }
 
+        // 三审4：把 compress job Running 校验**下沉到 publication UoW 事务内**。
+        // 当 request.job_id 存在时，在同一 BEGIN IMMEDIATE 事务里查
+        // chronicle_compress_jobs 行，断言 status='running'；否则拒绝发布
+        // （迟到批次不得在 job 已终态化后改写 summary/coverage/revision）。
+        // 这是权威校验点；worker 侧（backend_workflows::compress_job_is_running）
+        // 仅作早期短路，真正的事务级保证在这里。
+        if let Some(job_id) = request.job_id {
+            let job_status: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM chronicle_compress_jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            match job_status.as_deref() {
+                Some("running") => {}
+                Some(other) => {
+                    return Err(SqliteError::Conflict(format!(
+                        "compress job {job_id} is not running (status={other}); refuse publish"
+                    )));
+                }
+                None => {
+                    return Err(SqliteError::Conflict(format!(
+                        "compress job {job_id} not found; refuse publish"
+                    )));
+                }
+            }
+        }
+
         let mut campaign: Campaign = load_payload(
             tx,
             "SELECT payload_json FROM campaigns WHERE campaign_id = ?1",

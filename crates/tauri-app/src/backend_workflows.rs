@@ -2104,6 +2104,96 @@ fn compress_job_is_running(storage: &StorageFacade, job_id: &Id) -> Result<bool,
     }
 }
 
+// ─── 三审5：delete_card 命令级跨边界原子性（JSON 后端）─────────────────────
+//
+// JSON 多文件跨边界（会话/Turn/压缩任务 + CampaignStore 聚合）必须整体原子：
+// 前置删除成功、聚合写盘失败时，所有数据必须回到删除前原样（重启一致）。
+// 把 is_json / data_dir 访问集中在此（backend flag 白名单文件），commands 层
+// 只调用本函数，不直接触碰 backend flag。
+
+/// 受影响的 (campaign_id, conversation_ids) 列表（delete_card 删除前收集）。
+pub type AffectedCampaignConvIds = Vec<(Id, std::collections::HashSet<Id>)>;
+
+/// 三审5：delete_card 受影响文件的字节级快照（JSON 后端）。
+/// Some(bytes) = 原文件存在（恢复时写回）；None = 原文件缺失（恢复时删除新建的）。
+pub struct DeleteCardFileSnapshot(Vec<(std::path::PathBuf, Option<Vec<u8>>)>);
+
+/// 三审5：为 JSON 后端 delete_card 收集受影响文件的快照。SQLite 后端返回 None
+/// （单事务级联，无需快照）。
+pub fn snapshot_delete_card_affected_files(
+    storage: &crate::storage_backend::StorageFacade,
+    per_campaign_conv_ids: &AffectedCampaignConvIds,
+) -> Option<DeleteCardFileSnapshot> {
+    if !storage.is_json() {
+        return None;
+    }
+    let data_dir = storage.data_dir();
+    let mut paths: Vec<std::path::PathBuf> = vec![
+        data_dir.join("cards.json"),
+        data_dir.join("campaigns.json"),
+        data_dir.join("instances.json"),
+        data_dir.join("knowledge.json"),
+        data_dir.join("tasks.json"),
+        data_dir.join("round_summaries.json"),
+        data_dir.join("mvu_translations.json"),
+        data_dir.join("compress_jobs.json"),
+        data_dir.join("turns.json"),
+    ];
+    for (campaign_id, conv_ids) in per_campaign_conv_ids {
+        for conv_id in conv_ids {
+            paths.push(
+                data_dir
+                    .join("conversations")
+                    .join(format!("{conv_id}.json")),
+            );
+        }
+        paths.push(
+            data_dir
+                .join("campaign_world_info")
+                .join(format!("{campaign_id}.json")),
+        );
+    }
+    let snap = paths
+        .iter()
+        .map(|p| {
+            let bytes = match std::fs::read(p) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => None,
+            };
+            (p.clone(), bytes)
+        })
+        .collect();
+    Some(DeleteCardFileSnapshot(snap))
+}
+
+/// 三审5：按快照逆序恢复——Some(bytes) 写回；None 删除（本操作新建的）。
+pub fn restore_delete_card_snapshot(snapshot: DeleteCardFileSnapshot) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (path, old) in snapshot.0.iter().rev() {
+        let result = match old {
+            Some(bytes) => std::fs::write(path, bytes)
+                .map_err(|e| format!("恢复 {} 失败: {e}", path.display())),
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(path)
+                        .map_err(|e| format!("删除新建 {} 失败: {e}", path.display()))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = result {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

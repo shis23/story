@@ -320,6 +320,17 @@ pub enum CutoverState {
 pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     let marker_path = plan.marker_path();
     if !marker_path.exists() {
+        // 三审3：marker 缺失不能一律当作「空白新用户」。若 db_path 存在且是一个
+        // 带 authority_binding 的 StoryForge DB（中断的 cutover 残留），必须判
+        // Stale（ambiguous）让操作者显式处理，而非被当作 blank 并可能在后续
+        // cutover 中覆盖。真正的空白新用户 = 无 marker 且无 StoryForge DB。
+        if orphan_storyforge_db_exists(&plan.db_path) {
+            return MarkerStatus::Stale {
+                reason: "marker absent but a StoryForge database with authority binding exists \
+                         (interrupted cutover); resolve manually or re-run cutover"
+                    .into(),
+            };
+        }
         return MarkerStatus::Absent;
     }
     let raw = match fs::read_to_string(&marker_path) {
@@ -376,6 +387,54 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
             reason: e.to_string(),
         },
     }
+}
+
+/// 三审3：判断 marker 缺失时残留的孤儿 DB 是否**属于本次 cutover**。
+///
+/// 重新计算源 JSON 的 manifest hash（与正式 cutover 同一 readiness 路径），派生
+/// authority_id（与 `new_authority_identity` 同一确定性公式），再用只读探测查
+/// 孤儿 DB 的 authority_binding 是否匹配。
+///
+/// - 匹配 → 这是本次 cutover 的中断残留，可恢复（`run_cutover` 继续，发布时
+///   `owned_by_storyforge_readonly` 让旧 DB 让位）。
+/// - 不匹配 / 打不开 → 非本次 cutover 的孤儿 DB（不同 data_dir 或不同源派生），
+///   必须 fail closed（绝不静默覆盖）。
+fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
+    // 源 manifest 必须可计算（否则连 cutover 都进不去，交由后续步骤报错）。
+    let Ok(manifest) = readiness::validate_source_manifest(&plan.data_dir) else {
+        return false;
+    };
+    let (authority_id, _nonce) = new_authority_identity(&plan.data_dir, &manifest.manifest_hash);
+    orphan_db_matches_authority(&plan.db_path, &authority_id)
+}
+
+/// 只读探测：孤儿 DB 的 authority_binding.authority_id 是否等于给定身份。
+fn orphan_db_matches_authority(path: &Path, expected_authority_id: &str) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    use rusqlite::OpenFlags;
+    let Some(uri) = path.to_str() else {
+        return false;
+    };
+    let uri = format!("file:{uri}?mode=ro&immutable=1");
+    let conn = match rusqlite::Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let bound: Option<String> = conn
+        .query_row(
+            "SELECT authority_id FROM authority_binding WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    bound.as_deref() == Some(expected_authority_id)
 }
 
 /// Verify a database is openable, migrated, and bound to the marker identity.
@@ -563,9 +622,15 @@ pub fn run_cutover_with_fault(
             // Proceed with cutover.
         }
         MarkerStatus::Stale { reason } => {
-            return Err(SqliteError::Other(format!(
-                "stale backend marker; refusing cutover until resolved: {reason}"
-            )));
+            // 三审3：孤儿 DB（中断的 cutover 残留）若属于本次 cutover（同身份），
+            // 允许恢复继续；否则 fail closed（绝不静默覆盖无关/未知 DB）。
+            if orphan_belongs_to_this_cutover(plan) {
+                // 本次 cutover 的中断残留 → 继续（发布时让位旧 DB）。
+            } else {
+                return Err(SqliteError::Other(format!(
+                    "stale backend marker; refusing cutover until resolved: {reason}"
+                )));
+            }
         }
     }
 
@@ -593,9 +658,14 @@ pub fn run_cutover_with_fault(
         }
         MarkerStatus::JsonAuthoritative | MarkerStatus::Absent => {}
         MarkerStatus::Stale { reason } => {
-            return Err(SqliteError::Other(format!(
-                "stale backend marker after lock; refusing cutover until resolved: {reason}"
-            )));
+            // 三审3：加锁后再查——孤儿 DB 属于本次 cutover 才允许继续。
+            if orphan_belongs_to_this_cutover(plan) {
+                // 继续。
+            } else {
+                return Err(SqliteError::Other(format!(
+                    "stale backend marker after lock; refusing cutover until resolved: {reason}"
+                )));
+            }
         }
     }
 
@@ -1122,13 +1192,8 @@ fn atomic_publish_db(
         }
     }
 
-    // Atomic rename: temp → final.
-    match std::fs::rename(&temp, final_path.with_extension("probe")) {
-        Ok(_) => {
-            let _ = std::fs::rename(final_path.with_extension("probe"), &temp);
-        }
-        Err(e) => eprintln!("[BI4] probe rename FAILED: {e}"),
-    }
+    // 三审7：原子 rename temp → final（删除 .probe 来回 rename 探测——无意义的 IO
+    // 噪音，且在并发下有竞态；目标已确认不存在或已让位，直接 rename）。
     fs::rename(temp, final_path)?;
 
     // 审查一.5：rename 后 fsync 已发布 DB 文件（持久化发布结果）。
@@ -1171,6 +1236,70 @@ fn fsync_parent_dir(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn fsync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// 三审3：只读孤儿 DB 探测——判断 `path` 是否是一个**任何** StoryForge DB
+/// （application_id 魔数 + schema_migrations≥1 + authority_binding 行存在）。
+///
+/// 与 `owned_by_storyforge_readonly` 的区别：本函数**不**要求身份/hash 匹配本次
+/// cutover——它只回答「这是不是一个 StoryForge 权威库残留」。用于 marker 缺失时
+/// 区分「空白新用户」（无 DB）与「中断的 cutover 残留」（有 StoryForge DB）。
+///
+/// 同样只读、不改 PRAGMA、不创建文件；任何打开/读取错误 → false（保守当作非孤儿，
+/// 让下游 cutover 的 publish 阶段 `owned_by_storyforge_readonly` 再做严格判定）。
+fn orphan_storyforge_db_exists(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    use rusqlite::OpenFlags;
+    let Some(uri) = path.to_str() else {
+        return false;
+    };
+    let uri = format!("file:{uri}?mode=ro&immutable=1");
+    let conn = match rusqlite::Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // 1. application_id 魔数。
+    let app_id: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .unwrap_or(-1);
+    if app_id != i64::from(STORYFORGE_APPLICATION_ID) {
+        return false;
+    }
+    // 2. schema_migrations 存在且 MAX(version)>=1。
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_table != 1 {
+        return false;
+    }
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    if version < 1 {
+        return false;
+    }
+    // 3. authority_binding 行存在（StoryForge cutover 写入的身份绑定表）。
+    let bound: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM authority_binding WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    bound > 0
 }
 
 /// Read-only ownership probe: open the file with `SQLITE_OPEN_READONLY` (no

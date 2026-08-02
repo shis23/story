@@ -12,6 +12,8 @@ const BACKEND_FLAG_WHITELIST: &[&str] = &[
     "storage_backend.rs",
     "sqlite_runtime.rs",
     "backend_workflows.rs",
+    // 三审9：启动恢复协调模块，按 is_sqlite() 分派——与 backend_workflows 同性质。
+    "startup_recovery.rs",
 ];
 
 fn contains_backend_flag(source: &str) -> bool {

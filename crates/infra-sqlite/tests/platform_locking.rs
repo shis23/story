@@ -518,3 +518,79 @@ fn cross_process_shared_leases_coexist() {
     assert!(status.success());
     drop(guard);
 }
+
+// ─── 三审2：一个进程持 SHARED 时，两个外部进程同时尝试 EXCLUSIVE 都被阻塞 ──
+
+/// 用区分的信号路径 spawn 一个 lease_hold 子进程（支持同名 mode 多实例）。
+fn spawn_lease_hold_named(
+    dir: &Path,
+    mode: &str,
+    tag: &str,
+) -> (std::process::Child, PathBuf, PathBuf) {
+    let exe = std::env::var("CARGO_BIN_EXE_lease_hold")
+        .expect("CARGO_BIN_EXE_lease_hold must point to the compiled helper binary");
+    let ready = dir.join(format!("lease-ready-{mode}-{tag}.signal"));
+    let release = dir.join(format!("lease-release-{mode}-{tag}.signal"));
+    let _ = fs::remove_file(&ready);
+    let _ = fs::remove_file(&release);
+    let child = std::process::Command::new(&exe)
+        .arg(dir)
+        .arg(mode)
+        .arg(&ready)
+        .arg(&release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lease_hold");
+    (child, ready, release)
+}
+
+#[test]
+fn shared_lease_blocks_two_concurrent_exclusive_processes() {
+    // 三审2：一个外部进程持 SHARED 时，两个**同时**尝试 EXCLUSIVE 的外部进程
+    // 都必须拿不到（fail closed，非阻塞），直到 SHARED 释放。证明跨进程互斥在
+    // 多竞争者下成立（而非只有一对一阻塞）。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+
+    // 1) 先持有一个 SHARED（模拟普通写者进程）。
+    let (mut shared_child, shared_ready, shared_release) =
+        spawn_lease_hold_named(dir.path(), "shared", "holder");
+    wait_for_signal(&shared_ready, 60);
+
+    // 2) 同时 spawn 两个 EXCLUSIVE 竞争者。它们会尝试获取 EXCLUSIVE——应立即失败
+    //    （非阻塞），但 lease_hold bin 在失败时 panic 退出。我们给它们短暂时间，
+    //    然后断言两者都未写出 ready 信号（即都没拿到）。
+    let (mut excl_a, ready_a, release_a) = spawn_lease_hold_named(dir.path(), "exclusive", "a");
+    let (mut excl_b, ready_b, release_b) = spawn_lease_hold_named(dir.path(), "exclusive", "b");
+
+    // 等待足够时间让两个竞争者尝试并失败（lease_hold 失败即 panic 退出，无 ready）。
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !ready_a.exists() && !ready_b.exists(),
+        "两个 EXCLUSIVE 竞争者在 SHARED 持有期间都不应拿到租约"
+    );
+
+    // 3) 释放 SHARED 后，至少一个 EXCLUSIVE 竞争者应能拿到（证明阻塞是真因 SHARED，
+    //    而非永久死锁）。先让竞争者们重试：lease_hold panic 已退出，重新 spawn。
+    let excl_a_status = excl_a.try_wait();
+    let _ = excl_a.kill();
+    let _ = excl_b.kill();
+    let _ = excl_a_status;
+    fs::write(&shared_release, b"go").unwrap();
+    let _ = shared_child.wait();
+    // 清理可能残留的竞争者。
+    let _ = excl_a.wait();
+    let _ = excl_b.wait();
+    let _ = release_a;
+    let _ = release_b;
+
+    // SHARED 释放后，新 EXCLUSIVE 应能拿到（无死锁残留）。
+    let (mut excl_c, ready_c, release_c) = spawn_lease_hold_named(dir.path(), "exclusive", "c");
+    wait_for_signal(&ready_c, 10);
+    fs::write(&release_c, b"go").unwrap();
+    assert!(
+        excl_c.wait().unwrap().success(),
+        "exclusive acquirable after shared release"
+    );
+}

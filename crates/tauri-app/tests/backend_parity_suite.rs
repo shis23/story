@@ -1794,14 +1794,9 @@ impl ParityDriver {
                 "二次恢复后 Turn 状态必须不变（幂等）: {report:?}"
             );
         }
-        assert!(
-            report.compress_reset_first >= 1,
-            "Running compress job 必须被重置: {report:?}"
-        );
-        assert_eq!(
-            report.compress_reset_second, 0,
-            "二次恢复的 compress reset 必须为 0（幂等）: {report:?}"
-        );
+        // 三审9：重置现在在 `run_startup_recovery` 内部完成（公共入口统一处理），
+        // reset 探针在恢复之后读取 → 计数可能为 0（已被内部重置）。真正的不变式是
+        // 「压缩任务不得停留在 Running」，由下方断言保证。
         assert!(
             report
                 .compress_jobs
@@ -2274,29 +2269,6 @@ async fn backend_parity_equivalent_domain_snapshots() {
 // AppState::new_with_backend → recover_turns → recover_compress_jobs，
 // 等待压缩 worker 收敛后输出单行 JSON 报告并退出 0。
 
-fn recover_turns_for_backend(state: &AppState) -> Result<usize, String> {
-    let storage = state.storage();
-    if storage.is_sqlite() {
-        return sqlite_runtime::recover_turns_on_startup();
-    }
-    let campaign_store = storage
-        .json_campaign_store(
-            BackendCapability::TurnLifecycle,
-            "recover JSON turns (restart child)",
-        )
-        .map_err(|e| e.to_string())?;
-    let turn_store = storage
-        .json_turn_store("recover JSON turns (restart child)")
-        .map_err(|e| e.to_string())?;
-    let service = storyforge_lib::turn_lifecycle::TurnLifecycleService::new(
-        campaign_store,
-        turn_store,
-        &state.conv_store,
-    );
-    service.recover_turns_on_startup(|_batch| {});
-    Ok(0)
-}
-
 fn read_reported_turns(state: &AppState, turn_ids: &[String]) -> Vec<ReportTurn> {
     let mut out = Vec::new();
     for id in turn_ids {
@@ -2397,16 +2369,13 @@ async fn restart_child_entry() {
     let state =
         Arc::new(AppState::new_with_backend(data_dir, storage.clone()).expect("child AppState"));
 
-    // ── 生产启动恢复第 1 轮 ──────────────────────────────────────────
-    // JSON 恢复不返回计数（TurnLifecycleService），turns_failed 从报告 Turn
-    // 状态派生（各后端自身真值）；SQLite 返回 fail_incomplete 计数仅作参考。
-    let _recovered_count = recover_turns_for_backend(&state).expect("child turn recovery");
+    // ── 生产启动恢复第 1 轮（单一公共入口）──────────────────────────────
+    // 三审9：子进程与生产 setup hook 共用 `startup_recovery::run_startup_recovery`
+    // （内部：turn 重放 + compress Running→Pending + spawn worker），不再各自内联。
+    storyforge_lib::startup_recovery::run_startup_recovery(&state);
     let reset_first = storage
         .reset_running_compress_jobs_to_pending()
         .expect("child compress reset");
-    // recover_compress_jobs_on_startup：Running→Pending 后为 open job spawn
-    // worker（生产入口，含 worker 重复启动幂等）。
-    storyforge_lib::backend_workflows::recover_compress_jobs_on_startup(state.clone());
 
     // 等待压缩 worker 收敛（无 LLM → 快速失败回队；job 最终停在 Pending）。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -2424,7 +2393,8 @@ async fn restart_child_entry() {
 
     // ── 二次恢复（幂等证明）──────────────────────────────────────────
     let turns_after_first = read_reported_turns(&state, &turn_ids);
-    let _ = recover_turns_for_backend(&state).expect("second turn recovery");
+    // 三审9：二次恢复走同一公共入口（幂等：Running→Pending 已迁移、Committing 已重放）。
+    storyforge_lib::startup_recovery::run_startup_recovery(&state);
     let reset_second = storage
         .reset_running_compress_jobs_to_pending()
         .expect("second compress reset");

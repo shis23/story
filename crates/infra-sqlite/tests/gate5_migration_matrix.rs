@@ -803,11 +803,27 @@ fn marker_last_and_failure_retention_for_every_stage() {
         );
 
         // 失败后：marker 不声称 SQLite 权威。
-        assert_eq!(
-            inspect_marker(&request.plan),
-            MarkerStatus::Absent,
-            "fault {fault:?}: marker must be absent"
+        // 三审3：publish 后的 fault（AfterPublishBeforeMarker / AfterAudit）会留下
+        // 孤儿 StoryForge DB（带 authority_binding）→ inspect_marker 判 Stale
+        // （ambiguous，比 Absent 更安全）；publish 前的 fault 无 DB → Absent。
+        // 两者都不声称 SqliteAuthoritative（核心不变式）。
+        let status = inspect_marker(&request.plan);
+        let published_but_no_marker = matches!(
+            fault,
+            CutoverFault::AfterPublishBeforeMarker | CutoverFault::AfterAudit
         );
+        if published_but_no_marker {
+            assert!(
+                matches!(status, MarkerStatus::Stale { .. }),
+                "fault {fault:?}: orphan DB must be Stale, got {status:?}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                MarkerStatus::Absent,
+                "fault {fault:?}: marker must be absent (no DB published)"
+            );
+        }
         // 原 JSON 不被修改或删除。
         assert_eq!(
             fs::read(dir.path().join("campaigns.json")).unwrap(),

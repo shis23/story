@@ -338,20 +338,44 @@ fn validate_export_target(db_path: &Path, export_dir: &Path) -> Result<()> {
             export_dir.display()
         )));
     }
+    // 三审7：目标是数据根**内部**的任意后代（data_dir/sub/export 这类）→ 拒绝。
+    // 旧实现只在扁平 forbidden 列表里枚举已知文件名，data_dir 内部的任意新子路径
+    // 都能绕过——可能把导出写进活动数据根里污染权威树或与未来 JSON 文件冲突。
+    if export_canon.starts_with(&data_dir_canon) {
+        return Err(SqliteError::Other(format!(
+            "refusing export: target {} is inside the live data root",
+            export_dir.display()
+        )));
+    }
     Ok(())
 }
 
-/// 宽松 canonicalize：路径不存在时 canonicalize 父目录后重接文件名，保证
-/// 「路径即身份」的比较不受存在性影响。
+/// 宽松 canonicalize：路径不存在时沿父链向上找到第一个存在的祖先并 canonicalize，
+/// 再把剩余相对段重接回去，保证「路径即身份」的比较不受存在性影响（三审7：
+/// 深层不存在的目标 dir/subdir/export 也须与 data_dir 可靠比较 starts_with）。
 fn canonicalize_loose(path: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(path) {
         return c;
     }
-    if let Some(parent) = path.parent()
-        && let Ok(pc) = fs::canonicalize(parent)
-        && let Some(name) = path.file_name()
-    {
-        return pc.join(name);
+    // 收集从 path 向上直到第一个可 canonicalize 的祖先，把相对段记下。
+    let mut relative_segments: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Some(name) = cursor.file_name() {
+            relative_segments.push(name.to_os_string());
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if let Ok(pc) = fs::canonicalize(parent) {
+            // 祖先可 canonicalize：把记下的相对段逆序重接回去。
+            let mut result = pc;
+            for seg in relative_segments.iter().rev() {
+                result.push(seg);
+            }
+            return result;
+        }
+        cursor = parent.to_path_buf();
     }
     path.to_path_buf()
 }

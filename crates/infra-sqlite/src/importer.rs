@@ -292,6 +292,11 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     let compress_jobs = crate::readiness::read_compress_jobs_array(data_dir)?;
     let characters = crate::readiness::read_characters_array(data_dir)?;
 
+    // 三审6：Campaign 引用的 conversation_id 必须有对应的会话文件存在。
+    // 区分「空白新用户」（无核心文件，允许）与「部分文件丢失」（campaigns 引用了
+    // 不存在的会话，必须拒绝）——绝不静默当作无会话导入。
+    verify_campaign_conversation_references(&campaigns, &conversations)?;
+
     // 审查一.6：严格校验（与 readiness 同口径）。任何畸形条目 → 整体拒绝，
     // 绝不静默跳过/归一化。
     let campaign_ids: std::collections::HashSet<String> = campaigns
@@ -405,6 +410,40 @@ fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
         out.push(value);
     }
     Ok(out)
+}
+
+/// 三审6：校验 Campaign 引用的 conversation_id 在已读会话集合中存在。
+///
+/// 区分语义：
+/// - 空白新用户（campaigns 为空或无 conversation_id 引用）→ 允许；
+/// - 部分文件丢失（campaign 引用了某 conversation_id，但对应会话文件缺失）→
+///   拒绝（CorruptImportInput），绝不静默当作无会话。
+fn verify_campaign_conversation_references(
+    campaigns: &[Value],
+    conversations: &[Value],
+) -> Result<()> {
+    let conversation_ids: std::collections::HashSet<&str> = conversations
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+        .collect();
+    for campaign in campaigns {
+        let Some(conv_id) = campaign.get("conversation_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if conv_id.is_empty() {
+            continue;
+        }
+        if !conversation_ids.contains(conv_id) {
+            let camp_id = campaign
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            return Err(SqliteError::CorruptImportInput(format!(
+                "campaign {camp_id} references conversation {conv_id} but the conversation file is missing"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn hash_named_array(hasher: &mut Sha256, name: &str, items: &[Value]) {

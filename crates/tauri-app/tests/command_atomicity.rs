@@ -1001,6 +1001,70 @@ fn json_delete_card_mid_delete_failure_rolls_back_everything() {
     let _ = dir;
 }
 
+// ─── 三审5：delete_card 命令级跨边界原子（前置 + 聚合整体原子）────────────
+//
+// 判别性：经命令入口 storyforge_lib::delete_card（前置删会话/Turn/压缩任务 →
+// 聚合 delete_card）执行；注入聚合写盘失败（冻结 cards.json）。旧实现：前置
+// 已删、聚合失败 → 会话/Turn 文件丢失（半状态）。新实现：快照恢复，重启后
+// 卡 + Campaign + 会话 + Turn + 任务全部原样。
+
+#[test]
+fn json_delete_card_command_precursor_plus_aggregate_atomic_on_failure() {
+    let dir = temp_dir("delete-card-command-atomic");
+    let state = json_state(dir.path());
+    let (card_id, campaign_id, conversation_id, _instance_id) =
+        seed_full_card(&state, dir.path(), "cmd-atomic");
+
+    // 删除前的基线：会话 + Turn 文件存在。
+    let conv_path = dir
+        .path()
+        .join("conversations")
+        .join(format!("{conversation_id}.json"));
+    let turns_path = dir.path().join("turns.json");
+    assert!(conv_path.exists(), "会话文件删除前必须存在");
+    assert!(turns_path.exists(), "turns.json 删除前必须存在");
+    let turns_before = std::fs::read(&turns_path).unwrap();
+
+    // 冻结 cards.json：命令的聚合 delete_card 写 cards.json 时失败。
+    // （前置已先删会话/Turn/压缩任务——旧实现会留下半状态；新实现快照恢复。）
+    let cards_path = dir.path().join("cards.json");
+    storyforge_infra_util::write_fence::freeze(&cards_path);
+    let error = storyforge_lib::delete_card(card_id.as_str().to_string(), to_state(&state))
+        .expect_err("delete_card command must fail when cards.json is fenced");
+    assert!(
+        error.to_string().contains("存储写入失败"),
+        "error must report storage failure: {error}"
+    );
+    storyforge_infra_util::write_fence::unfreeze(&cards_path);
+
+    // 重启一致（全新 store，同目录）：卡 + Campaign + 会话 + Turn 全部原样。
+    // 三审5 判别点：旧实现会话/Turn 文件已被前置删除且未恢复 → 这里读不到。
+    let reloaded = CampaignStore::new(dir.path());
+    assert_eq!(
+        reloaded.list_cards().len(),
+        1,
+        "card must survive the failed command-level delete (snapshot restored)"
+    );
+    assert_eq!(
+        reloaded.list_campaigns().len(),
+        1,
+        "campaign must survive the failed command-level delete"
+    );
+    assert_eq!(
+        reload_conversation_count(dir.path()),
+        1,
+        "conversation file must be restored after failed aggregate (precursor atomicity)"
+    );
+    // turns.json 字节不变（前置删除被快照恢复）。
+    let turns_after = std::fs::read(&turns_path).unwrap();
+    assert_eq!(
+        turns_before, turns_after,
+        "turns.json bytes must be unchanged after failed command-level delete"
+    );
+    let _ = campaign_id;
+    let _ = dir;
+}
+
 // ─── 四.2：JSON MutationBatch 最终持久化状态 == "committed" ───────────────
 
 #[test]

@@ -1352,7 +1352,9 @@ fn reverse_export_marks_preaccept_outbox_as_unsupported_without_silent_loss() {
     )
     .unwrap();
 
-    let export_dir = f._dir.path().join("export-out");
+    // 三审7：导出目标必须在活动数据根之外。
+    let export_root = TempDir::new().unwrap();
+    let export_dir = export_root.path().join("export-out");
     let result = export_sqlite_to_json(&f.db, &export_dir).unwrap();
     assert!(
         result

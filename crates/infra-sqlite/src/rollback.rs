@@ -1,4 +1,4 @@
-//! 生产 rollback 入口：SQLite 权威 → JSON 权威（审查二.7）。
+//! 生产 rollback 入口：SQLite 权威 → JSON 权威（审查二.7 + 三审1）。
 //!
 //! 精确序列：
 //! 1. 获取 `data_dir` 的 EXCLUSIVE authority 租约——覆盖整个 rollback，
@@ -9,7 +9,10 @@
 //! 4. staging 自检：把 staging 重新导入全新内存 DB，比较计数与内容 hash
 //!    （导出器投影）并断言 manifest 声明零脱敏——证明产物可恢复。
 //! 5. 显式确认：`confirm` 必须为 true；否则 Err（无任何状态变更）。
-//! 6. 最后原子写 `JsonAuthoritative` marker（tmp + fsync + rename + fsync；
+//! 6. **原子安装回滚后的 JSON 进 data_dir**（三审1）：把 staging 树原子发布进
+//!    data_dir（snapshot 全部受影响路径 → 写候选 → 失败逆序恢复）。否则新进程
+//!    仍读到迁移前 JSON。成功后 data_dir 内就是可被新进程直接读取的 JSON 权威树。
+//! 7. 最后原子写 `JsonAuthoritative` marker（tmp + fsync + rename + fsync；
 //!    unix 上额外 fsync 父目录）。SQLite DB 文件**不删除**——只有 marker 切换。
 //!
 //! 任何步骤失败：marker 不动（SQLite 仍权威）、staging 清理、DB 文件字节不变。
@@ -57,14 +60,16 @@ pub struct RollbackReport {
     pub characters: usize,
 }
 
-/// Test-only fault injection for the rollback（审查二.7）。
+/// Test-only fault injection for the rollback（审查二.7 + 三审1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollbackFault {
     None,
     /// 无损导出完成后立即失败（自检之前）。
     AfterExport,
-    /// 自检通过后、confirm / marker 之前失败。
+    /// 自检通过后、JSON 安装之前失败。
     AfterSelfCheck,
+    /// JSON 已原子安装进 data_dir、写 marker 之前失败（三审1：证明装步骤幂等可重跑）。
+    AfterJsonInstall,
 }
 
 /// Run the production rollback（SQLite 权威 → JSON 权威）。
@@ -133,7 +138,20 @@ pub fn run_rollback_with_fault(
             ));
         }
 
-        // ── Step 6: 最后写 JsonAuthoritative marker（提交点）──────────
+        // ── Step 6: 原子安装回滚后的 JSON 进 data_dir（三审1）─────────
+        // 仅写 marker 不装 JSON → 新进程仍读到迁移前 JSON（致命）。把 staging
+        // 树原子发布进 data_dir：snapshot 全部受影响路径 → 写候选 → 失败逆序恢复。
+        // 成功后 data_dir 内就是可被新进程直接读取的完整 JSON 权威树。幂等：
+        // 重跑会再次覆盖（候选状态来自同一 staging，内容一致）。
+        install_rollback_json_into_data_dir(&stage_dir, &plan.data_dir)?;
+
+        if fault == RollbackFault::AfterJsonInstall {
+            return Err(SqliteError::Other(
+                "injected fault: after json install".into(),
+            ));
+        }
+
+        // ── Step 7: 最后写 JsonAuthoritative marker（提交点）──────────
         write_json_authoritative_marker(plan)?;
 
         Ok(staged)
@@ -246,6 +264,209 @@ fn check_self_count(name: &str, actual: usize, map: &Map<String, Value>) -> Resu
         )));
     }
     Ok(())
+}
+
+/// 三审1：原子安装回滚后的 JSON 进 data_dir。
+///
+/// 把 staging 树发布进 `data_dir`：对每个目标路径先快照（存在则记原文，缺失则
+/// 记 Missing），再写 staging 对应文件；任一写入失败按逆序恢复，保证「全部安装
+/// 或全部保留」。conversations/ 与 campaign_world_info/ 目录按文件级快照（逐个
+/// 会话/世界书文件）+ 整目录发布。`export-manifest.json` 是 rollback 产物元数据，
+/// **不**安装进 data_dir（JSON 权威布局里没有它）。
+///
+/// 幂等：重跑会用同一 staging 内容再次覆盖（候选状态一致）。
+fn install_rollback_json_into_data_dir(stage_dir: &Path, data_dir: &Path) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // 要安装的顶层 JSON 数组文件（staging 与 data_dir 同名）。
+    const JSON_ARRAY_FILES: &[&str] = &[
+        "cards.json",
+        "campaigns.json",
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "mvu_translations.json",
+        "compress_jobs.json",
+        "characters.json",
+    ];
+    // 要整体发布的子目录（按文件级快照）。
+    const SUBDIRS: &[&str] = &["conversations", "campaign_world_info"];
+
+    // ── 收集「目标路径 → (快照, 源字节)」计划 ──
+    // 目标存在 → 记原文（可回滚）；目标缺失 → 记 Missing（恢复时删除新建文件）。
+    // 源字节是 staging 对应文件的当前内容（已自检通过）。
+    enum InstallPlan {
+        Overwrite { old: Option<Vec<u8>>, new: Vec<u8> },
+    }
+
+    let mut plan: BTreeMap<PathBuf, InstallPlan> = BTreeMap::new();
+
+    for name in JSON_ARRAY_FILES {
+        let src = stage_dir.join(name);
+        let dst = data_dir.join(name);
+        if !src.exists() {
+            // staging 缺该文件（空数据集时某些文件可能未生成）→ 目标应被清空为
+            // 空数组，确保 data_dir 不残留迁移前的旧行。写入 `[]`。
+            plan.insert(
+                dst.clone(),
+                InstallPlan::Overwrite {
+                    old: read_snapshot(&dst)?,
+                    new: b"[]".to_vec(),
+                },
+            );
+            continue;
+        }
+        let new = read_bytes(&src)?;
+        plan.insert(
+            dst.clone(),
+            InstallPlan::Overwrite {
+                old: read_snapshot(&dst)?,
+                new,
+            },
+        );
+    }
+
+    // 子目录：逐文件级快照 + 发布。staging 里有、data_dir 没有的文件 → Missing。
+    for subdir in SUBDIRS {
+        let src_dir = stage_dir.join(subdir);
+        let dst_dir = data_dir.join(subdir);
+        if src_dir.exists() {
+            for entry in fs::read_dir(&src_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+                let dst = dst_dir.join(file_name);
+                let new = read_bytes(&path)?;
+                plan.insert(
+                    dst.clone(),
+                    InstallPlan::Overwrite {
+                        old: read_snapshot(&dst)?,
+                        new,
+                    },
+                );
+            }
+        }
+        // data_dir 里存在但 staging 已不含的旧文件（如被回滚掉的会话）→ 计划删除。
+        if dst_dir.exists() {
+            for entry in fs::read_dir(&dst_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+                let src = src_dir.join(file_name);
+                if !src.exists() && !plan.contains_key(&path) {
+                    // 旧文件需删除：记原文以便回滚。
+                    plan.insert(
+                        path.clone(),
+                        InstallPlan::Overwrite {
+                            old: read_snapshot(&path)?,
+                            new: Vec::new(), // 哨兵：空 + Missing-old 表示删除
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // ── 执行：按计划顺序写盘；任一失败逆序恢复 ──
+    let ordered: Vec<(PathBuf, InstallPlan)> = plan.into_iter().collect();
+    let mut written: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    for (dst, InstallPlan::Overwrite { old, new }) in &ordered {
+        let install_result: Result<()> = (|| {
+            if new.is_empty() && old.as_ref().is_some_and(|o| !o.is_empty()) {
+                // 删除目标（staging 已不含、data_dir 仍存在的旧文件）。
+                if dst.exists() {
+                    fs::remove_file(dst)?;
+                }
+                return Ok(());
+            }
+            fs::create_dir_all(dst.parent().unwrap_or(Path::new(".")))?;
+            atomic_install_file(dst, new)
+        })();
+        if let Err(e) = install_result {
+            // 逆序恢复已写入的路径（恢复失败一并上报）。
+            let mut restore_errors = Vec::new();
+            for (path, old_bytes) in written.iter().rev() {
+                if let Err(re) = restore_path(path, old_bytes) {
+                    restore_errors.push(format!("{re}"));
+                }
+            }
+            return if restore_errors.is_empty() {
+                Err(SqliteError::Other(format!(
+                    "rollback json install failed at {}: {e}",
+                    dst.display()
+                )))
+            } else {
+                Err(SqliteError::Other(format!(
+                    "rollback json install failed at {}: {e}; restore also failed: {}",
+                    dst.display(),
+                    restore_errors.join("; ")
+                )))
+            };
+        }
+        written.push((dst.clone(), old.clone()));
+    }
+    Ok(())
+}
+
+/// 读文件字节；不存在返回 None（Missing）。
+fn read_snapshot(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SqliteError::Other(format!(
+            "snapshot read failed {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path)
+        .map_err(|e| SqliteError::Other(format!("read staging file {}: {e}", path.display())))
+}
+
+/// 原子安装单文件：写 .tmp → fsync → rename → fsync（与 marker 写入同款持久化）。
+fn atomic_install_file(dst: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension("json.rollback-tmp");
+    fs::write(&tmp, bytes)
+        .map_err(|e| SqliteError::Other(format!("write tmp {}: {e}", tmp.display())))?;
+    fsync_file(&tmp)
+        .map_err(|e| SqliteError::Other(format!("fsync tmp {}: {e}", tmp.display())))?;
+    fs::rename(&tmp, dst)
+        .map_err(|e| SqliteError::Other(format!("rename -> {}: {e}", dst.display())))?;
+    fsync_file(dst).map_err(|e| SqliteError::Other(format!("fsync {}: {e}", dst.display())))?;
+    Ok(())
+}
+
+/// 恢复单路径：有 old → 原子写回；None → 删除（本安装新建的）。
+fn restore_path(path: &Path, old: &Option<Vec<u8>>) -> Result<()> {
+    match old {
+        Some(bytes) => fs::write(path, bytes)
+            .map_err(|e| SqliteError::Other(format!("restore {}: {e}", path.display()))),
+        None => {
+            if path.exists() {
+                fs::remove_file(path).map_err(|e| {
+                    SqliteError::Other(format!("remove created {}: {e}", path.display()))
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// 最后写 JsonAuthoritative marker：tmp + fsync + rename + fsync；

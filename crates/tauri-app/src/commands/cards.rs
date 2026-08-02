@@ -200,6 +200,14 @@ pub fn delete_card(
         }
     }
 
+    // 三审5：JSON 多文件跨边界（会话/Turn/压缩任务 + CampaignStore 聚合）必须整体
+    // 原子——前置删除成功、聚合写盘失败时，所有数据必须回到删除前原样（重启一致）。
+    // 快照收集经 backend_workflows（backend flag 白名单文件），SQLite 返回 None。
+    let snapshot = crate::backend_workflows::snapshot_delete_card_affected_files(
+        state.storage(),
+        &per_campaign_conv_ids,
+    );
+
     // 1) 前置清理：会话 + Turn + 压缩任务（JSON 多文件无法单事务，先删前置、
     //    失败时卡仍在可安全重试；SQLite 由 delete_card_payload 单事务级联，
     //    此处 no-op，与 delete_campaign_playthrough 同款补偿顺序）。
@@ -230,11 +238,24 @@ pub fn delete_card(
     }
 
     // 2) 删卡（JSON：快照/补偿式全级联；SQLite：单事务级联）。
-    if !state
-        .storage()
-        .delete_card(&card_id)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
-    {
+    //    三审5：聚合写盘失败时，用前置快照逆序恢复全部受影响文件（含会话/Turn），
+    //    保证重启后所有数据保持删除前原样——绝不留「前置已删、卡还在」的半状态。
+    let aggregate_result = state.storage().delete_card(&card_id);
+    if let Err(e) = aggregate_result {
+        if let Some(snap) = snapshot
+            && let Err(restore_err) = crate::backend_workflows::restore_delete_card_snapshot(snap)
+        {
+            return Err(TauriCommandError::storage(format!(
+                "存储写入失败: {e}; 删除回滚也失败，数据需要恢复: {restore_err}"
+            )));
+        }
+        return Err(TauriCommandError::storage(format!("存储写入失败: {e}")));
+    }
+    if !aggregate_result.unwrap() {
+        // 卡不存在：聚合未改任何状态，但前置可能已删——用快照恢复前置原样。
+        if let Some(snap) = snapshot {
+            let _ = crate::backend_workflows::restore_delete_card_snapshot(snap);
+        }
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
     }
 

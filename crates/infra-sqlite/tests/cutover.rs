@@ -248,10 +248,18 @@ fn fault_after_publish_before_marker_recovers_on_restart() {
     assert!(err.to_string().contains("after publish"));
 
     // The DB was published but marker not written.
-    // inspect_marker sees Absent (no marker), so JSON is still authoritative.
-    assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
+    // 三审3：marker 缺失 + 孤儿 StoryForge DB（带 authority_binding）→ Stale
+    // （ambiguous），而非 Absent。这比「当作空白新用户」更安全：避免被当作
+    // blank 并在后续被静默覆盖。
+    let status = inspect_marker(&request.plan);
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "orphan DB must be Stale (ambiguous), not Absent; got {status:?}"
+    );
 
-    // Recovery: a clean re-run should succeed.
+    // Recovery: a clean re-run should succeed — the orphan DB belongs to THIS
+    // cutover (same data_dir + source → same authority identity), so publish
+    // lets it aside and re-publishes.
     let outcome = recover_or_verify(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
 
@@ -646,7 +654,7 @@ fn fault_after_audit_before_marker_leaves_json_authoritative() {
         "fault message must identify the audit step, got: {err}"
     );
 
-    // DB 已发布但 marker 未写 → JSON 仍权威。
+    // DB 已发布但 marker 未写 → JSON 仍权威（marker 不存在）。
     assert!(
         dir.path().join("storyforge.sqlite3").exists(),
         "DB is published before the marker step"
@@ -655,7 +663,12 @@ fn fault_after_audit_before_marker_leaves_json_authoritative() {
         !dir.path().join("storyforge.backend.json").exists(),
         "audit happens BEFORE marker write: no marker may exist after AfterAudit"
     );
-    assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
+    // 三审3：marker 缺失 + 孤儿 DB → Stale（ambiguous），而非 Absent。
+    let status = inspect_marker(&request.plan);
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "orphan DB must be Stale, not Absent; got {status:?}"
+    );
 
     // 恢复：重新跑完整 cutover 成功（发布过的自身 DB 可让位）。
     let outcome = recover_or_verify(&request).unwrap();
@@ -693,4 +706,94 @@ fn marker_write_failure_keeps_json_authoritative_and_recovers() {
     let outcome = recover_or_verify(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
     assert!(dir.path().join("storyforge.backend.json").is_file());
+}
+
+// ─── 三审3：孤儿 DB（marker 缺失 + 带 authority_binding）的判别 ─────────
+//
+// 正向（属于本次 cutover）：中断的 publish 残留 → Stale 但可恢复（已在
+//   fault_after_publish_before_marker_recovers_on_restart 覆盖）。
+// 负向（不属于本次 cutover）：把**另一个** data_dir 的 cutover 产物 DB 拷进
+//   一个**不同源**的 data_dir（不同 manifest hash → 不同 authority_id）→ 必须
+//   Stale 且 run_cutover fail closed，DB 字节不变（绝不静默覆盖未知库）。
+
+#[test]
+fn orphan_db_with_mismatched_identity_is_stale_and_fail_closed() {
+    // 源 A：在 data_dir_A 跑完整 cutover，得到带 authority_binding 的 DB（身份 A）。
+    let dir_a = TempDir::new().unwrap();
+    sample_source(dir_a.path());
+    let request_a = make_request(dir_a.path());
+    match run_cutover(&request_a).unwrap() {
+        CutoverOutcome::Completed(_) => {}
+        other => panic!("cutover A must complete: {other:?}"),
+    }
+    let db_a = dir_a.path().join("storyforge.sqlite3");
+    assert!(db_a.exists(), "DB A must exist after cutover");
+    let db_a_bytes = fs::read(&db_a).unwrap();
+
+    // 源 B：**不同**的 data_dir + 不同 JSON 内容（campaign 名不同 → 不同 manifest
+    // hash → 不同身份），保留外键一致（id 不变，仅 name 改）。
+    let dir_b = TempDir::new().unwrap();
+    sample_source(dir_b.path());
+    write_json(
+        &dir_b.path().join("campaigns.json"),
+        &serde_json::json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "DifferentNameForB",
+            "created_at": "2026-07-13T00:00:00Z", "revision": 0,
+            "chronicle_revision": 0, "conversation_id": "conv-1", "lineage_id": "lin-1"
+        }]),
+    );
+    // 把 A 的 DB（身份 A）拷进 B 的目录当作「marker 缺失 + 孤儿 DB」。无 marker。
+    let db_b = dir_b.path().join("storyforge.sqlite3");
+    fs::write(&db_b, &db_a_bytes).unwrap();
+    assert!(!dir_b.path().join("storyforge.backend.json").exists());
+
+    // 判别：inspect_marker 必须是 Stale（孤儿 DB 检测），而非 Absent。
+    let status = inspect_marker(&request_b_plan(dir_b.path()));
+    assert!(
+        matches!(status, MarkerStatus::Stale { .. }),
+        "orphan DB must be Stale, not Absent; got {status:?}"
+    );
+
+    // run_cutover 必须 fail closed（身份不匹配，绝不覆盖未知库）。
+    let request_b = make_request(dir_b.path());
+    let err = run_cutover(&request_b).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("stale backend marker") || msg.contains("refusing"),
+        "mismatched orphan DB must fail closed, got: {msg}"
+    );
+
+    // DB 字节不变（未被覆盖/让位）。
+    assert_eq!(
+        db_a_bytes,
+        fs::read(&db_b).unwrap(),
+        "orphan DB bytes must be untouched when identity does not match"
+    );
+    // 仍未写 marker。
+    assert!(!dir_b.path().join("storyforge.backend.json").exists());
+}
+
+/// helper：仅构建 plan（不跑 cutover），用于 inspect_marker。
+fn request_b_plan(dir: &Path) -> CutoverPlan {
+    let db_path = dir.join("storyforge.sqlite3");
+    CutoverPlan::new(dir, &db_path)
+}
+
+#[test]
+fn blank_new_user_without_db_is_absent_not_stale() {
+    // 真正的空白新用户：无 marker 且无 DB → Absent（可正常 cutover），
+    // 不被误判为孤儿。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    // 无 DB 文件。
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+    assert_eq!(
+        inspect_marker(&request_b_plan(dir.path())),
+        MarkerStatus::Absent,
+        "blank user (no DB) must be Absent"
+    );
+    // cutover 正常完成。
+    let request = make_request(dir.path());
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
 }

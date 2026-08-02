@@ -607,3 +607,72 @@ fn world_info_for_unknown_campaign_is_rejected() {
         other => panic!("expected CorruptImportInput, got {other}"),
     }
 }
+
+// ─── 三审6：Campaign 引用不存在的会话文件必须拒绝（区分空白新用户与部分丢失）───
+
+#[test]
+fn campaign_referencing_missing_conversation_is_rejected() {
+    // 三审6：campaigns.json 引用了 conv-missing，但 conversations/ 里没有该文件
+    // （部分文件丢失）→ importer 必须拒绝，绝不静默当作无会话导入。
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "Main",
+            "created_at": "2026-07-13T00:00:00Z",
+            "conversation_id": "conv-missing"
+        }]),
+    );
+    // conversations/ 目录存在但为空（conv-missing.json 缺失）。
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("campaign referencing a missing conversation must be rejected");
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("conv-missing"),
+                "error must mention the missing conversation id, got: {msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+}
+
+#[test]
+fn blank_new_user_without_core_files_is_allowed() {
+    // 三审6：真正的空白新用户——核心 JSON 文件存在但为空（无 campaigns 引用）→ 允许
+    // （不被误判为部分丢失）。这是新安装的初始状态。
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path()); // 空 cards/campaigns/...（无任何引用）
+    storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect("blank new user (empty core files, no references) must pass manifest validation");
+    let mut db = Database::open_in_memory().unwrap();
+    JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("blank new user must import cleanly (empty)");
+}
+
+#[test]
+fn campaign_without_conversation_reference_imports_cleanly() {
+    // 正向：campaign 存在但不引用任何 conversation（conversation_id 为 null/空）→ 允许。
+    let dir = TempDir::new().unwrap();
+    empty_but_valid_layout(dir.path());
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "Main",
+            "created_at": "2026-07-13T00:00:00Z"
+            // 无 conversation_id 字段
+        }]),
+    );
+    let mut db = Database::open_in_memory().unwrap();
+    JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("campaign without conversation reference must import cleanly");
+}

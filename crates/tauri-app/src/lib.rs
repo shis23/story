@@ -20,6 +20,7 @@ pub mod sqlite_compress_jobs;
 pub mod sqlite_meta_repo;
 pub mod sqlite_mvu_repo;
 pub mod sqlite_runtime;
+pub mod startup_recovery;
 mod startup_support;
 mod storage;
 pub mod storage_backend;
@@ -228,52 +229,9 @@ fn get_turn_by_variant_for_backend(
     storage.get_turn_by_variant(variant_id)
 }
 
-/// Phase A 启动恢复：幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn 为 Failed。
-///
-/// 规则（收敛决策步骤 12/16/17）：
-/// 1. Committing 态 Turn：重放 MutationBatch（幂等 upsert + revision CAS）。
-///    - revision 已是 target_revision → 校验/补齐 no-op。
-///    - revision 是 expected_revision → 完整重放 + bump。
-///    - revision 冲突 → 标 Failed（被外部推进，需人工处理）。
-///    - 重放成功后补齐 Draft→Final + accepted_attempt_id + Attempt Committed。
-/// 2. Generating/DraftReady/DerivingState/AwaitingAcceptance 态 Turn：
-///    标 Failed（无副作用，安全失败；已落盘 Draft 保留为 Draft）。
-///    Committing 不在此步处理（避免覆盖第 1 步未完成的恢复）。
-/// 3. Committed/Degraded/Failed/Abandoned 态 Turn：不动。
-fn recover_turns_on_startup(app_state: &AppState) {
-    // SQLite accept is atomic: recover by failing incomplete pipeline turns.
-    // Never fall back to JSON stores when SQLite is authoritative.
-    if app_state.storage.is_sqlite() {
-        match sqlite_runtime::recover_turns_on_startup() {
-            Ok(n) if n > 0 => {
-                tracing::warn!(count = n, "sqlite recovery failed incomplete turns")
-            }
-            Ok(_) => {}
-            Err(e) => tracing::error!("sqlite recovery failed: {e}"),
-        }
-        return;
-    }
-    let campaign_store = app_state
-        .storage()
-        .json_campaign_store(
-            storage_backend::BackendCapability::TurnLifecycle,
-            "recover JSON turns",
-        )
-        .expect("JSON recovery requires the facade-owned CampaignStore");
-    let turn_store = app_state
-        .storage()
-        .json_turn_store("recover JSON turns")
-        .expect("JSON recovery requires the facade-owned TurnStore");
-    let service = turn_lifecycle::TurnLifecycleService::new(
-        campaign_store,
-        turn_store,
-        &app_state.conv_store,
-    );
-    service.recover_turns_on_startup(|batch| {
-        // 启动恢复路径只做同步关键词索引，避免阻塞启动
-        index_round_summaries_to_vector(app_state.vector_store.as_ref(), batch);
-    });
-}
+// 三审9：启动恢复已抽取为单一公共入口 `startup_recovery::run_startup_recovery`
+// （生产 setup hook 与子进程重启测试共同调用）。原先的 `recover_turns_on_startup`
+// 自由函数包装器与 `recover_compress_jobs_on_startup` 直调已合并进去。
 
 /// 在 `start_writing` 追加 user 消息**之前**调用。
 /// 如果存在非 terminal Turn，返回错误，阻止新一轮启动。
@@ -1187,10 +1145,9 @@ pub fn run() {
             storyforge_app_logging::init_tracing(app_state.log_store.clone());
             app.manage(app_state.clone());
 
-            // Phase A: 启动恢复——幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn
-            recover_turns_on_startup(app_state.as_ref());
-            // M4: 重放未完成 ChronicleCompressor 任务（Running→Pending 后 spawn）
-            recover_compress_jobs_on_startup(app_state);
+            // 三审9：单一公共启动恢复入口（幂等重放 Committing 态 Turn + 标记非
+            // terminal 活动 Turn + 补挂 preaccept 恢复 + 重放 ChronicleCompressor）。
+            startup_recovery::run_startup_recovery(&app_state);
 
             // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
             let mvu_rt =

@@ -105,8 +105,21 @@ impl AuthorityLeaseGuard {
                 .lock()
                 .map_err(|_| SqliteError::Other("authority lease book poisoned".into()))?;
             if let Some((held_mode, count)) = book.entries.get_mut(&key) {
-                // Same-process reentrancy: allow regardless of mode combination.
-                // The original OS lock remains; this guard is a no-op.
+                // 三审2：同进程重入的模式规则——
+                // - Shared→Shared、Exclusive→Shared（降级）、Exclusive→Exclusive：允许
+                //   no-op（原 OS 锁保留，更强或同等）。
+                // - Shared→Exclusive（升级）：**拒绝**。OS 层 Shared 锁无法原子升级为
+                //   Exclusive（flock/Windows 都不保证升级不阻塞或不会与其它 Shared
+                //   持有者死锁），伪装成功会让调用方误以为已独占。必须先释放 Shared
+                //   再获取 Exclusive。
+                if *held_mode == LeaseMode::Shared && mode == LeaseMode::Exclusive {
+                    return Err(SqliteError::Other(format!(
+                        "cannot upgrade shared lease to exclusive in-process at {}; \
+                         release the shared lease first",
+                        key.display()
+                    )));
+                }
+                // 允许的重入：原 OS 锁保留；此 guard 是 no-op。
                 *count = count.saturating_add(1);
                 let _ = held_mode; // keep original mode as the OS lock mode
                 return Ok(AuthorityLeaseGuard {
@@ -305,14 +318,30 @@ mod tests {
         assert!(second.is_reentrant());
         drop(second);
         // First still holds.
-        let third = AuthorityLeaseGuard::acquire(&path, LeaseMode::Exclusive).unwrap();
-        assert!(third.is_reentrant());
-        drop(third);
         drop(first);
     }
 
     #[test]
+    fn same_process_shared_to_exclusive_upgrade_is_rejected() {
+        // 三审2：同进程已持 Shared 时请求 Exclusive 必须拒绝（OS 层无法原子升级，
+        // 伪装成功会让调用方误以为已独占）。
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(AUTHORITY_LEASE_FILENAME);
+        let shared = AuthorityLeaseGuard::acquire(&path, LeaseMode::Shared).unwrap();
+        let err = AuthorityLeaseGuard::acquire(&path, LeaseMode::Exclusive).unwrap_err();
+        assert!(
+            err.to_string().contains("upgrade"),
+            "shared→exclusive in-process upgrade must be rejected, got: {err}"
+        );
+        drop(shared);
+        // 释放 Shared 后可正常获取 Exclusive。
+        let excl = AuthorityLeaseGuard::acquire(&path, LeaseMode::Exclusive).unwrap();
+        assert!(!excl.is_reentrant());
+    }
+
+    #[test]
     fn same_process_exclusive_then_shared_reentrancy() {
+        // 三审2：Exclusive→Shared（降级）允许 no-op（原更强锁保留）。
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(AUTHORITY_LEASE_FILENAME);
         let excl = AuthorityLeaseGuard::acquire(&path, LeaseMode::Exclusive).unwrap();
