@@ -176,6 +176,34 @@
         "route": "disabled",
         "depth": 4,
         "order": 999
+      },
+      {
+        "id": "wi-selective-harbor-badge",
+        "label": "选择性：港务徽章核验",
+        "keys": ["徽章"],
+        "secondary_keys": [],
+        "content": "堤务署巡查佩戴的铜质港务徽章正面铸有钟楼纹章，背面刻六位编号；凭徽章编号可在堤务署登记簿核对持有人当值时段。徽章本身不开启任何闸门，仅作身份核验。",
+        "constant": false,
+        "selective": true,
+        "selective_logic": "and",
+        "disabled": false,
+        "route": "selective",
+        "depth": 2,
+        "order": 60
+      },
+      {
+        "id": "wi-both-ledger-procedure",
+        "label": "双路由：账本核签规程",
+        "keys": ["账本"],
+        "secondary_keys": [],
+        "content": "堤务署账本核签规程：每页须经双人铜印与朱印交叉签注方为有效；空白页须划对角斜线注销。该规程既是常驻公示条款，也可按关键词检索复核。规程不涉及任何具体案件内容。",
+        "constant": true,
+        "selective": true,
+        "selective_logic": "and",
+        "disabled": false,
+        "route": "both",
+        "depth": 2,
+        "order": 61
       }
     ]
   },
