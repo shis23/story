@@ -22,7 +22,8 @@ use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
 use harness_real_llm::resolve_llm_connection;
 use harness_real_llm::sqlite_endurance::{
-    SqliteHarnessEnv, fixture_source_hash16, fixture_turn_spec, is_retryable_quality_blocked_error,
+    SqliteHarnessEnv, fixture_source_hash16, fixture_turn_spec, is_retryable_derivation_failed_error,
+    is_retryable_quality_blocked_error,
 };
 use sha2::{Digest, Sha256};
 use storyforge_app_conversation::PartialRollTarget;
@@ -460,6 +461,15 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
         // Editor autofix path the same bounded retry budget as other transient
         // generation failures; the scheduled action assertion remains strict
         // and requires the eventual accepted attempt to have zero errors.
+        let _ = action;
+        return WriteFailureClass::QualityBlocked;
+    }
+    if is_retryable_derivation_failed_error(error) {
+        // A derivation (记账推导) failure is pre-commit and retryable: a fresh
+        // draft may derive cleanly. Same bounded retry budget as quality-blocked;
+        // the accepted row still requires a clean derivation (force_accept is
+        // never used in endurance, so a persistently-failing derivation exhausts
+        // the retry budget and fail-closes honestly).
         let _ = action;
         return WriteFailureClass::QualityBlocked;
     }
@@ -2919,6 +2929,15 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
         classify_write_failure("storage timeout during authority write", &private_probe),
         WriteFailureClass::Fatal,
         "internal StoryForge storage failure stays fatal (no LLM error wrapper)"
+    );
+    // Gate 6 §11.2: a derivation (记账推导) failure must retry (regenerate),
+    // not fail-closed. The harness formats it with retryable_derivation_failed:
+    // and the classifier routes it through the bounded write-retry loop. A
+    // long endurance run must survive a single derivation gap by regenerating.
+    assert_eq!(
+        classify_write_failure("retryable_derivation_failed:derivation_had_failures", &private_probe),
+        WriteFailureClass::QualityBlocked,
+        "derivation failure must retry via the write-retry loop, not fail-closed"
     );
 
     let mut state = None;

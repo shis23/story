@@ -47,15 +47,34 @@ use crate::production_evidence::{ProductionPostprocessProof, mutation_batch_dige
 
 const FIXTURE_REL: &str = "fixtures/cot_three_arm_80turn_v1.json";
 const RETRYABLE_QUALITY_BLOCKED_PREFIX: &str = "retryable_quality_blocked:";
+/// A derivation (记账推导) failure is retryable: the model's state-change
+/// derivation had failing components, but a fresh draft may produce a clean
+/// derivation. This mirrors the production UX ("只有记账推导失败的待采纳草稿
+/// 可以重试") and lets long endurance runs regenerate instead of fail-closing
+/// the whole stage on one derivation gap. Distinct prefix so the runner
+/// classifier can route it through the bounded write-retry loop.
+const RETRYABLE_DERIVATION_FAILED_PREFIX: &str = "retryable_derivation_failed:";
 
 pub fn is_retryable_quality_blocked_error(error: &str) -> bool {
     error.starts_with(RETRYABLE_QUALITY_BLOCKED_PREFIX)
+}
+
+/// True when the accept error is a derivation (记账推导) failure, which the
+/// runner should retry by regenerating the draft (same bounded budget as a
+/// quality-blocked turn).
+pub fn is_retryable_derivation_failed_error(error: &str) -> bool {
+    error.starts_with(RETRYABLE_DERIVATION_FAILED_PREFIX)
 }
 
 fn format_accept_error_for_runner(error: turn_lifecycle::AcceptError) -> String {
     match error {
         turn_lifecycle::AcceptError::QualityBlocked { error_count } => {
             format!("{RETRYABLE_QUALITY_BLOCKED_PREFIX}error_count={error_count}")
+        }
+        // DerivationFailed is retryable: a fresh draft may derive cleanly. Route
+        // it through the write-retry loop instead of fail-closing the run.
+        turn_lifecycle::AcceptError::DerivationFailed => {
+            format!("{RETRYABLE_DERIVATION_FAILED_PREFIX}derivation_had_failures")
         }
         other => format!("nonretryable_accept:{other}"),
     }
