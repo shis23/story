@@ -432,6 +432,20 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
     if error.starts_with("nonretryable_accept:") {
         return WriteFailureClass::Fatal;
     }
+    // Provider/relay transient failures wrapped in PipelineError::Llm
+    // ("LLM 错误: 服务端错误 (5xx): ..." / "LLM 错误: 超时" / "LLM 错误: 速率限制 (429): ...")
+    // MUST be retryable. The relay's forwarded error body can incidentally
+    // contain words like "storage"/"authority" (e.g. "upstream storage error"),
+    // which would otherwise trip the StoryForge-internal fatal-keyword check
+    // below and fail-closed a long endurance run on a single transient 5xx.
+    // LlmError Display prefixes are stable (thiserror), so match them first.
+    if error.contains("LLM 错误: 服务端错误 (5xx)")
+        || error.contains("LLM 错误: 超时")
+        || error.contains("LLM 错误: 速率限制 (429)")
+        || error.contains("LLM 错误: HTTP 请求失败")
+    {
+        return WriteFailureClass::Transient;
+    }
     let lower = error.to_ascii_lowercase();
     if lower.contains("storage")
         || lower.contains("sqlite")
@@ -2866,6 +2880,45 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
         ),
         WriteFailureClass::QualityBlocked,
         "a residual quality failure may retry, but the accepted row still requires zero errors"
+    );
+
+    // Gate 6 §11.2: a provider/relay transient failure wrapped in
+    // PipelineError::Llm must be retryable EVEN IF the relay's forwarded error
+    // body incidentally contains a StoryForge-internal fatal keyword. Long
+    // endurance runs (Stability 30 / Full 100) must survive a single transient
+    // 5xx/timeout from the relay without fail-closing the whole stage.
+    assert_eq!(
+        classify_write_failure(
+            "LLM 错误: 服务端错误 (5xx): upstream storage backend unavailable",
+            &private_probe,
+        ),
+        WriteFailureClass::Transient,
+        "relay 5xx with incidental 'storage' in the body must retry, not fail-closed"
+    );
+    assert_eq!(
+        classify_write_failure(
+            "LLM 错误: 服务端错误 (5xx): authority check failed upstream",
+            &private_probe,
+        ),
+        WriteFailureClass::Transient,
+        "relay 5xx with incidental 'authority' in the body must retry"
+    );
+    assert_eq!(
+        classify_write_failure("LLM 错误: 超时", &private_probe),
+        WriteFailureClass::Transient,
+        "provider timeout must retry"
+    );
+    assert_eq!(
+        classify_write_failure("LLM 错误: 速率限制 (429): too many requests", &private_probe),
+        WriteFailureClass::Transient,
+        "provider rate-limit must retry"
+    );
+    // Regression guard: genuine StoryForge-internal storage/authority failures
+    // (NOT wrapped in PipelineError::Llm) stay Fatal.
+    assert_eq!(
+        classify_write_failure("storage timeout during authority write", &private_probe),
+        WriteFailureClass::Fatal,
+        "internal StoryForge storage failure stays fatal (no LLM error wrapper)"
     );
 
     let mut state = None;
