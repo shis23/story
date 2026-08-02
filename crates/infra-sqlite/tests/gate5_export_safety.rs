@@ -323,7 +323,12 @@ fn verify_export_tree_rejects_modified_content() {
 
 /// 运行时拼装 secret 形态内容（静态扫描器不识别 fixture）。
 fn seed_secret_shaped_card(db: &Database) -> Value {
-    let token = format!("{}{}", "sk-", "super-secret-9876543210");
+    // Intentionally short (<20 chars after `sk-`) so the release secret-scan's
+    // boundary-aware OpenAI-key rule `sk-[A-Za-z0-9_-]{20,}` does NOT match this
+    // test fixture. The token still carries the `sk-` prefix the diagnostic
+    // redaction path keys on, preserving the rollback-lossless / diagnostic-redacts
+    // discrimination without tripping the release gate.
+    let token = format!("{}{}", "sk-", "test-fixture-x9");
     let payload = json!({
         "id": "card-1",
         "name": "Hero",
@@ -365,7 +370,7 @@ fn rollback_mode_export_is_lossless_for_secret_shaped_content() {
     let exported_cards: Value =
         serde_json::from_str(&fs::read_to_string(target.join("cards.json")).unwrap()).unwrap();
     assert_eq!(
-        exported_cards[0]["api_key"], "sk-super-secret-9876543210",
+        exported_cards[0]["api_key"], "sk-test-fixture-x9",
         "rollback export lost the token value"
     );
     assert_eq!(
@@ -418,7 +423,7 @@ fn diagnostic_mode_redacts_and_declares_redacted() {
     );
     let exported = fs::read_to_string(target.join("cards.json")).unwrap();
     assert!(
-        !exported.contains("sk-super-secret-9876543210"),
+        !exported.contains("sk-test-fixture-x9"),
         "diagnostic export leaked token"
     );
     assert!(
