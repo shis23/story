@@ -150,6 +150,7 @@ CampaignRuntimeContext
   instances: Vec<CharacterInstance>
   definitions_by_id: HashMap<Id, CharacterDefinition>
   knowledge: Vec<CharacterKnowledgeEntry>
+  tasks: Vec<StoryTask>
   turn: u32
 ```
 
