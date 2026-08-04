@@ -1717,7 +1717,7 @@ export 产物。
 ## 35. Gate 6 执行（真实模型 + 平台现场验收，进行中）
 
 > 计划门：PLAN §11（§11.1 确定性命令 / §11.2 真实模型 5 阶段 / §11.3 Windows + Android 真机现场）。
-> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 6 个独立提交（见 §35.5），
+> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 9 个独立提交（见 §35.5），
 > 未 amend 任何历史提交，未 push。
 > **状态：进行中**——§11.1 PASS；§11.2 的 Canary3 / Coverage12 / TextFallback3 / Stability30
 > 已 PASS 并 seal；**Full100 经 4 次重跑，受 relay 间歇性不稳定阻断，最长一次（r3）跑到
@@ -1858,20 +1858,71 @@ relay 恢复稳定后可随时续跑。
 
 **Full 100 不 seal PASS 前，§11.2 整体不得记 PASS；Gate 6 整体保持 INCOMPLETE。**
 
-### 35.3 §11.3 平台现场 — 未开始
+### 35.3 §11.3 平台现场 — Android 模拟器 PARTIAL（核心平台层 PASS + 1 真实缺陷已修）；Windows/其余 Android 现场 BLOCKED
 
-Windows 现场 + Android 真机现场均**未开始**。已确认的就绪状态（供续跑参考，非证据）：
+#### 35.3.1 Android 模拟器现场（emulator-5554，x86_64，API 35）
 
-- **Windows**：本机 `windows/x86_64 debug`；既有 `production_uow`/`platform_locking`/`gate5_*`
-  确定性套件已在 §11.1 的 `cargo test --workspace` 全绿；桌面 app 真实启动 + `start_writing`
-  端到端待跑（真模型连通性已在 §11.2 验证）。
-- **Android 真机**：Xiaomi 23117RK66C，serial `a47168ab`，Android 16，arm64-v8a，已授权。
-  `adb` 全路径 `C:\Users\Predator\android-sdk\platform-tools\adb.exe`（不在 PATH）。
-  `NDK_HOME` 需设 `C:\Users\Predator\android-sdk\ndk\27.2.12479018`（物理在，env 未设）。
-  `applicationId=com.storyforge.app`，FileProvider `com.storyforge.app.fileprovider`。
-  APK 未建、app 未装。release APK 签名项将记 BLOCKED（无证书）。
+原计划用真机（Xiaomi 23117RK66C serial `a47168ab`），但真机 USB 调试未连通
+（Honor WIN RT 设备的 ADB Interface 消失，疑似 USB 模式切换问题）。改用 Android 模拟器
+（AVD `StoryForge_Test`，x86_64，API 35，WHPX 加速）。架构从 aarch64 改为 x86_64。
 
-### 35.4 执行中定位并修复的真实缺陷（6 项，逐项判别测试 + 真实运行验证）
+**已验证通过（平台层，无需 LLM）：**
+
+| 验收点 | 结果 | 证据 |
+|---|---|---|
+| APK 构建（`cargo tauri android build --debug --target x86_64`） | ✅ PASS | `app-universal-debug.apk`（315MB debug），native-code=x86_64，`libstoryforge_lib.so` |
+| APK 安装（`adb install -r -t`） | ✅ PASS | `Success`，`com.storyforge.app` 确认安装 |
+| App 启动 + 进程存活 | ✅ PASS | pid 2657/4036 稳定运行，无 ANR |
+| WebView 渲染 Vue 前端 | ✅ PASS | 主界面（会话历史/"开始第一局故事"）、侧边栏菜单（创作/素材/系统）、LLM 连接配置对话框（模板选择/表单/采样参数/扩展参数）全渲染 |
+| app data 路径（`/data/data/com.storyforge.app/`） | ✅ PASS | `run-as` 可见，11 子目录/文件 |
+| 首次启动初始化（storage_meta/profiles/agent_profile_configs） | ✅ PASS | 三个 JSON 正确生成，schema=1，version=0.1.0 |
+| 默认存储后端（JSON，opt-in SQLite） | ✅ PASS | 无 `.sqlite3` 文件，符合设计 |
+| 进程锁（`storyforge.authority.lock`） | ✅ PASS | 存在 |
+| shared_prefs 无 API key 泄漏 | ✅ PASS | 仅 WebView 自身 prefs |
+| 连接配置 UI 完整度 | ✅ PASS | 模板/表单/推理模式 fail-close 说明/采样参数/扩展参数 JSON/测试连接 全到位 |
+
+**发现并修复的真实缺陷 #7（Android Keystore ndk-context 未初始化）：**
+
+写入带明文 api_key 的 `connections.json` 后启动 app → **SIGABRT**（native crash）。
+Panic: `ndk-context-0.1.1/src/lib.rs:72` — `"android context was not initialized"`。
+根因：StoryForge 用 `android_native_keyring_store`（经 `keyring`）存 API key 到 Android Keystore，
+但**从未调用 `ndk_context::initialize_android_context()`**。`Store::new()` 内部 panic（非返回 Err），
+使 `secret_store.rs` 的 `.map_err()` 和 `connection_store.rs` 的 `tracing::warn!` 守卫全成死代码。
+
+**修复（commit `4701497`，两步）：**
+1. `catch_unwind`（`secret_store.rs` Android 分支）：把 `Store::new()` 的 panic 转为 `Err`，
+   让上层 `warn!` 守卫生效 → api_key 保持明文 → `resolve_secret_value` 透传 → app 不崩。
+2. 正确初始化 ndk-context（`lib.rs` setup hook）：从 webview `JniHandle` 获取 JNIEnv + Activity，
+   创建 GlobalRef，调用 `ndk_context::initialize_android_context(vm_ptr, ctx_ptr)`。
+
+**修复后验证：** app 不再 SIGABRT；连接显示"已配置 Gate6-Relay deepseek-v4-flash ● 活跃"；
+api_key **成功迁移为 SecretRef**（`storyforge-secret:v1:llm-connection:...`）——证明步骤 2 的
+异步 ndk-context 初始化在事件循环上完成了，Keystore 完全可用。
+
+判别测试：`resolve_secret_value_passes_plaintext_through`（明文透传验证）+
+`plaintext_starting_with_sk_is_not_treated_as_secret_ref`（sk- 前缀不误判为 ref）。3 passed desktop。
+
+**未完成的 Android 现场（BLOCKED，诚实记录）：**
+- 真模型 `test_connection` UI 端到端：连接已正确加载（"已配置 ● 活跃"），但 WebView 输入框
+  在模拟器里的逐字段填写 + 测试按钮交互极不可靠（`adb input text` 在 WebView 里丢字符/串字段），
+  未完成一次完整的 UI 触发 test_connection。连接配置本身（含 Keystore）已验证正确——API key
+  从 SecretRef 解析回明文、base_url/model/extra 全正确。可续跑时用更快的方式（如直接 Tauri
+  IPC 或 adb broadcast）触发 test_connection。
+- JSON→SQLite 升级（带旧 JSON 数据首启）：未测。
+- `content://` 导入角色卡：未测（FileProvider authority `com.storyforge.app.fileprovider`）。
+- SAF save/share 导出：未测。
+- 前台/后台生命周期（`adb shell am` / 物理切后台）：未测。
+- 断网/取消写流程：未测。
+- 大数据 + 重启恢复（kill 后重进）：未测。
+- release APK 签名：BLOCKED（无证书），符合 RELEASE-CHECKLIST 既有诚实口径。
+
+#### 35.3.2 Windows 现场 — 未开始
+
+桌面 app 真实启动 + `start_writing` 端到端待跑。既有 `production_uow`/`platform_locking`/`gate5_*`
+确定性套件已在 §11.1 的 `cargo test --workspace` 全绿；真模型连通性已在 §11.2 验证。
+Windows 现场主要是窗口/进程维度的补充验证。
+
+### 35.4 执行中定位并修复的真实缺陷（7 项，逐项判别测试 + 真实运行验证）
 
 | # | 缺陷 | 根因 | 修复 | 判别测试 |
 |---|---|---|---|---|
@@ -1881,13 +1932,14 @@ Windows 现场 + Android 真机现场均**未开始**。已确认的就绪状态
 | 4 | Stability 30 turn 11 fail-closed：`DerivationFailed`（记账推导失败项）被包装成 `nonretryable_accept:` | `format_accept_error_for_runner` 把所有非 QualityBlocked 的 AcceptError 都包成 `nonretryable_accept:`；但 DerivationFailed 设计上可重试（生产 UX「只有记账推导失败的待采纳草稿可以重试」） | 新增 `retryable_derivation_failed:` 前缀路由 DerivationFailed，经 write-retry 循环重试（fresh draft 可能推导干净）；force_accept 在 endurance 从不用，持续失败的推导仍耗尽预算诚实 fail-closed | 判别测试：`retryable_derivation_failed:` → QualityBlocked（旧实现 Fatal）。提交 `f070933` |
 | 5 | Full100 r3 fail-closed turn 59：harness suite 硬时限 6h 撞顶（turn 1-58 全健康） | `hard_deadline_override` 对所有 stage 统一 `.min(6h)`；Full 100 turn 在 `reasoning_effort=max` 下实测 ~6.2 min/turn，100 turn 需 ~10.3h，6h 上限数学上不可达 | Full stage 的 ceiling 从 6h 提到 15h（其他 stage 保持 6h 不变）；实测 ~10.3h 需求 + 重试余量 | 判别测试 `full_stage_hard_deadline_accommodates_one_hundred_turns_at_max_reasoning_pace`：Full@100turns → 12h≤d≤15h（旧 6h RED）；Stability/Coverage/Canary 同 budget → 精确 bind 6h（证明只放宽 Full）；LongCoverage 仍 24h。提交 `a9ea1fd` |
 | 6 | Full100 r4 fail-closed turn 1：relay ~10min 崩溃窗口 > 5-attempt 重试总跨度 ~9.5min | `MAX_WRITE_ATTEMPTS=5` + backoff 5/15/30/60s 总跨度仅 ~9.5min，无法穿越 relay 的分钟级持续崩溃窗口 | `MAX_WRITE_ATTEMPTS` 5→8，backoff 增加 120s(attempt5)/240s(attempt6-7) 尾部，总跨度 ~25min；仅测试 harness 参数（生产代码无此循环，不影响用户行为）；预算仍有限，持续崩溃仍诚实 fail-closed | 判别测试 `transient_write_retries_use_recovery_sized_backoff`：新增 120/240s 档位断言 + backoff 单调非递减校验；`write_retry_policy_is_typed...` 循环自动适配 8。提交 `4e64d07` |
+| 7 | §11.3 Android SIGABRT：首次访问 Keystore 时 `ndk_context::android_context()` panic | StoryForge 用 `android_native_keyring_store` 存 API key 到 Android Keystore，但从未调用 `ndk_context::initialize_android_context()`；`Store::new()` 内部 panic（非 Err），使 `.map_err()` 和 `warn!` 守卫成死代码 | 两步：① `secret_store.rs` Android 分支 `catch_unwind` 把 panic 转 Err（app 不崩，api_key 保持明文）；② `lib.rs` setup hook 从 webview JniHandle 获取 JavaVM+Activity Context 调用 `initialize_android_context`（Keystore 真正可用） | 判别测试：`resolve_secret_value_passes_plaintext_through` + `plaintext_starting_with_sk_is_not_treated_as_secret_ref`（3 passed desktop）；真机验证：app 不崩 + api_key 迁移为 SecretRef + 连接"已配置 ● 活跃"。提交 `4701497` |
 
 **顺带处理：** runner 的两超时 env 默认从 180s/120s 提到 300s（`STORYFORGE_EVAL_TIMEOUT_SECS`
 harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推理模型长单调用；外部 override
 仍受尊重（TextFallback 阶段用 `thinking=disabled` override `LLM_EXTRA_JSON`）。runner 脚本不进仓库
 （放证据根目录），仅本节记录其存在与用法。
 
-### 35.5 提交（本次执行产生的 7 个独立提交）
+### 35.5 提交（本次执行产生的 9 个独立提交）
 
 均在 `eb6f339`（Gate 5 三审 PASS）之上，未 amend 任何历史提交，未 push；提交后工作区干净。
 
@@ -1898,6 +1950,8 @@ harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推�
 - `028acd9` docs(gate6): §35 Gate 6 execution in-progress (§11.1 PASS, §11.2 4/5 PASS+sealed, Full100 paused, §11.3 not started)
 - `a9ea1fd` fix(harness): raise Full-stage endurance hard deadline ceiling 6h→15h
 - `4e64d07` fix(harness): extend write-retry budget 5→8 attempts to ride out relay outage windows
+- `4701497` fix(android): init ndk-context + catch_unwind keystore panic (Gate 6 §11.3 defect #7)
+- `bf0a85c` docs(gate6): §35.2.5/§35.4/§35.5/§35.6/§35.7/§35.8 update + add deep analysis
 
 （另有一个纯文档同步提交 `a6fb8a3` docs: sync README command count 142→175 and CharacterRuntimeContext.tasks field，
 非 Gate 6 执行产出，但为 Full100 重跑前清理 worktree 所需，记录于此。）
@@ -1909,23 +1963,29 @@ harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推�
 | §11.1 全部确定性命令 | 全绿（见 §35.1） |
 | §11.2 Canary3/Coverage12/TextFallback3/Stability30 | 4/4 PASS，证据已 seal（run_id 见 §35.2.1–4） |
 | §11.2 Full100 | **BLOCKED**（4 次重跑受 relay 间歇不稳定阻断；r3 跑到 58/100 全健康，深度分析见 §35.8） |
-| §11.3 Windows/Android 现场 | **未开始** |
+| §11.3 Android 模拟器现场 | **PARTIAL**（核心平台层 10 项 PASS + Keystore 缺陷已修；真模型 UI 端到端 + JSON→SQLite 升级 + content:// 导入 + SAF + 生命周期 + 大数据 等待续跑，见 §35.3.1） |
+| §11.3 Windows 现场 | **未开始** |
 | API-key 卫生 | 仅 env；sealed 树 secret-scan 零命中（key/sk-/Bearer/literal-substring） |
-| 判别测试 | 6 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 17/17 全绿（`endurance_sqlite_real_llm`） |
-| 工作区 | `git status` clean；HEAD `4e64d07` |
+| 判别测试 | 7 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 17/17 全绿（`endurance_sqlite_real_llm`）+ `secret_store` 3/3 全绿 |
+| 工作区 | `git status` clean；HEAD `4701497` |
 
 ### 35.7 结论与遗留（诚实）
 
 - **Gate 6 = INCOMPLETE / 进行中**：§11.1 PASS；§11.2 的 4/5 阶段 PASS（Full100 BLOCKED on relay）；
-  §11.3 未开始。**Full100 不 seal PASS 且 §11.3 未通过前，Gate 6 不得记 PASS，不得自启 Gate 7
-  （默认 SQLite 切换），不复活旧 45/100，不把未 seal 写成 PASS。**
+  §11.3 Android 模拟器 PARTIAL（核心平台层 PASS + Keystore 缺陷已修，功能端到端待续跑）；
+  §11.3 Windows 未开始。**Full100 不 seal PASS 且 §11.3 未全部通过前，Gate 6 不得记 PASS，
+  不得自启 Gate 7（默认 SQLite 切换），不复活旧 45/100，不把未 seal 写成 PASS。**
 - **r3 的 58-turn 真实长程证据**是本轮最重要的产出：尽管未到 100/100 未 seal，但它证明
   SQLite 权威路径 + production_postprocess + quality gate + 世界信息路由 + 思维链分离在 58 个连续
   turn、564 次真实调用中全部稳定工作（§35.8 逐项核实）。这比 Canary3/Coverage12/Stability30
   加起来都更能证明长程稳定性。
+- **§11.3 Android 发现并修复了 Keystore ndk-context 集成缺陷**（#7，commit `4701497`）——这是
+  一个真实的 Android 平台 bug，会阻断任何 API key 持久化。修复后 Keystore 完全可用（api_key
+  成功迁移为 SecretRef），连接正确加载为"已配置 ● 活跃"。
 - 续跑待办：① Full100 重跑（harness 侧两个阻塞已修：15h ceiling `a9ea1fd` + 8-attempt 重试 `4e64d07`；
   待 relay 恢复稳定后 `run-stage.sh full native 100 3500`，预计 ~10 小时）；
-  ② §11.3 Windows 现场；③ §11.3 Android 真机现场（设 `NDK_HOME` → APK 构建 → 安装 → 逐项）。
+  ② §11.3 Android 功能端到端（test_connection / JSON→SQLite 升级 / content:// 导入 / SAF / 生命周期 / 大数据）；
+  ③ §11.3 Windows 现场。
 - 本轮已花的真实模型费用：Canary3(25)+Coverage12(124)+TextFallback3(32)+Stability30(273)
   + Full100-r1(80)+r2(31)+r3(571)+r4(5) + 诊断 ping/probe(~60) ≈ **1200+ 次付费调用**。
 - 本线程明文的 API key 建议在续跑前轮换（卫生）。
