@@ -1485,7 +1485,20 @@ impl HardDeadlineExt for RealLlmRunBudget {
         if matches!(stage, EnduranceStage::LongCoverage) {
             return std::time::Duration::from_secs(24 * 60 * 60);
         }
-        let total = by_calls.max(by_turns).max(floor).min(6 * 60 * 60);
+        // The Full stage targets 100 turns. At the empirical sustained pace of
+        // deepseek-v4-flash with reasoning_effort=max (~6.2 min/turn, observed
+        // across 58 accepted turns in run-full-9026a573 on 2026-08-04), 100
+        // turns need ~10.3 h, which exceeds the 6 h guard rail used for smaller
+        // stages. Capping Full at 6 h makes it un-passable by construction
+        // regardless of relay/model health. Give Full a 15 h ceiling (covers the
+        // observed ~10.3 h need plus retry/backoff headroom) while every other
+        // stage keeps the conservative 6 h guard rail.
+        let ceiling = if matches!(stage, EnduranceStage::Full) {
+            15 * 60 * 60
+        } else {
+            6 * 60 * 60
+        };
+        let total = by_calls.max(by_turns).max(floor).min(ceiling);
         std::time::Duration::from_secs(total)
     }
 }
@@ -3692,6 +3705,71 @@ fn model_identity_hashes_the_full_name_not_only_the_display_prefix() {
     assert_ne!(
         model_identity_sha256(&first),
         model_identity_sha256(&second)
+    );
+}
+
+#[test]
+fn full_stage_hard_deadline_accommodates_one_hundred_turns_at_max_reasoning_pace() {
+    // Regression gate: a Full-stage endurance run with 100 turns must NOT be
+    // killed by the suite hard-deadline before it can finish. The empirical
+    // sustained pace of deepseek-v4-flash with reasoning_effort=max on the
+    // SQLite native-tool pipeline is ~6.2 min/turn (observed across 58
+    // accepted turns in run-full-9026a573 on 2026-08-04), so 100 turns need
+    // ~10.3 h. A 6 h ceiling is mathematically impossible to satisfy for the
+    // Full stage regardless of relay/model health, which would make Full 100
+    // un-passable by construction — masking that as a "test failure" would be
+    // dishonest. The deadline for Full must cover the observed worst-case
+    // sustained pace with retry/backoff headroom.
+    let budget = RealLlmRunBudget {
+        enabled: true,
+        max_calls: 3500,
+        max_turns: 100,
+        timeout_secs: 300,
+        max_tokens: None,
+    };
+    let full = budget.hard_deadline_override(100, EnduranceStage::Full);
+    // 100 turns * 6.2 min/turn ≈ 10.3 h observed; require >= 12 h so the
+    // ceiling cannot regress below the empirically-needed runway.
+    let twelve_hours = std::time::Duration::from_secs(12 * 60 * 60);
+    assert!(
+        full >= twelve_hours,
+        "Full-100 hard deadline {full:?} must be >= 12h (observed ~10.3h need at reasoning_effort=max); \
+         a lower ceiling makes Full 100 un-passable by construction"
+    );
+    // Full is capped at 15 h, not unbounded.
+    assert!(
+        full <= std::time::Duration::from_secs(15 * 60 * 60),
+        "Full-100 hard deadline {full:?} must stay <= 15h ceiling"
+    );
+
+    // Discriminating counter-examples: the SAME budget (max_calls=3500,
+    // timeout=300s) applied to a smaller stage must still be capped at the
+    // conservative 6 h guard rail — proving the widening is scoped to Full
+    // only. (by_calls = 300*3500 = 291 h would otherwise dominate; the 6 h
+    // ceiling is exactly what binds here for non-Full stages.)
+    let six_hours = std::time::Duration::from_secs(6 * 60 * 60);
+    let stability = budget.hard_deadline_override(30, EnduranceStage::Stability);
+    assert_eq!(
+        stability, six_hours,
+        "Stability hard deadline must bind at the 6h ceiling (only Full was widened), got {stability:?}"
+    );
+    let coverage = budget.hard_deadline_override(12, EnduranceStage::Coverage);
+    assert_eq!(
+        coverage, six_hours,
+        "Coverage hard deadline must bind at the 6h ceiling (only Full was widened), got {coverage:?}"
+    );
+    let canary = budget.hard_deadline_override(3, EnduranceStage::Canary);
+    assert_eq!(
+        canary, six_hours,
+        "Canary hard deadline must bind at the 6h ceiling under a Full-sized budget, got {canary:?}"
+    );
+
+    // LongCoverage keeps its explicit 24h regardless.
+    let long_coverage = budget.hard_deadline_override(80, EnduranceStage::LongCoverage);
+    assert_eq!(
+        long_coverage,
+        std::time::Duration::from_secs(24 * 60 * 60),
+        "LongCoverage hard deadline must remain exactly 24h"
     );
 }
 
