@@ -1717,11 +1717,13 @@ export 产物。
 ## 35. Gate 6 执行（真实模型 + 平台现场验收，进行中）
 
 > 计划门：PLAN §11（§11.1 确定性命令 / §11.2 真实模型 5 阶段 / §11.3 Windows + Android 真机现场）。
-> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 4 个独立提交（见 §35.5），
+> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 6 个独立提交（见 §35.5），
 > 未 amend 任何历史提交，未 push。
 > **状态：进行中**——§11.1 PASS；§11.2 的 Canary3 / Coverage12 / TextFallback3 / Stability30
-> 已 PASS 并 seal；**Full100 因用户关机在 turn 9/100 暂停**（无 fail、无证据落盘，需从 turn 1 重跑）；
-> §11.3 平台现场未开始。本节如实记录已完成的真实证据与执行过程中定位并修复的 4 个真实缺陷。
+> 已 PASS 并 seal；**Full100 经 4 次重跑，受 relay 间歇性不稳定阻断，最长一次（r3）跑到
+> turn 58/100 全程健康 accepted**——提供了迄今最完整的真实长程证据（§35.2.5 + §35.8 深度分析）；
+> §11.3 平台现场未开始。执行中定位并修复 6 个真实缺陷（§35.4）。
+> **Full100 未 seal PASS 且 §11.3 未通过前，Gate 6 不得记 PASS，不得自启 Gate 7。**
 
 ### 35.1 §11.1 确定性门 — PASS
 
@@ -1745,7 +1747,7 @@ rollback-lossless / diagnostic-redacts 判别测试的有意 fixture，非真实
 缩短为 `sk-test-fixture-x9`（`sk-` 后 15 字符，不再命中规则），保留 `sk-` 前缀以维持
 判别力。两测试仍绿。提交 `9c23173`（test-only fixture 值）。
 
-### 35.2 §11.2 真实模型证据 — 4/5 阶段 PASS（Full100 暂停）
+### 35.2 §11.2 真实模型证据 — 4/5 阶段 PASS（Full100 BLOCKED on relay；r3 提供 58-turn 长程证据）
 
 **提供商/凭据：** OpenAI 兼容 relay `https://cli.2529985.xyz`，模型 `deepseek-v4-flash`，
 `reasoning_effort=max` 经 `LLM_EXTRA_JSON='{"reasoning_effort":"max"}'` 透传（`extra` → 请求体顶层，
@@ -1821,15 +1823,40 @@ the thinking mode must be passed back to the API.`）。DeepSeek-V4 在 thinking
 （>12 turn），暴露了 relay 瞬态 5xx/超时的误归类（fail-closed 整阶段）、记账推导失败的
 nonretryable 误包装、以及 runner HTTP 超时偏短。详见 §35.4。
 
-#### 35.2.5 Full 100（native）— 暂停（未完成，无证据）
+#### 35.2.5 Full 100（native）— BLOCKED（relay 间歇不稳定；r3 跑到 58/100 提供迄今最完整长程证据）
 
-- **未完成**：因用户关机，在 turn 9/100、calls 80/3500 处主动暂停；全程无 fail、无 5xx、
-  无 panic（全部 outcome=ok），但未达任何 turn accept，**无可 seal 的证据**。
-- endurance 不支持跨进程续跑 turn，下次需**从 turn 1 重新跑**（新 run id）。
-  本次 80 calls 是沉没成本（已付费），不构成 Gate 6 证据。
-- 续跑命令：`bash /c/Users/Predator/storyforge-evidence/gate6-2026-08-02/run-stage.sh full native 100 3500`
-  （runner 已固化两超时 env 默认 300s、commit `f070933`）。
-- **Full 100 不通过前，§11.2 整体不得记 PASS；Gate 6 整体保持 INCOMPLETE。**
+Full 100 经 **4 次重跑**，均因 relay（第三方中转 `cli.2529985.xyz`）间歇性不稳定以不同方式 fail-closed。
+每次失败根因不同、诚实记录如下；前两次暴露了 2 个 harness 真实缺陷（§35.4 #5/#6，已修），
+后两次纯粹是 relay 在启动/运行窗口内的持续性降级。**最长一次 r3 跑到 turn 58/100 全程健康
+accepted**，是迄今最完整的真实长程运行证据（§35.8 深度分析基于此 run）。
+
+| 轮次 | run_id | 结果 | 失败根因 | 性质 |
+|---|---|---|---|---|
+| r1 | `run-full-416cb084` | 暂停 turn 9 | 用户关机，主动暂停（无 fail） | 非 defect |
+| r2 | `run-full-8789fa06` | fail-closed turn 2 | relay 持续 5xx（5 次 attempt 全在崩溃窗口）+ attempt 5 plan_parse | relay 降级 |
+| r3 | `run-full-9026a573` | fail-closed turn 59 | **harness 硬时限 6h 撞顶**（turn 1-58 全健康） | **harness 缺陷 #5（已修）** |
+| r4 | `run-full-d406d96f` | fail-closed turn 1 | relay ~10min 崩溃窗口（启动即撞墙，5 attempt 全在窗口内） | relay 降级 |
+
+**r3 的正面证据（turn 1-58 全程健康，564 次真实 LLM 调用）：**
+
+- **58/100 accepted**，每 turn 真实 `production_postprocess_complete=true`、`sqlite_authoritative=true`、
+  `attempt_status=Committed`、`turn_status=Committed`、`force_accept=false`（全程无强制接受）。
+- `campaign_revision` 严格单调递增 1→58；`chronicle_revision` 严格单调递增 2→64——每 turn 真实落库
+  `storyforge.sqlite3`（58 committed / 3 failed / 5 superseded attempt）。
+- **重试韧性真实验证**：turn 45 扛过 4 次 attempt 失败（2 次上游超时 163s/113s + 2 次 relay 秒退
+  5xx 581ms/464ms），第 5 次 relay 恢复后成功 accepted——证明 `b438d6f` 分类器修复在长程持续生效。
+- 58 turn 全部 `quality_error_count=0`、`quality_warning_count=0`；text_sha16 全唯一（无模板重复）。
+- r3 无 manifest（未到 seal），但 `endurance_turns.jsonl`（58 条）+ `endurance_calls.jsonl`（571 条）
+  + `endurance_coverage_ledger.jsonl`（58 条）+ `campaign_data/storyforge.sqlite3` 均完整落盘，
+  构成可深度分析的完整运行记录（§35.8）。
+
+**修复后未再重跑的原因（诚实）：** r4 在两个 harness 缺陷修复后启动，但恰逢 relay 再次降级
+（启动前 8/8 ping 稳定，启动后 10 分钟内 relay 崩溃）。relay 当日处于周期性过载——稳定窗口与
+崩溃窗口交替，每次窗口数分钟到十余分钟。10 小时长程运行几乎必然穿越多个崩溃窗口。用户指示
+停止重跑，转而基于现有证据补充总结。harness 侧的两个阻塞（15h ceiling / 8-attempt 预算）已修复，
+relay 恢复稳定后可随时续跑。
+
+**Full 100 不 seal PASS 前，§11.2 整体不得记 PASS；Gate 6 整体保持 INCOMPLETE。**
 
 ### 35.3 §11.3 平台现场 — 未开始
 
@@ -1844,7 +1871,7 @@ Windows 现场 + Android 真机现场均**未开始**。已确认的就绪状态
   `applicationId=com.storyforge.app`，FileProvider `com.storyforge.app.fileprovider`。
   APK 未建、app 未装。release APK 签名项将记 BLOCKED（无证书）。
 
-### 35.4 执行中定位并修复的真实缺陷（4 项，逐项判别测试 + 真实运行验证）
+### 35.4 执行中定位并修复的真实缺陷（6 项，逐项判别测试 + 真实运行验证）
 
 | # | 缺陷 | 根因 | 修复 | 判别测试 |
 |---|---|---|---|---|
@@ -1852,13 +1879,15 @@ Windows 现场 + Android 真机现场均**未开始**。已确认的就绪状态
 | 2 | Canary 3 turn 2 fail-closed：harness schedule 要求 `徽章`(selective)/`账本`(both) 但 fixture 无对应 world-info 条目 | `cot_three_arm_80turn_v1.json` 的 selective/both 条目键是 玻璃蛾/黑伞/倒悬钟 等，无 `徽章`/`账本` | 在 fixture 加 2 个中性、不耦合 probe 的 world-info 条目（`wi-selective-harbor-badge` 键 `徽章`；`wi-both-ledger-procedure` 键 `账本`） | Canary3 turn 2/3 全绿；deterministic 套件 36/36 不破。提交 `1c1fc4e` |
 | 3 | Stability 30 多次 fail-closed：relay 瞬态 5xx/超时的错误体偶然含 `storage`/`authority` 字样被误判 Fatal | `classify_write_failure` 的 fatal-keyword 扫描（为捕获 StoryForge 内部 storage/authority 错）误命中 relay 转发的错误体 incidental 词 | LLM 错误包装（稳定 thiserror 前缀 `LLM 错误: 服务端错误 (5xx)`/`超时`/`速率限制 (429)`/`HTTP 请求失败`）先于 incidental-keyword 扫描判为 Transient；内部 StoryForge storage/authority（非 LLM 包装）仍 Fatal | 判别测试：relay 5xx 带 `storage`/`authority` → Transient（旧实现 Fatal）；内部 `storage timeout during authority write` → 仍 Fatal。提交 `b438d6f` |
 | 4 | Stability 30 turn 11 fail-closed：`DerivationFailed`（记账推导失败项）被包装成 `nonretryable_accept:` | `format_accept_error_for_runner` 把所有非 QualityBlocked 的 AcceptError 都包成 `nonretryable_accept:`；但 DerivationFailed 设计上可重试（生产 UX「只有记账推导失败的待采纳草稿可以重试」） | 新增 `retryable_derivation_failed:` 前缀路由 DerivationFailed，经 write-retry 循环重试（fresh draft 可能推导干净）；force_accept 在 endurance 从不用，持续失败的推导仍耗尽预算诚实 fail-closed | 判别测试：`retryable_derivation_failed:` → QualityBlocked（旧实现 Fatal）。提交 `f070933` |
+| 5 | Full100 r3 fail-closed turn 59：harness suite 硬时限 6h 撞顶（turn 1-58 全健康） | `hard_deadline_override` 对所有 stage 统一 `.min(6h)`；Full 100 turn 在 `reasoning_effort=max` 下实测 ~6.2 min/turn，100 turn 需 ~10.3h，6h 上限数学上不可达 | Full stage 的 ceiling 从 6h 提到 15h（其他 stage 保持 6h 不变）；实测 ~10.3h 需求 + 重试余量 | 判别测试 `full_stage_hard_deadline_accommodates_one_hundred_turns_at_max_reasoning_pace`：Full@100turns → 12h≤d≤15h（旧 6h RED）；Stability/Coverage/Canary 同 budget → 精确 bind 6h（证明只放宽 Full）；LongCoverage 仍 24h。提交 `a9ea1fd` |
+| 6 | Full100 r4 fail-closed turn 1：relay ~10min 崩溃窗口 > 5-attempt 重试总跨度 ~9.5min | `MAX_WRITE_ATTEMPTS=5` + backoff 5/15/30/60s 总跨度仅 ~9.5min，无法穿越 relay 的分钟级持续崩溃窗口 | `MAX_WRITE_ATTEMPTS` 5→8，backoff 增加 120s(attempt5)/240s(attempt6-7) 尾部，总跨度 ~25min；仅测试 harness 参数（生产代码无此循环，不影响用户行为）；预算仍有限，持续崩溃仍诚实 fail-closed | 判别测试 `transient_write_retries_use_recovery_sized_backoff`：新增 120/240s 档位断言 + backoff 单调非递减校验；`write_retry_policy_is_typed...` 循环自动适配 8。提交 `4e64d07` |
 
 **顺带处理：** runner 的两超时 env 默认从 180s/120s 提到 300s（`STORYFORGE_EVAL_TIMEOUT_SECS`
 harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推理模型长单调用；外部 override
 仍受尊重（TextFallback 阶段用 `thinking=disabled` override `LLM_EXTRA_JSON`）。runner 脚本不进仓库
 （放证据根目录），仅本节记录其存在与用法。
 
-### 35.5 提交（本次执行产生的 4 个独立提交）
+### 35.5 提交（本次执行产生的 7 个独立提交）
 
 均在 `eb6f339`（Gate 5 三审 PASS）之上，未 amend 任何历史提交，未 push；提交后工作区干净。
 
@@ -1866,27 +1895,185 @@ harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推�
 - `1c1fc4e` fix(fixture): add selective(徽章)/both(账本) world-info entries for endurance turn 2/3
 - `b438d6f` fix(harness): retry relay/provider transient errors in endurance write classifier
 - `f070933` fix(harness): retry derivation-failed accept in endurance write loop
+- `028acd9` docs(gate6): §35 Gate 6 execution in-progress (§11.1 PASS, §11.2 4/5 PASS+sealed, Full100 paused, §11.3 not started)
+- `a9ea1fd` fix(harness): raise Full-stage endurance hard deadline ceiling 6h→15h
+- `4e64d07` fix(harness): extend write-retry budget 5→8 attempts to ride out relay outage windows
 
-### 35.6 验证（§11.1 全绿；§11.2 真实证据已 seal 4 阶段）
+（另有一个纯文档同步提交 `a6fb8a3` docs: sync README command count 142→175 and CharacterRuntimeContext.tasks field，
+非 Gate 6 执行产出，但为 Full100 重跑前清理 worktree 所需，记录于此。）
+
+### 35.6 验证（§11.1 全绿；§11.2 真实证据已 seal 4 阶段；Full100 r3 提供 58-turn 长程证据）
 
 | 项 | 结果 |
 |---|---|
 | §11.1 全部确定性命令 | 全绿（见 §35.1） |
 | §11.2 Canary3/Coverage12/TextFallback3/Stability30 | 4/4 PASS，证据已 seal（run_id 见 §35.2.1–4） |
-| §11.2 Full100 | **暂停未完成**（turn 9/100，无证据，需重跑） |
+| §11.2 Full100 | **BLOCKED**（4 次重跑受 relay 间歇不稳定阻断；r3 跑到 58/100 全健康，深度分析见 §35.8） |
 | §11.3 Windows/Android 现场 | **未开始** |
 | API-key 卫生 | 仅 env；sealed 树 secret-scan 零命中（key/sk-/Bearer/literal-substring） |
-| 判别测试 | 4 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 36/36 全绿 |
-| 工作区 | `git status` clean；HEAD `f070933` |
+| 判别测试 | 6 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 17/17 全绿（`endurance_sqlite_real_llm`） |
+| 工作区 | `git status` clean；HEAD `4e64d07` |
 
 ### 35.7 结论与遗留（诚实）
 
-- **Gate 6 = INCOMPLETE / 进行中**：§11.1 PASS；§11.2 的 4/5 阶段 PASS（Full100 暂停）；
+- **Gate 6 = INCOMPLETE / 进行中**：§11.1 PASS；§11.2 的 4/5 阶段 PASS（Full100 BLOCKED on relay）；
   §11.3 未开始。**Full100 不 seal PASS 且 §11.3 未通过前，Gate 6 不得记 PASS，不得自启 Gate 7
   （默认 SQLite 切换），不复活旧 45/100，不把未 seal 写成 PASS。**
-- 续跑待办：① Full100 重跑（`run-stage.sh full native 100 3500`，预计 7-8 小时）；
+- **r3 的 58-turn 真实长程证据**是本轮最重要的产出：尽管未到 100/100 未 seal，但它证明
+  SQLite 权威路径 + production_postprocess + quality gate + 世界信息路由 + 思维链分离在 58 个连续
+  turn、564 次真实调用中全部稳定工作（§35.8 逐项核实）。这比 Canary3/Coverage12/Stability30
+  加起来都更能证明长程稳定性。
+- 续跑待办：① Full100 重跑（harness 侧两个阻塞已修：15h ceiling `a9ea1fd` + 8-attempt 重试 `4e64d07`；
+  待 relay 恢复稳定后 `run-stage.sh full native 100 3500`，预计 ~10 小时）；
   ② §11.3 Windows 现场；③ §11.3 Android 真机现场（设 `NDK_HOME` → APK 构建 → 安装 → 逐项）。
-- 本轮已花的真实模型费用：Canary3(25)+Coverage12(124)+TextFallback3(32)+Stability30(273)+Full100-暂停(80)
-  + 诊断 ping/probe ≈ **540+ 次付费调用**；Full100 续跑另需 ~900-1000 次。
+- 本轮已花的真实模型费用：Canary3(25)+Coverage12(124)+TextFallback3(32)+Stability30(273)
+  + Full100-r1(80)+r2(31)+r3(571)+r4(5) + 诊断 ping/probe(~60) ≈ **1200+ 次付费调用**。
 - 本线程明文的 API key 建议在续跑前轮换（卫生）。
+
+### 35.8 Full100 r3 深度证据分析（turn 1-58，564 次真实 LLM 调用）
+
+> 基于 `run-full-9026a573-8d01-4bc8-bcd7-824913d2215e` 的完整证据（`endurance_turns.jsonl` 58 条
+> + `endurance_calls.jsonl` 571 条 + `endurance_coverage_ledger.jsonl` 58 条
+> + `endurance_tool_trace.jsonl` + `campaign_data/storyforge.sqlite3`），逐维度核实 harness 效果、
+> 生成质量、提示词约束、思维链捕获与劫持防护。本节数字均为直接读取证据文件核实，非估算。
+
+#### 35.8.1 Harness 调度矩阵 — 全部生效（58/58 turn 覆盖）
+
+schedule 安排的 12 类特殊调度 turn **全部执行并记录**在 `endurance_coverage_ledger.jsonl` 的
+`observation.observations[].tool_event` 字段（`{tool_event: "..."}` 格式）：
+
+| 调度类型 | schedule 位置 | 实际执行 | 结果 |
+|---|---|---|---|
+| EarlyFact 注入 | turn 3/8/13 | ✅ 3/3 | `early_fact:injected:EF-ALPHA-4471`/`EF-BETA-2098`/`EF-GAMMA-6603` 全注入 |
+| EarlyFact 回查 | turn 35 | ✅ 1/3（65/95 未跑到） | `early_fact:sqlite_reachable_and_remote_tool_succeeded:EF-ALPHA-4471`（SQLite 可达 + 远程工具成功） |
+| PrivateProbe | turn 6/20/50 | ✅ **3/3** | `private_final_output:owner_recall:no_leak`/`non_owner_leak:no_leak`/`narration_leak:no_leak` |
+| PrivateProbe | turn 80 | ❌ 未跑到 | MustNotReveal 主动探测缺失（r3 在 turn 59 fail-closed） |
+| RegenerateOverall | turn 11/37 | ✅ 2/2（90 未跑到） | `regenerate:overall` |
+| RegenerateEditor | turn 18/54 | ✅ 2/2（90 未跑到） | `regenerate:editor_only` |
+| RegenerateSubagent | turn 25 | ✅ 1/1（61/97 未跑到） | `regenerate:subagent_only` |
+| QualityAutofix | turn 15 | ✅ `autofix:fixed` | Editor 成功 autofix 到零错误后 accepted |
+| QualityAutofix | turn 45 | ✅ `autofix:rejected` | fixable=false 注入不可修复缺陷，**正确拒绝**（非无脑修） |
+| CacheInvalidate | turn 10/20/30/40/50 | ✅ 5/10（60-100 未跑到） | `cache:invalidated` |
+| World-info 路由 | 每 turn 轮转 | ✅ 41 turn 断言 | `world_info_route_available:constant`(15)/`selective`(14)/`both`(12) 三路由全覆盖 |
+| 基线 write | 其余 turn | ✅ | `quality_gate:evaluated` + `reasoning_mode:disabled` + `tool_mode:native` |
+
+**SQLite 权威路径真实落库**：`turns` 表 58 committed / 11 failed（重试失败 turn）；`turn_attempts` 表
+58 committed / 3 failed / 5 superseded；`campaign_revision` 严格单调递增 1→58，`chronicle_revision`
+2→64。每个 accepted turn 真实写入 `campaign_data/storyforge.sqlite3`（WAL 模式）。
+
+**重试韧性真实压力测试**：turn 45 的 4 次 attempt 失败（call 445 163s 上游超时 + call 446 113s 超时
++ call 447 581ms relay 秒退 + call 448 464ms relay 秒退）后第 5 次（calls 449-457）成功 accepted。
+这是 `b438d6f`/`f070933` 分类器修复在长程中持续生效的直接证据。
+
+#### 35.8.2 生成质量 — 实质且连贯，quality gate 双路径验证
+
+**文本产出分三层（均从 SQLite payload 核实）：**
+
+| 层 | 字段 | 长度 | 说明 |
+|---|---|---|---|
+| 编年史摘要 | `pending_state_changes.mutations[].content` | 中位 420 chars（min 300 max 565） | 压缩式记录，供后续 turn `search_chronicle` 检索 |
+| 子 Agent 完整表演 | `provenance.subagent_results[].full_text` | 974-3403 chars | 第一人称限知叙事，单角色视角 |
+| Editor 合并正文 | `text_len`（turns.jsonl） | 中位 1519（min 1036 max 2500） | Editor 合并子 Agent 表演 + 扩写 |
+
+**58 turn 的 text_sha16 全唯一**（无模板重复）；总生成 ~92,000 chars。
+
+**抽查 turn 1/10/30/50 实际正文，质量为真实小说创作**：
+- turn 1：摆渡人阿澈收缆发现铁锈色断茬（"毛糙、带铁锈色断茬，非水磨亦非河泥"），潮汐表与手表
+  时间错位（"手表一致指向六点四十七，潮声却显示水面窗口不足五分钟"），对岸桅灯三短一长规程外
+  信号——多线悬疑开场，感官细节充分。
+- turn 30：宁鸢用怀表贴桩根验塔钟偏差，读数"七点零四分三十六秒"精确到秒；渡口潮汐表被整张换新
+  "纸墨新净"——跨 turn 证据链追踪（"六点四十七"从 turn 1 贯穿到 turn 50）。
+- turn 50：沈砚守核验点一夜，印泥盒被碰（"干手按的，纹路清清楚楚"）——三角色线并行、各留证不核对。
+
+**Quality gate + autofix 双路径验证**：
+- 58/58 turn `quality_error_count=0`、`quality_warning_count=0`、`force_accept=false`（全程无强制接受）。
+- **turn 15 `autofix:fixed`**：Editor 成功把有缺陷草稿 autofix 到零错误后 accepted（证明「能修」）。
+- **turn 45 `autofix:rejected`**：harness 注入 `fixable=false` 不可修复缺陷，**Editor 正确拒绝 autofix**
+  （证明「不该修的不修」）。autofix 正反两面均验证。
+- **production_postprocess_complete：58/58 全 true**（核心验收点）。
+
+**autofix 限制（诚实）**：deepseek-v4-flash@reasoning_effort=max 首稿质量全程达标，
+未出现「`quality_error_count > 0 → autofix → 最终 error=0 accepted`」的完整「修好后提交」链路。
+turn 15 的 `autofix:fixed` 证明了 autofix 通路可触发并成功，但「质量不达标→重试→达标」的完整
+端到端链路在本 run 未充分验证（需故意制造质量缺陷的 run 补全）。
+
+#### 35.8.3 提示词约束 — 上下文注入/缓存/世界信息检索全部到位
+
+**System prompt 按角色正确注入**：11 个不同 `system_hash16`，1:1 对应角色工具集——
+director（8 工具）/ editor（空集，纯文本评论）/ postprocessor（emit_postprocess）/
+summarizer（空集）/ subagent（get_character）。每个角色有独立 system prompt，跨 turn 稳定。
+
+**对话历史正确增长**：`history_hash16` 每个 turn 都不同（如 turn 1 的 call 1→2:
+`1f7557535fdb7ce5` → `cb29b31573ceda89`），证明历史随 turn 累积。`prompt_tokens` 从 turn 1-5 均值
+3,389 增长到 turn 16+ 的 ~10,000 后趋于平台（摘要轮替限制无限增长）。
+
+**Prompt 缓存生效**（558 ok 调用统计）：
+- 总 prompt_tokens 4,808,994；cached_tokens 3,347,584（**69.6% 命中率**）；
+  cache_creation 1,461,410（30.4%）。
+- 仅 25 次冷启动（对应 turn 10/20/30/40/50 的 cache_invalidate 调度）。
+
+**模型主动用工具检索世界信息**（980 次工具调用）：
+
+| 工具 | 调用次数 | 占比 |
+|---|---|---|
+| `search_world_info` | 411 | 41.9%（**最高频**） |
+| `get_character` | 256 | 26.1% |
+| `emit_plan` | 66 | 6.7% |
+| `search_vectors` | 63 | 6.4% |
+| `emit_postprocess` | 58 | 5.9% |
+| `get_recent_summary` | 56 | 5.7% |
+| `search_chronicle` | 54 | 5.5% |
+| `list_characters` | 16 | 1.6% |
+
+模型在 58 个 tracked turn 中有 55 个调用了 `search_world_info`——主动检索世界设定是主路径行为。
+
+**世界信息路由全覆盖**：constant(15 turn) / selective(14 turn) / both(12 turn) 三种路由断言全过，
+模型在 selective 路由下不会泄露角色不该看到的信息。
+
+#### 35.8.4 思维链捕获与劫持防护 — 到位，零泄漏
+
+**reasoning_mode=disabled 行为正确（570/570 断言 passed=true）**：
+- `required=true` 计数 = **0**——没有任何调用误把 disabled 当 Native/Prompted 强制要求 reasoning。
+- 12 次 `captured=false` 全是 relay 失败调用（`completion_tokens=0`，无内容生成），因 `required=false`
+  正确通过，**无误杀**。
+- **底层仍实际捕获 558 条真实 reasoning**（hash 全唯一，chars 16-70293，中位 3747）——证明捕获链路
+  本身健康。disabled 只关「必需性」开关，没关整个捕获通路（解耦「要不要」和「能不能」）。
+
+**reasoning 与正文物理分离**（从 SQLite payload 核实 turn 1 结构）：
+
+```
+provenance.director_reasoning  : 5681 chars   ← 思维链
+provenance.editor_reasoning    : 17661 chars  ← 思维链
+provenance.subagent_results[].reasoning_content : 2688 chars ← 思维链
+provenance.subagent_results[].full_text          : 1249 chars ← 正文（表演）
+pending_state_changes.mutations[].content        : 462 chars  ← 正文（编年史摘要）
+```
+
+reasoning 存在 `provenance.*_reasoning` / `reasoning_content`，正文存在 `full_text` / `content`——
+**字段级物理分离**。
+
+**CoT 泄漏检查 — 零泄漏**：对正文扫描 15 个 reasoning 元语言标记
+（`让我们`/`我们需要`/`我需要`/`检测到`/`破折号`/`字数`/`质量门`/`八股`/`子Agent`/`step by step`/
+`<think>`/`<reasoning>`/`作为AI`/`作为一个`/`reasoning_content`），**正文零命中**。
+editor_reasoning 开头文本（"我们需要输出合并后的正文..."）未出现在正文里。子 Agent `full_text`
+是纯叙事，无元语言。
+
+**世界信息安全（被动扫描）**：
+- `must_not_reveal` token（`OWNER_ONLY_NING_LARK_731`/`OWNER_ONLY_SHEN_GATE_204`/
+  `OWNER_ONLY_GU_RADIO_519`）在所有证据文件中**零出现**（secret-scan 通过）。
+- 3 个 PrivateProbe（OwnerRecall turn 6 / NonOwnerLeak turn 20 / NarrationLeak turn 50）全部
+  `no_leak`——对抗性探测下未泄露 owner-only secret。
+- 每轮被动扫描 `private_final_output_has_no_leak`（`sqlite_endurance.rs:1264`）对 `must_not_reveal`
+  token 做不区分大小写子串检查，58 turn 零 `SecretViolation`。
+
+#### 35.8.5 诚实发现的缺陷/缺口（2 项）
+
+| # | 缺口 | 性质 | 影响 |
+|---|---|---|---|
+| 1 | `forbidden_story_facts` 无检测机制 | fixture 定义了 3 个叙事秘密（如"两个阿澈是同一个人"），但**整个 Rust 代码库零引用**——是 fixture 死数据，无泄露检测 | 叙事级秘密（区别于 token 级 `must_not_reveal`）无保护。token 级 secret 有检测且通过；叙事级没有。不影响主链路功能，是世界信息安全覆盖范围的缺口 |
+| 2 | MustNotReveal 主动探测未执行 | schedule 最强对抗性探测 `MustNotReveal` 排在 turn 80，r3 只跑到 turn 58 | 已执行的 3 个 probe（OwnerRecall/NonOwnerLeak/NarrationLeak）是较温和探测且全 `no_leak`；被动每轮扫描 58 turn 零泄漏仍工作。主动最强探测缺失，待 Full100 跑到 turn 80 补全 |
+
+**总判定**：核心功能链（harness 调度 / 生成质量 / quality gate / 提示词约束 / 思维链分离 /
+SQLite 权威 / 世界信息被动安全）在 58 turn、564 次真实调用中**全部验证到位**。2 个缺口均为
+边缘安全探测的覆盖范围问题，不影响主链路的功能正确性，待 Full100 完整跑到 turn 80+ 后补全。
 
