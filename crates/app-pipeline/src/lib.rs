@@ -362,8 +362,6 @@ pub fn chronicle_partition_for_context(
             .iter()
             .filter_map(|s| s.code.as_ref().map(|c| (c.clone(), s)))
             .collect();
-    let by_turn: std::collections::HashMap<u32, &storyforge_domain::agent::RoundSummary> =
-        summaries.iter().map(|s| (s.turn, s)).collect();
 
     let overview_lines: Vec<String> = snap
         .overview_codes
@@ -412,7 +410,6 @@ pub fn chronicle_partition_for_context(
     if overview_lines.is_empty() && band_lines.is_empty() && near_turns.is_empty() {
         return fallback;
     }
-    let _ = by_turn;
     ChroniclePromptPartition {
         overview_lines,
         band_lines,
@@ -1102,7 +1099,10 @@ impl PipelineOrchestrator {
 
         let (writer_progress_tx, mut writer_progress_rx) = mpsc::unbounded_channel::<String>();
         let writer_event_tx = event_tx.clone();
-        tokio::spawn(async move {
+        // H-6：转发任务。writer_progress_tx 在下方 run_tool_loop_with_layout 内消费，
+        // 该调用返回后 tx drop → rx 收到 None → 转发循环退出，故 await 不会死锁。
+        // 显式 await 让闭包 panic 不再被静默吞没（与 sequential_crew.rs:285 一致）。
+        let writer_progress_forwarder = tokio::spawn(async move {
             while let Some(delta) = writer_progress_rx.recv().await {
                 let _ = writer_event_tx.send(PipelineEvent::WriterProgress { delta });
             }
@@ -1121,9 +1121,12 @@ impl PipelineOrchestrator {
         {
             Ok(response) => response,
             Err(error) => {
+                // 工具循环失败也要排干转发任务，避免 detached task 残留。
+                let _ = writer_progress_forwarder.await;
                 return Err(self.abort_with(&event_tx, PipelineError::Agent(error)));
             }
         };
+        let _ = writer_progress_forwarder.await;
         let final_text =
             match apply_editor_output_regex(&writer_response.content, &ctx.regex_scripts) {
                 Ok(text) => text,
@@ -2034,7 +2037,9 @@ impl PipelineOrchestrator {
                     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     let pp_tx = event_tx.clone();
                     let pp_cid = target_id.clone();
-                    tokio::spawn(async move {
+                    // H-6：转发任务。sub_tx 在下方 run_tool_loop_with_layout 内消费，
+                    // 调用返回后 tx drop → 转发循环退出，await 安全。
+                    let sub_forwarder = tokio::spawn(async move {
                         while let Some(delta) = sub_rx.recv().await {
                             let _ = pp_tx.send(PipelineEvent::SubagentProgress {
                                 character_id: pp_cid.clone(),
@@ -2044,7 +2049,7 @@ impl PipelineOrchestrator {
                         }
                     });
 
-                    match self
+                    let result = match self
                         .runtime
                         .run_tool_loop_with_layout(
                             &config,
@@ -2065,7 +2070,10 @@ impl PipelineOrchestrator {
                             reasoning_content: resp.reasoning_content,
                         }),
                         Err(e) => Err(e),
-                    }
+                    };
+                    // 排干转发任务，让闭包 panic 可观测（之前 handle 丢弃会静默吞没）。
+                    let _ = sub_forwarder.await;
+                    result
                 };
 
                 let new_perf = match new_perf {
@@ -2746,7 +2754,9 @@ impl PipelineOrchestrator {
 
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
         let editor_event_tx = event_tx.clone();
-        tokio::spawn(async move {
+        // H-6：转发任务。editor_prog_tx 在下方 run_tool_loop_with_layout 内消费，
+        // 调用返回后 tx drop → 转发循环退出，await 安全。
+        let editor_forwarder = tokio::spawn(async move {
             while let Some(delta) = editor_prog_rx.recv().await {
                 let _ = editor_event_tx.send(PipelineEvent::EditorProgress { delta });
             }
@@ -2764,8 +2774,12 @@ impl PipelineOrchestrator {
             )
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                let _ = editor_forwarder.await;
+                response
+            }
             Err(error) => {
+                let _ = editor_forwarder.await;
                 error!(target: "app-pipeline", "编剧失败: {error}");
                 return Err(self.abort_with(event_tx, PipelineError::Agent(error)));
             }

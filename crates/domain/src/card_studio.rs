@@ -946,7 +946,9 @@ pub fn merge_review_reports(base: CheckReport, llm_value: &serde_json::Value) ->
     let score = llm_value
         .get("score")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
+        // L-8：LLM 幻觉出超大 score 时，直接 `as u32` 会按 2^32 回绕（巨大数可能
+        // 变成小分数，静默通过校验）。改用饱和转换，超出 u32 上限一律钳到 u32::MAX。
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
         .or(base.score)
         .map(|s| {
             // never higher than rule score if errors remain

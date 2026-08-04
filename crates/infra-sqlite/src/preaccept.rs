@@ -751,7 +751,13 @@ impl SqlitePreacceptRepository {
         write_conversation(tx, &conversation)?;
 
         {
-            let attempt = turn.find_attempt_mut(attempt_id).unwrap();
+            // H-5：line 724 已 ok_or_else 校验过 attempt 存在，但中间 write_conversation
+            // 写盘——同函数其他分支都用 `?`+ok_or_else，唯独此处 unwrap 不一致，且
+            // 未来若插入 reload 不变式会静默失效。改为 fail-closed 的 RecordNotFound
+            // （与该 crate 设计一致），避免生产路径 panic = 进程 abort。
+            let attempt = turn
+                .find_attempt_mut(attempt_id)
+                .ok_or_else(|| SqliteError::RecordNotFound(format!("attempt {attempt_id}")))?;
             // Keep original draft_hash deliberately so Accept can detect edit mismatch.
             attempt.status = AttemptStatus::Stale;
         }

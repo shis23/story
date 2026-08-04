@@ -100,6 +100,10 @@ struct PublicBeat {
 pub struct SequentialStageRecord {
     opening: String,
     beats: Vec<PublicBeat>,
+    // L-12：失败计数。生产路径只 record 不读（record_failure 被调用，但
+    // failure_count/should_stop_actor 仅在 #[cfg(test)] 下编译）。保留是为了
+    // 让「连续失败熔断」在测试里可验证；生产熔断逻辑未接入主循环——加 `#[cfg(test)]`
+    // 会割裂错误处理调用点，故保留为带观测语义的死字段，待熔断策略定稿后接入。
     failures: HashMap<String, u8>,
 }
 
@@ -114,7 +118,7 @@ impl SequentialStageRecord {
 
     pub fn push_performance(&mut self, performance: &Performance) {
         let public_text = public_performance_text(&performance.narrative, &performance.dialogue);
-        if !public_text.is_empty() {
+        if !public_text.trim().is_empty() {
             self.beats.push(PublicBeat {
                 actor_id: performance.character_id.clone(),
                 text: public_text,
@@ -135,6 +139,8 @@ impl SequentialStageRecord {
         sections.join("\n\n")
     }
 
+    /// L-12：记录某 actor 的失败次数（观测用）。生产路径不消费该计数；测试通过
+    /// `failure_count`/`should_stop_actor` 验证熔断阈值。
     pub fn record_failure(&mut self, actor_id: &str, _safe_class: &str) {
         let count = self.failures.entry(actor_id.to_string()).or_default();
         *count = count.saturating_add(1);

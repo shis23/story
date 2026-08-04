@@ -37,6 +37,17 @@ impl GlobalRegexStore {
     }
 
     pub fn replace_all(&self, mut scripts: Vec<RegexScript>) -> Result<usize, String> {
+        // H-1: trial-compile every find_regex before accepting the batch, so a
+        // malformed/catastrophic regex in imported ST settings JSON is rejected at
+        // import time with an actionable error naming the offending script, instead
+        // of freezing the writing pipeline on first application. (Runtime
+        // catastrophic backtracking is still backstopped by apply_single_script's
+        // wall-clock timeout.)
+        for script in &scripts {
+            storyforge_infra_regex::validate_regex(&script.find_regex, &script.flags).map_err(
+                |error| format!("全局正则 '{}' 校验失败: {error}", script.script_name),
+            )?;
+        }
         normalize_global_sources(&mut scripts);
         let len = scripts.len();
         {

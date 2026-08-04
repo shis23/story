@@ -299,22 +299,9 @@ pub enum CutoverFault {
     AfterMarker,
 }
 
-/// Persistent cutover state used for recovery across restarts.
-///
-/// This is encoded into the marker's metadata. When a cutover is interrupted
-/// we can determine exactly how far it got and whether JSON or SQLite is
-/// authoritative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CutoverState {
-    /// Nothing has started yet.
-    NotStarted,
-    /// JSON is authoritative; cutover in progress (temp DB may exist).
-    JsonAuthoritative,
-    /// SQLite DB published but marker not yet written — ambiguous, must reconcile.
-    DbPublishedMarkerMissing,
-    /// Marker written — SQLite is authoritative.
-    SqliteAuthoritative,
-}
+// (L-2: 此前这里定义的 `CutoverState` 枚举及其文档注释从未被使用——状态判定
+// 实际由下方 `inspect_marker` 返回的 `MarkerStatus` 承担。已删除该死枚举、其
+// 文档注释与 lib.rs 重导出。)
 
 /// Inspect the marker file and database state to determine authority.
 pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
@@ -579,14 +566,18 @@ fn write_authority_binding(db: &Database, authority_id: &str, cutover_nonce: &st
         rusqlite::params![authority_id, cutover_nonce, chrono::Utc::now().to_rfc3339()],
     )?;
     // Also stamp the latest completed import_runs row for defense in depth.
-    let _ = db.connection().execute(
+    // H-4：cutover「提交点」路径。authority_binding 已写入但 import_runs UPDATE
+    // 失败时不能静默吞没——validate_marker_db_binding（cutover.rs:465）的回退分支
+    // 会读 import_runs.authority_id，UPDATE 失败会导致身份判定错误。cutover 刚
+    // import 完必有 completed 行，传播错误（影响 0 行本身就是不一致信号）。
+    db.connection().execute(
         "UPDATE import_runs SET authority_id = ?1, cutover_nonce = ?2 \
          WHERE status = 'completed' AND run_id = ( \
             SELECT run_id FROM import_runs WHERE status = 'completed' \
             ORDER BY finished_at DESC LIMIT 1 \
          )",
         rusqlite::params![authority_id, cutover_nonce],
-    );
+    )?;
     Ok(())
 }
 
@@ -1106,17 +1097,20 @@ pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
 }
 
 fn check_count(db: &Database, table: &str, id_column: &str, expected: usize) -> Result<()> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
+    // L-1：用 COUNT(<id_column>) 而非 COUNT(*)，让 id_column 真正参与校验——
+    // 若列名拼错或为 NULL 会被 SQLite 报错（COUNT(不存在的列) → SQL 错误），
+    // 不再是 `let _ = id_column` 给人的「按 id 校验」错觉。这些表的 id_column
+    // 是 NOT NULL 主键，所以 COUNT(id) == COUNT(*)，数值不变。
+    let sql = format!("SELECT COUNT({id_column}) FROM {table}");
     let actual: i64 = db
         .connection()
         .query_row(&sql, [], |row| row.get(0))
-        .map_err(|e| SqliteError::Other(format!("count {table}: {e}")))?;
+        .map_err(|e| SqliteError::Other(format!("count {table}.{id_column}: {e}")))?;
     if actual as usize != expected {
         return Err(SqliteError::Other(format!(
             "{table} count {actual} != source {expected}"
         )));
     }
-    let _ = id_column;
     Ok(())
 }
 
@@ -1132,11 +1126,8 @@ fn atomic_publish_db(
     let temp = plan.temp_db_path();
     let final_path = &plan.db_path;
 
-    eprintln!(
-        "[BI2] p0 temp={} final={}",
-        temp.display(),
-        final_path.display()
-    );
+    // (M-1：删除调试残留 `[BI2]` eprintln——它在生产路径把绝对 DB 路径打到 stderr，
+    // 泄漏用户名/安装目录。服务器端 tracing 已覆盖诊断需求。)
     if !temp.exists() {
         return Err(SqliteError::Other(
             "temp database missing during publish".into(),

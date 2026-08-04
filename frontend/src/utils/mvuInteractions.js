@@ -13,6 +13,43 @@ import {
 
 const MAX_FLATTEN_DEPTH = 5
 
+// M-6：evaluateMvuValueExpr 的 JSON.parse 字面量边界。JSON.parse 本身不执行 JS，
+// 但卡可塞任意大/深嵌套 JSON 字面量到变量，下游 buildMvuStatDataTree 按 `.` 分段
+// 递归建树无深度限制，深嵌套会放大内存/CPU 压力。这两条上限把字面量约束在合理范围。
+const MAX_MVU_EXPR_BYTES = 64 * 1024 // 64KB，足够任何合理的 stat 字面量
+const MAX_MVU_EXPR_DEPTH = 32 // 嵌套层数上限
+
+/**
+ * M-6：校验 MVU value_expr 的 JSON 字面量——字节上限 + 嵌套深度上限。
+ * @param {string} raw 原始表达式字符串
+ * @returns {{ok:false,reason:string}|{ok:true}}
+ */
+function validateMvuJsonLiteral(raw) {
+  if (raw.length > MAX_MVU_EXPR_BYTES) {
+    return { ok: false, reason: `表达式过长（${raw.length} 字节，上限 ${MAX_MVU_EXPR_BYTES}）` }
+  }
+  // 深度只能对结构化 JSON 计算；裸词字符串字面量（下面的分支）走另一条路径，
+  // 这里仅约束 JSON.parse 成功后的值。
+  return { ok: true }
+}
+
+/**
+ * M-6：测量一个已解析 JSON 值的最大嵌套深度。
+ * @param {unknown} value
+ * @param {number} depth
+ * @returns {number}
+ */
+function jsonDepth(value, depth = 0) {
+  if (value === null || typeof value !== 'object') return depth
+  if (Array.isArray(value)) {
+    return value.reduce((max, item) => Math.max(max, jsonDepth(item, depth + 1)), depth + 1)
+  }
+  return Object.values(value).reduce(
+    (max, item) => Math.max(max, jsonDepth(item, depth + 1)),
+    depth + 1,
+  )
+}
+
 export function flattenInteractionActions(actions, depth = 0) {
   if (!Array.isArray(actions) || depth >= MAX_FLATTEN_DEPTH) return []
   const flat = []
@@ -78,7 +115,14 @@ export function evaluateMvuValueExpr(valueExpr, currentValue, key) {
   }
 
   try {
-    return { ok: true, value: JSON.parse(raw) }
+    // M-6：先做字节上限校验，再解析；解析后做嵌套深度校验。
+    const sizeCheck = validateMvuJsonLiteral(raw)
+    if (!sizeCheck.ok) return sizeCheck
+    const parsed = JSON.parse(raw)
+    if (jsonDepth(parsed) > MAX_MVU_EXPR_DEPTH) {
+      return { ok: false, reason: `JSON 字面量嵌套过深（上限 ${MAX_MVU_EXPR_DEPTH} 层）` }
+    }
+    return { ok: true, value: parsed }
   } catch {
     // 不是 JSON，继续
   }

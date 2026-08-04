@@ -217,6 +217,12 @@ export function extractInlineShellDocsFromDisplay(displayContent) {
   return { docs, residualText: out.replace(/\n{3,}/g, '\n\n').trim() }
 }
 
+// M-7：与后端 ReDoS（H-1）对称的前端防护。JS RegExp 无原生超时，灾难性回溯
+// 会冻结主线程 UI；用两条长度上限把回溯成本约束在合理范围（回溯代价随输入长度
+// 与 pattern 复杂度增长）。
+const MAX_TRIGGER_PATTERN_LEN = 4096 // 单条 trigger pattern 字节数上限
+const MAX_TRIGGER_TEXT_LEN = 200_000 // 待匹配文本字符数上限
+
 /**
  * Parse an ST find_regex string (`/pattern/flags` or bare pattern) into a
  * JS RegExp. Returns null when the pattern does not compile.
@@ -226,6 +232,8 @@ export function extractInlineShellDocsFromDisplay(displayContent) {
 export function parseStFindRegex(trigger) {
   const t = String(trigger || '').trim()
   if (!t) return null
+  // M-7：超长 pattern 本身就是可疑信号（ReDoS 风险），直接跳过。
+  if (t.length > MAX_TRIGGER_PATTERN_LEN) return null
   const wrapped = t.match(/^\/([\s\S]+)\/([a-z]*)$/i)
   try {
     if (wrapped) {
@@ -249,10 +257,13 @@ export function parseStFindRegex(trigger) {
 export function matchesAnyInlineShellTrigger(sourceText, triggers) {
   const text = String(sourceText || '')
   if (!text) return false
+  // M-7：截断待匹配文本——回溯代价随输入长度增长，200K 字符上界把最坏情况
+  // 约束在可接受范围。inline-shell 触发 marker 总在消息前部，截断尾部不影响检测。
+  const cappedText = text.length > MAX_TRIGGER_TEXT_LEN ? text.slice(0, MAX_TRIGGER_TEXT_LEN) : text
   for (const item of Array.isArray(triggers) ? triggers : []) {
     const trigger = typeof item === 'string' ? item : item?.trigger
     const re = parseStFindRegex(trigger)
-    if (re && re.test(text)) return true
+    if (re && re.test(cappedText)) return true
   }
   return false
 }

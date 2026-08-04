@@ -765,7 +765,10 @@ pub async fn spawn_subagents(
             let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<String>();
             let fwd_tx = sub_event_tx.clone();
             let fwd_cid = character_id.clone();
-            tokio::spawn(async move {
+            // H-6：转发任务。sub_tx 在下方 run_tool_loop_with_layout 内消费，
+            // 该调用返回后 tx drop → 转发循环退出。捕获 handle 并在返回前 await，
+            // 让闭包 panic 可观测（之前 handle 丢弃会静默吞没）。
+            let sub_forwarder = tokio::spawn(async move {
                 while let Some(delta) = sub_rx.recv().await {
                     let _ = fwd_tx.send(PipelineEvent::SubagentProgress {
                         character_id: fwd_cid.clone(),
@@ -789,7 +792,9 @@ pub async fn spawn_subagents(
                     Some(sub_probe),
                 )
                 .await;
-            // sub_tx 在此 drop，转发任务收到 None 后自然结束
+            // sub_tx 在此 drop，转发任务收到 None 后自然结束。显式 await 排干转发
+            // 任务，避免 detached panic 被静默吞没。
+            let _ = sub_forwarder.await;
 
             match result {
                 Ok(resp) => Ok(Performance {

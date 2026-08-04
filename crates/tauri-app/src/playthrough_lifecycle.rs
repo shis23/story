@@ -124,6 +124,22 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         })?;
     }
 
+    // M-4：JSON 跨文件删除无单事务。删除顺序为 compress_jobs → 会话/Turn →
+    // Campaign，使任一步失败都留下「可重试且不残留孤儿」的状态：
+    //  - compress_jobs 先删：失败时所有数据原样保留，可安全重试。
+    //  - 会话/Turn 次删：失败时 compress_jobs 已清，Campaign 仍在，可重试
+    //    （相比旧顺序「会话→compress_jobs→Campaign」，旧顺序若 compress_jobs
+    //    失败会让会话已删而 Campaign+compress_jobs 残留——压缩任务会在重启时
+    //    反复重放一个会话已不存在的 campaign，是 M-4 的核心问题）。
+    //  - Campaign 最后删：失败时仅留下可被 GC/重试清理的孤儿会话，用户不会再
+    //    看到「空壳」Campaign。
+    // SQLite 由 delete_campaign_cascade 单事务级联删除（facade 内 backend 策略，
+    // delete_compress_jobs_for_campaign 与 delete_campaign_precursors 均为 no-op）。
+    state
+        .storage()
+        .delete_compress_jobs_for_campaign(campaign_id)
+        .map_err(|error| TauriCommandError::storage(format!("删除活动的压缩任务失败: {error}")))?;
+
     // 先删会话 + Turn。失败时 Campaign 仍存在，用户可以安全重试；
     // 这是跨 JSON 文件删除无法使用单一事务时的补偿顺序。SQLite 由
     // delete_campaign_cascade 单事务级联删除（facade 内 backend 策略）。
@@ -148,16 +164,6 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
             "清理活动前置数据失败，活动仍保留可重试: {error}{suffix}"
         )));
     }
-
-    // 三.9 级联等价：SQLite `delete_campaign_cascade` 在同一事务内删除
-    // chronicle_compress_jobs；JSON 的 CompressJobStore 是独立文件，必须在此
-    // 补齐同语义级联（`delete_compress_jobs_for_campaign` 对 SQLite 为 Ok(0)
-    // no-op）。放在 Campaign 删除**之前**：失败时活动仍保留可重试，不会留下
-    // 孤儿压缩任务在重启时反复重放。失败必须传播，绝不吞错。
-    state
-        .storage()
-        .delete_compress_jobs_for_campaign(campaign_id)
-        .map_err(|error| TauriCommandError::storage(format!("删除活动的压缩任务失败: {error}")))?;
 
     if campaign_present {
         let deleted = match source.delete_campaign(campaign_id) {

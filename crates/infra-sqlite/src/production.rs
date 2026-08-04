@@ -293,18 +293,24 @@ impl SqliteProductionRepository {
 
     /// All non-terminal turns across campaigns (startup recovery / barrier).
     pub fn list_active_turns(db: &Database) -> Result<Vec<TurnRecord>> {
-        let mut stmt = db.connection().prepare(
-            r#"
-            SELECT turn_id FROM turns
-            WHERE status IN ('generating', 'draft_ready', 'deriving_state',
-                             'awaiting_acceptance', 'committing')
-            ORDER BY updated_at, turn_id
-            "#,
-        )?;
-        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        // M-3：先把所有 id 收集成 Vec，让 stmt 与 Rows 在嵌套查询前 drop，避免
+        // 同连接上「prepared stmt 仍 borrow 时再 prepare/查询」在某些 SQLite +
+        // WAL 版本上触发 `database table is locked`。与 get_turn_by_variant
+        // （251-270）的正确写法对齐。
+        let ids: Vec<String> = {
+            let mut stmt = db.connection().prepare(
+                r#"
+                SELECT turn_id FROM turns
+                WHERE status IN ('generating', 'draft_ready', 'deriving_state',
+                                 'awaiting_acceptance', 'committing')
+                ORDER BY updated_at, turn_id
+                "#,
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         let mut out = Vec::new();
         for id in ids {
-            let id = id?;
             if let Some(turn) = load_validated_turn(db.connection(), &Id::from_str(id))? {
                 out.push(turn);
             }

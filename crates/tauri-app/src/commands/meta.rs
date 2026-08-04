@@ -76,12 +76,14 @@ pub fn meta_accept_patch(
             .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
         // 反序列化回 WorldInfoEntry 并替换
+        // M-1：错误信息只保留 entry 索引，不回显 `value`（世界书条目可能含私密剧情内容）。
         let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
             .into_iter()
-            .map(|v| {
+            .enumerate()
+            .map(|(idx, v)| {
                 serde_json::from_value(v.clone()).map_err(|e| {
                     TauriCommandError::internal(format!(
-                        "Patch entry failed to deserialize as WorldInfoEntry: {e}, value: {v}"
+                        "Patch entry #{idx} 反序列化为 WorldInfoEntry 失败: {e}"
                     ))
                 })
             })

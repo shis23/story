@@ -345,8 +345,20 @@ pub struct TurnRecord {
     /// 崩溃恢复必须复用该意图：force accept 的 Degraded 不能被恢复路径升级成 Committed。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intended_terminal_status: Option<TurnStatus>,
+    /// H-3：启动恢复对同一 Committing Turn 的累计重放次数。
+    ///
+    /// 持久化的瞬时错误（IO/锁）若每次启动都重放会无限循环。超过
+    /// `MAX_RECOVERY_RETRIES` 后升级为 Failed，停止跨启动重放。旧记录无此字段
+    /// 时 serde 填 0，与「尚未重放过」语义一致。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub recovery_retries: u32,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// `skip_serializing_if` helper for `recovery_retries` (omit the common 0 value).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl TurnRecord {
@@ -369,6 +381,7 @@ impl TurnRecord {
             accepted_attempt_id: None,
             failure_reason: None,
             intended_terminal_status: None,
+            recovery_retries: 0,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -822,5 +835,38 @@ mod tests {
 
         let active = record.active_attempt().unwrap();
         assert_eq!(active.attempt_id, Id::from_str("att-2"));
+    }
+
+    /// H-3：旧版持久化的 TurnRecord JSON 没有 `recovery_retries` 字段，反序列化
+    /// 必须填 0（与「尚未重放过」一致），否则升级计数会从 garbage 起步。
+    #[test]
+    fn turn_record_recovery_retries_defaults_to_zero_for_legacy_json() {
+        let legacy = serde_json::json!({
+            "turn_id": "t-1",
+            "campaign_id": "c-1",
+            "conversation_id": "v-1",
+            "input_node_id": "n-1",
+            "base_campaign_revision": 0,
+            "status": "committing",
+            "attempts": [],
+            "accepted_attempt_id": null,
+            "failure_reason": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let record: TurnRecord = serde_json::from_value(legacy).expect("legacy JSON must parse");
+        assert_eq!(record.recovery_retries, 0);
+
+        // Round-trip preserves an explicit nonzero value.
+        let mut record = TurnRecord::new(
+            Id::from_str("c-1"),
+            Id::from_str("v-1"),
+            Id::from_str("n-1"),
+            0,
+        );
+        record.recovery_retries = 3;
+        let json = serde_json::to_value(&record).unwrap();
+        let back: TurnRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.recovery_retries, 3);
     }
 }

@@ -85,15 +85,17 @@ where
     if !path.exists() {
         return Ok(serde_json::json!([]));
     }
+    // M-1：错误信息脱敏，避免把绝对数据目录路径泄漏到前端。
+    let safe = crate::error::sanitize_path_for_ipc(path);
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("{} metadata: {error}", path.display()))?;
+        .map_err(|error| format!("{safe} metadata: {error}"))?;
     if !metadata.file_type().is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+        return Err(format!("{safe} is not a regular file"));
     }
-    let bytes = std::fs::read(path).map_err(|error| format!("{} read: {error}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|error| format!("{safe} read: {error}"))?;
     let parsed: Vec<T> = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{} parse: {error}", path.display()))?;
-    value_of(parsed, &path.display().to_string())
+        .map_err(|error| format!("{safe} parse: {error}"))?;
+    value_of(parsed, &safe)
 }
 
 pub(crate) fn read_conversations_strict(
@@ -102,26 +104,29 @@ pub(crate) fn read_conversations_strict(
     if !dir.exists() {
         return Ok(serde_json::json!([]));
     }
+    // M-1：错误信息脱敏，避免把绝对数据目录路径泄漏到前端。
+    let safe_dir = crate::error::sanitize_path_for_ipc(dir);
     let metadata = std::fs::symlink_metadata(dir)
-        .map_err(|error| format!("{} metadata: {error}", dir.display()))?;
+        .map_err(|error| format!("{safe_dir} metadata: {error}"))?;
     if !metadata.file_type().is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
+        return Err(format!("{safe_dir} is not a directory"));
     }
     let mut conversations = Vec::new();
     for entry in
-        std::fs::read_dir(dir).map_err(|error| format!("{} read_dir: {error}", dir.display()))?
+        std::fs::read_dir(dir).map_err(|error| format!("{safe_dir} read_dir: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("{} entry: {error}", dir.display()))?;
+        let entry = entry.map_err(|error| format!("{safe_dir} entry: {error}"))?;
         let path = entry.path();
         if path
             .extension()
             .is_some_and(|extension| extension == "json")
         {
+            let safe_path = crate::error::sanitize_path_for_ipc(&path);
             let bytes = std::fs::read(&path)
-                .map_err(|error| format!("{} read: {error}", path.display()))?;
+                .map_err(|error| format!("{safe_path} read: {error}"))?;
             let conversation: storyforge_domain::conversation::Conversation =
                 serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("{} parse: {error}", path.display()))?;
+                    .map_err(|error| format!("{safe_path} parse: {error}"))?;
             conversations.push(conversation);
         }
     }
@@ -567,6 +572,13 @@ pub(crate) fn import_campaign_bundle(
     bundle_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignImportResult, TauriCommandError> {
+    // H-2: bound the IPC payload before deserializing (16 MiB). A hijacked plugin
+    // iframe or buggy frontend could otherwise OOM the process with a huge string.
+    crate::error::require_ipc_size(
+        &bundle_json,
+        crate::error::MAX_BUNDLE_JSON_BYTES,
+        "Campaign Bundle",
+    )?;
     let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
         .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
     state

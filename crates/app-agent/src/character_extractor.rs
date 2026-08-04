@@ -53,13 +53,18 @@ pub async fn extract_characters(
     info!(target: "character-extractor", "开始识别卡「{}」的角色", character.name);
 
     // 流式工具循环：大卡的抽取 prompt 在慢中继上会被边缘超时（CF ~100s）掐成 524，
-    // SSE 流式首字节早到可规避；progress 不消费，排水任务防 send 报错
+    // SSE 流式首字节早到可规避；progress 不消费，故用排水任务（drain）防 send 报错。
+    // H-6：progress_tx 在下方 run_tool_loop_streaming 内消费，调用返回后 tx drop →
+    // 排水循环收到 None 退出，await 不会死锁。捕获 handle 在调用后 await，让闭包
+    // panic 可观测（之前 detached handle 会被静默吞没）。
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+    let drain = tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
 
     let resp = runtime
         .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
         .await?;
+    // 排干转发任务（tx 已在 run_tool_loop_streaming 内 drop）。
+    let _ = drain.await;
 
     let mut defs = parse_character_definitions_from_response(&resp)?;
     if defs.is_empty() {

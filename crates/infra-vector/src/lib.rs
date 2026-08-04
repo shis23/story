@@ -160,8 +160,17 @@ pub enum VectorError {
     #[error("序列化错误: {0}")]
     Serde(#[from] serde_json::Error),
 
-    #[error("维度不匹配: 期望 {expected}，实际 {actual}")]
-    DimensionMismatch { expected: usize, actual: usize },
+    #[error("维度不匹配: 期望 {expected}，实际 {actual}（记录 id={id}）")]
+    DimensionMismatch {
+        expected: usize,
+        actual: usize,
+        id: String,
+    },
+
+    /// H-7：BruteForceStore 全内存，长期运行 campaign 远记忆持续累积无上限会
+    /// 导致内存不可逆增长。新增配额，超限拒绝 upsert。
+    #[error("向量库配额超限: 当前 {current} 条，上限 {limit} 条")]
+    QuotaExceeded { current: usize, limit: usize },
 
     #[error("索引错误: {0}")]
     Index(String),
@@ -169,10 +178,17 @@ pub enum VectorError {
 
 // ─── 暴力检索实现（M0，设计 §7.4 决策）─────────────────────────────────────
 
+/// H-7：BruteForceStore 全内存，长期运行 campaign 远记忆持续累积无上限会
+/// 导致内存不可逆增长。默认配额 5 万条（每条含向量+正文，约 4KB → ~200MB 上界）。
+pub const DEFAULT_MAX_RECORDS: usize = 50_000;
+
 /// 暴力向量存储（M0：Vec + 余弦相似度，数据量小时够用）
 pub struct BruteForceStore {
     records: RwLock<HashMap<Id, VectorRecord>>,
     persist_path: Option<PathBuf>,
+    /// H-7：记录数上限。超过时新 id 的 upsert 返回 `QuotaExceeded`；已存在 id
+    /// 的替换不计入增长（覆盖旧记录）。
+    max_records: usize,
 }
 
 impl BruteForceStore {
@@ -180,11 +196,17 @@ impl BruteForceStore {
         Self {
             records: RwLock::new(HashMap::new()),
             persist_path: None,
+            max_records: DEFAULT_MAX_RECORDS,
         }
     }
 
     /// 带持久化的构造
     pub fn with_persistence(path: PathBuf) -> Self {
+        Self::with_persistence_and_quota(path, DEFAULT_MAX_RECORDS)
+    }
+
+    /// H-7：带持久化 + 自定义配额的构造。
+    pub fn with_persistence_and_quota(path: PathBuf, max_records: usize) -> Self {
         let records = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
@@ -219,6 +241,16 @@ impl BruteForceStore {
         Self {
             records: RwLock::new(records),
             persist_path: Some(path),
+            max_records,
+        }
+    }
+
+    /// H-7：自定义配额的非持久化构造（测试/内存模式）。
+    pub fn with_max_records(max_records: usize) -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            persist_path: None,
+            max_records,
         }
     }
 
@@ -240,6 +272,14 @@ impl Default for BruteForceStore {
 impl VectorStore for BruteForceStore {
     fn upsert(&self, record: VectorRecord) -> Result<(), VectorError> {
         let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
+        // H-7：配额校验。替换已存在 id 不计入增长（覆盖），仅新 id 触发上限检查。
+        let is_new = !records.contains_key(&record.id);
+        if is_new && records.len() >= self.max_records {
+            return Err(VectorError::QuotaExceeded {
+                current: records.len(),
+                limit: self.max_records,
+            });
+        }
         records.insert(record.id.clone(), record);
         self.persist_records(&records)?;
         Ok(())
@@ -256,24 +296,26 @@ impl VectorStore for BruteForceStore {
         filter: &MetadataFilter,
     ) -> Result<Vec<VectorHit>, VectorError> {
         let records = self.records.read().unwrap_or_else(|p| p.into_inner());
+        // H-7：维度不匹配改为返回错误（之前静默跳过 = 结果集缺条却不报错，损坏记录
+        // 污染检索且无法排查）。第一条不匹配即短路返回，调用方可定位并修复损坏记录。
         let mut scored: Vec<VectorHit> = records
             .values()
             .filter(|r| filter.accepts(r))
-            .filter_map(|r| {
-                let score = match cosine_similarity(query, &r.vector) {
-                    Some(s) => s,
-                    None => {
-                        // 历史 bug：维度不匹配静默跳过，用户无感知检索结果缺条且无法排查
-                        warn!(
-                            "向量维度不匹配，跳过记录 id={}（期望 {} 维，实际 {} 维）",
-                            r.id.as_str(),
-                            query.len(),
-                            r.vector.len()
-                        );
-                        return None;
+            .map(|r| {
+                let score = cosine_similarity(query, &r.vector).ok_or_else(|| {
+                    warn!(
+                        "向量维度不匹配，查询 {} 维 vs 记录 id={} {} 维",
+                        query.len(),
+                        r.id.as_str(),
+                        r.vector.len()
+                    );
+                    VectorError::DimensionMismatch {
+                        expected: query.len(),
+                        actual: r.vector.len(),
+                        id: r.id.to_string(),
                     }
-                };
-                Some(VectorHit {
+                })?;
+                Ok(VectorHit {
                     id: r.id.clone(),
                     content: r.content.clone(),
                     score,
@@ -282,7 +324,7 @@ impl VectorStore for BruteForceStore {
                     metadata: r.metadata.clone(),
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, VectorError>>()?;
 
         // 按分数降序排序
         scored.sort_by(|a, b| {
@@ -728,5 +770,56 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.as_str(), "k2");
+    }
+
+    /// H-7：超出配额的新 id upsert 必须被拒（返回 QuotaExceeded）。
+    #[test]
+    fn test_upsert_rejects_new_id_beyond_quota() {
+        let store = BruteForceStore::with_max_records(2);
+        store.upsert(make_record("r1", "a", vec![])).unwrap();
+        store.upsert(make_record("r2", "b", vec![])).unwrap();
+        // 第三条新 id → 拒绝。
+        let err = store
+            .upsert(make_record("r3", "c", vec![]))
+            .expect_err("超过配额的新 id 必须被拒");
+        assert!(
+            matches!(err, VectorError::QuotaExceeded { current: 2, limit: 2 }),
+            "expected QuotaExceeded, got {err:?}"
+        );
+        assert_eq!(store.count(), 2);
+    }
+
+    /// H-7：替换已存在 id 不触发配额（覆盖不计入增长）。
+    #[test]
+    fn test_upsert_replacing_existing_id_does_not_trigger_quota() {
+        let store = BruteForceStore::with_max_records(1);
+        store.upsert(make_record("r1", "a", vec![])).unwrap();
+        // 同 id 覆盖 → 允许。
+        store
+            .upsert(make_record("r1", "更新内容", vec![]))
+            .expect("同 id 覆盖不应触发配额");
+        assert_eq!(store.count(), 1);
+    }
+
+    /// H-7：维度不匹配必须返回 DimensionMismatch 错误（之前静默跳过）。
+    #[test]
+    fn test_search_returns_dimension_mismatch_error() {
+        let store = BruteForceStore::new();
+        // 记录是 3 维，用 2 维查询 → 不匹配。
+        store.upsert(make_record("r1", "a", vec![])).unwrap();
+        let err = store
+            .search_by_vector(&[1.0, 0.0], 10)
+            .expect_err("维度不匹配必须返回错误");
+        assert!(
+            matches!(
+                err,
+                VectorError::DimensionMismatch {
+                    expected: 2,
+                    actual: 3,
+                    ..
+                }
+            ),
+            "expected DimensionMismatch, got {err:?}"
+        );
     }
 }

@@ -87,9 +87,20 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
 }
 
 /// 导入 ST 预设（JSON）
+///
+/// H-1：与 `import_character` 对齐——先做大小上限检查，再试编译每条
+/// `find_regex`，把灾难性/无法解析的正则挡在导入阶段（而非写作流水线里
+/// 第一次应用时才冻结 UI）。
 pub fn import_preset(data: &[u8]) -> Result<Preset, ImportError> {
+    check_import_size(data.len(), MAX_IMPORT_SIZE)?;
     let st: StPreset = serde_json::from_slice(strip_utf8_bom(data))?;
-    Ok(Preset::from_st(st))
+    let preset = Preset::from_st(st);
+    for script in &preset.regex_scripts {
+        storyforge_infra_regex::validate_regex(&script.find_regex, &script.flags).map_err(
+            |error| ImportError::PngError(format!("预设正则 '{}' 校验失败: {error}", script.script_name)),
+        )?;
+    }
+    Ok(preset)
 }
 
 /// 检查是否为 PNG 文件

@@ -246,7 +246,15 @@ impl Drop for AuthorityLeaseGuard {
     fn drop(&mut self) {
         let mut book = match held_book().lock() {
             Ok(b) => b,
-            Err(_) => return,
+            // L-5：锁中毒时静默 return 会丢失 lease 计数清理，难以排查。加日志便于诊断。
+            Err(_) => {
+                tracing::error!(
+                    target: "authority_lease",
+                    "authority lease book lock poisoned during Drop; path={}",
+                    self.path.display()
+                );
+                return;
+            }
         };
         if let Some((_, count)) = book.entries.get_mut(&self.path) {
             if *count > 1 {

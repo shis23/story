@@ -54,6 +54,12 @@ pub(crate) fn save_profile(
     profile_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    // H-2: bound the IPC payload before parsing (4 MiB).
+    crate::error::require_ipc_size(
+        &profile_json,
+        crate::error::MAX_CONFIG_JSON_BYTES,
+        "Profile",
+    )?;
     let profile: PromptProfile = serde_json::from_str(&profile_json)
         .map_err(|error| TauriCommandError::validation(format!("Profile 解析失败: {error}")))?;
     state
@@ -101,6 +107,12 @@ pub(crate) fn save_agent_profile_config(
     config_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    // H-2: bound the IPC payload before parsing (4 MiB).
+    crate::error::require_ipc_size(
+        &config_json,
+        crate::error::MAX_CONFIG_JSON_BYTES,
+        "Agent Profile Config",
+    )?;
     let mut config: storyforge_domain::agent_profile_config::AgentProfileConfig =
         serde_json::from_str(&config_json).map_err(|error| {
             TauriCommandError::validation(format!("Agent Profile Config 解析失败: {error}"))
@@ -128,6 +140,12 @@ pub(crate) fn import_agent_profile_config(
     config_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<storyforge_domain::agent_profile_config::AgentProfileConfig, TauriCommandError> {
+    // H-2: bound the IPC payload before delegating (4 MiB).
+    crate::error::require_ipc_size(
+        &config_json,
+        crate::error::MAX_CONFIG_JSON_BYTES,
+        "Agent Profile Config",
+    )?;
     state
         .agent_profile_config_store
         .import_json(&config_json)

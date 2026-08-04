@@ -242,6 +242,48 @@ impl TauriCommandError {
     }
 }
 
+// ─── H-2 IPC input size limits ───────────────────────────────────────────
+//
+// Commands that accept a raw `String` JSON payload from the frontend (or a
+// hijacked plugin iframe) must bound the size BEFORE `serde_json::from_str`,
+// otherwise a super-large payload allocates heavily during IPC deserialization
+// and can OOM the process. `import_character` (Vec<u8>) is bounded inside
+// `infra-import` (100 MiB); these are the lower limits appropriate for
+// structured config payloads that never legitimately approach those sizes.
+
+/// Upper bound for a Campaign bundle JSON (cards + conversations + summaries).
+pub const MAX_BUNDLE_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Upper bound for structured config JSON (profiles, regex settings).
+pub const MAX_CONFIG_JSON_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Reject an IPC payload exceeding `max_bytes`.
+///
+/// `label` names the command/kind in the error so users can identify which
+/// import was rejected.
+pub fn require_ipc_size(input: &str, max_bytes: usize, label: &str) -> Result<(), TauriCommandError> {
+    if input.len() > max_bytes {
+        return Err(TauriCommandError::validation(format!(
+            "{label} 输入过大（{} 字节，上限 {} 字节）",
+            input.len(),
+            max_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// M-1：把绝对数据目录路径脱敏成 `<data_dir>/<filename>`，避免把
+/// `C:\Users\<用户名>\...` 这样的绝对路径泄漏到前端错误信息里。
+///
+/// 服务器端日志（`tracing::error!`）仍可保留完整路径，但跨 IPC 返回的错误
+/// 字符串只应包含文件名（帮助用户定位是哪个文件，但不暴露用户名/安装目录）。
+pub fn sanitize_path_for_ipc(path: &std::path::Path) -> String {
+    match path.file_name() {
+        Some(name) => format!("<data_dir>/{}", name.to_string_lossy()),
+        None => "<data_dir>".to_string(),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -292,6 +334,26 @@ mod tests {
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["type"], "llm");
         assert_eq!(json["retryable"], false);
+    }
+
+    /// H-2: oversize IPC payloads must be rejected with a validation error.
+    #[test]
+    fn require_ipc_size_rejects_oversize_and_allows_within_limit() {
+        assert!(require_ipc_size("{}", 16, "bundle").is_ok());
+        let err = require_ipc_size(&"x".repeat(17), 16, "bundle").unwrap_err();
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["type"], "validation");
+        assert!(json["message"].as_str().unwrap().contains("bundle"));
+        assert!(json["message"].as_str().unwrap().contains("17"));
+    }
+
+    /// M-1: absolute paths must be redacted to `<data_dir>/<filename>` for IPC.
+    #[test]
+    fn sanitize_path_for_ipc_redacts_absolute_path() {
+        let p = std::path::Path::new("C:/Users/Alice/AppData/storyforge/conversations/c-1.json");
+        assert_eq!(sanitize_path_for_ipc(p), "<data_dir>/c-1.json");
+        // Directory without file_name (root-ish) → just the placeholder.
+        assert_eq!(sanitize_path_for_ipc(std::path::Path::new("/")), "<data_dir>");
     }
 
     #[test]

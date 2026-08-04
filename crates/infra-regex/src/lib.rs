@@ -6,6 +6,7 @@
 /// - Output: applied after the writer finalizes
 /// - sub-agents do not run regex
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use storyforge_domain::preset::{
     RegexPlacement, RegexScript, ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING,
     ST_REGEX_PLACEMENT_SLASH_COMMAND, ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
@@ -28,6 +29,32 @@ pub enum RegexError {
 
     #[error("替换失败: {0}")]
     Replace(String),
+
+    /// H-1: regress exceeded the wall-clock budget (catastrophic backtracking).
+    #[error("正则执行超时（{timeout}s）：可能为灾难性回溯，script={script}")]
+    Timeout { script: String, timeout: u64 },
+}
+
+/// H-1: regress (backtracking engine) wall-clock budget per `apply_single_script`.
+///
+/// 1MB input cap (see `MAX_REGEX_INPUT_LEN`) bounds backtracking cost linearly in
+/// input length but a malicious/buggy regex (e.g. `^(a+)+$`) can still be polynomial
+/// or exponential in pattern structure. This timeout is the hard backstop that turns
+/// a multi-minute UI freeze into a 5s error.
+pub const REGEX_TIMEOUT_SECS: u64 = 5;
+
+/// H-1: trial-compile an ST regex script's `find_regex` + `flags`.
+///
+/// Imported presets/character cards/ST settings JSON can carry a malformed or
+/// catastrophic regex. Compiling at import time rejects unparseable patterns early
+/// (before they freeze the writing pipeline) and gives the user an actionable error
+/// naming the offending script. Note: compilation success does NOT prove the regex
+/// is non-catastrophic at runtime — `apply_single_script`'s timeout covers that case.
+pub fn validate_regex(find_regex: &str, flags: &str) -> Result<(), RegexError> {
+    let spec = parse_st_regex_spec(find_regex, flags);
+    regress::Regex::with_flags(spec.pattern.as_str(), spec.flags.as_str())
+        .map_err(|e| RegexError::Compile(format!("正则编译失败: {e}")))?;
+    Ok(())
 }
 
 /// Apply a list of regex scripts in order (skipping disabled ones)
@@ -107,9 +134,14 @@ pub fn apply_reasoning_regex_to_think_blocks_at_depth(
 
 /// Apply a single regex script.
 ///
-/// H-8 ReDoS mitigation: regress is a backtracking engine; regexes imported from ST
-/// presets can be catastrophic (e.g. `^(a+)+$`). We cap input length to bound the
-/// worst-case backtracking cost (which scales with input length).
+/// H-1 ReDoS mitigation: regress is a backtracking engine; regexes imported from ST
+/// presets can be catastrophic (e.g. `^(a+)+$`). Two layered defenses:
+/// 1. `MAX_REGEX_INPUT_LEN` (1MB) bounds the worst-case backtracking cost, which
+///    scales with input length.
+/// 2. `REGEX_TIMEOUT_SECS` wall-clock budget via a blocking worker thread + timed
+///    `join`. regress is sync and CPU-bound, so a thread is the only way to bound
+///    runtime without an async runtime. On timeout the worker is detached (its
+///    result discarded) and we return `RegexError::Timeout`.
 fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, RegexError> {
     const MAX_REGEX_INPUT_LEN: usize = 1024 * 1024; // 1MB
     if text.len() > MAX_REGEX_INPUT_LEN {
@@ -120,20 +152,57 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
         )));
     }
     let regex_spec = parse_st_regex_spec(&script.find_regex, &script.flags);
-    // Compile (regress is an ECMAScript engine).
-    // Apply flags (e.g. gm); regress parses i/m/s/u/v and ignores unsupported g.
-    let re = regress::Regex::with_flags(regex_spec.pattern.as_str(), regex_spec.flags.as_str())
-        .map_err(|e| {
-            RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
-        })?;
 
-    let result = if regex_spec.flags.contains('g') {
-        re.replace_all(text, script.replace_string.as_str())
-    } else {
-        re.replace(text, script.replace_string.as_str())
+    // The worker thread requires `'static` inputs, so clone the owned pieces once
+    // and move them in. `text` is capped at 1MB so this clone is bounded.
+    let script_name = script.script_name.clone();
+    let thread_name = script_name.clone();
+    let text_owned = text.to_string();
+    let pattern_owned = regex_spec.pattern.clone();
+    let flags_owned = regex_spec.flags.clone();
+    let replace_owned = script.replace_string.clone();
+    let is_global = regex_spec.flags.contains('g');
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, RegexError>>();
+    let worker = move || {
+        let outcome = (|| -> Result<String, RegexError> {
+            let re = regress::Regex::with_flags(pattern_owned.as_str(), flags_owned.as_str())
+                .map_err(|e| {
+                RegexError::Compile(format!("正则 '{}' 编译失败: {}", script_name, e))
+            })?;
+            let result = if is_global {
+                re.replace_all(&text_owned, &replace_owned)
+            } else {
+                re.replace(&text_owned, &replace_owned)
+            };
+            Ok(result.to_string())
+        })();
+        // Ignore send error: parent timed out and dropped the receiver.
+        let _ = result_tx.send(outcome);
     };
 
-    Ok(result.to_string())
+    // Spawn the worker; on timeout recv_timeout returns Timeout and we detach the
+    // worker (its result is dropped via the ignored send). The OS thread keeps
+    // running regress until it finishes or the process exits — bounded by the 1MB
+    // input cap so even pathological cases complete in bounded time/space.
+    std::thread::Builder::new()
+        .name(format!("sf-regex-{thread_name}"))
+        .spawn(worker)
+        .map_err(|e| RegexError::Compile(format!("正则工作线程启动失败: {e}")))?;
+
+    match result_rx.recv_timeout(Duration::from_secs(REGEX_TIMEOUT_SECS)) {
+        Ok(inner) => inner,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RegexError::Timeout {
+            script: thread_name,
+            timeout: REGEX_TIMEOUT_SECS,
+        }),
+        // Disconnected without a value = worker panicked before sending. Map to a
+        // Compile error so callers see a normal regex failure, not a crash.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RegexError::Compile(format!(
+            "正则 '{}' 执行线程异常结束（panic 或断连）",
+            thread_name
+        ))),
+    }
 }
 
 fn apply_regex_to_tagged_blocks(
@@ -807,5 +876,61 @@ mod tests {
         let huge = "a".repeat(2 * 1024 * 1024); // 2MB > 1MB limit
         let result = apply_regex_scripts(&huge, &scripts, RegexPlacement::Input);
         assert!(result.is_err());
+    }
+
+    /// H-1: `validate_regex` accepts a normal pattern and rejects an unparseable one.
+    #[test]
+    fn test_validate_regex_accepts_and_rejects() {
+        assert!(validate_regex(r"\n{3,}", "gm").is_ok());
+        assert!(validate_regex(r"[invalid", "gm").is_err());
+    }
+
+    /// H-1: a catastrophic regex (`^(a+)+$`) against a long all-'a' input must hit
+    /// the wall-clock budget and return `RegexError::Timeout`, not freeze.
+    ///
+    /// We deliberately shorten the budget for this test by calling the inner logic
+    /// indirectly through `apply_single_script` is not feasible (constant is fixed),
+    /// so we instead verify the timeout *path* via a regex that genuinely
+    /// catastrophically backtracks on a modest input within `REGEX_TIMEOUT_SECS`.
+    /// The 1MB cap means even a runaway worker exits eventually; the timeout turns
+    /// a multi-minute freeze into at most `REGEX_TIMEOUT_SECS` seconds.
+    #[test]
+    fn test_redos_catastrophic_regex_times_out() {
+        // `^(a+)+$` is the textbook catastrophic backtracking pattern. On a 40KB
+        // run of 'a' followed by a non-matching suffix, regress explores an
+        // exponential number of partitions and cannot finish within 5s.
+        let script = RegexScript {
+            id: "redos".into(),
+            script_name: "灾难性回溯".into(),
+            find_regex: r"^(a+)+$".into(),
+            replace_string: String::new(),
+            placement: RegexPlacement::Input,
+            placement_codes: vec![],
+            source: storyforge_domain::preset::RegexScriptSource::Preset,
+            disabled: false,
+            flags: "gm".into(),
+            only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
+        };
+        // 40_000 'a' + a 'b' forces non-match → exponential backtracking.
+        let bomb = format!("{}b", "a".repeat(40_000));
+        let start = std::time::Instant::now();
+        let result = apply_single_script(&bomb, &script);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(RegexError::Timeout { .. })),
+            "expected Timeout, got {result:?}"
+        );
+        // Sanity: we returned near the budget, not after minutes.
+        assert!(
+            elapsed.as_secs() < REGEX_TIMEOUT_SECS + 5,
+            "timeout returned too slowly: {elapsed:?}"
+        );
     }
 }

@@ -358,10 +358,19 @@ fn check_private_knowledge_leak(text: &str, contract: &NarrativeContract) -> Vec
 
 /// attribution-aware 泄漏判定。
 ///
-/// 对每个 probe 命中位置取邻近窗口（约前后 48 字）：
+/// M-8：probe 邻近窗口半径（字符）。窗口决定「归属是否邻近 probe」的判定范围。
+/// 48 字覆盖大多数同段归属；过大会让真正越权的全知叙述漏检，过小会把长间隔
+/// 合法回忆误报为越权。需要调优时改这一处常量。
+const ATTRIBUTION_WINDOW_RADIUS: usize = 48;
+
+/// 判定 probe 是否以「非拥有者/无归属」方式泄漏。
+///
+/// 对每个 probe 命中位置取邻近窗口（约前后 `ATTRIBUTION_WINDOW_RADIUS` 字）：
 /// - 窗口内有拥有者标签且无其他角色标签 → 合法
 /// - 窗口内有其他角色标签 → 泄漏
-/// - 窗口内无任何角色标签 → 叙述层泄漏
+/// - 窗口内无任何角色标签 → 再用 2× 宽窗口复核：
+///     - 宽窗口内有拥有者 → 长间隔合法回忆（probe 属拥有者，只是距离较远）→ 不报
+///     - 宽窗口内仍无拥有者 → 叙述层/作者视角越权 → 报 Error
 fn is_attributed_private_leak(
     text: &str,
     probe: &str,
@@ -371,7 +380,7 @@ fn is_attributed_private_leak(
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find(probe) {
         let abs = search_from + rel;
-        let window = nearby_window(text, abs, probe.chars().count(), 48);
+        let window = nearby_window(text, abs, probe.chars().count(), ATTRIBUTION_WINDOW_RADIUS);
         let has_owner = owner_labels
             .iter()
             .any(|l| !l.is_empty() && window.contains(l));
@@ -382,10 +391,24 @@ fn is_attributed_private_leak(
             return true;
         }
         if !has_owner {
-            // 无归属线索：叙述层/作者视角
-            return true;
+            // M-8：窄窗口无归属时，先用 2× 宽窗口复核一次，避免把「拥有者标签在
+            // 窗口外但 probe 合法出现」的长间隔合法回忆误报为越权 Error。宽窗口
+            // 内仍找不到拥有者，才认定是叙述层/作者视角越权。
+            let wide = nearby_window(
+                text,
+                abs,
+                probe.chars().count(),
+                ATTRIBUTION_WINDOW_RADIUS * 2,
+            );
+            let wide_has_owner = owner_labels
+                .iter()
+                .any(|l| !l.is_empty() && wide.contains(l));
+            if !wide_has_owner {
+                return true;
+            }
+            // 宽窗口内有拥有者 → 合法回忆，继续检查其他命中
         }
-        // 仅拥有者：继续检查其他命中
+        // 仅拥有者（窄或宽窗口命中）：继续检查其他命中
         search_from = abs + probe.len().max(1);
         if search_from >= text.len() {
             break;
@@ -679,6 +702,36 @@ mod tests {
                 .iter()
                 .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
             "owner legal recall must not Error: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_long_interval_legal_recall_not_false_positive() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        // M-8：拥有者标签在窄窗口（48 字）外、但 probe 仍属拥有者的长间隔合法回忆。
+        // 旧逻辑会把「窄窗口无拥有者」一律判 Error；新逻辑用 2× 宽窗口复核，
+        // 找到拥有者即不报。
+        let contract = NarrativeContract {
+            focalizers: vec!["inst-lin".into(), "inst-chen".into()],
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+        // probe 在前，拥有者标签「陈警官」在 100+ 字之后——超出窄窗口但落在宽窗口内。
+        let text = "案件的关键是 SF_SECRET_CHEN_BADGE_X91，这一点毋庸置疑。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味，走廊尽头传来脚步声，护士推着推车经过，墙上的钟滴答作响，时间仿佛凝固。陈警官站在门口，眉头紧锁。";
+        let report = run_quality_gate_with_contract(text, Some(&contract));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })
+                    && w.severity == QualitySeverity::Error),
+            "long-interval owner recall must not be a false-positive Error: {:?}",
             report.warnings
         );
     }

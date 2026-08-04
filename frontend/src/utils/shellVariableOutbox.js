@@ -4,6 +4,19 @@
  */
 
 /**
+ * M-6：是否为 StoryForge 内部保留命名空间键（`__storyforge*`）。
+ *
+ * 与 mvuStatTree.js 的 buildMvuStatDataTree 镜像——后者跳过这些键不进状态树，
+ * 这里在 persistShellVariableWrite 入口拒绝写入，防止恶意卡 schema 通过 MVU
+ * 交互（点击即确认、绕过提案门）覆盖内部命名空间（卡壳桶等）。
+ * @param {string} key
+ * @returns {boolean}
+ */
+export function isReservedNamespace(key) {
+  return typeof key === 'string' && key.startsWith('__storyforge')
+}
+
+/**
  * @param {unknown} value
  * @returns {import('../../tauri-api.js') extends never ? any : any}
  */
@@ -44,6 +57,15 @@ export async function persistShellVariableWrite({
   if (!k) {
     return { ok: false, scope: 'none', key: '', error: 'empty key' }
   }
+  // M-6：拒绝 __storyforge* 内部命名空间。dispatchMvuInteraction（用户点 MVU 按钮）
+  // 走「点击即确认」绕过提案门，mapping key 来自卡 schema——恶意卡可塞任意 key 名
+  // 覆盖内部命名空间（如 __storyforge_card_shell_variables）。与 buildMvuStatDataTree
+  // （mvuStatTree.js:16）的命名空间黑名单镜像。
+  if (isReservedNamespace(k)) {
+    const err = `reserved namespace key rejected: ${k}`
+    if (log) await log('warn', `shell_var_write skip: ${err}`)
+    return { ok: false, scope: 'none', key: k, error: err }
+  }
   if (!campaignId) {
     const err = 'no active campaign for variable write'
     if (log) await log('warn', `shell_var_write skip: ${err} key=${k}`)
@@ -69,6 +91,13 @@ export async function persistShellVariableWrite({
   } else if (k.startsWith('campaign:')) {
     writeKey = k.slice('campaign:'.length)
     scope = 'campaign'
+  }
+
+  // M-6：拆分后的 writeKey 也要复核（防 instance:foo:__storyforge_x 这类前缀伪装）。
+  if (isReservedNamespace(writeKey)) {
+    const err = `reserved namespace key rejected: ${writeKey}`
+    if (log) await log('warn', `shell_var_write skip: ${err}`)
+    return { ok: false, scope, key: writeKey, error: err }
   }
 
   try {

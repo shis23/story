@@ -64,7 +64,8 @@ tracing-appender = "0.2"
 keyring = { version = "4.1.3", features = ["android-native-keyring-store"] }
 
 # 向量库
-hnsw_rs = "0.3"
+# (L-19: hnsw_rs = "0.3" 已移除——workspace 声明但无任何 crate 引用，Cargo.lock 里
+# 也无 hnsw。向量库实际用 BruteForceStore（infra-vector）。)
 rand = "0.9"
 
 # infra 层
@@ -80,3 +81,11 @@ storyforge-app-conversation = { path = "crates/app-conversation" }
 storyforge-app-pipeline = { path = "crates/app-pipeline" }
 storyforge-infra-vector = { path = "crates/infra-vector" }
 storyforge-app-memory = { path = "crates/app-memory" }
+
+# L-20：显式 release profile。默认 profile 不 strip 符号、不做 LTO，发布产物偏大且
+# 含调试符号。开启 thin LTO + strip，减小体积并轻微提升运行时性能；codegen-unents=1
+# 关闭多代码单元以最大化内联（编译变慢，但这是 release 一次性代价）。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

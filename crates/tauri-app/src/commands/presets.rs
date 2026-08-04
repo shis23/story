@@ -233,6 +233,12 @@ pub(crate) fn list_global_regex_scripts() -> Vec<RegexScriptDto> {
 pub(crate) fn import_global_regex_settings(
     settings_json: String,
 ) -> Result<usize, TauriCommandError> {
+    // H-2: bound the IPC payload before parsing (4 MiB).
+    crate::error::require_ipc_size(
+        &settings_json,
+        crate::error::MAX_CONFIG_JSON_BYTES,
+        "Global Regex Settings",
+    )?;
     get_global_regex_store()
         .import_from_settings_json(&settings_json)
         .map_err(|e| TauriCommandError::storage(format!("global regex import failed: {e}")))

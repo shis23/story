@@ -29,6 +29,12 @@ pub fn prefer_autofix_response_text(response_text: Option<String>, original: Str
     response_text.unwrap_or(original)
 }
 
+/// H-3：启动恢复对同一 Committing Turn 的最大重放次数。
+///
+/// 超过此值后，瞬时错误（IO/锁/派生失败）升级为 Failed，停止跨启动无限重放。
+/// `CampaignNotFound` 不计数——Campaign 已删除即不可恢复，第一次就标 Failed。
+pub const MAX_RECOVERY_RETRIES: u32 = 5;
+
 /// After auto-fix, quality_report and draft_hash must both track the final text.
 pub fn sync_attempt_after_autofix(
     attempt: &mut TurnAttempt,
@@ -748,10 +754,22 @@ impl<'a> TurnLifecycleService<'a> {
         }
     }
 
-    fn record_recovery_issue(&self, turn_id: &Id, message: String) {
+    fn record_recovery_issue(&self, turn_id: &Id, attempt_id: Option<&Id>, message: String) {
         if let Err(error) = self.update_turn_record(turn_id, |record| {
-            // Remain Committing/recoverable; failure_reason is diagnostic only.
+            // H-3：每次重放都累计计数。超过上限即升级为 Failed，停止跨启动无限重放。
+            // 升级阈值用 `>`：retries 从 0 开始递增，第 MAX 次失败后（retries == MAX）
+            // 才升级，给瞬时错误 MAX 次重放机会。
+            record.recovery_retries = record.recovery_retries.saturating_add(1);
             record.failure_reason = Some(message);
+            if record.recovery_retries > MAX_RECOVERY_RETRIES {
+                record.status = TurnStatus::Failed;
+                record.intended_terminal_status = None;
+                if let Some(attempt_id) = attempt_id
+                    && let Some(attempt) = record.find_attempt_mut(attempt_id)
+                {
+                    attempt.status = AttemptStatus::Failed;
+                }
+            }
             record.touch();
         }) {
             tracing::error!(
@@ -777,6 +795,7 @@ impl<'a> TurnLifecycleService<'a> {
             let Some(attempt) = attempt else {
                 self.record_recovery_issue(
                     &turn_id,
+                    None,
                     "启动恢复缺少 Committing Attempt，保持 Committing".into(),
                 );
                 continue;
@@ -784,6 +803,7 @@ impl<'a> TurnLifecycleService<'a> {
             let Some(terminal) = Self::recovery_terminal_status(turn, attempt) else {
                 self.record_recovery_issue(
                     &turn_id,
+                    None,
                     "旧 Turn 缺少可证明的 intended_terminal_status，拒绝自动升级".into(),
                 );
                 continue;
@@ -875,14 +895,32 @@ impl<'a> TurnLifecycleService<'a> {
                     }
                 }
                 Err(CommitError::CampaignNotFound(_)) => {
-                    self.record_recovery_issue(
-                        &turn_id,
-                        format!("启动恢复 Campaign {campaign_id} 不存在，保持 Committing"),
-                    );
+                    // H-3：Campaign 已删除 = 该 Turn 永远不可能成功提交。直接标
+                    // Failed，不要保持 Committing 让它每次启动都重放 + 全表扫描 +
+                    // 抢锁（与 RevisionConflict/MutationConflict 的 Failed 写法一致）。
+                    if let Err(error) = self.update_turn_record(&turn_id, |record| {
+                        record.status = TurnStatus::Failed;
+                        record.failure_reason = Some(format!(
+                            "启动恢复 Campaign {campaign_id} 不存在，Turn 不可恢复"
+                        ));
+                        record.intended_terminal_status = None;
+                        if let Some(attempt) = record.find_attempt_mut(&attempt_id) {
+                            attempt.status = AttemptStatus::Failed;
+                        }
+                        record.touch();
+                    }) {
+                        tracing::error!(
+                            target: "turn_recovery",
+                            turn_id = %turn_id,
+                            "failed to persist CampaignNotFound terminal: {error}"
+                        );
+                    }
                 }
                 Err(error) => {
+                    // H-3：瞬时错误累计重放次数，超 MAX_RECOVERY_RETRIES 升级 Failed。
                     self.record_recovery_issue(
                         &turn_id,
+                        Some(&attempt_id),
                         format!("启动恢复遇到可重试错误，保持 Committing: {error}"),
                     );
                 }
