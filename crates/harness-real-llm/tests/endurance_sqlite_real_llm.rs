@@ -312,7 +312,7 @@ fn safe_error_summary(error: &str) -> String {
     )
 }
 
-const MAX_WRITE_ATTEMPTS: u32 = 5;
+const MAX_WRITE_ATTEMPTS: u32 = 8;
 const MAX_PROBE_ATTEMPTS: u32 = 3;
 // The SQLite real-model supplement is bounded by accepted turns, per-turn
 // attempts, probe attempts, request timeouts, and the suite deadline. Keep the
@@ -410,7 +410,17 @@ fn write_retry_delay(attempt: u32, failure: WriteFailureClass) -> std::time::Dur
             0 | 1 => 5,
             2 => 15,
             3 => 30,
-            _ => 60,
+            4 => 60,
+            // Extended backoff tail (attempts 5-7): the relay (cli.2529985.xyz)
+            // exhibits multi-minute outage windows under load (observed a ~10 min
+            // window on 2026-08-04 that defeated the original 5-attempt / ~9.5 min
+            // span during run-full-d406d96f). The longer tail lets the bounded
+            // write-retry loop ride out a transient infrastructure outage for a
+            // Full-stage long run without fabricating acceptance; the budget is
+            // still finite and a persistent outage still fail-closes honestly.
+            5 => 120,
+            6 | 7 => 240,
+            _ => 240,
         },
         WriteFailureClass::Fatal => 0,
     };
@@ -2962,7 +2972,7 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     assert!(!state.as_ref().unwrap().can_retry);
     assert!(
         next_retry_state(state.as_ref(), 9, WriteFailureClass::QualityBlocked).is_err(),
-        "a process restart must not reset the five-attempt ceiling"
+        "a process restart must not reset the bounded write-attempt ceiling"
     );
 }
 
@@ -2984,10 +2994,34 @@ fn transient_write_retries_use_recovery_sized_backoff() {
         write_retry_delay(4, WriteFailureClass::Transient),
         std::time::Duration::from_secs(60)
     );
+    // Extended tail for riding out multi-minute relay outage windows.
+    assert_eq!(
+        write_retry_delay(5, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(120)
+    );
+    assert_eq!(
+        write_retry_delay(6, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(240)
+    );
+    assert_eq!(
+        write_retry_delay(7, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(240)
+    );
     assert_eq!(
         write_retry_delay(4, WriteFailureClass::QualityBlocked),
         std::time::Duration::from_secs(2)
     );
+    // The extended backoff curve must be monotonically non-decreasing so a
+    // later retry never waits less than an earlier one under the same class.
+    let mut prev = 0u64;
+    for attempt in 1..=7 {
+        let secs = write_retry_delay(attempt, WriteFailureClass::Transient).as_secs();
+        assert!(
+            secs >= prev,
+            "Transient backoff must be non-decreasing: attempt {attempt} secs={secs} < prev {prev}"
+        );
+        prev = secs;
+    }
 
     let ample = SuiteDeadline::new(std::time::Duration::from_secs(60));
     assert_eq!(
