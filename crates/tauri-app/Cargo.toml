@@ -47,5 +47,12 @@ tauri-build = { version = "2", features = [] }
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+[target.'cfg(target_os = "android")'.dependencies]
+# Initialize ndk-context so android-native-keyring-store can access the Android
+# Keystore. Without this, Store::new() panics on "android context was not
+# initialized". Versions pinned to match the existing dependency graph.
+ndk-context = "0.1"
+jni = "0.21"
+
 [dev-dependencies]
 tempfile = "3"

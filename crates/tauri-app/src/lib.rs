@@ -1101,6 +1101,43 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(mvu_pending.clone())
         .setup(move |app| {
+            // Initialize ndk-context on Android so android-native-keyring-store
+            // (used by SystemSecretStore for API-key persistence) can access the
+            // Android Keystore. The closure runs asynchronously on the webview's
+            // main-thread event loop; the first ConnectionStore construction in
+            // AppState below is guarded by catch_unwind in secret_store.rs and
+            // degrades to plaintext if this hasn't run yet. Subsequent Keystore
+            // operations (after the event loop pumps) will succeed.
+            #[cfg(target_os = "android")]
+            {
+                use tauri::Manager;
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.with_webview(|webview| {
+                        webview.jni_handle().exec(|env, activity, _webview| {
+                            static CTX_REF: std::sync::OnceLock<
+                                Option<jni::objects::GlobalRef>,
+                            > = std::sync::OnceLock::new();
+                            CTX_REF.get_or_init(|| {
+                                let global = env.new_global_ref(activity).ok()?;
+                                let vm = env.get_java_vm().ok()?;
+                                let vm_ptr =
+                                    vm.get_java_vm_pointer() as *mut std::ffi::c_void;
+                                let ctx_ptr =
+                                    global.as_obj().as_raw() as *mut std::ffi::c_void;
+                                // SAFETY: vm_ptr is a valid JavaVM* and ctx_ptr is a
+                                // global-ref to the Activity Context. Both outlive the
+                                // process (CTX_REF is a static OnceLock, never dropped).
+                                unsafe {
+                                    ndk_context::initialize_android_context(
+                                        vm_ptr, ctx_ptr,
+                                    );
+                                }
+                                Some(global)
+                            });
+                        });
+                    });
+                }
+            }
             // Android's private data path is provided by the running Activity.
             // Resolve it here, never from a hardcoded /data/data alias. Desktop
             // keeps its existing StoryForge locations for data compatibility.

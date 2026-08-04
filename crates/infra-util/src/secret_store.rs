@@ -59,7 +59,18 @@ fn init_native_store() -> Result<(), String> {
 
 #[cfg(target_os = "android")]
 fn init_native_store() -> Result<(), String> {
-    let store = android_native_keyring_store::Store::new()
+    // android_native_keyring_store::Store::new() calls ndk_context::android_context()
+    // internally, which panics (not returns Err) when ndk-context has not been
+    // initialized yet. Wrap in catch_unwind so the panic becomes an Err; this
+    // lets the upstream tracing::warn! guard in ConnectionStore
+    // (connection_store.rs migrate_plaintext_api_keys) keep the api_key as
+    // plaintext instead of crashing the process. Once ndk-context is properly
+    // initialized (see tauri-app setup hook), Store::new() succeeds and this
+    // catch_unwind is a no-op.
+    let store = std::panic::catch_unwind(android_native_keyring_store::Store::new)
+        .map_err(|_| {
+            "Android Keystore 初始化 panic（ndk-context 未初始化），凭据降级为明文".to_string()
+        })?
         .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
     keyring_core::set_default_store(store);
     Ok(())
@@ -162,6 +173,30 @@ mod tests {
         assert_eq!(store.get_secret(&secret_ref).unwrap(), secret);
         store.delete_secret(&secret_ref).unwrap();
         assert!(store.get_secret(&secret_ref).is_err());
+    }
+
+    /// Plaintext values must pass through resolve_secret_value unchanged.
+    /// This is the Android degraded-mode correctness invariant: when the
+    /// Keystore is unavailable (init_native_store returned Err via
+    /// catch_unwind), ConnectionStore keeps api_key as plaintext, and every
+    /// read path must resolve it back to the same plaintext without error.
+    #[test]
+    fn resolve_secret_value_passes_plaintext_through() {
+        let store = SystemSecretStore::new("test-plaintext-passthrough");
+        // Plaintext (not a secret ref) → returned as-is, no store access.
+        let plain = "sk-plaintext-fallback-key";
+        let resolved = resolve_secret_value(plain, &store).unwrap();
+        assert_eq!(resolved, plain);
+    }
+
+    /// A non-SecretRef value is never confused with a SecretRef.
+    /// Discriminates the plaintext fallback from the keystore path: a real
+    /// key that happens to start with "sk-" must NOT be treated as a ref.
+    #[test]
+    fn plaintext_starting_with_sk_is_not_treated_as_secret_ref() {
+        let val = "sk-something-1234567890";
+        assert!(!is_secret_ref(val));
+        assert!(val.starts_with("sk-"));
     }
 
     fn unique_id() -> String {
