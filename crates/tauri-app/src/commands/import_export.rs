@@ -87,14 +87,14 @@ where
     }
     // M-1：错误信息脱敏，避免把绝对数据目录路径泄漏到前端。
     let safe = crate::error::sanitize_path_for_ipc(path);
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("{safe} metadata: {error}"))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{safe} metadata: {error}"))?;
     if !metadata.file_type().is_file() {
         return Err(format!("{safe} is not a regular file"));
     }
     let bytes = std::fs::read(path).map_err(|error| format!("{safe} read: {error}"))?;
-    let parsed: Vec<T> = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{safe} parse: {error}"))?;
+    let parsed: Vec<T> =
+        serde_json::from_slice(&bytes).map_err(|error| format!("{safe} parse: {error}"))?;
     value_of(parsed, &safe)
 }
 
@@ -106,15 +106,13 @@ pub(crate) fn read_conversations_strict(
     }
     // M-1：错误信息脱敏，避免把绝对数据目录路径泄漏到前端。
     let safe_dir = crate::error::sanitize_path_for_ipc(dir);
-    let metadata = std::fs::symlink_metadata(dir)
-        .map_err(|error| format!("{safe_dir} metadata: {error}"))?;
+    let metadata =
+        std::fs::symlink_metadata(dir).map_err(|error| format!("{safe_dir} metadata: {error}"))?;
     if !metadata.file_type().is_dir() {
         return Err(format!("{safe_dir} is not a directory"));
     }
     let mut conversations = Vec::new();
-    for entry in
-        std::fs::read_dir(dir).map_err(|error| format!("{safe_dir} read_dir: {error}"))?
-    {
+    for entry in std::fs::read_dir(dir).map_err(|error| format!("{safe_dir} read_dir: {error}"))? {
         let entry = entry.map_err(|error| format!("{safe_dir} entry: {error}"))?;
         let path = entry.path();
         if path
@@ -122,8 +120,8 @@ pub(crate) fn read_conversations_strict(
             .is_some_and(|extension| extension == "json")
         {
             let safe_path = crate::error::sanitize_path_for_ipc(&path);
-            let bytes = std::fs::read(&path)
-                .map_err(|error| format!("{safe_path} read: {error}"))?;
+            let bytes =
+                std::fs::read(&path).map_err(|error| format!("{safe_path} read: {error}"))?;
             let conversation: storyforge_domain::conversation::Conversation =
                 serde_json::from_slice(&bytes)
                     .map_err(|error| format!("{safe_path} parse: {error}"))?;

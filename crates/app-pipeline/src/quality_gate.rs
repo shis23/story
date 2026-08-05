@@ -726,11 +726,10 @@ mod tests {
         let text = "案件的关键是 SF_SECRET_CHEN_BADGE_X91，这一点毋庸置疑。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味，走廊尽头传来脚步声，护士推着推车经过，墙上的钟滴答作响，时间仿佛凝固。陈警官站在门口，眉头紧锁。";
         let report = run_quality_gate_with_contract(text, Some(&contract));
         assert!(
-            !report
-                .warnings
-                .iter()
-                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })
-                    && w.severity == QualitySeverity::Error),
+            !report.warnings.iter().any(|w| matches!(
+                &w.code,
+                QualityWarningCode::PrivateKnowledgeLeak { .. }
+            ) && w.severity == QualitySeverity::Error),
             "long-interval owner recall must not be a false-positive Error: {:?}",
             report.warnings
         );

@@ -168,8 +168,8 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
         let outcome = (|| -> Result<String, RegexError> {
             let re = regress::Regex::with_flags(pattern_owned.as_str(), flags_owned.as_str())
                 .map_err(|e| {
-                RegexError::Compile(format!("正则 '{}' 编译失败: {}", script_name, e))
-            })?;
+                    RegexError::Compile(format!("正则 '{}' 编译失败: {}", script_name, e))
+                })?;
             let result = if is_global {
                 re.replace_all(&text_owned, &replace_owned)
             } else {

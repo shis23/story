@@ -245,7 +245,10 @@ mod tests {
                 Ok(())
             }
         };
-        assert!(ensure_with_init(&lock, init).is_err(), "first call should fail");
+        assert!(
+            ensure_with_init(&lock, init).is_err(),
+            "first call should fail"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // The decisive assertion: recovery is possible after a failure.
         assert!(

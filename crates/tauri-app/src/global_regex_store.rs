@@ -44,9 +44,8 @@ impl GlobalRegexStore {
         // catastrophic backtracking is still backstopped by apply_single_script's
         // wall-clock timeout.)
         for script in &scripts {
-            storyforge_infra_regex::validate_regex(&script.find_regex, &script.flags).map_err(
-                |error| format!("全局正则 '{}' 校验失败: {error}", script.script_name),
-            )?;
+            storyforge_infra_regex::validate_regex(&script.find_regex, &script.flags)
+                .map_err(|error| format!("全局正则 '{}' 校验失败: {error}", script.script_name))?;
         }
         normalize_global_sources(&mut scripts);
         let len = scripts.len();

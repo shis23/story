@@ -22,8 +22,8 @@ use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
 use harness_real_llm::resolve_llm_connection;
 use harness_real_llm::sqlite_endurance::{
-    SqliteHarnessEnv, fixture_source_hash16, fixture_turn_spec, is_retryable_derivation_failed_error,
-    is_retryable_quality_blocked_error,
+    SqliteHarnessEnv, fixture_source_hash16, fixture_turn_spec,
+    is_retryable_derivation_failed_error, is_retryable_quality_blocked_error,
 };
 use sha2::{Digest, Sha256};
 use storyforge_app_conversation::PartialRollTarget;
@@ -2942,7 +2942,10 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
         "provider timeout must retry"
     );
     assert_eq!(
-        classify_write_failure("LLM 错误: 速率限制 (429): too many requests", &private_probe),
+        classify_write_failure(
+            "LLM 错误: 速率限制 (429): too many requests",
+            &private_probe
+        ),
         WriteFailureClass::Transient,
         "provider rate-limit must retry"
     );
@@ -2958,7 +2961,10 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     // and the classifier routes it through the bounded write-retry loop. A
     // long endurance run must survive a single derivation gap by regenerating.
     assert_eq!(
-        classify_write_failure("retryable_derivation_failed:derivation_had_failures", &private_probe),
+        classify_write_failure(
+            "retryable_derivation_failed:derivation_had_failures",
+            &private_probe
+        ),
         WriteFailureClass::QualityBlocked,
         "derivation failure must retry via the write-retry loop, not fail-closed"
     );

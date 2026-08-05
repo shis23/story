@@ -97,7 +97,12 @@ pub fn import_preset(data: &[u8]) -> Result<Preset, ImportError> {
     let preset = Preset::from_st(st);
     for script in &preset.regex_scripts {
         storyforge_infra_regex::validate_regex(&script.find_regex, &script.flags).map_err(
-            |error| ImportError::PngError(format!("预设正则 '{}' 校验失败: {error}", script.script_name)),
+            |error| {
+                ImportError::PngError(format!(
+                    "预设正则 '{}' 校验失败: {error}",
+                    script.script_name
+                ))
+            },
         )?;
     }
     Ok(preset)

@@ -783,7 +783,13 @@ mod tests {
             .upsert(make_record("r3", "c", vec![]))
             .expect_err("超过配额的新 id 必须被拒");
         assert!(
-            matches!(err, VectorError::QuotaExceeded { current: 2, limit: 2 }),
+            matches!(
+                err,
+                VectorError::QuotaExceeded {
+                    current: 2,
+                    limit: 2
+                }
+            ),
             "expected QuotaExceeded, got {err:?}"
         );
         assert_eq!(store.count(), 2);

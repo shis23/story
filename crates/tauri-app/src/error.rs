@@ -261,7 +261,11 @@ pub const MAX_CONFIG_JSON_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 ///
 /// `label` names the command/kind in the error so users can identify which
 /// import was rejected.
-pub fn require_ipc_size(input: &str, max_bytes: usize, label: &str) -> Result<(), TauriCommandError> {
+pub fn require_ipc_size(
+    input: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), TauriCommandError> {
     if input.len() > max_bytes {
         return Err(TauriCommandError::validation(format!(
             "{label} 输入过大（{} 字节，上限 {} 字节）",
@@ -353,7 +357,10 @@ mod tests {
         let p = std::path::Path::new("C:/Users/Alice/AppData/storyforge/conversations/c-1.json");
         assert_eq!(sanitize_path_for_ipc(p), "<data_dir>/c-1.json");
         // Directory without file_name (root-ish) → just the placeholder.
-        assert_eq!(sanitize_path_for_ipc(std::path::Path::new("/")), "<data_dir>");
+        assert_eq!(
+            sanitize_path_for_ipc(std::path::Path::new("/")),
+            "<data_dir>"
+        );
     }
 
     #[test]
