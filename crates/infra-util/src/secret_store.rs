@@ -45,8 +45,34 @@ impl SystemSecretStore {
 }
 
 fn ensure_native_store() -> Result<(), String> {
-    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    INIT.get_or_init(init_native_store).clone()
+    // Only cache *success* (process-lifetime native store). Failures must stay
+    // retryable: on Android the native store's first attempt can fail because
+    // ndk-context is initialized asynchronously from the webview main thread,
+    // after the first ConnectionStore construction (which runs synchronously
+    // during setup). Caching that Err permanently would make every subsequent
+    // put/get return the cached failure and leave API keys in plaintext
+    // forever. Once ndk-context is ready, the next call re-runs init_native_store
+    // and succeeds, after which we pin Ok for the rest of the process.
+    static INIT_OK: OnceLock<()> = OnceLock::new();
+    ensure_with_init(&INIT_OK, init_native_store)
+}
+
+/// Cache-success-only ensure: once `init` returns Ok, pin Ok for the process;
+/// while it returns Err, keep retrying on every call (no permanent cache of
+/// the failure). Factored out so a test can inject an init that fails-then-
+/// succeeds and assert the retry actually happens.
+fn ensure_with_init<F: Fn() -> Result<(), String>>(
+    init_ok: &OnceLock<()>,
+    init: F,
+) -> Result<(), String> {
+    if init_ok.get().is_some() {
+        return Ok(());
+    }
+    let result = init();
+    if result.is_ok() {
+        let _ = init_ok.set(());
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -197,6 +223,43 @@ mod tests {
         let val = "sk-something-1234567890";
         assert!(!is_secret_ref(val));
         assert!(val.starts_with("sk-"));
+    }
+
+    /// Discriminating test for defect #8 (Android keystore migration never
+    /// retries). `ensure_with_init` must NOT cache an Err — after a failing
+    /// init, a subsequent call whose init succeeds must return Ok. The old
+    /// implementation (`OnceLock<Result>::get_or_init`) cached the first Err
+    /// permanently and would have failed this assertion.
+    #[test]
+    fn ensure_does_not_cache_failure_and_recovers_on_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lock = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let init = || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            // fail the first call, succeed afterwards — models ndk-context
+            // becoming ready between the first and second attempt.
+            if n == 0 {
+                Err("not ready yet".into())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(ensure_with_init(&lock, init).is_err(), "first call should fail");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The decisive assertion: recovery is possible after a failure.
+        assert!(
+            ensure_with_init(&lock, init).is_ok(),
+            "second call must retry and succeed (defect #8 regression)"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Once Ok is cached, init must not run again.
+        assert!(ensure_with_init(&lock, init).is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "success is pinned; init must not re-run"
+        );
     }
 
     fn unique_id() -> String {

@@ -1104,10 +1104,13 @@ pub fn run() {
             // Initialize ndk-context on Android so android-native-keyring-store
             // (used by SystemSecretStore for API-key persistence) can access the
             // Android Keystore. The closure runs asynchronously on the webview's
-            // main-thread event loop; the first ConnectionStore construction in
-            // AppState below is guarded by catch_unwind in secret_store.rs and
-            // degrades to plaintext if this hasn't run yet. Subsequent Keystore
-            // operations (after the event loop pumps) will succeed.
+            // main-thread event loop, *after* AppState::new_with_backend below
+            // has already constructed ConnectionStore synchronously. That first
+            // migration attempt fail-closes to plaintext (catch_unwind in
+            // secret_store.rs turns the Store::new() panic into an Err, and
+            // ensure_native_store does not cache the Err). Once this closure
+            // runs, ndk-context is ready, so we trigger retry_migration() to
+            // actually move any plaintext API keys into the Keystore.
             #[cfg(target_os = "android")]
             {
                 use tauri::Manager;
@@ -1117,6 +1120,7 @@ pub fn run() {
                             static CTX_REF: std::sync::OnceLock<
                                 Option<jni::objects::GlobalRef>,
                             > = std::sync::OnceLock::new();
+                            let already = CTX_REF.get().is_some();
                             CTX_REF.get_or_init(|| {
                                 let global = env.new_global_ref(activity).ok()?;
                                 let vm = env.get_java_vm().ok()?;
@@ -1134,6 +1138,18 @@ pub fn run() {
                                 }
                                 Some(global)
                             });
+                            // ndk-context is now initialized (first time only). The
+                            // ConnectionStore constructed during AppState::new_with_backend
+                            // above already ran its first migration attempt against an
+                            // uninitialized Keystore and fail-closed to plaintext.
+                            // ensure_native_store no longer caches that Err, so retrying
+                            // migration here (on the webview thread, after ndk-context is
+                            // ready) actually moves the seeded plaintext API key into the
+                            // Keystore and rewrites connections.json with a SecretRef.
+                            // Idempotent; errors are warned-and-kept-plaintext inside.
+                            if !already {
+                                get_conn_store().retry_migration();
+                            }
                         });
                     });
                 }

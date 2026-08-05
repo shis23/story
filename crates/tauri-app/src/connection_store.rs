@@ -218,6 +218,20 @@ impl ConnectionStore {
         }
     }
 
+    /// Re-run plaintext→SecretRef migration. Idempotent (already-migrated
+    /// SecretRefs are skipped). Used on Android after ndk-context finishes
+    /// its async initialization: the first migration attempt ran during
+    /// `ConnectionStore::new` (synchronously in the setup hook, before
+    /// ndk-context was ready) and fail-closed to plaintext; this retries it
+    /// against the now-available Keystore. Errors are non-fatal — the caller
+    /// logs a warning and keeps plaintext (resolve_secret_value passes it
+    /// through), so the app keeps working either way.
+    pub fn retry_migration(&self) {
+        if let Err(e) = self.migrate_plaintext_api_keys() {
+            tracing::warn!("重试迁移连接 API key 到系统凭据库失败，保留旧文件: {e}");
+        }
+    }
+
     fn migrate_plaintext_api_keys(&self) -> Result<(), String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut changed = false;
