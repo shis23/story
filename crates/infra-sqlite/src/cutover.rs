@@ -162,6 +162,10 @@ pub struct CutoverReport {
     pub characters: usize,
     pub schema_version: i64,
     pub import_skipped_duplicate: bool,
+    /// Gate 7 发现 #3：导入时跳过的孤儿行数（父对象在源数据中不存在，
+    /// JSON 应用里本就不可达）。审计/恢复路径为 0。
+    #[serde(default)]
+    pub skipped_orphan_rows: usize,
     pub backup_label: String,
 }
 
@@ -170,6 +174,7 @@ impl CutoverReport {
         manifest: &SourceManifestReport,
         schema_version: i64,
         import_skipped_duplicate: bool,
+        skipped_orphan_rows: usize,
         backup_label: &str,
     ) -> Self {
         CutoverReport {
@@ -185,6 +190,7 @@ impl CutoverReport {
             characters: manifest.characters,
             schema_version,
             import_skipped_duplicate,
+            skipped_orphan_rows,
             backup_label: backup_label.to_string(),
         }
     }
@@ -534,6 +540,7 @@ fn run_fresh_start_cutover(
         &empty_manifest,
         schema_version,
         false,
+        0,
         &backup.label,
     );
     Ok(CutoverOutcome::Completed(report))
@@ -974,8 +981,15 @@ pub fn run_cutover_with_fault(
         &manifest,
         schema_version,
         import_report.skipped_as_duplicate,
+        import_report.skipped_orphan_rows,
         &backup.label,
     );
+    if import_report.skipped_orphan_rows > 0 {
+        tracing::info!(
+            skipped_orphan_rows = import_report.skipped_orphan_rows,
+            "cutover skipped unreachable orphan rows (deleted parents)"
+        );
+    }
 
     Ok(CutoverOutcome::Completed(report))
 }
@@ -1088,6 +1102,7 @@ fn audit_sqlite_authoritative(
         characters: table_count(&db, "characters")?,
         schema_version,
         import_skipped_duplicate: false,
+        skipped_orphan_rows: 0,
         backup_label: String::new(),
     })
 }

@@ -466,6 +466,48 @@ fn malformed_character_info_is_rejected() {
 }
 
 #[test]
+fn empty_character_info_strings_import_like_json_app() {
+    // Gate 7 候选周期发现 #2：JSON 应用的 CharacterInfo 是普通 String 字段
+    // （允许空串，如未填写的 description/system_prompt）。真实 legacy 数据
+    // 可能带空 description——必须正常导入（数据不丢、用户不被挡在门外）；
+    // 「存在但类型错误/缺字段」仍由 malformed_character_info_is_rejected 拒绝。
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    write_json(
+        &dir.path().join("characters.json"),
+        &json!([{
+            "id": "char-empty-desc",
+            "info": {
+                "id": "char-empty-desc",
+                "name": "命定之诗",
+                "description": "",
+                "personality": "",
+                "scenario": "",
+                "first_mes": "",
+                "system_prompt": "",
+                "creator": "",
+                "spec_version": "",
+                "tags": [],
+                "world_info_entries": [],
+                "created_at": "2026-07-01T00:00:00Z",
+                "updated_at": "2026-07-01T00:00:00Z"
+            },
+            "imported_at": "2026-07-01T00:00:00Z"
+        }]),
+    );
+
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect("empty CharacterInfo strings must dry-run cleanly (Gate 7 finding #2)");
+    assert_eq!(report.characters, 1);
+
+    let mut db = Database::open_in_memory().unwrap();
+    let imported = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("empty CharacterInfo strings must import (Gate 7 finding #2)");
+    assert_eq!(imported.characters, 1);
+}
+
+#[test]
 fn conversations_dir_replaced_by_file_is_rejected() {
     let dir = TempDir::new().unwrap();
     empty_but_valid_layout(dir.path());
@@ -675,4 +717,93 @@ fn campaign_without_conversation_reference_imports_cleanly() {
     JsonImporter::new(&mut db)
         .import_data_dir(dir.path())
         .expect("campaign without conversation reference must import cleanly");
+}
+
+#[test]
+fn orphan_rows_are_skipped_and_counted_not_blocking() {
+    // Gate 7 候选周期发现 #3：父对象（campaign/conversation）已删除的残留行
+    // 在 JSON 应用里按 campaign 列出时不可达（等价于不存在），SQLite FK 拒绝
+    // 插入。导入必须跳过并计数——不静默丢可达数据，也不因死行把用户挡在门外。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "Main",
+            "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-1", "lineage_id": "lin-1"
+        }]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-1", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    // 1 个有效实例 + 1 个孤儿实例（campaign 不存在）。
+    write_json(
+        &dir.path().join("instances.json"),
+        &json!([
+            { "id": "inst-ok", "campaign_id": "camp-1", "name": "主角" },
+            { "id": "inst-orphan", "campaign_id": "gone-camp", "name": "残留" }
+        ]),
+    );
+    // 2 个有效 turn + 1 个孤儿 turn（campaign 不存在）+ 1 个孤儿 turn（会话不存在）。
+    write_json(
+        &dir.path().join("turns.json"),
+        &json!([
+            {
+                "turn_id": "turn-ok-1", "campaign_id": "camp-1", "conversation_id": "conv-1",
+                "input_node_id": "n1", "status": "committed", "attempts": []
+            },
+            {
+                "turn_id": "turn-ok-2", "campaign_id": "camp-1", "conversation_id": "conv-1",
+                "input_node_id": "n2", "status": "committed", "attempts": []
+            },
+            {
+                "turn_id": "turn-orphan-camp", "campaign_id": "gone-camp", "conversation_id": "conv-1",
+                "input_node_id": "n3", "status": "committed", "attempts": []
+            },
+            {
+                "turn_id": "turn-orphan-conv", "campaign_id": "camp-1", "conversation_id": "gone-conv",
+                "input_node_id": "n4", "status": "committed", "attempts": []
+            }
+        ]),
+    );
+
+    // readiness：计数基于过滤后数组（与落库一致）。
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path()).unwrap();
+    assert_eq!(report.instances, 1, "孤儿实例不计入");
+    assert_eq!(report.turns, 2, "孤儿 turn 不计入");
+    assert!(report.issues.is_empty());
+
+    let mut db = Database::open_in_memory().unwrap();
+    let imported = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("孤儿行必须被跳过而不是阻断导入（Gate 7 发现 #3）");
+    assert_eq!(imported.instances, 1);
+    assert_eq!(imported.turns, 2);
+    assert_eq!(imported.skipped_orphan_rows, 3, "1 孤儿实例 + 2 孤儿 turn");
+
+    // 落库只有非孤儿行（FK 完整性成立）。
+    let instances: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM character_instances", [], |r| r.get(0))
+        .unwrap();
+    let turns: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(instances, 1);
+    assert_eq!(turns, 2);
+
+    // 重跑幂等：同一 hash（去重命中），skipped 统计一致。
+    let second = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .unwrap();
+    assert_eq!(second.status, ImportStatus::SkippedDuplicate);
+    assert_eq!(second.skipped_orphan_rows, 3);
 }

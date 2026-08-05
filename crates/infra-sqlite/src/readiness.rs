@@ -71,9 +71,43 @@ pub fn recompute_db_content_hash_for_test(db: &Database) -> Result<String> {
     crate::cutover::recompute_db_content_hash(db)
 }
 
-/// Read-only dry-run over a JSON source tree. Must not open/write a live DB.
-pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceManifestReport> {
-    let data_dir = data_dir.as_ref();
+/// 导入快照——readiness 与 importer 的**单一权威**。
+///
+/// 构建流水线：读取（缺失 = 空，Gate 7 发现 #1）→ 会话引用校验 → 严格校验
+/// （原始数组，任何畸形条目整体拒绝）→ **孤儿行过滤**（Gate 7 发现 #3）→
+/// 同口径 manifest hash（基于过滤后数组，与 SQLite 落库内容一致，verify 的
+/// check_count / content-hash 才可比）。
+///
+/// 孤儿行 = campaign_id 不在源 campaigns 中（turns/summaries 还需
+/// conversation_id 在源 conversations 中）。它们在 JSON 应用里按 campaign
+/// 列出时本就不可达（父对象已删除的残留），等价于不存在；SQLite FK 拒绝
+/// 插入，导入时跳过并计数（不静默丢可达数据，也不因死行把用户挡在门外）。
+#[derive(Debug, Clone)]
+pub struct ImportSnapshot {
+    pub manifest_hash: String,
+    pub cards: Vec<Value>,
+    pub campaigns: Vec<Value>,
+    pub instances: Vec<Value>,
+    pub knowledge: Vec<Value>,
+    pub tasks: Vec<Value>,
+    pub summaries: Vec<Value>,
+    pub conversations: Vec<Value>,
+    pub turns: Vec<Value>,
+    pub mvu_translations: Vec<Value>,
+    /// (campaign_id, payload) 对（与 hash 投影同序）。
+    pub world_info: Vec<(String, Value)>,
+    pub compress_jobs: Vec<Value>,
+    pub characters: Vec<Value>,
+    /// 被跳过的孤儿行总数（父对象在源数据中不存在）。
+    pub skipped_orphan_rows: usize,
+    /// 按集合的跳过明细（日志/报告用）。
+    pub skipped: Vec<(&'static str, usize)>,
+    /// 语义问题（摘要图 / attempt 归属，基于过滤后数组）。
+    pub issues: Vec<String>,
+}
+
+/// 构建导入快照（readiness 与 importer 共用）。
+pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     if !data_dir.exists() {
         return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
     }
@@ -102,8 +136,13 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     // 三审6：Campaign 引用的 conversation_id 必须有对应会话文件（与 importer 同口径）。
     verify_campaign_conversation_references(&campaigns, &conversations)?;
 
-    // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝。
+    // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝
+    // （含孤儿行——存在但损坏仍 fail-closed）。
     let campaign_ids: HashSet<String> = campaigns
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let conversation_ids: HashSet<String> = conversations
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
@@ -119,6 +158,64 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     strict_validate_entries("compress_jobs", &compress_jobs, &campaign_ids)?;
     strict_validate_entries("characters", &characters, &campaign_ids)?;
     strict_validate_world_info(&world_info, &campaign_ids)?;
+
+    // Gate 7 发现 #3：孤儿行过滤（父对象在源数据中不存在 = JSON 应用不可达）。
+    let mut skipped: Vec<(&'static str, usize)> = Vec::new();
+    let instances = filter_orphan_rows(
+        "instances",
+        instances,
+        &campaign_ids,
+        &conversation_ids,
+        false,
+        &mut skipped,
+    );
+    let knowledge = filter_orphan_rows(
+        "knowledge",
+        knowledge,
+        &campaign_ids,
+        &conversation_ids,
+        false,
+        &mut skipped,
+    );
+    let tasks = filter_orphan_rows(
+        "tasks",
+        tasks,
+        &campaign_ids,
+        &conversation_ids,
+        false,
+        &mut skipped,
+    );
+    let summaries = filter_orphan_rows(
+        "round_summaries",
+        summaries,
+        &campaign_ids,
+        &conversation_ids,
+        true,
+        &mut skipped,
+    );
+    let turns = filter_orphan_rows(
+        "turns",
+        turns,
+        &campaign_ids,
+        &conversation_ids,
+        true,
+        &mut skipped,
+    );
+    let world_info_total = world_info.len();
+    let world_info: Vec<(String, Value)> = world_info
+        .into_iter()
+        .filter(|(campaign_id, _)| campaign_ids.contains(campaign_id))
+        .collect();
+    let skipped_world_info = world_info_total - world_info.len();
+    if skipped_world_info > 0 {
+        skipped.push(("world_info", skipped_world_info));
+    }
+    let (compress_jobs, skipped_jobs) =
+        filter_orphan_rows_counted(compress_jobs, &campaign_ids, &conversation_ids, false);
+    if skipped_jobs > 0 {
+        skipped.push(("compress_jobs", skipped_jobs));
+    }
+    let skipped_orphan_rows: usize = skipped.iter().map(|(_, n)| n).sum();
 
     // Keep labels/order identical to the importer so hashes are comparable.
     let mut hasher = Sha256::new();
@@ -150,18 +247,85 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     issues.extend(validate_summary_graph(&summaries));
     issues.extend(validate_attempt_ownership(&turns));
 
-    Ok(SourceManifestReport {
+    Ok(ImportSnapshot {
         manifest_hash,
-        cards: cards.len(),
-        campaigns: campaigns.len(),
-        instances: instances.len(),
-        knowledge: knowledge.len(),
-        tasks: tasks.len(),
-        summaries: summaries.len(),
-        conversations: conversations.len(),
-        turns: turns.len(),
-        characters: characters.len(),
+        cards,
+        campaigns,
+        instances,
+        knowledge,
+        tasks,
+        summaries,
+        conversations,
+        turns,
+        mvu_translations,
+        world_info,
+        compress_jobs,
+        characters,
+        skipped_orphan_rows,
+        skipped,
         issues,
+    })
+}
+
+/// 孤儿行过滤（campaign 引用集合；turns/summaries 还需会话引用）。
+fn filter_orphan_rows(
+    kind: &'static str,
+    items: Vec<Value>,
+    campaign_ids: &HashSet<String>,
+    conversation_ids: &HashSet<String>,
+    need_conversation: bool,
+    skipped: &mut Vec<(&'static str, usize)>,
+) -> Vec<Value> {
+    let (kept, count) =
+        filter_orphan_rows_counted(items, campaign_ids, conversation_ids, need_conversation);
+    if count > 0 {
+        skipped.push((kind, count));
+    }
+    kept
+}
+
+fn filter_orphan_rows_counted(
+    items: Vec<Value>,
+    campaign_ids: &HashSet<String>,
+    conversation_ids: &HashSet<String>,
+    need_conversation: bool,
+) -> (Vec<Value>, usize) {
+    let mut kept = Vec::with_capacity(items.len());
+    let mut skipped_count = 0usize;
+    for item in items {
+        let campaign_ok = item
+            .get("campaign_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| campaign_ids.contains(id));
+        let conversation_ok = !need_conversation
+            || item
+                .get("conversation_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| conversation_ids.contains(id));
+        if campaign_ok && conversation_ok {
+            kept.push(item);
+        } else {
+            skipped_count += 1;
+        }
+    }
+    (kept, skipped_count)
+}
+
+/// Read-only dry-run over a JSON source tree. Must not open/write a live DB.
+pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceManifestReport> {
+    let snapshot = build_import_snapshot(data_dir.as_ref())?;
+    Ok(SourceManifestReport {
+        manifest_hash: snapshot.manifest_hash,
+        cards: snapshot.cards.len(),
+        campaigns: snapshot.campaigns.len(),
+        instances: snapshot.instances.len(),
+        knowledge: snapshot.knowledge.len(),
+        tasks: snapshot.tasks.len(),
+        summaries: snapshot.summaries.len(),
+        conversations: snapshot.conversations.len(),
+        turns: snapshot.turns.len(),
+        characters: snapshot.characters.len(),
+        issues: snapshot.issues,
     })
 }
 
@@ -358,6 +522,29 @@ fn req_str<'v>(kind: &str, index: usize, item: &'v Value, key: &str) -> Result<&
         ));
     }
     Ok(s)
+}
+
+/// 必填字符串字段（**允许空串**）：与 JSON 应用的 serde 模型一致——String
+/// 字段必须存在且是字符串，但可以为空（如未填写的 description/system_prompt/
+/// first_mes）。Gate 7 候选周期发现 #2：真实 legacy 树里
+/// `characters.json` 的 description 为空（JSON 应用正常加载），旧实现用
+/// `req_str` 拒绝，默认切换会把这类正常用户挡在门外。
+fn req_str_allow_empty<'v>(
+    kind: &str,
+    index: usize,
+    item: &'v Value,
+    key: &str,
+) -> Result<&'v str> {
+    let v = item
+        .get(key)
+        .ok_or_else(|| err_entry(kind, index, format!("missing field '{key}'")))?;
+    v.as_str().ok_or_else(|| {
+        err_entry(
+            kind,
+            index,
+            format!("field '{key}' must be a string, got {v}"),
+        )
+    })
 }
 
 /// 可选字符串：缺省/null → None；非字符串（数字/布尔/对象）→ Err。
@@ -773,7 +960,8 @@ pub(crate) fn strict_validate_entries(
                     ));
                 }
                 // CharacterInfo 镜像（tauri-app commands/characters.rs）：必填
-                // 字符串字段 + 布尔/数组字段类型。
+                // 字符串字段（**允许空串**，与 JSON serde 模型一致，见
+                // req_str_allow_empty）+ 布尔/数组字段类型。
                 for key in [
                     "name",
                     "description",
@@ -784,7 +972,7 @@ pub(crate) fn strict_validate_entries(
                     "creator",
                     "spec_version",
                 ] {
-                    req_str(kind, index, info, key)?;
+                    req_str_allow_empty(kind, index, info, key)?;
                 }
                 for key in [
                     "mes_example",

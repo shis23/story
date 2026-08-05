@@ -1,9 +1,7 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::OptionalExtension;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::connection::Database;
 use crate::error::{Result, SqliteError};
@@ -31,6 +29,9 @@ pub struct ImportReport {
     pub compress_jobs: usize,
     /// 导入的角色库条目数（V007 characters，Gate 5）。
     pub characters: usize,
+    /// Gate 7 发现 #3：被跳过的孤儿行总数（父对象在源数据中不存在，
+    /// JSON 应用里本就不可达；SQLite FK 拒绝插入，导入时跳过并计数）。
+    pub skipped_orphan_rows: usize,
     pub skipped_as_duplicate: bool,
 }
 
@@ -228,6 +229,7 @@ impl<'a> JsonImporter<'a> {
             world_info: snapshot.world_info.len(),
             compress_jobs: snapshot.compress_jobs.len(),
             characters: snapshot.characters.len(),
+            skipped_orphan_rows: snapshot.skipped_orphan_rows,
             skipped_as_duplicate: false,
         })
     }
@@ -250,6 +252,7 @@ fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
         world_info: snapshot.world_info.len(),
         compress_jobs: snapshot.compress_jobs.len(),
         characters: snapshot.characters.len(),
+        skipped_orphan_rows: snapshot.skipped_orphan_rows,
         skipped_as_duplicate: true,
     }
 }
@@ -273,191 +276,31 @@ struct SourceSnapshot {
     /// characters.json 中的 StoredCharacter 条目（Gate 5，归一化为
     /// `{id, info, imported_at}` 三字段契约形态）。
     characters: Vec<Value>,
+    /// Gate 7 发现 #3：被跳过的孤儿行总数（父对象在源数据中不存在）。
+    skipped_orphan_rows: usize,
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
-    // Gate 7（默认切换）语义变更：核心布局文件从「必需」改为「缺失 = 空
-    // 集合」，与 readiness / JSON `CampaignStore::load_or_default` 同口径——
-    // 正常 legacy 用户可以没有部分集合文件。缺失放行、**存在但损坏**仍
-    // fail-closed（不把已有数据当空集合吞掉）。
-    let cards = read_json_array(data_dir.join("cards.json"), true)?;
-    let campaigns = read_json_array(data_dir.join("campaigns.json"), true)?;
-    let instances = read_json_array(data_dir.join("instances.json"), true)?;
-    let knowledge = read_json_array(data_dir.join("knowledge.json"), true)?;
-    let tasks = read_json_array(data_dir.join("tasks.json"), true)?;
-    let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
-    let turns = read_json_array(data_dir.join("turns.json"), true)?;
-    let conversations = read_conversation_dir(data_dir.join("conversations"))?;
-    let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
-    // 与 readiness 共用读取 + 投影（hash 必须同口径）。
-    let world_info = crate::readiness::read_world_info_dir(data_dir.join("campaign_world_info"))?;
-    let compress_jobs = crate::readiness::read_compress_jobs_array(data_dir)?;
-    let characters = crate::readiness::read_characters_array(data_dir)?;
-
-    // 三审6：Campaign 引用的 conversation_id 必须有对应的会话文件存在。
-    // 区分「空白新用户」（无核心文件，允许）与「部分文件丢失」（campaigns 引用了
-    // 不存在的会话，必须拒绝）——绝不静默当作无会话导入。
-    verify_campaign_conversation_references(&campaigns, &conversations)?;
-
-    // 审查一.6：严格校验（与 readiness 同口径）。任何畸形条目 → 整体拒绝，
-    // 绝不静默跳过/归一化。
-    let campaign_ids: std::collections::HashSet<String> = campaigns
-        .iter()
-        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
-        .collect();
-    crate::readiness::strict_validate_entries("cards", &cards, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("campaigns", &campaigns, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("instances", &instances, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("knowledge", &knowledge, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("tasks", &tasks, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("round_summaries", &summaries, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("turns", &turns, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("conversations", &conversations, &campaign_ids)?;
-    crate::readiness::strict_validate_entries(
-        "mvu_translations",
-        &mvu_translations,
-        &campaign_ids,
-    )?;
-    crate::readiness::strict_validate_entries("compress_jobs", &compress_jobs, &campaign_ids)?;
-    crate::readiness::strict_validate_entries("characters", &characters, &campaign_ids)?;
-    crate::readiness::strict_validate_world_info(&world_info, &campaign_ids)?;
-
-    let mut hasher = Sha256::new();
-    hash_named_array(&mut hasher, "cards", &cards);
-    hash_named_array(&mut hasher, "campaigns", &campaigns);
-    hash_named_array(&mut hasher, "instances", &instances);
-    hash_named_array(&mut hasher, "knowledge", &knowledge);
-    hash_named_array(&mut hasher, "tasks", &tasks);
-    hash_named_array(&mut hasher, "round_summaries", &summaries);
-    hash_named_array(&mut hasher, "turns", &turns);
-    hash_named_array(&mut hasher, "conversations", &conversations);
-    // 注意：为保持既有已完成 run 的 manifest hash 稳定（幂等去重不被打破），
-    // 这些可选集合仅在非空时参与 hash——无相应数据的老目录 hash 不变。
-    if !mvu_translations.is_empty() {
-        hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
-    }
-    // 审查一.6：世界书 hash 绑定 campaign_id（与 readiness / cutover 同投影）。
-    if !world_info.is_empty() {
-        crate::readiness::hash_world_info_pairs(&mut hasher, &world_info);
-    }
-    if !compress_jobs.is_empty() {
-        hash_named_array(&mut hasher, "compress_jobs", &compress_jobs);
-    }
-    if !characters.is_empty() {
-        hash_named_array(&mut hasher, "characters", &characters);
-    }
-    let manifest_hash = hex_encode(hasher.finalize());
-
+    // 委托 readiness 的单一权威快照构建：读取（缺失 = 空，Gate 7 发现 #1）
+    // → 严格校验（原始数组）→ 孤儿行过滤（发现 #3）→ 同口径 manifest hash。
+    // importer 与 readiness 的 counts/hash 由此保证完全一致（verify 依赖）。
+    let snapshot = crate::readiness::build_import_snapshot(data_dir)?;
     Ok(SourceSnapshot {
-        manifest_hash,
-        cards,
-        campaigns,
-        instances,
-        knowledge,
-        tasks,
-        summaries,
-        conversations,
-        turns,
-        mvu_translations,
-        world_info,
-        compress_jobs,
-        characters,
+        manifest_hash: snapshot.manifest_hash,
+        cards: snapshot.cards,
+        campaigns: snapshot.campaigns,
+        instances: snapshot.instances,
+        knowledge: snapshot.knowledge,
+        tasks: snapshot.tasks,
+        summaries: snapshot.summaries,
+        conversations: snapshot.conversations,
+        turns: snapshot.turns,
+        mvu_translations: snapshot.mvu_translations,
+        world_info: snapshot.world_info,
+        compress_jobs: snapshot.compress_jobs,
+        characters: snapshot.characters,
+        skipped_orphan_rows: snapshot.skipped_orphan_rows,
     })
-}
-
-fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
-    if !path.exists() {
-        if optional {
-            return Ok(Vec::new());
-        }
-        return Err(SqliteError::ImportSourceMissing(path));
-    }
-    let text = fs::read_to_string(&path)?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
-    match value {
-        Value::Array(items) => Ok(items),
-        other => Err(SqliteError::CorruptImportInput(format!(
-            "{}: expected JSON array, got {other}",
-            path.display()
-        ))),
-    }
-}
-
-fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
-    // 审查一.6：conversations 目录沿用既有 manifest 逻辑（可选——目录缺失 =
-    // 无会话，应用运行时按需创建）；但目录**存在而不可读**（如被文件顶替）时
-    // read_dir 错误必须传播，绝不静默当作空。
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<PathBuf>>>()?
-        .into_iter()
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
-    let mut out = Vec::new();
-    for path in paths {
-        let text = fs::read_to_string(&path)?;
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
-        if !value.is_object() {
-            return Err(SqliteError::CorruptImportInput(format!(
-                "{}: expected conversation object",
-                path.display()
-            )));
-        }
-        out.push(value);
-    }
-    Ok(out)
-}
-
-/// 三审6：校验 Campaign 引用的 conversation_id 在已读会话集合中存在。
-///
-/// 区分语义：
-/// - 空白新用户（campaigns 为空或无 conversation_id 引用）→ 允许；
-/// - 部分文件丢失（campaign 引用了某 conversation_id，但对应会话文件缺失）→
-///   拒绝（CorruptImportInput），绝不静默当作无会话。
-fn verify_campaign_conversation_references(
-    campaigns: &[Value],
-    conversations: &[Value],
-) -> Result<()> {
-    let conversation_ids: std::collections::HashSet<&str> = conversations
-        .iter()
-        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
-        .collect();
-    for campaign in campaigns {
-        let Some(conv_id) = campaign.get("conversation_id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if conv_id.is_empty() {
-            continue;
-        }
-        if !conversation_ids.contains(conv_id) {
-            let camp_id = campaign
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>");
-            return Err(SqliteError::CorruptImportInput(format!(
-                "campaign {camp_id} references conversation {conv_id} but the conversation file is missing"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn hash_named_array(hasher: &mut Sha256, name: &str, items: &[Value]) {
-    hasher.update(name.as_bytes());
-    hasher.update(b"\0");
-    // 规范化：对每个 item 的紧凑 JSON 排序后哈希，避免键序噪音
-    let mut encoded: Vec<String> = items.iter().map(stable_json).collect();
-    encoded.sort();
-    for item in encoded {
-        hasher.update(item.as_bytes());
-        hasher.update(b"\n");
-    }
 }
 
 fn stable_json(value: &Value) -> String {
@@ -1050,17 +893,6 @@ fn new_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("import-{nanos:x}")
-}
-
-fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0xf) as usize] as char);
-    }
-    out
 }
 
 /// 测试辅助：统计表行数。
