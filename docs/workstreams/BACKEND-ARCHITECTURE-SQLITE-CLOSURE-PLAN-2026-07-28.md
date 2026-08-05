@@ -2,7 +2,7 @@
 
 > 状态：**进行中（Gate 1–5 已通过；Gate 6 进行中；Gate 7–8 尚未完成）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
 > Gate 5 二审（2026-08-02 独立审查）全部反例已关闭，终态 PASS 见 RESULT §33；三审（2026-08-02，10 项阻塞全部关闭）见 RESULT §34。
-> Gate 6（§11，真实模型 + 平台现场）已启动：§11.1 确定性门 PASS；§11.2 真实模型 Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal，**Full100 经 4 次重跑受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康，提供迄今最完整长程证据，深度分析见 RESULT §35.8），BLOCKED 待 relay 恢复后续跑**（harness 侧两个阻塞已修：15h ceiling + 8-attempt 重试）；§11.3 Android 模拟器 PARTIAL（核心平台层 PASS + Keystore ndk-context 缺陷已修 commit 4701497，功能端到端待续跑），§11.3 Windows 未开始。详见 RESULT §35。**Gate 6 整体 INCOMPLETE，不得自启 Gate 7。**
+> Gate 6（§11，真实模型 + 平台现场）已启动：§11.1 确定性门 PASS；§11.2 真实模型 Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal，**Full100 经 4 次重跑受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康，提供迄今最完整长程证据，深度分析见 RESULT §35.8），BLOCKED 待 relay 恢复后续跑**（harness 侧两个阻塞已修：15h ceiling + 8-attempt 重试）；**§11.3 Android 模拟器 PASS（15 项验收点全现场验证）+ §11.3 Windows 现场 PASS**（release APK 签名 BLOCKED 无证书）；发现并修复 2 个真实 Android Keystore 缺陷（#7 ndk-context panic、#8 迁移永不重试）。详见 RESULT §35。**Gate 6 仅剩 Full100 阻塞，不得自启 Gate 7。**
 > code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。

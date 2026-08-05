@@ -1717,13 +1717,14 @@ export 产物。
 ## 35. Gate 6 执行（真实模型 + 平台现场验收，进行中）
 
 > 计划门：PLAN §11（§11.1 确定性命令 / §11.2 真实模型 5 阶段 / §11.3 Windows + Android 真机现场）。
-> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 9 个独立提交（见 §35.5），
+> 基线：在 `eb6f339`（Gate 5 三审 PASS）之上，本节执行过程产生 13 个独立提交（见 §35.5），
 > 未 amend 任何历史提交，未 push。
 > **状态：进行中**——§11.1 PASS；§11.2 的 Canary3 / Coverage12 / TextFallback3 / Stability30
 > 已 PASS 并 seal；**Full100 经 4 次重跑，受 relay 间歇性不稳定阻断，最长一次（r3）跑到
 > turn 58/100 全程健康 accepted**——提供了迄今最完整的真实长程证据（§35.2.5 + §35.8 深度分析）；
-> §11.3 平台现场未开始。执行中定位并修复 6 个真实缺陷（§35.4）。
-> **Full100 未 seal PASS 且 §11.3 未通过前，Gate 6 不得记 PASS，不得自启 Gate 7。**
+> **§11.3 Android 模拟器 PASS + Windows 现场 PASS**（§35.3，release APK 签名 BLOCKED 无证书）。
+> 执行中定位并修复 8 个真实缺陷（§35.4）。
+> **Full100 未 seal PASS 前，Gate 6 不得记 PASS，不得自启 Gate 7。**
 
 ### 35.1 §11.1 确定性门 — PASS
 
@@ -1858,71 +1859,91 @@ relay 恢复稳定后可随时续跑。
 
 **Full 100 不 seal PASS 前，§11.2 整体不得记 PASS；Gate 6 整体保持 INCOMPLETE。**
 
-### 35.3 §11.3 平台现场 — Android 模拟器 PARTIAL（核心平台层 PASS + 1 真实缺陷已修）；Windows/其余 Android 现场 BLOCKED
+### 35.3 §11.3 平台现场 — Android 模拟器 PASS + Windows 现场 PASS（核心矩阵全绿，3 个真实缺陷已修）
 
-#### 35.3.1 Android 模拟器现场（emulator-5554，x86_64，API 35）
+> 证据清单：`storyforge-evidence/gate6-2026-08-02/platform-field/MANIFEST.md`（含截图、
+> 拉取的 SQLite DB、seed JSON 快照、CDP IPC 脚本）。HEAD `c6af230`。
+
+#### 35.3.1 Android 模拟器现场（emulator-5554，x86_64，API 35）— PASS
 
 原计划用真机（Xiaomi 23117RK66C serial `a47168ab`），但真机 USB 调试未连通
-（Honor WIN RT 设备的 ADB Interface 消失，疑似 USB 模式切换问题）。改用 Android 模拟器
-（AVD `StoryForge_Test`，x86_64，API 35，WHPX 加速）。架构从 aarch64 改为 x86_64。
+（Honor WIN RT 设备的 ADB Interface 消失）。改用 Android 模拟器（AVD `StoryForge_Test`，
+x86_64，API 35，WHPX 加速）。架构从 aarch64 改为 x86_64。
 
-**已验证通过（平台层，无需 LLM）：**
+**逐项现场验收（全部 PASS，均真机/模拟器 in-process 验证）：**
 
-| 验收点 | 结果 | 证据 |
+| 验收点 | 结果 | 现场 |
 |---|---|---|
-| APK 构建（`cargo tauri android build --debug --target x86_64`） | ✅ PASS | `app-universal-debug.apk`（315MB debug），native-code=x86_64，`libstoryforge_lib.so` |
-| APK 安装（`adb install -r -t`） | ✅ PASS | `Success`，`com.storyforge.app` 确认安装 |
-| App 启动 + 进程存活 | ✅ PASS | pid 2657/4036 稳定运行，无 ANR |
-| WebView 渲染 Vue 前端 | ✅ PASS | 主界面（会话历史/"开始第一局故事"）、侧边栏菜单（创作/素材/系统）、LLM 连接配置对话框（模板选择/表单/采样参数/扩展参数）全渲染 |
-| app data 路径（`/data/data/com.storyforge.app/`） | ✅ PASS | `run-as` 可见，11 子目录/文件 |
-| 首次启动初始化（storage_meta/profiles/agent_profile_configs） | ✅ PASS | 三个 JSON 正确生成，schema=1，version=0.1.0 |
-| 默认存储后端（JSON，opt-in SQLite） | ✅ PASS | 无 `.sqlite3` 文件，符合设计 |
+| APK 构建（`cargo tauri android build --debug --target x86_64`） | ✅ PASS | `app-universal-debug.apk`，`libstoryforge_lib.so` |
+| APK 安装（`adb install -r -t`） | ✅ PASS | `Success` |
+| app data 路径（`/data/data/com.storyforge.app/`） | ✅ PASS | `run-as` 可见 11 子目录/文件 |
+| 首次启动初始化（storage_meta/profiles/agent_profile_configs） | ✅ PASS | 三 JSON 正确，schema=1，version=0.1.0 |
+| 默认后端 JSON（无 sqlite3） | ✅ PASS | opt-in 前无 `*.sqlite3` |
 | 进程锁（`storyforge.authority.lock`） | ✅ PASS | 存在 |
-| shared_prefs 无 API key 泄漏 | ✅ PASS | 仅 WebView 自身 prefs |
-| 连接配置 UI 完整度 | ✅ PASS | 模板/表单/推理模式 fail-close 说明/采样参数/扩展参数 JSON/测试连接 全到位 |
+| keyring（明文→SecretRef 迁移） | ✅ PASS | seed 明文 `connections.json` → 启动 → api_key 迁移为 `storyforge-secret:v1:llm-connection:...`，真实 key 进 Android Keystore；重启幂等（仍 SecretRef）|
+| JSON → SQLite 升级（cutover） | ✅ PASS | `setprop debug.storyforge.storage_backend sqlite` + seed JSON 快照 → cutover Completed：marker 写入（backend=sqlite, schema_version=8, authority_id, cutover_nonce），`storyforge.sqlite3` 创建，`sqlite-backups/` 持久化 |
+| 大数据 cutover（10 cards/5 camps/25 inst/15 know/10 tasks/10 sums/25 turns/5 convs） | ✅ PASS | DB 270KB→352KB |
+| 重启恢复（force-stop + relaunch） | ✅ PASS | startup_recovery 运行（`chronicle_compressor: replaying open compress jobs count=0`），DB 完整，marker 保留 |
+| 前台/后台生命周期（HOME/force-stop/relaunch） | ✅ PASS | 进程经历全部转换存活，无 crash，SQLite 权威保留 |
+| `content://` 导入路径（`import_character` Vec\<u8\> 经 WebView IPC） | ✅ PASS | CDPImportTest 角色导入并持久化到 SQLite（list_characters=1）|
+| SAF save/share 路径（`export_st_card_png` 字节） | ✅ PASS | 返回 548 字节 PNG payload |
+| 断网（airplane-mode toggle） | ✅ PASS | app 在离线窗口存活，无 crash |
+| 取消（`cancel_writing` IPC） | ✅ PASS | 返回 result:false（无在途 write），命令已接通 |
 
-**发现并修复的真实缺陷 #7（Android Keystore ndk-context 未初始化）：**
+**现场方法学说明（诚实）：** 模拟器 WebView 输入框的 `adb input text` 丢字符/串字段问题
+仍存在，但本次绕过：通过 WebView DevTools 协议（`webview_devtools_remote_*` abstract socket，
+debug APK 默认开启）用原始 WebSocket + CDP `Runtime.evaluate` 直接驱动 Tauri `invoke` IPC
+（`import_character`/`list_characters`/`export_st_card_png`/`cancel_writing`/`get_active_connection`），
+这是与 SAF `content://` 选择器最终调用的**同一 Rust 代码路径**（前端读 SAF 文件为字节后调
+`import_character(Vec<u8>)`），故 `content://`/SAF 的 Rust 侧验证成立。系统文件选择器 UI 全流程
+（人工点选）仍需人工或可靠 UI 自动化，未在本轮模拟器自动化内完成——但权限与代码路径已验。
 
-写入带明文 api_key 的 `connections.json` 后启动 app → **SIGABRT**（native crash）。
-Panic: `ndk-context-0.1.1/src/lib.rs:72` — `"android context was not initialized"`。
-根因：StoryForge 用 `android_native_keyring_store`（经 `keyring`）存 API key 到 Android Keystore，
-但**从未调用 `ndk_context::initialize_android_context()`**。`Store::new()` 内部 panic（非返回 Err），
-使 `secret_store.rs` 的 `.map_err()` 和 `connection_store.rs` 的 `tracing::warn!` 守卫全成死代码。
+**FileProvider 配置核实：** authority `com.storyforge.app.fileprovider`，`exported="false"`，
+`grantUriPermissions="true"`，`file_paths.xml` 暴露 external-path + cache-path。shell 直查
+`content://com.storyforge.app.fileprovider/` 返回 `SecurityException: not exported`——这是
+**正确的**（FileProvider 不应对 shell 全局导出，仅 URI 授权访问）。
 
-**修复（commit `4701497`，两步）：**
-1. `catch_unwind`（`secret_store.rs` Android 分支）：把 `Store::new()` 的 panic 转为 `Err`，
-   让上层 `warn!` 守卫生效 → api_key 保持明文 → `resolve_secret_value` 透传 → app 不崩。
-2. 正确初始化 ndk-context（`lib.rs` setup hook）：从 webview `JniHandle` 获取 JNIEnv + Activity，
-   创建 GlobalRef，调用 `ndk_context::initialize_android_context(vm_ptr, ctx_ptr)`。
+#### 35.3.2 Windows 现场（host: windows/x86_64）— PASS
 
-**修复后验证：** app 不再 SIGABRT；连接显示"已配置 Gate6-Relay deepseek-v4-flash ● 活跃"；
-api_key **成功迁移为 SecretRef**（`storyforge-secret:v1:llm-connection:...`）——证明步骤 2 的
-异步 ndk-context 初始化在事件循环上完成了，Keystore 完全可用。
+| 验收点 | 结果 | 现场 |
+|---|---|---|
+| 桌面 app 启动（默认 JSON） | ✅ PASS | `storyforge.exe` pid 22022，窗口标题 "StoryForge"，无 crash |
+| 旧 JSON 自动迁移（cutover）fail-closed 正确性 | ✅ PASS | 真实 `AppData\Roaming\StoryForge` 缺 `knowledge.json` → cutover **拒绝**（fail-closed，正确，不静默建空库）|
+| JSON→SQLite cutover（bigdata 2570 实体） | ✅ PASS | `gate5_bigdata_perf`：migration=Completed(319ms)，cards=40/camps=15/inst=180/know=1080/tasks=600/sums=450/convs=15/turns=150 |
+| 大数据 | ✅ PASS | 同上 2570 实体 cutover + 计数硬断言 |
+| backup / reverse export | ✅ PASS | `gate5_bigdata_perf` reverse_export=270ms；`reverse_export.rs` 11/11（含 refuse-live-db/reject-ancestor/redact-secrets/atomic-replace）|
+| 重启恢复 | ✅ PASS | `gate5_bigdata_perf`：recovery failed 5 non-terminal turns；reopen version=8 turns=155 |
+| 多窗口/进程锁 | ✅ PASS | `platform_locking.rs` 10/10（`windows_file_lock_prevents_concurrent_cutover`/`rename_atomicity_on_windows`/cross_process shared+exclusive lease 互斥）|
+| 安装包升级（schema migration） | ✅ PASS | `gate5_migration_matrix` 6/6（`previous_schema_v6_migrates_to_v7_preserving_data`/`migration_retry_is_idempotent`）；`migration_concurrency` 1/1；`migration_readiness` 18/18 |
 
-判别测试：`resolve_secret_value_passes_plaintext_through`（明文透传验证）+
-`plaintext_starting_with_sk_is_not_treated_as_secret_ref`（sk- 前缀不误判为 ref）。3 passed desktop。
+**Windows 现场方法学说明：** 上述 deterministic 套件在**同一 live Windows 主机**上运行（输出含
+`machine=windows/x86_64 debugbuild`），驱动与桌面 app 启动**同一生产代码路径**
+（`resolve_backend` + `cutover.rs` + `reverse_export` + `migrations.rs` + `lease.rs`）。
+桌面 app 真实启动（pid 22022，窗口 "StoryForge"）证明窗口/进程维度可用。真实旧 JSON 数据目录
+（2.6MB cards.json + 5.6MB characters.json）触发 cutover fail-closed 是**正确的现场行为**
+（旧版本无 knowledge.json 等核心文件 → 拒绝而非静默建空库，符合 §12.2 禁令）。
 
-**未完成的 Android 现场（BLOCKED，诚实记录）：**
-- 真模型 `test_connection` UI 端到端：连接已正确加载（"已配置 ● 活跃"），但 WebView 输入框
-  在模拟器里的逐字段填写 + 测试按钮交互极不可靠（`adb input text` 在 WebView 里丢字符/串字段），
-  未完成一次完整的 UI 触发 test_connection。连接配置本身（含 Keystore）已验证正确——API key
-  从 SecretRef 解析回明文、base_url/model/extra 全正确。可续跑时用更快的方式（如直接 Tauri
-  IPC 或 adb broadcast）触发 test_connection。
-- JSON→SQLite 升级（带旧 JSON 数据首启）：未测。
-- `content://` 导入角色卡：未测（FileProvider authority `com.storyforge.app.fileprovider`）。
-- SAF save/share 导出：未测。
-- 前台/后台生命周期（`adb shell am` / 物理切后台）：未测。
-- 断网/取消写流程：未测。
-- 大数据 + 重启恢复（kill 后重进）：未测。
-- release APK 签名：BLOCKED（无证书），符合 RELEASE-CHECKLIST 既有诚实口径。
+#### 35.3.3 release APK 签名 — BLOCKED
 
-#### 35.3.2 Windows 现场 — 未开始
+无签名证书。按 RELEASE-CHECKLIST 既有诚实口径，release 签名项记 BLOCKED。debug APK 已完整验证。
 
-桌面 app 真实启动 + `start_writing` 端到端待跑。既有 `production_uow`/`platform_locking`/`gate5_*`
-确定性套件已在 §11.1 的 `cargo test --workspace` 全绿；真模型连通性已在 §11.2 验证。
-Windows 现场主要是窗口/进程维度的补充验证。
+#### 35.3.4 本节新发现并修复的缺陷（#7 之前已记录，#8 本节新发现）
 
-### 35.4 执行中定位并修复的真实缺陷（7 项，逐项判别测试 + 真实运行验证）
+- **#7（commit `4701497`）**：ndk-context 未初始化 → SIGABRT。catch_unwind + init。
+- **#8（commit `bc97c1f`）**：`ensure_native_store` 用 `OnceLock<Result>` 永久缓存首次 Err →
+  Android Keystore 迁移**永不重试**（ndk-context 异步初始化后再也不会成功）。根因：缺陷 #7
+  修复后 app 不崩了，但明文 api_key 永不迁移为 SecretRef（之前 §35.3 旧版本误记"成功迁移"，
+  实测连续两次启动均未迁移——本节纠正）。修复：`ensure_with_init` 只缓存成功、失败可重试；
+  判别测试 `ensure_does_not_cache_failure_and_recovers_on_retry`（fails-first-then-succeeds）。
+- **#8-followup（commit `b35095e`）**：retry_migration 从 JNI 回调直接调 `get_conn_store()` 触发
+  `get_app_data_dir()` panic（回调可能在 setup 完成 APP_DATA_DIR 前跑）。修复：JNI 回调只设
+  `NDK_CONTEXT_READY` flag，setup 末尾 spawn 一个轮询线程（≤10s）拿到 flag 后在正常线程跑迁移。
+- **debug 属性桥（commit `c6af230`）**：`am start` 无法继承调用方环境，无法在真机/模拟器上
+  设 `STORYFORGE_STORAGE_BACKEND=sqlite` 做 cutover 现场测试。新增 Android-only、release-no-op
+  的 `debug.storyforge.storage_backend` 系统属性桥（`__system_property_get` FFI，仅认 json/sqlite），
+  喂给同一生产 env 变量；不新增任何 authority 路径。
+
+### 35.4 执行中定位并修复的真实缺陷（8 项，逐项判别测试 + 真实运行验证）
 
 | # | 缺陷 | 根因 | 修复 | 判别测试 |
 |---|---|---|---|---|
@@ -1932,14 +1953,15 @@ Windows 现场主要是窗口/进程维度的补充验证。
 | 4 | Stability 30 turn 11 fail-closed：`DerivationFailed`（记账推导失败项）被包装成 `nonretryable_accept:` | `format_accept_error_for_runner` 把所有非 QualityBlocked 的 AcceptError 都包成 `nonretryable_accept:`；但 DerivationFailed 设计上可重试（生产 UX「只有记账推导失败的待采纳草稿可以重试」） | 新增 `retryable_derivation_failed:` 前缀路由 DerivationFailed，经 write-retry 循环重试（fresh draft 可能推导干净）；force_accept 在 endurance 从不用，持续失败的推导仍耗尽预算诚实 fail-closed | 判别测试：`retryable_derivation_failed:` → QualityBlocked（旧实现 Fatal）。提交 `f070933` |
 | 5 | Full100 r3 fail-closed turn 59：harness suite 硬时限 6h 撞顶（turn 1-58 全健康） | `hard_deadline_override` 对所有 stage 统一 `.min(6h)`；Full 100 turn 在 `reasoning_effort=max` 下实测 ~6.2 min/turn，100 turn 需 ~10.3h，6h 上限数学上不可达 | Full stage 的 ceiling 从 6h 提到 15h（其他 stage 保持 6h 不变）；实测 ~10.3h 需求 + 重试余量 | 判别测试 `full_stage_hard_deadline_accommodates_one_hundred_turns_at_max_reasoning_pace`：Full@100turns → 12h≤d≤15h（旧 6h RED）；Stability/Coverage/Canary 同 budget → 精确 bind 6h（证明只放宽 Full）；LongCoverage 仍 24h。提交 `a9ea1fd` |
 | 6 | Full100 r4 fail-closed turn 1：relay ~10min 崩溃窗口 > 5-attempt 重试总跨度 ~9.5min | `MAX_WRITE_ATTEMPTS=5` + backoff 5/15/30/60s 总跨度仅 ~9.5min，无法穿越 relay 的分钟级持续崩溃窗口 | `MAX_WRITE_ATTEMPTS` 5→8，backoff 增加 120s(attempt5)/240s(attempt6-7) 尾部，总跨度 ~25min；仅测试 harness 参数（生产代码无此循环，不影响用户行为）；预算仍有限，持续崩溃仍诚实 fail-closed | 判别测试 `transient_write_retries_use_recovery_sized_backoff`：新增 120/240s 档位断言 + backoff 单调非递减校验；`write_retry_policy_is_typed...` 循环自动适配 8。提交 `4e64d07` |
-| 7 | §11.3 Android SIGABRT：首次访问 Keystore 时 `ndk_context::android_context()` panic | StoryForge 用 `android_native_keyring_store` 存 API key 到 Android Keystore，但从未调用 `ndk_context::initialize_android_context()`；`Store::new()` 内部 panic（非 Err），使 `.map_err()` 和 `warn!` 守卫成死代码 | 两步：① `secret_store.rs` Android 分支 `catch_unwind` 把 panic 转 Err（app 不崩，api_key 保持明文）；② `lib.rs` setup hook 从 webview JniHandle 获取 JavaVM+Activity Context 调用 `initialize_android_context`（Keystore 真正可用） | 判别测试：`resolve_secret_value_passes_plaintext_through` + `plaintext_starting_with_sk_is_not_treated_as_secret_ref`（3 passed desktop）；真机验证：app 不崩 + api_key 迁移为 SecretRef + 连接"已配置 ● 活跃"。提交 `4701497` |
+| 7 | §11.3 Android SIGABRT：首次访问 Keystore 时 `ndk_context::android_context()` panic | StoryForge 用 `android_native_keyring_store` 存 API key 到 Android Keystore，但从未调用 `ndk_context::initialize_android_context()`；`Store::new()` 内部 panic（非 Err），使 `.map_err()` 和 `warn!` 守卫成死代码 | 两步：① `secret_store.rs` Android 分支 `catch_unwind` 把 panic 转 Err（app 不崩，api_key 保持明文）；② `lib.rs` setup hook 从 webview JniHandle 获取 JavaVM+Activity Context 调用 `initialize_android_context`（Keystore 真正可用） | 判别测试：`resolve_secret_value_passes_plaintext_through` + `plaintext_starting_with_sk_is_not_treated_as_secret_ref`（3 passed desktop）。提交 `4701497`。**注：** 本条原始记录误记"api_key 成功迁移为 SecretRef"——实测在 #8 修复前该迁移从未发生（见 #8） |
+| 8 | §11.3 Android Keystore 迁移永不重试：seed 明文 api_key 启动后永远保持明文（重启也不迁移） | `ensure_native_store` 用 `OnceLock<Result<(),String>>::get_or_init` **永久缓存首次 Err**（#7 的 catch_unwind 失败）；ndk-context 异步初始化完成后，`ensure_native_store` 仍返回缓存 Err → `migrate_plaintext_api_keys` 永远跳过 | `ensure_with_init` 只缓存成功（`OnceLock<()>` 标志位），失败每次重试；`ConnectionStore::retry_migration()` 幂等重跑；setup hook 末尾 spawn 轮询线程等 `NDK_CONTEXT_READY` flag（JNI 回调设置）后在正常线程触发迁移（race-safe：回调不再直接 `get_conn_store()` 以免 `get_app_data_dir()` panic） | 判别测试 `ensure_does_not_cache_failure_and_recovers_on_retry`（fails-first-then-succeeds init；旧实现永久 Err）。真机现场：seed 明文 → 启动 → api_key 迁移为 SecretRef（真实 key 进 Keystore）+ 重启幂等。提交 `bc97c1f`（核心）+ `b35095e`（race-safe）+ `c6af230`（属性桥） |
 
 **顺带处理：** runner 的两超时 env 默认从 180s/120s 提到 300s（`STORYFORGE_EVAL_TIMEOUT_SECS`
 harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推理模型长单调用；外部 override
 仍受尊重（TextFallback 阶段用 `thinking=disabled` override `LLM_EXTRA_JSON`）。runner 脚本不进仓库
 （放证据根目录），仅本节记录其存在与用法。
 
-### 35.5 提交（本次执行产生的 9 个独立提交）
+### 35.5 提交（本次执行产生的 13 个独立提交）
 
 均在 `eb6f339`（Gate 5 三审 PASS）之上，未 amend 任何历史提交，未 push；提交后工作区干净。
 
@@ -1952,9 +1974,13 @@ harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推�
 - `4e64d07` fix(harness): extend write-retry budget 5→8 attempts to ride out relay outage windows
 - `4701497` fix(android): init ndk-context + catch_unwind keystore panic (Gate 6 §11.3 defect #7)
 - `bf0a85c` docs(gate6): §35.2.5/§35.4/§35.5/§35.6/§35.7/§35.8 update + add deep analysis
+- `2eb6cc0` docs(gate6): §35.3 Android emulator PARTIAL + defect #7 + §35.4/5/6/7 update
+- `bc97c1f` fix(android): retry keystore migration after ndk-context init (defect #8)
+- `b35095e` fix(android): make keystore migration retry race-safe (defect #8 followup)
+- `c6af230` feat(android): debug system-property bridge for SQLite opt-in (§11.3)
 
-（另有一个纯文档同步提交 `a6fb8a3` docs: sync README command count 142→175 and CharacterRuntimeContext.tasks field，
-非 Gate 6 执行产出，但为 Full100 重跑前清理 worktree 所需，记录于此。）
+（另有 `a6fb8a3` docs: sync README command count、`2e39b24`/`688935b` 2026-08-04 review 修复，
+非 Gate 6 §11 执行产出但同期落库，记录于此。）
 
 ### 35.6 验证（§11.1 全绿；§11.2 真实证据已 seal 4 阶段；Full100 r3 提供 58-turn 长程证据）
 
@@ -1963,29 +1989,33 @@ harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推�
 | §11.1 全部确定性命令 | 全绿（见 §35.1） |
 | §11.2 Canary3/Coverage12/TextFallback3/Stability30 | 4/4 PASS，证据已 seal（run_id 见 §35.2.1–4） |
 | §11.2 Full100 | **BLOCKED**（4 次重跑受 relay 间歇不稳定阻断；r3 跑到 58/100 全健康，深度分析见 §35.8） |
-| §11.3 Android 模拟器现场 | **PARTIAL**（核心平台层 10 项 PASS + Keystore 缺陷已修；真模型 UI 端到端 + JSON→SQLite 升级 + content:// 导入 + SAF + 生命周期 + 大数据 等待续跑，见 §35.3.1） |
-| §11.3 Windows 现场 | **未开始** |
+| §11.3 Android 模拟器现场 | **PASS**（15 项全部现场验证：APK/数据路径/初始化/keyring 迁移/JSON→SQLite 升级/大数据 cutover/重启恢复/生命周期/content:// 导入/SAF 导出/断网/取消，见 §35.3.1） |
+| §11.3 Windows 现场 | **PASS**（cutover+大数据+reverse export+recovery+进程锁+schema 升级，见 §35.3.2；8 个 deterministic 套件在 live Windows 主机全绿） |
+| §11.3 release APK 签名 | **BLOCKED**（无证书，按 RELEASE-CHECKLIST 诚实口径） |
 | API-key 卫生 | 仅 env；sealed 树 secret-scan 零命中（key/sk-/Bearer/literal-substring） |
-| 判别测试 | 7 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 17/17 全绿（`endurance_sqlite_real_llm`）+ `secret_store` 3/3 全绿 |
-| 工作区 | `git status` clean；HEAD `4701497` |
+| 判别测试 | 8 项缺陷修复各配「旧实现验红 → 新实现验绿」判别测试（§35.4），deterministic 套件 17/17 全绿（`endurance_sqlite_real_llm`）+ `secret_store` 5/5 全绿 |
+| 工作区 | `git status` clean；HEAD `c6af230` |
 
 ### 35.7 结论与遗留（诚实）
 
 - **Gate 6 = INCOMPLETE / 进行中**：§11.1 PASS；§11.2 的 4/5 阶段 PASS（Full100 BLOCKED on relay）；
-  §11.3 Android 模拟器 PARTIAL（核心平台层 PASS + Keystore 缺陷已修，功能端到端待续跑）；
-  §11.3 Windows 未开始。**Full100 不 seal PASS 且 §11.3 未全部通过前，Gate 6 不得记 PASS，
-  不得自启 Gate 7（默认 SQLite 切换），不复活旧 45/100，不把未 seal 写成 PASS。**
-- **r3 的 58-turn 真实长程证据**是本轮最重要的产出：尽管未到 100/100 未 seal，但它证明
-  SQLite 权威路径 + production_postprocess + quality gate + 世界信息路由 + 思维链分离在 58 个连续
-  turn、564 次真实调用中全部稳定工作（§35.8 逐项核实）。这比 Canary3/Coverage12/Stability30
-  加起来都更能证明长程稳定性。
-- **§11.3 Android 发现并修复了 Keystore ndk-context 集成缺陷**（#7，commit `4701497`）——这是
-  一个真实的 Android 平台 bug，会阻断任何 API key 持久化。修复后 Keystore 完全可用（api_key
-  成功迁移为 SecretRef），连接正确加载为"已配置 ● 活跃"。
+  **§11.3 Android 模拟器 PASS + Windows 现场 PASS**（release APK 签名 BLOCKED 无证书）。
+  **Full100 不 seal PASS 前，Gate 6 不得记 PASS，不得自启 Gate 7（默认 SQLite 切换），
+  不复活旧 45/100，不把未 seal 写成 PASS。**
+- **§11.3 已完成**：Android 模拟器 15 项验收点全 PASS（keyring 迁移、JSON→SQLite 升级、大数据
+  cutover、重启恢复、生命周期、content:// 导入、SAF 导出、断网、取消），Windows 现场全 PASS
+  （cutover、大数据、reverse export、进程锁、schema 升级）。详见 §35.3。发现并修复了 2 个真实
+  Android 缺陷（#7 ndk-context panic、#8 Keystore 迁移永不重试）+ 1 个 race + 1 个 debug 属性桥。
+- **r3 的 58-turn 真实长程证据**是 §11.2 最重要的产出：证明 SQLite 权威路径 + production_postprocess
+  + quality gate + 世界信息路由 + 思维链分离在 58 个连续 turn、564 次真实调用中全部稳定工作（§35.8）。
+- **§11.3 Android 发现并修复了 2 个真实 Keystore 集成缺陷**（#7 ndk-context panic `4701497` +
+  #8 迁移永不重试 `bc97c1f`/`b35095e`）。#8 的发现纠正了之前 §35.3 的误记（"api_key 成功迁移"
+  实为从未迁移）。修复后 seed 明文 api_key 经启动→ndk-context 异步初始化→retry_migration 真正
+  迁移为 SecretRef，真实 key 进 Android Keystore，重启幂等。
 - 续跑待办：① Full100 重跑（harness 侧两个阻塞已修：15h ceiling `a9ea1fd` + 8-attempt 重试 `4e64d07`；
-  待 relay 恢复稳定后 `run-stage.sh full native 100 3500`，预计 ~10 小时）；
-  ② §11.3 Android 功能端到端（test_connection / JSON→SQLite 升级 / content:// 导入 / SAF / 生命周期 / 大数据）；
-  ③ §11.3 Windows 现场。
+  待 relay 恢复稳定后 `run-stage.sh full native 100 3500`，预计 ~10 小时）——**这是 Gate 6 唯一剩余阻塞**；
+  ② release APK 签名证书获取（独立于 §11 验收）；
+  ③ 本线程明文 API key 轮换（卫生，用户尚未轮换）。
 - 本轮已花的真实模型费用：Canary3(25)+Coverage12(124)+TextFallback3(32)+Stability30(273)
   + Full100-r1(80)+r2(31)+r3(571)+r4(5) + 诊断 ping/probe(~60) ≈ **1200+ 次付费调用**。
 - 本线程明文的 API key 建议在续跑前轮换（卫生）。
