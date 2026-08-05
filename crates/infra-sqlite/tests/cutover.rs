@@ -896,19 +896,50 @@ fn fresh_start_fault_after_publish_before_marker_recovers_on_restart() {
 }
 
 #[test]
-fn partial_legacy_layout_never_treated_as_fresh() {
-    // 只有部分核心文件（如只剩 cards.json）= 有数据但坏了：必须 fail-closed，
-    // 不得被 fresh-start 分支静默跳过（§12.2「不遇错静默创建空数据库」）。
+fn missing_collections_import_as_empty_like_json_store() {
+    // Gate 7 候选周期发现 #1：JSON store 对缺失集合文件视为空。默认切换后
+    // cutover 必须同口径——只存在 cards.json 的 legacy 树正常迁移，数据不丢。
     let dir = TempDir::new().unwrap();
-    write_json(&dir.path().join("cards.json"), &serde_json::json!([]));
+    write_json(
+        &dir.path().join("cards.json"),
+        &serde_json::json!([{
+            "id": "card-1", "name": "Hero", "source_character_id": null
+        }]),
+    );
+    let request = make_request(dir.path());
+
+    let outcome = run_cutover(&request).unwrap();
+    match outcome {
+        CutoverOutcome::Completed(report) => {
+            assert_eq!(report.cards, 1);
+            assert_eq!(report.campaigns, 0);
+            assert_eq!(report.turns, 0);
+        }
+        CutoverOutcome::AlreadyCutover(_) => panic!("first cutover should complete"),
+    }
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
+#[test]
+fn corrupt_legacy_file_fails_closed_never_treated_as_fresh() {
+    // 有数据但坏了（文件存在且不可解析）：绝不当作空集合吞掉，也绝不当作
+    // 全新用户跳过——必须 fail-closed（§12.2「不遇错静默创建空数据库」）。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &serde_json::json!({"not": "an array"}),
+    );
     let request = make_request(dir.path());
 
     let err = run_cutover(&request).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("source")
-            || err.to_string().to_lowercase().contains("missing")
-            || err.to_string().to_lowercase().contains("import"),
-        "partial legacy layout must fail closed, got: {err}"
+            || err.to_string().to_lowercase().contains("corrupt")
+            || err.to_string().to_lowercase().contains("array"),
+        "corrupt legacy file must fail closed, got: {err}"
     );
     assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
     assert!(!dir.path().join("storyforge.sqlite3").exists());

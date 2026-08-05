@@ -78,15 +78,21 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
         return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
     }
 
-    // 审查一.6：核心布局文件是**必需**的（缺失 → 报错，不得当作空集合）；
-    // 可选集合（mvu / compress_jobs / characters / world_info）保持可选。
-    let cards = read_json_array(data_dir.join("cards.json"), false)?;
-    let campaigns = read_json_array(data_dir.join("campaigns.json"), false)?;
-    let instances = read_json_array(data_dir.join("instances.json"), false)?;
-    let knowledge = read_json_array(data_dir.join("knowledge.json"), false)?;
-    let tasks = read_json_array(data_dir.join("tasks.json"), false)?;
-    let summaries = read_json_array(data_dir.join("round_summaries.json"), false)?;
-    let turns = read_json_array(data_dir.join("turns.json"), false)?;
+    // Gate 7（默认切换）语义变更：核心布局文件从「必需」改为「缺失 = 空
+    // 集合」——与 JSON `CampaignStore` 的 `load_or_default` 完全一致（旧 JSON
+    // 应用把缺失文件当作空数组，正常 legacy 用户可以没有 knowledge/tasks/
+    // round_summaries 等）。「全新用户 vs 坏掉的数据」的区分由 cutover 的
+    // `legacy_json_layout_present` 承担（目录里没有任何 legacy 文件 → fresh
+    // start）；**存在但损坏/不可读**的文件仍 fail-closed（CorruptImportInput），
+    // 绝不把已有数据当作空集合吞掉（§12.2「不遇错静默创建空数据库」只放行
+    // 缺失，不放行损坏）。
+    let cards = read_json_array(data_dir.join("cards.json"), true)?;
+    let campaigns = read_json_array(data_dir.join("campaigns.json"), true)?;
+    let instances = read_json_array(data_dir.join("instances.json"), true)?;
+    let knowledge = read_json_array(data_dir.join("knowledge.json"), true)?;
+    let tasks = read_json_array(data_dir.join("tasks.json"), true)?;
+    let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
+    let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
     let world_info = read_world_info_dir(data_dir.join("campaign_world_info"))?;

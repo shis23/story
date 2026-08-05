@@ -276,15 +276,17 @@ struct SourceSnapshot {
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
-    // 审查一.6：核心布局文件**必需**（缺失 → ImportSourceMissing，不得当作
-    // 空集合）；可选集合（mvu / compress_jobs / characters / world_info）保持可选。
-    let cards = read_json_array(data_dir.join("cards.json"), false)?;
-    let campaigns = read_json_array(data_dir.join("campaigns.json"), false)?;
-    let instances = read_json_array(data_dir.join("instances.json"), false)?;
-    let knowledge = read_json_array(data_dir.join("knowledge.json"), false)?;
-    let tasks = read_json_array(data_dir.join("tasks.json"), false)?;
-    let summaries = read_json_array(data_dir.join("round_summaries.json"), false)?;
-    let turns = read_json_array(data_dir.join("turns.json"), false)?;
+    // Gate 7（默认切换）语义变更：核心布局文件从「必需」改为「缺失 = 空
+    // 集合」，与 readiness / JSON `CampaignStore::load_or_default` 同口径——
+    // 正常 legacy 用户可以没有部分集合文件。缺失放行、**存在但损坏**仍
+    // fail-closed（不把已有数据当空集合吞掉）。
+    let cards = read_json_array(data_dir.join("cards.json"), true)?;
+    let campaigns = read_json_array(data_dir.join("campaigns.json"), true)?;
+    let instances = read_json_array(data_dir.join("instances.json"), true)?;
+    let knowledge = read_json_array(data_dir.join("knowledge.json"), true)?;
+    let tasks = read_json_array(data_dir.join("tasks.json"), true)?;
+    let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
+    let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
     let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
     // 与 readiness 共用读取 + 投影（hash 必须同口径）。

@@ -330,27 +330,27 @@ fn empty_but_valid_layout_imports_cleanly_with_zero_counts() {
 }
 
 #[test]
-fn missing_required_layout_file_fails_closed() {
+fn missing_layout_file_imports_as_empty_like_json_store() {
+    // Gate 7 候选周期发现 #1：JSON `CampaignStore` 用 load_or_default（缺失 =
+    // 空集合）。默认切换后 readiness/importer 同口径——删掉 cards.json 的
+    // legacy 树按空集合导入（其余文件数据保留），不得再 fail-closed 把正常
+    // 旧用户挡在门外。**存在但损坏**仍由 CorruptImportInput fail-closed。
     let dir = TempDir::new().unwrap();
     empty_but_valid_layout(dir.path());
-    // 删掉一个必需文件：不得当作空集合静默通过。
     std::fs::remove_file(dir.path().join("cards.json")).unwrap();
 
-    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
-        .expect_err("missing required layout file must fail the dry run");
-    assert!(
-        err.to_string().to_lowercase().contains("source") || err.to_string().contains("missing"),
-        "error must mention the missing file, got: {err}"
-    );
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect("missing layout file must dry-run as empty (Gate 7)");
+    assert_eq!(report.cards, 0);
+    assert_eq!(report.campaigns, 0);
+    assert!(report.issues.is_empty());
 
     let mut db = Database::open_in_memory().unwrap();
-    let err = JsonImporter::new(&mut db)
+    let imported = JsonImporter::new(&mut db)
         .import_data_dir(dir.path())
-        .expect_err("missing required layout file must fail the import");
-    assert!(
-        err.to_string().to_lowercase().contains("source") || err.to_string().contains("missing"),
-        "error must mention the missing file, got: {err}"
-    );
+        .expect("missing layout file must import as empty (Gate 7)");
+    assert_eq!(imported.cards, 0);
+    assert_eq!(imported.campaigns, 0);
 }
 
 #[test]

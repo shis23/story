@@ -2033,7 +2033,9 @@ mod tests {
     #[test]
     fn sqlite_default_does_not_construct_json_writers() {
         // Gate 7 默认决议（无 env）→ SQLite：数据库 + marker 被创建，JSON
-        // 文件不被触碰（不双写、不删除）。
+        // 文件不被触碰（不双写、不删除）。env=json 显式回退的「不创建任何
+        // 数据库/marker」由 explicit_json_fallback_touches_no_sqlite_with_
+        // legacy_source 覆盖（本测试不 set env，避免与并行测试的 env 竞争）。
         let dir = TempDir::new().unwrap();
         // SAFETY: test-only.
         unsafe {
@@ -2043,18 +2045,6 @@ mod tests {
         assert_eq!(resolution.pinned.backend(), StorageBackend::Sqlite);
         assert!(dir.path().join("storyforge.backend.json").exists());
         assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
-        // 显式 JSON 回退（唯一回退通道）不创建任何数据库/marker。
-        unsafe {
-            std::env::set_var("STORYFORGE_STORAGE_BACKEND", "json");
-        }
-        let json_dir = TempDir::new().unwrap();
-        let json_resolution = resolve_backend_inner(json_dir.path()).unwrap();
-        assert_eq!(json_resolution.pinned.backend(), StorageBackend::Json);
-        assert!(!json_dir.path().join("storyforge.backend.json").exists());
-        assert!(!json_dir.path().join(SQLITE_DB_FILENAME).exists());
-        unsafe {
-            std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
-        }
     }
 
     #[test]
@@ -2402,18 +2392,50 @@ mod tests {
     }
 
     #[test]
-    fn partial_legacy_layout_fails_closed_instead_of_fresh_start() {
-        // 有数据但坏了（只存在部分核心文件）绝不当作新用户静默建空库：
+    fn missing_collections_import_as_empty_like_json_store() {
+        // Gate 7 候选周期发现 #1：JSON `CampaignStore` 用 load_or_default——
+        // 缺失文件 = 空集合，正常 legacy 用户可能没有部分集合文件。默认切换
+        // 下 cutover 必须同口径（缺失放行），否则正常旧用户被挡在门外。
+        let dir = TempDir::new().unwrap();
+        // 只有 cards.json（无 campaigns/knowledge/tasks/summaries/turns/会话）。
+        write_json(
+            &dir.path().join("cards.json"),
+            &serde_json::json!([{
+                "id": "card-1", "name": "Hero", "source_character_id": null
+            }]),
+        );
+        clear_env();
+        let resolution = resolve_backend_inner(dir.path()).unwrap();
+        assert!(resolution.is_sqlite());
+        assert!(resolution.cutover_performed);
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+        // 导入的卡在 SQLite 里可查（数据不丢）。
+        let db =
+            storyforge_infra_sqlite::Database::open(dir.path().join(SQLITE_DB_FILENAME)).unwrap();
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM character_cards", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "cards.json 内容必须被导入，而不是被当作空");
+    }
+
+    #[test]
+    fn corrupt_legacy_file_fails_closed_instead_of_fresh_start() {
+        // 有数据但坏了（文件存在且不可解析）绝不当作空集合静默吞掉：
         // 必须 fail-closed 并给出可操作错误（§12.2「不遇错静默创建空数据库」）。
         let dir = TempDir::new().unwrap();
-        write_json(&dir.path().join("cards.json"), &serde_json::json!([]));
+        write_json(
+            &dir.path().join("cards.json"),
+            &serde_json::json!({"not": "an array"}),
+        );
         clear_env();
         let err = resolve_backend_inner(dir.path()).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("source")
-                || err.to_string().to_lowercase().contains("missing")
-                || err.to_string().to_lowercase().contains("import"),
-            "partial legacy layout must fail closed, got: {err}"
+                || err.to_string().to_lowercase().contains("corrupt")
+                || err.to_string().to_lowercase().contains("import")
+                || err.to_string().to_lowercase().contains("array"),
+            "corrupt legacy file must fail closed, got: {err}"
         );
         // 不得留下任何半成品权威。
         assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());

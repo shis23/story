@@ -2167,8 +2167,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_no_batch_and_missing_campaign_stays_committing() {
-        let fx = Fixture::new("recover_missing_campaign_no_batch");
+    fn recovery_with_missing_campaign_fails_terminal_immediately() {
+        // H-3（2026-08-04 审查修复）：Campaign 已删除 = 该 Turn 永不可恢复，
+        // 启动恢复第一次就标 Failed（不再保持 Committing 跨启动无限重放），
+        // 且不累计 recovery_retries（H-3 注释明确 CampaignNotFound 不计数）。
+        let fx = Fixture::new("recover_missing_campaign_fails");
         let draft = "缺失 Campaign 的旧式空 batch 不得伪装成成功。".repeat(3);
         let variant_id = fx.append_draft(&draft);
         let missing_campaign = Id::from_str("missing-owner-campaign");
@@ -2197,9 +2200,93 @@ mod tests {
 
         fx.service().recover_turns_on_startup(|_| {});
 
+        let after = fx.turn_store.get_turn(&turn_id).unwrap();
         assert_eq!(
-            fx.turn_store.get_turn(&turn_id).unwrap().status,
-            TurnStatus::Committing
+            after.status,
+            TurnStatus::Failed,
+            "缺失 Campaign 的 Turn 必须直接 Failed（H-3），不得保持 Committing"
+        );
+        assert_eq!(
+            after.recovery_retries, 0,
+            "CampaignNotFound 不累计重试计数（H-3）"
+        );
+        assert!(
+            after
+                .failure_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("不存在"),
+            "失败原因必须说明 Campaign 不可恢复: {:?}",
+            after.failure_reason
+        );
+        assert_eq!(
+            after
+                .find_attempt(&Id::from_str("attempt-missing-campaign"))
+                .unwrap()
+                .status,
+            AttemptStatus::Failed
+        );
+    }
+
+    #[test]
+    fn transient_recovery_errors_upgrade_to_failed_after_max_retries() {
+        // H-3：瞬时错误（会话暂不可用 → Storage）保持 Committing 并累计
+        // recovery_retries；超过 MAX_RECOVERY_RETRIES（第 6 次重放）升级
+        // Failed，停止跨启动无限重放。
+        let fx = Fixture::new("recover_transient_retries");
+        let draft = "瞬时错误不得一次就终态化。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let mut record = TurnRecord::new(
+            fx.campaign_id.clone(),
+            Id::from_str("conversation-gone"),
+            Id::from_str("input-transient"),
+            0,
+        );
+        record.status = TurnStatus::Committing;
+        record.intended_terminal_status = Some(TurnStatus::Committed);
+        record.attempts.push(TurnAttempt {
+            attempt_id: Id::from_str("attempt-transient"),
+            variant_id: variant_id.clone(),
+            draft_hash: compute_draft_hash(&draft),
+            status: AttemptStatus::Committing,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "t".into(),
+        });
+        let turn_id = record.turn_id.clone();
+        fx.turn_store.create_turn(record).unwrap();
+
+        for _ in 0..MAX_RECOVERY_RETRIES {
+            fx.service().recover_turns_on_startup(|_| {});
+            let now = fx.turn_store.get_turn(&turn_id).unwrap();
+            assert_eq!(
+                now.status,
+                TurnStatus::Committing,
+                "MAX 次内瞬时错误必须保持可重放"
+            );
+        }
+        assert_eq!(
+            fx.turn_store.get_turn(&turn_id).unwrap().recovery_retries,
+            MAX_RECOVERY_RETRIES
+        );
+
+        fx.service().recover_turns_on_startup(|_| {});
+        let after = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(
+            after.status,
+            TurnStatus::Failed,
+            "超过 MAX_RECOVERY_RETRIES 必须升级 Failed"
+        );
+        assert_eq!(after.recovery_retries, MAX_RECOVERY_RETRIES + 1);
+        assert_eq!(
+            after
+                .find_attempt(&Id::from_str("attempt-transient"))
+                .unwrap()
+                .status,
+            AttemptStatus::Failed
         );
     }
 
