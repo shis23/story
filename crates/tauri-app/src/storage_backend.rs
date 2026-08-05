@@ -1,8 +1,13 @@
 //! Application-level storage backend wiring.
 //!
-//! This module resolves the storage backend at process startup and, when
-//! SQLite is explicitly selected, runs the fail-closed cutover. JSON remains
-//! the production default — no dual-write, no automatic data deletion.
+//! This module resolves the storage backend at process startup. SQLite is the
+//! production default (Gate 7: 默认切换与兼容退场): with no marker and no
+//! explicit override the process runs the fail-closed cutover — migrating a
+//! legacy JSON tree in place, or initializing a fresh empty SQLite authority
+//! for a brand-new user. JSON is retained only as an explicit fallback
+//! (`STORYFORGE_STORAGE_BACKEND=json`, a `JsonAuthoritative` reverse-export
+//! marker, or a settings config value) — no dual-write, no automatic data
+//! deletion.
 //!
 //! After a successful cutover (or when a valid SQLite marker already exists),
 //! `sqlite_runtime` is activated and becomes the sole authority for
@@ -1729,9 +1734,12 @@ fn empty_world_info_book() -> storyforge_domain::world_info::WorldInfoBook {
 
 /// Resolve and pin the storage backend for this process.
 ///
-/// When SQLite is explicitly selected, this also runs the cutover (or verifies
-/// it has already completed). When JSON is selected (the default), no database
-/// is opened and no cutover runs.
+/// SQLite is the default (Gate 7). Running the SQLite branch runs the cutover
+/// (or verifies it has already completed); a directory with no legacy JSON
+/// layout at all is treated as a fresh user and initialized as an empty SQLite
+/// authority. JSON is selected only by an explicit override (`env=json`, a
+/// `JsonAuthoritative` marker, or a settings config value); those paths never
+/// open a database and never run a cutover.
 ///
 /// This function is safe to call multiple times — the first call pins the
 /// backend, and subsequent calls return the cached resolution.
@@ -1764,7 +1772,8 @@ pub fn resolve_backend(data_dir: &Path) -> Result<BackendResolution, BackendWiri
 /// - JsonAuthoritative marker（官方 reverse-cutover 写入）→ JSON 权威；
 ///   env=sqlite 是合法全新 opt-in，可重跑 cutover（forward 路径）；
 /// - Stale marker → 无论 env 是什么都拒绝（JSON 与 SQLite 都不放行）；
-/// - 无 marker → env=sqlite 走 cutover，否则 JSON。
+/// - 无 marker → **默认 SQLite**（Gate 7）：env=json 显式回退走 JSON，
+///   否则走 cutover / 全新用户初始化。
 ///
 /// JSON 与 SQLite 分支在决议成功后都持有进程级 SHARED authority 租约
 /// （`storyforge.authority.lock`），把并发 cutover 挡在门外（审查一.3）。
@@ -1782,7 +1791,7 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
     let pinned_source = pinned.source();
 
     let run_sqlite = || -> Result<BackendResolution, BackendWiringError> {
-        // 运行 cutover（或验证已完成）。
+        // 运行 cutover（或验证已完成；全新目录 → 空 SQLite 权威初始化）。
         let request = CutoverRequest {
             plan: plan.clone(),
             label: "app-startup".to_string(),
@@ -1814,11 +1823,14 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
 
     let run_json = || -> Result<BackendResolution, BackendWiringError> {
         // JSON 权威决议成功：持有进程级 SHARED 租约（普通 JSON 写者进程）。
+        // PinnedBackend::resolve 的默认已翻转为 Sqlite，这里必须显式构造
+        // Json pinned（source 保持 env/default，如实反映选择来源）。
         hold_process_shared_lease(data_dir)
             .map_err(|e| BackendWiringError::Lease(format!("{e}")))?;
-        let diag = BackendDiagnostics::from_pinned(&pinned, None);
+        let json_pinned = PinnedBackend::new(StorageBackend::Json, pinned_source);
+        let diag = BackendDiagnostics::from_pinned(&json_pinned, None);
         Ok(BackendResolution {
-            pinned,
+            pinned: json_pinned,
             db_path: None,
             diagnostics: diag,
             cutover_performed: false,
@@ -1847,10 +1859,12 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
             }
         }
         MarkerStatus::Absent => {
-            if env_backend == StorageBackend::Sqlite && selection.is_explicit() {
-                run_sqlite()
-            } else {
+            // Gate 7 默认：无 marker 时 SQLite 是默认后端（旧 JSON 自动迁移 /
+            // 全新用户初始化）；env=json 是唯一显式回退 JSON 的通道。
+            if env_backend == StorageBackend::Json && selection.is_explicit() {
                 run_json()
+            } else {
+                run_sqlite()
             }
         }
         MarkerStatus::Stale { reason } => {
@@ -1952,7 +1966,9 @@ mod tests {
     }
 
     #[test]
-    fn default_resolution_is_json_without_database() {
+    fn default_resolution_is_sqlite_fresh_start_without_database_source() {
+        // Gate 7：无 env 无 marker 且目录里没有任何 legacy JSON 布局 =
+        // 全新用户 → 直接初始化空 SQLite 权威（不导入、不失败）。
         let dir = TempDir::new().unwrap();
         // Ensure env var is not set.
         // SAFETY: test-only; no concurrent threads depend on this env var.
@@ -1960,11 +1976,31 @@ mod tests {
             std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
         }
         let resolution = resolve_backend_inner(dir.path()).unwrap();
-        assert!(!resolution.is_sqlite());
-        assert!(resolution.db_path.is_none());
-        assert!(!resolution.cutover_performed);
-        // No SQLite file created.
-        assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert!(resolution.is_sqlite());
+        assert!(resolution.db_path.is_some());
+        assert!(resolution.cutover_performed);
+        // Fresh-start created the empty authority DB + marker.
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert!(dir.path().join("storyforge.backend.json").exists());
+    }
+
+    #[test]
+    fn default_resolution_migrates_legacy_json_automatically() {
+        // Gate 7：无 env + 完整 legacy JSON 树 → 自动 cutover，JSON 原样保留。
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        // SAFETY: test-only.
+        unsafe {
+            std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
+        }
+        let resolution = resolve_backend_inner(dir.path()).unwrap();
+        assert!(resolution.is_sqlite());
+        assert!(resolution.cutover_performed);
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert!(dir.path().join("storyforge.backend.json").exists());
+        // 旧 JSON 不被删除（§12.2：不因默认化删除用户旧 JSON）。
+        assert!(dir.path().join("cards.json").exists());
+        assert!(dir.path().join("campaigns.json").exists());
     }
 
     #[test]
@@ -1995,18 +2031,30 @@ mod tests {
     }
 
     #[test]
-    fn no_dual_write_json_stores_not_affected_by_resolution() {
-        // When JSON is selected, resolve_backend must not open any database.
+    fn sqlite_default_does_not_construct_json_writers() {
+        // Gate 7 默认决议（无 env）→ SQLite：数据库 + marker 被创建，JSON
+        // 文件不被触碰（不双写、不删除）。
         let dir = TempDir::new().unwrap();
         // SAFETY: test-only.
         unsafe {
             std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
         }
         let resolution = resolve_backend_inner(dir.path()).unwrap();
-        assert_eq!(resolution.pinned.backend(), StorageBackend::Json);
-        // No marker, no database.
-        assert!(!dir.path().join("storyforge.backend.json").exists());
-        assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert_eq!(resolution.pinned.backend(), StorageBackend::Sqlite);
+        assert!(dir.path().join("storyforge.backend.json").exists());
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+        // 显式 JSON 回退（唯一回退通道）不创建任何数据库/marker。
+        unsafe {
+            std::env::set_var("STORYFORGE_STORAGE_BACKEND", "json");
+        }
+        let json_dir = TempDir::new().unwrap();
+        let json_resolution = resolve_backend_inner(json_dir.path()).unwrap();
+        assert_eq!(json_resolution.pinned.backend(), StorageBackend::Json);
+        assert!(!json_dir.path().join("storyforge.backend.json").exists());
+        assert!(!json_dir.path().join(SQLITE_DB_FILENAME).exists());
+        unsafe {
+            std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
+        }
     }
 
     #[test]
@@ -2227,9 +2275,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_sqlite_marker_wins_over_default_json_without_env() {
-        // 审查核心 bug：重启后无 env 时，默认 JSON 不得重新启用——
-        // 有效 sqlite marker 存在时必须以 SQLite 权威启动。
+    fn valid_sqlite_marker_wins_without_env() {
+        // 审查核心 bug：重启后无 env 时，默认后端不得重新启用——
+        // 有效 sqlite marker 存在时必须以 SQLite 权威启动（Gate 7 后默认
+        // 即 SQLite，本测试继续钉住「marker 优先于任何隐式默认」）。
         let dir = TempDir::new().unwrap();
         sample_source(dir.path());
         set_env_sqlite();
@@ -2241,7 +2290,7 @@ mod tests {
         let resolution = resolve_backend_inner(dir.path()).unwrap();
         assert!(
             resolution.is_sqlite(),
-            "valid sqlite marker must beat default JSON, got {:?}",
+            "valid sqlite marker must beat any default, got {:?}",
             resolution.pinned.backend()
         );
         assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
@@ -2339,16 +2388,55 @@ mod tests {
     }
 
     #[test]
-    fn env_sqlite_without_source_files_fails_closed() {
-        // 空目录（无任何布局文件）+ env=sqlite：不得静默成功，必须报错。
+    fn empty_dir_with_explicit_sqlite_is_fresh_start() {
+        // Gate 7 语义变更：空目录（无任何 legacy 布局）+ env=sqlite 与默认
+        // 一致 → 全新用户初始化，不再 fail-closed（旧行为是防「误建空库」，
+        // 现由「部分布局 fail-closed」承接该保护）。
         let dir = TempDir::new().unwrap();
         set_env_sqlite();
+        let resolution = resolve_backend_inner(dir.path()).unwrap();
+        assert!(resolution.is_sqlite());
+        assert!(resolution.cutover_performed);
+        assert!(dir.path().join(SQLITE_DB_FILENAME).exists());
+        clear_env();
+    }
+
+    #[test]
+    fn partial_legacy_layout_fails_closed_instead_of_fresh_start() {
+        // 有数据但坏了（只存在部分核心文件）绝不当作新用户静默建空库：
+        // 必须 fail-closed 并给出可操作错误（§12.2「不遇错静默创建空数据库」）。
+        let dir = TempDir::new().unwrap();
+        write_json(&dir.path().join("cards.json"), &serde_json::json!([]));
+        clear_env();
         let err = resolve_backend_inner(dir.path()).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("source")
                 || err.to_string().to_lowercase().contains("missing")
                 || err.to_string().to_lowercase().contains("import"),
-            "empty dir + env=sqlite must fail closed, got: {err}"
+            "partial legacy layout must fail closed, got: {err}"
+        );
+        // 不得留下任何半成品权威。
+        assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert!(!dir.path().join("storyforge.backend.json").exists());
+    }
+
+    #[test]
+    fn explicit_json_fallback_touches_no_sqlite_with_legacy_source() {
+        // §12.3：显式回退（env=json）在存在 legacy JSON 数据时直接以 JSON
+        // 权威启动，不创建数据库/marker、不改动 JSON（无数据倒退）。
+        // 注意：JSON→SQLite 的后续切换是跨进程场景（JSON 进程持 SHARED
+        // 租约，进程内 cutover 必须 fail-closed——由 lease 设计保证）。
+        let dir = TempDir::new().unwrap();
+        sample_source(dir.path());
+        set_env_json();
+        let json_resolution = resolve_backend_inner(dir.path()).unwrap();
+        assert!(!json_resolution.is_sqlite());
+        assert!(!dir.path().join(SQLITE_DB_FILENAME).exists());
+        assert!(!dir.path().join("storyforge.backend.json").exists());
+        assert!(dir.path().join("cards.json").exists());
+        assert_eq!(
+            json_resolution.pinned.source(),
+            storyforge_infra_sqlite::backend::BackendSource::Env
         );
         clear_env();
     }

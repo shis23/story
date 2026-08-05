@@ -376,6 +376,188 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     }
 }
 
+/// 全新用户检测：`data_dir` 里是否存在任何 legacy JSON 布局文件。
+///
+/// 覆盖 readiness 的七个核心文件（缺失即 fail-closed）、`conversations/`
+/// 目录、可选集合文件（mvu_translations / compress_jobs / characters）与旧
+/// 版 active 指针。任意一个存在 → 必须走正常 cutover（fail-closed 源校验）；
+/// 全部不存在 → 真正的空白新用户，允许直接初始化空 SQLite 权威。
+fn legacy_json_layout_present(data_dir: &Path) -> bool {
+    const CORE_FILES: [&str; 7] = [
+        "cards.json",
+        "campaigns.json",
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+    ];
+    const OPTIONAL_FILES: [&str; 4] = [
+        "mvu_translations.json",
+        "compress_jobs.json",
+        "characters.json",
+        "active_campaign.json",
+    ];
+    CORE_FILES.iter().any(|name| data_dir.join(name).exists())
+        || data_dir.join("conversations").exists()
+        || data_dir.join("campaign_world_info").exists()
+        || OPTIONAL_FILES
+            .iter()
+            .any(|name| data_dir.join(name).exists())
+}
+
+/// 计算「已迁移空库」的确定性内容 hash（Gate 7 fresh start / 孤儿身份判定）。
+///
+/// 与 `recompute_db_content_hash` 同投影：空库的 hash 只取决于 schema 迁移
+/// 序列，同一版本代码下恒定。因此 fresh cutover 与中断恢复能派生同一身份。
+fn empty_db_content_hash() -> Result<String> {
+    let mut db = Database::open_in_memory()?;
+    crate::migrations::migrate(&mut db)?;
+    recompute_db_content_hash(&db)
+}
+
+/// Gate 7：空白新用户初始化——不导入任何 JSON，直接建立空 SQLite 权威。
+///
+/// 与正式 cutover 共用同一套机制：temp DB → 迁移 → 空 manifest hash →
+/// 身份绑定 + completed import_runs → 备份检查点 → 校验 → 原子发布 → 审计 →
+/// marker 最后写。任一步失败都保持「无 marker、JSON（若存在）仍权威」；
+/// 中断残留可恢复续跑（`orphan_belongs_to_this_cutover` 用同一空 hash 身份
+/// 识别自身产物）。不存在「静默空库顶替用户数据」的路径——本分支只在确认
+/// 目录里没有任何 legacy 布局文件时进入。
+fn run_fresh_start_cutover(
+    request: &CutoverRequest,
+    fault: CutoverFault,
+) -> Result<CutoverOutcome> {
+    let plan = &request.plan;
+
+    // Step F1: 丢弃可能的中断残留 temp DB。
+    discard_temp_db(plan);
+
+    // Step F2: 全新 temp DB（空 schema）+ 身份绑定 + completed import_runs。
+    let mut fresh_db = Database::open(plan.temp_db_path())?;
+    crate::migrations::migrate(&mut fresh_db)?;
+    let schema_version = crate::migrations::current_version(&fresh_db)?;
+
+    // 空 manifest hash：由已迁移的空库确定性重建（与 verify 同投影）。
+    let empty_hash = recompute_db_content_hash(&fresh_db)?;
+    let (authority_id, cutover_nonce) = new_authority_identity(&plan.data_dir, &empty_hash);
+
+    // 与 importer 同形态的 completed import_runs 行（空源、空 hash）——
+    // `verify_imported_database` 与 `validate_marker_db_binding` 都依赖它。
+    let run_id = new_fresh_run_id();
+    let now = chrono::Utc::now().to_rfc3339();
+    fresh_db.connection().execute(
+        "INSERT INTO import_runs \
+         (run_id, source_root, source_manifest_hash, status, started_at, finished_at, error) \
+         VALUES (?1, ?2, ?3, 'completed', ?4, ?5, NULL)",
+        rusqlite::params![
+            run_id,
+            plan.data_dir.display().to_string(),
+            empty_hash,
+            now,
+            now,
+        ],
+    )?;
+    write_authority_binding(&fresh_db, &authority_id, &cutover_nonce)?;
+
+    if fault == CutoverFault::AfterImport {
+        drop(fresh_db);
+        discard_temp_db(plan);
+        return Err(SqliteError::Other(
+            "injected fault: after fresh import".into(),
+        ));
+    }
+
+    // Step F3: 备份检查点（空库的审计轨迹，与正式 cutover 同一目录/格式）。
+    let backup = readiness::create_backup_checkpoint(&fresh_db, &plan.backup_dir, &request.label)?;
+    drop(fresh_db);
+
+    if fault == CutoverFault::AfterBackup {
+        discard_temp_db(plan);
+        return Err(SqliteError::Other(
+            "injected fault: after backup checkpoint".into(),
+        ));
+    }
+
+    // Step F4: 校验空库（schema 版本 + 全零计数 + import_runs/hash 一致）。
+    let verify_db = Database::open(plan.temp_db_path())?;
+    let empty_manifest = SourceManifestReport {
+        manifest_hash: empty_hash.clone(),
+        cards: 0,
+        campaigns: 0,
+        instances: 0,
+        knowledge: 0,
+        tasks: 0,
+        summaries: 0,
+        conversations: 0,
+        turns: 0,
+        characters: 0,
+        issues: Vec::new(),
+    };
+    verify_imported_database(&verify_db, &empty_manifest, schema_version)?;
+    drop(verify_db);
+
+    if fault == CutoverFault::AfterVerify {
+        discard_temp_db(plan);
+        return Err(SqliteError::Other(
+            "injected fault: after verification".into(),
+        ));
+    }
+
+    // Step F5: 原子发布 + 审计 + marker（提交点）。
+    atomic_publish_db(plan, &empty_hash, &authority_id)?;
+
+    if fault == CutoverFault::AfterPublishBeforeMarker {
+        return Err(SqliteError::Other(
+            "injected fault: after publish, before marker".into(),
+        ));
+    }
+
+    audit_published_database(&plan.db_path)?;
+
+    if fault == CutoverFault::AfterAudit {
+        return Err(SqliteError::Other(
+            "injected fault: after audit, before marker".into(),
+        ));
+    }
+
+    let marker = BackendMarker::sqlite(schema_version, &empty_hash, &authority_id, &cutover_nonce);
+    write_marker_atomically(&plan.marker_path(), &marker)?;
+
+    if fault == CutoverFault::AfterMarker {
+        return Err(SqliteError::Other(
+            "injected fault: after marker write".into(),
+        ));
+    }
+
+    let report = CutoverReport::from_manifest_and_import(
+        &empty_manifest,
+        schema_version,
+        false,
+        &backup.label,
+    );
+    Ok(CutoverOutcome::Completed(report))
+}
+
+/// Fresh-start import_runs run id（与 importer 同风格，不引入 uuid 依赖）。
+fn new_fresh_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("fresh-{nanos:x}")
+}
+
+///
+/// 重新计算源 JSON 的 manifest hash（与正式 cutover 同一 readiness 路径），派生
+/// authority_id（与 `new_authority_identity` 同一确定性公式），再用只读探测查
+/// 孤儿 DB 的 authority_binding 是否匹配。
+///
+/// - 匹配 → 这是本次 cutover 的中断残留，可恢复（`run_cutover` 继续，发布时
+///   `owned_by_storyforge_readonly` 让旧 DB 让位）。
+/// - 不匹配 / 打不开 → 非本次 cutover 的孤儿 DB（不同 data_dir 或不同源派生），
+///   必须 fail closed（绝不静默覆盖）。
 /// 三审3：判断 marker 缺失时残留的孤儿 DB 是否**属于本次 cutover**。
 ///
 /// 重新计算源 JSON 的 manifest hash（与正式 cutover 同一 readiness 路径），派生
@@ -386,7 +568,18 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
 ///   `owned_by_storyforge_readonly` 让旧 DB 让位）。
 /// - 不匹配 / 打不开 → 非本次 cutover 的孤儿 DB（不同 data_dir 或不同源派生），
 ///   必须 fail closed（绝不静默覆盖）。
+///
+/// Gate 7（默认切换）：全新用户目录（无任何 legacy 布局文件）改用「已迁移空库
+/// 的确定性 hash」派生身份，使中断的 fresh cutover 同样可恢复续跑。
 fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
+    if !legacy_json_layout_present(&plan.data_dir) {
+        // 源 manifest 无法对空目录计算（核心文件必需），改用空库 hash。
+        let Ok(empty_hash) = empty_db_content_hash() else {
+            return false;
+        };
+        let (authority_id, _nonce) = new_authority_identity(&plan.data_dir, &empty_hash);
+        return orphan_db_matches_authority(&plan.db_path, &authority_id);
+    }
     // 源 manifest 必须可计算（否则连 cutover 都进不去，交由后续步骤报错）。
     let Ok(manifest) = readiness::validate_source_manifest(&plan.data_dir) else {
         return false;
@@ -664,6 +857,15 @@ pub fn run_cutover_with_fault(
         return Err(SqliteError::Other(
             "injected fault: after lock acquisition".into(),
         ));
+    }
+
+    // ── Step 1.5: 空白新用户 → 直接初始化空 SQLite 权威（Gate 7 默认切换）──
+    // 无 marker 且目录里没有任何 legacy JSON 布局文件 = 全新用户：不存在可
+    // 导入的旧数据，直接建立空 SQLite 权威（空库 + 身份绑定 + marker），
+    // 跳过 JSON 导入。部分布局（缺核心文件）仍走下方 fail-closed 校验——
+    // 绝不把「有数据但坏了」误判成「新用户」而静默建空库。
+    if !legacy_json_layout_present(&plan.data_dir) {
+        return run_fresh_start_cutover(request, fault);
     }
 
     // ── Step 2: Dry-run JSON validation ──────────────────────────────

@@ -1,5 +1,6 @@
-//! Backend selector tests: default JSON, explicit SQLite, unknown rejection,
-//! no dual-write, runtime switch rejection, diagnostics secret redaction.
+//! Backend selector tests: default SQLite (Gate 7), explicit JSON fallback,
+//! unknown rejection, no dual-write, runtime switch rejection, diagnostics
+//! secret redaction.
 
 use storyforge_infra_sqlite::backend::{
     BackendDiagnostics, BackendSelection, BackendSource, DEFAULT_BACKEND_ENV_VAR, PinnedBackend,
@@ -8,7 +9,7 @@ use storyforge_infra_sqlite::backend::{
 use tempfile::TempDir;
 
 #[test]
-fn default_backend_is_json() {
+fn explicit_json_backend_is_selectable() {
     let pinned = PinnedBackend::new(StorageBackend::Json, BackendSource::Default);
     assert_eq!(pinned.backend(), StorageBackend::Json);
     assert!(!pinned.is_sqlite());
@@ -25,6 +26,20 @@ fn explicit_sqlite_from_config_value() {
     let sel = BackendSelection::from_env(Some("sqlite".into()));
     let pinned = PinnedBackend::resolve(&sel).unwrap();
     assert_eq!(pinned.backend(), StorageBackend::Sqlite);
+    assert_eq!(pinned.source(), BackendSource::Config);
+}
+
+#[test]
+fn explicit_json_from_config_value() {
+    // Ensure the env var is not set so config_value is used.
+    // SAFETY: this is a test; we remove and restore the env var. No other thread
+    // depends on it during this test.
+    unsafe {
+        std::env::remove_var(DEFAULT_BACKEND_ENV_VAR);
+    }
+    let sel = BackendSelection::from_env(Some("json".into()));
+    let pinned = PinnedBackend::resolve(&sel).unwrap();
+    assert_eq!(pinned.backend(), StorageBackend::Json);
     assert_eq!(pinned.source(), BackendSource::Config);
 }
 
@@ -70,7 +85,9 @@ fn no_dual_write_selector_does_not_open_database() {
     let _dir = TempDir::new().unwrap();
     let sel = BackendSelection::from_env(None);
     let pinned = PinnedBackend::resolve(&sel).unwrap();
-    assert_eq!(pinned.backend(), StorageBackend::Json);
+    // Gate 7: 无任何显式选择时默认 SQLite。
+    assert_eq!(pinned.backend(), StorageBackend::Sqlite);
+    assert_eq!(pinned.source(), BackendSource::Default);
 }
 
 #[test]

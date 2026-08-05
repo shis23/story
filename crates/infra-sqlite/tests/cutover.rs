@@ -797,3 +797,151 @@ fn blank_new_user_without_db_is_absent_not_stale() {
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
 }
+
+// ── Gate 7: fresh-start（空白新用户 → 空 SQLite 权威）────────────────
+
+#[test]
+fn fresh_start_completes_and_writes_marker() {
+    // 空目录（无任何 legacy JSON 布局）= 全新用户：直接初始化空 SQLite 权威，
+    // 不导入、不报「源缺失」错误。
+    let dir = TempDir::new().unwrap();
+    let request = make_request(dir.path());
+
+    let outcome = run_cutover(&request).unwrap();
+    match outcome {
+        CutoverOutcome::Completed(report) => {
+            assert_eq!(report.cards, 0);
+            assert_eq!(report.campaigns, 0);
+            assert_eq!(report.conversations, 0);
+            assert!(report.schema_version >= 3);
+            assert!(!report.manifest_hash.is_empty());
+        }
+        CutoverOutcome::AlreadyCutover(_) => panic!("first fresh start should complete"),
+    }
+
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+    assert!(dir.path().join("storyforge.sqlite3").exists());
+    // 没有任何 JSON 文件被创建（不双写）。
+    assert!(!dir.path().join("cards.json").exists());
+    assert!(!dir.path().join("campaigns.json").exists());
+}
+
+#[test]
+fn fresh_start_is_idempotent_on_restart() {
+    let dir = TempDir::new().unwrap();
+    let request = make_request(dir.path());
+
+    let first = run_cutover(&request).unwrap();
+    assert!(matches!(first, CutoverOutcome::Completed(_)));
+
+    // 重启：marker 在握 → 只审计，不重跑 fresh 初始化。
+    let second = run_cutover(&request).unwrap();
+    assert!(
+        matches!(second, CutoverOutcome::AlreadyCutover(_)),
+        "fresh start must be idempotent on restart"
+    );
+}
+
+#[test]
+fn fresh_start_fault_after_import_leaves_no_authority() {
+    // 全新初始化在 import 阶段注入故障：不得留下 marker / 最终 DB。
+    let dir = TempDir::new().unwrap();
+    let request = make_request(dir.path());
+
+    let err = run_cutover_with_fault(&request, CutoverFault::AfterImport).unwrap_err();
+    assert!(err.to_string().contains("after fresh import"));
+
+    assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+    assert!(!dir.path().join("storyforge.sqlite3.cutover-tmp").exists());
+}
+
+#[test]
+fn fresh_start_fault_after_publish_before_marker_recovers_on_restart() {
+    // 最危险窗口：空库已发布但 marker 未写。重启后孤儿 DB 必须被识别为
+    // 「本次 fresh cutover 的自身产物」（空 hash 身份派生）并恢复续跑，
+    // 绝不 fail-closed 卡死新用户。
+    let dir = TempDir::new().unwrap();
+    let request = make_request(dir.path());
+
+    let err = run_cutover_with_fault(&request, CutoverFault::AfterPublishBeforeMarker).unwrap_err();
+    assert!(err.to_string().contains("before marker"));
+    // 孤儿 DB 存在但无 marker → Stale（ambiguous），与正式 cutover 同语义。
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::Stale { .. }
+    ));
+    assert!(dir.path().join("storyforge.sqlite3").exists());
+
+    // 重启：run_cutover 识别自身产物 → 恢复 → 完成。
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+
+    // 恢复后的库是有效的空库（schema 版本正确、计数为零）。
+    let db = Database::open(dir.path().join("storyforge.sqlite3")).unwrap();
+    let version = current_version(&db).unwrap();
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM character_cards", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(version >= 3);
+}
+
+#[test]
+fn partial_legacy_layout_never_treated_as_fresh() {
+    // 只有部分核心文件（如只剩 cards.json）= 有数据但坏了：必须 fail-closed，
+    // 不得被 fresh-start 分支静默跳过（§12.2「不遇错静默创建空数据库」）。
+    let dir = TempDir::new().unwrap();
+    write_json(&dir.path().join("cards.json"), &serde_json::json!([]));
+    let request = make_request(dir.path());
+
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("source")
+            || err.to_string().to_lowercase().contains("missing")
+            || err.to_string().to_lowercase().contains("import"),
+        "partial legacy layout must fail closed, got: {err}"
+    );
+    assert_eq!(inspect_marker(&request.plan), MarkerStatus::Absent);
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+}
+
+#[test]
+fn orphan_fresh_cutover_identity_does_not_match_foreign_db() {
+    // 孤儿 DB 身份防护也覆盖 fresh 分支：不属于本次空 hash 身份的数据库
+    // （如别处复制来的正式 cutover 产物）绝不能被当作 fresh 残留放行。
+    // 先做一个**正式 cutover**（有源数据），把其 DB 复制到另一个全新目录，
+    // 再对该全新目录跑 cutover → 必须 fail-closed（不是自身产物）。
+    let src = TempDir::new().unwrap();
+    sample_source(src.path());
+    let src_request = make_request(src.path());
+    run_cutover(&src_request).unwrap();
+
+    let target = TempDir::new().unwrap();
+    fs::copy(
+        src.path().join("storyforge.sqlite3"),
+        target.path().join("storyforge.sqlite3"),
+    )
+    .unwrap();
+    let target_request = make_request(target.path());
+
+    // 无 marker + 存在 StoryForge DB → Stale；不是 fresh 空库身份 → 拒绝。
+    assert!(matches!(
+        inspect_marker(&target_request.plan),
+        MarkerStatus::Stale { .. }
+    ));
+    let err = run_cutover(&target_request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "foreign StoryForge DB must fail closed, got: {err}"
+    );
+}

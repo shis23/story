@@ -1,11 +1,13 @@
-//! Typed storage backend selector for the opt-in SQLite path.
+//! Typed storage backend selector.
 //!
-//! JSON remains the production default. SQLite is only selected when an explicit
-//! override is present. The selector is resolved once at process startup and is
-//! fixed for the process lifetime — runtime switching is rejected.
+//! SQLite is the production default (Gate 7: 默认切换与兼容退场). JSON is
+//! selected only through an explicit override (`STORYFORGE_STORAGE_BACKEND=json`),
+//! a `JsonAuthoritative` marker written by the official reverse export, or a
+//! settings-file config value. The selector is resolved once at process startup
+//! and is fixed for the process lifetime — runtime switching is rejected.
 //!
 //! This module never opens a database or performs I/O. It only parses and
-//! validates the selection, keeping the default path free of SQLite coupling.
+//! validates the selection, keeping the default path free of JSON coupling.
 
 use std::env;
 use std::fmt;
@@ -14,16 +16,14 @@ use serde::{Deserialize, Serialize};
 
 /// The configured storage backend.
 ///
-/// `Json` is the serde default and the value used when no selector is present.
+/// `Sqlite` is the serde default and the value used when no selector is present.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    /// The default production backend (JSON files).
-    #[default]
+    /// The legacy JSON backend; selected only by explicit override / marker.
     Json,
-    /// The opt-in transactional backend (SQLite).
-    ///
-    /// Requires an explicit configuration override; never chosen implicitly.
+    /// The default transactional backend (SQLite).
+    #[default]
     Sqlite,
 }
 
@@ -76,7 +76,7 @@ pub enum BackendSelectionError {
 /// 1. `config_value` (from a settings file / explicit struct field)
 /// 2. `env_value` (from `env_name`)
 ///
-/// When both are absent the default (`Json`) is used.
+/// When both are absent the default (`Sqlite`) is used.
 #[derive(Debug, Clone, Default)]
 pub struct BackendSelection {
     /// Value parsed from an explicit config field, if any.
@@ -107,7 +107,7 @@ impl BackendSelection {
         Self::from_env_with(config_value, DEFAULT_BACKEND_ENV_VAR)
     }
 
-    /// Resolve the final backend, defaulting to JSON when nothing is set.
+    /// Resolve the final backend, defaulting to SQLite when nothing is set.
     pub fn resolve(&self) -> Result<StorageBackend, BackendSelectionError> {
         if let Some(raw) = &self.env_value {
             return StorageBackend::parse(raw);
@@ -115,7 +115,7 @@ impl BackendSelection {
         if let Some(raw) = &self.config_value {
             return StorageBackend::parse(raw);
         }
-        Ok(StorageBackend::Json)
+        Ok(StorageBackend::Sqlite)
     }
 
     /// Whether the selection is explicit (i.e. not just the default).
@@ -124,7 +124,7 @@ impl BackendSelection {
     }
 }
 
-/// Canonical environment variable name for the opt-in override.
+/// Canonical environment variable name for the explicit override.
 pub const DEFAULT_BACKEND_ENV_VAR: &str = "STORYFORGE_STORAGE_BACKEND";
 
 /// Fixed, process-lifetime backend guard.
@@ -172,7 +172,7 @@ impl PinnedBackend {
             return Ok(PinnedBackend::new(backend, BackendSource::Config));
         }
         Ok(PinnedBackend::new(
-            StorageBackend::Json,
+            StorageBackend::Sqlite,
             BackendSource::Default,
         ))
     }
@@ -216,18 +216,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_backend_is_json() {
-        assert_eq!(StorageBackend::default(), StorageBackend::Json);
+    fn default_backend_is_sqlite() {
+        assert_eq!(StorageBackend::default(), StorageBackend::Sqlite);
     }
 
     #[test]
-    fn serde_uses_lowercase_and_defaults_to_json() {
+    fn serde_uses_lowercase_and_defaults_to_sqlite() {
         let json: StorageBackend = serde_json::from_str("\"json\"").unwrap();
         assert_eq!(json, StorageBackend::Json);
         let sqlite: StorageBackend = serde_json::from_str("\"sqlite\"").unwrap();
         assert_eq!(sqlite, StorageBackend::Sqlite);
         let defaulted: StorageBackend = serde_json::from_str("null").unwrap_or_default();
-        assert_eq!(defaulted, StorageBackend::Json);
+        assert_eq!(defaulted, StorageBackend::Sqlite);
         assert_eq!(
             serde_json::to_string(&StorageBackend::Sqlite).unwrap(),
             "\"sqlite\""
@@ -253,15 +253,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_defaults_to_json_when_nothing_set() {
+    fn resolve_defaults_to_sqlite_when_nothing_set() {
         let sel = BackendSelection {
             config_value: None,
             env_value: None,
             env_name: DEFAULT_BACKEND_ENV_VAR,
         };
         let pinned = PinnedBackend::resolve(&sel).unwrap();
-        assert_eq!(pinned.backend(), StorageBackend::Json);
+        assert_eq!(pinned.backend(), StorageBackend::Sqlite);
         assert_eq!(pinned.source(), BackendSource::Default);
+        assert!(pinned.is_sqlite());
+    }
+
+    #[test]
+    fn resolve_explicit_json_from_config() {
+        let sel = BackendSelection {
+            config_value: Some("json".into()),
+            env_value: None,
+            env_name: DEFAULT_BACKEND_ENV_VAR,
+        };
+        let pinned = PinnedBackend::resolve(&sel).unwrap();
+        assert_eq!(pinned.backend(), StorageBackend::Json);
+        assert_eq!(pinned.source(), BackendSource::Config);
         assert!(!pinned.is_sqlite());
     }
 

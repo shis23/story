@@ -1161,23 +1161,18 @@ pub fn run() {
                 if let Some(main) = app.get_webview_window("main") {
                     let _ = main.with_webview(|webview| {
                         webview.jni_handle().exec(|env, activity, _webview| {
-                            static CTX_REF: std::sync::OnceLock<
-                                Option<jni::objects::GlobalRef>,
-                            > = std::sync::OnceLock::new();
+                            static CTX_REF: std::sync::OnceLock<Option<jni::objects::GlobalRef>> =
+                                std::sync::OnceLock::new();
                             CTX_REF.get_or_init(|| {
                                 let global = env.new_global_ref(activity).ok()?;
                                 let vm = env.get_java_vm().ok()?;
-                                let vm_ptr =
-                                    vm.get_java_vm_pointer() as *mut std::ffi::c_void;
-                                let ctx_ptr =
-                                    global.as_obj().as_raw() as *mut std::ffi::c_void;
+                                let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
+                                let ctx_ptr = global.as_obj().as_raw() as *mut std::ffi::c_void;
                                 // SAFETY: vm_ptr is a valid JavaVM* and ctx_ptr is a
                                 // global-ref to the Activity Context. Both outlive the
                                 // process (CTX_REF is a static OnceLock, never dropped).
                                 unsafe {
-                                    ndk_context::initialize_android_context(
-                                        vm_ptr, ctx_ptr,
-                                    );
+                                    ndk_context::initialize_android_context(vm_ptr, ctx_ptr);
                                 }
                                 Some(global)
                             });
@@ -1208,14 +1203,17 @@ pub fn run() {
             let data_dir = initialize_app_data_dir(framework_data_dir.as_deref())
                 .map_err(std::io::Error::other)?;
 
-            // Resolve storage backend before any store recovery. JSON remains
-            // default; explicit SQLite selection activates a fail-closed,
-            // process-owned production boundary (no dual-write).
+            // Resolve storage backend before any store recovery. SQLite is the
+            // default (Gate 7); JSON is retained as an explicit fallback
+            // (STORYFORGE_STORAGE_BACKEND=json). SQLite startup activates a
+            // fail-closed, process-owned production boundary (no dual-write);
+            // a legacy JSON tree is migrated in place, a fresh directory is
+            // initialized as an empty SQLite authority.
             //
             // Android-only debug bridge: the launch environment cannot be set
             // from adb (am start does not inherit the caller's env), so to allow
-            // on-device field verification of the SQLite opt-in / JSON→SQLite
-            // cutover we also honor the system property
+            // on-device field verification of the JSON→SQLite cutover and the
+            // explicit fallback we also honor the system property
             // `debug.storyforge.storage_backend` (json|sqlite). It only feeds the
             // same env var the production code already reads; it adds no new
             // authority path and is a no-op on release builds where the property
