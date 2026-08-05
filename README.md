@@ -17,8 +17,8 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 
 - 多角色 Campaign 写作、重 roll、QualityGate、1× Editor auto-fix、私密知识归属门禁与 Editor redaction 已接入。
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
-- M5 endurance runner 已合入；真实 Full 证据为 45/100 Accept，仍是 Partial Evidence。
-- 默认存储仍是 JSON；SQLite 是显式 opt-in 后端，已覆盖 cutover、Accept、recovery、barrier 和 reverse export，完整 draft/postprocess 生命周期仍需继续统一。
+- M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康），仍在续跑中（见 docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md §35）。
+- **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
 - 发布脚本、Gitea workflow、导入兼容矩阵和插件兼容矩阵已具备确定性门禁；真实 GUI、Gitea runner、Android 真机和完整生产 Postprocess 证据仍未关闭。
 
 ## 技术栈
@@ -27,7 +27,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - Tauri v2，175 个 command。
 - Vue 3 + Pinia + Vite + Tailwind v4。
 - OpenAI-compatible LLM API。
-- 默认 JSON 存储；opt-in SQLite/WAL 基础设施。
+- 默认 SQLite/WAL 存储；JSON 保留为显式回退与迁移/反向导出源。
 - 关键词、向量、ContextEpoch 与 Chronicle A/B/C 记忆路径。
 
 ## 快速启动
