@@ -145,7 +145,16 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     // importer 的 `campaigns.card_id` FK 硬失败会让默认迁移卡死且无诊断。
     let card_ids: HashSet<String> = cards
         .iter()
-        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|c| {
+            // 与 strict_validate_entries("cards") 同口径：id 可能在顶层或
+            // `{"card": {...}}` 包裹内层。
+            let inner = match c.get("card") {
+                None => c,
+                Some(card) if card.is_object() => card,
+                _ => c,
+            };
+            inner.get("id").and_then(|v| v.as_str()).map(str::to_string)
+        })
         .collect();
     let mut skipped: Vec<(&'static str, usize)> = Vec::new();
     let campaigns = filter_campaigns_without_card(campaigns, &card_ids, &mut skipped);

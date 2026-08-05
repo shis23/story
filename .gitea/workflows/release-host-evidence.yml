@@ -6,6 +6,12 @@
 #
 # This workflow does NOT sign, publish, deploy, install to a device, or run GUI
 # acceptance. It may only claim host evidence and (when produced) an unsigned APK.
+#
+# 2026-08-05 Gate 8 审查 P2-F2：本 workflow 引用 GitHub 官方 actions
+# （dtolnay/rust-toolchain、actions/setup-node、actions/upload-artifact），
+# 与 ci-gates.yml 的「github.com 不可达、需手写安装」约束不同——仅在 Gitea
+# 实例配置了 actions 镜像时才可 dispatch；未配置镜像时本 workflow 不可用，
+# 发布证据以本机手工 run-android-smoke/run-release-build 为准。
 name: release-host-evidence
 
 on:

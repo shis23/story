@@ -70,8 +70,8 @@ function Invoke-CargoSmoke {
         if ($exitCode -ne 0) {
             throw "Meta smoke step '$Label' failed with exit code $exitCode."
         }
-        # Gate 8 审查 P2-D4: filter 无匹配时 cargo 报 "0 tests" 且 exit 0，
-        # 脚本会静默假绿——显式断言至少运行 1 个测试。
+        # Gate 8 review P2-D4: cargo reports "0 tests" with exit 0 when a
+        # filter matches nothing; fail instead of silently passing.
         $outputText = $output -join "`n"
         if ($outputText -match 'running 0 tests' -or $outputText -match 'test result: ok\. 0 passed') {
             throw "Meta smoke step '$Label' ran 0 tests (filter '$Filter' matched nothing); update or remove the stale filter."

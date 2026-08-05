@@ -133,7 +133,10 @@ impl HttpLlmClient {
     /// 复用同步 client（带 timeout）。失败时返回错误（调用方可回退模板兜底）。
     pub async fn fetch_models(&self, raw_base_url: &str) -> Result<Vec<String>, LlmError> {
         let models_url = normalize_models_url(raw_base_url);
-        debug!(target: "infra-llm", "fetch_models: GET {models_url}");
+        // Gate 8 审查 P3-1：凭据可能嵌在 base_url（user:pass@host）——日志
+        // 只记 host/path，绝不记录 userinfo。
+        let log_url = models_url.rsplit('@').next().unwrap_or(&models_url);
+        debug!(target: "infra-llm", "fetch_models: GET {log_url}");
 
         let resp = self
             .client

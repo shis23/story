@@ -1,5 +1,6 @@
 [package]
 name = "storyforge-app-memory"
+publish = false
 version.workspace = true
 edition.workspace = true
 

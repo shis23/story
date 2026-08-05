@@ -10,7 +10,8 @@ files. LLM_TOOL_MODE is optional and is passed through when present.
 
 .PARAMETER Suite
 Comma-separated suite names to run. Available suites:
-knowledge, t1, t2, t3, c1, c6, c7, i1, all. Defaults to knowledge.
+knowledge, t1, t2, t3, c1, c6, c7, i1, m5, eval, endurance, all. Defaults to knowledge.
+(2026-08-05 Gate 8 review P3-10: m5/eval/endurance are real-model exploratory probes; they need explicit env authorization.)
 
 .PARAMETER List
 Prints available suites and exits.
@@ -309,8 +310,8 @@ function Invoke-SmokeSuite {
     }
 
     $suiteEndedAt = Get-Date
-    # Gate 8 审查 P2-D4: filter 无匹配时 cargo 报 "0 tests" 且 exit 0，
-    # 脚本会静默假绿——显式断言至少运行 1 个测试。
+    # Gate 8 review P2-D4: cargo reports "0 tests" with exit 0 when a
+    # filter matches nothing; fail instead of silently passing.
     if ($null -ne $output) {
         $outputText = $output -join "`n"
         if ($outputText -match 'running 0 tests' -or $outputText -match 'test result: ok\. 0 passed') {
@@ -319,7 +320,7 @@ function Invoke-SmokeSuite {
     }
     if ($exitCode -eq 0) {
         if ($SuiteName -eq 'm5' -or $SuiteName -eq 'eval' -or $SuiteName -eq 'endurance') {
-            # M5/eval 是真实模型探索性探针：exit 0 = 探针执行通过，不等于完整验收通过
+            # M5/eval are real-model exploratory probes: exit 0 = probe executed,
             Write-Host ("OK: suite {0} probe execution passed (acceptance may still be Partial Evidence / Inconclusive)." -f $SuiteName) -ForegroundColor Green
             $status = 'PROBE_PASS'
         } else {
@@ -434,7 +435,7 @@ try {
         if (-not $endOn -and -not $DryRun) {
             throw 'Suite endurance requires STORYFORGE_EVAL_REAL_LLM=1 (explicit paid-model authorization).'
         }
-        # endurance builds the character in code — no fixture PNG required.
+        # endurance builds the character in code - no fixture PNG required.
         $endStage = Get-RequiredEnv -Name 'STORYFORGE_EVAL_ENDURANCE_STAGE'
         if ($null -eq $endStage) {
             $endStage = 'canary'
@@ -536,8 +537,9 @@ try {
     exit 0
 } catch {
     Write-Host ''
-    # Write-Error 在 ErrorActionPreference=Stop 下会再次抛出并丢失原始异常上下文;
-    # 直接写 host 流 + 显式退出码,保证失败信息可见且退出码确定。
+    # Write-Error would rethrow under ErrorActionPreference=Stop and lose the
+    # original exception context; write to the host stream + explicit exit code
+    # so the failure message is visible and the exit code is deterministic.
     Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
     exit 1
 }

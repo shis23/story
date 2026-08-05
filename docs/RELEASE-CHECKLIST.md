@@ -3,6 +3,11 @@
 > 状态：2026-08-05 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。SQLite 当前事实见 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`（`SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md` 为历史审计，已挂「已被取代」横幅）。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
+>
+> 2026-08-05 Gate 8 审查 P2-F1：Windows 门禁（Pester 套件 / secret scan / workflow
+> YAML 校验）在 CI 上**实际不执行**——本部署无 Windows runner（windows-gates.yml
+> 头注释明示）。以上门禁为本机手工门禁，发布记录以本机 `verify-release.ps1` 输出为准，
+> 不得把「PR 合并」解读为 Windows 门禁已过。
 
 ## 状态说明
 

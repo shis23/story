@@ -1309,7 +1309,7 @@ impl CampaignStore {
                 return Ok(UpsertResult::AlreadyPresent);
             }
             return Ok(UpsertResult::Conflict(format!(
-                "summary campaign={}? turn={} 已存在但 payload 不一致",
+                "summary campaign={} turn={} 已存在但 payload 不一致",
                 summary.campaign_id, summary.turn
             )));
         }

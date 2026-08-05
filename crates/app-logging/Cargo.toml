@@ -1,5 +1,6 @@
 [package]
 name = "storyforge-app-logging"
+publish = false
 version.workspace = true
 edition.workspace = true
 

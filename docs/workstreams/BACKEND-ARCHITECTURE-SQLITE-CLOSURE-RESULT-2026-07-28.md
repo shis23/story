@@ -1954,7 +1954,7 @@ debug APK 默认开启）用原始 WebSocket + CDP `Runtime.evaluate` 直接驱�
 | 5 | Full100 r3 fail-closed turn 59：harness suite 硬时限 6h 撞顶（turn 1-58 全健康） | `hard_deadline_override` 对所有 stage 统一 `.min(6h)`；Full 100 turn 在 `reasoning_effort=max` 下实测 ~6.2 min/turn，100 turn 需 ~10.3h，6h 上限数学上不可达 | Full stage 的 ceiling 从 6h 提到 15h（其他 stage 保持 6h 不变）；实测 ~10.3h 需求 + 重试余量 | 判别测试 `full_stage_hard_deadline_accommodates_one_hundred_turns_at_max_reasoning_pace`：Full@100turns → 12h≤d≤15h（旧 6h RED）；Stability/Coverage/Canary 同 budget → 精确 bind 6h（证明只放宽 Full）；LongCoverage 仍 24h。提交 `a9ea1fd` |
 | 6 | Full100 r4 fail-closed turn 1：relay ~10min 崩溃窗口 > 5-attempt 重试总跨度 ~9.5min | `MAX_WRITE_ATTEMPTS=5` + backoff 5/15/30/60s 总跨度仅 ~9.5min，无法穿越 relay 的分钟级持续崩溃窗口 | `MAX_WRITE_ATTEMPTS` 5→8，backoff 增加 120s(attempt5)/240s(attempt6-7) 尾部，总跨度 ~25min；仅测试 harness 参数（生产代码无此循环，不影响用户行为）；预算仍有限，持续崩溃仍诚实 fail-closed | 判别测试 `transient_write_retries_use_recovery_sized_backoff`：新增 120/240s 档位断言 + backoff 单调非递减校验；`write_retry_policy_is_typed...` 循环自动适配 8。提交 `4e64d07` |
 | 7 | §11.3 Android SIGABRT：首次访问 Keystore 时 `ndk_context::android_context()` panic | StoryForge 用 `android_native_keyring_store` 存 API key 到 Android Keystore，但从未调用 `ndk_context::initialize_android_context()`；`Store::new()` 内部 panic（非 Err），使 `.map_err()` 和 `warn!` 守卫成死代码 | 两步：① `secret_store.rs` Android 分支 `catch_unwind` 把 panic 转 Err（app 不崩，api_key 保持明文）；② `lib.rs` setup hook 从 webview JniHandle 获取 JavaVM+Activity Context 调用 `initialize_android_context`（Keystore 真正可用） | 判别测试：`resolve_secret_value_passes_plaintext_through` + `plaintext_starting_with_sk_is_not_treated_as_secret_ref`（3 passed desktop）。提交 `4701497`。**注：** 本条原始记录误记"api_key 成功迁移为 SecretRef"——实测在 #8 修复前该迁移从未发生（见 #8） |
-| 8 | §11.3 Android Keystore 迁移永不重试：seed 明文 api_key 启动后永远保持明文（重启也不迁移） | `ensure_native_store` 用 `OnceLock<Result<(),String>>::get_or_init` **永久缓存首次 Err**（#7 的 catch_unwind 失败）；ndk-context 异步初始化完成后，`ensure_native_store` 仍返回缓存 Err → `migrate_plaintext_api_keys` 永远跳过 | `ensure_with_init` 只缓存成功（`OnceLock<()>` 标志位），失败每次重试；`ConnectionStore::retry_migration()` 幂等重跑；setup hook 末尾 spawn 轮询线程等 `NDK_CONTEXT_READY` flag（JNI 回调设置）后在正常线程触发迁移（race-safe：回调不再直接 `get_conn_store()` 以免 `get_app_data_dir()` panic） | 判别测试 `ensure_does_not_cache_failure_and_recovers_on_retry`（fails-first-then-succeeds init；旧实现永久 Err）。真机现场：seed 明文 → 启动 → api_key 迁移为 SecretRef（真实 key 进 Keystore）+ 重启幂等。提交 `bc97c1f`（核心）+ `b35095e`（race-safe）+ `c6af230`（属性桥） |
+| 8 | §11.3 Android Keystore 迁移永不重试：seed 明文 api_key 启动后永远保持明文（重启也不迁移） | `ensure_native_store` 用 `OnceLock<Result<(),String>>::get_or_init` **永久缓存首次 Err**（#7 的 catch_unwind 失败）；ndk-context 异步初始化完成后，`ensure_native_store` 仍返回缓存 Err → `migrate_plaintext_api_keys` 永远跳过 | `ensure_with_init` 只缓存成功（`OnceLock<()>` 标志位），失败每次重试；`ConnectionStore::retry_migration()` 幂等重跑；setup hook 末尾 spawn 轮询线程等 `NDK_CONTEXT_READY` flag（JNI 回调设置）后在正常线程触发迁移（race-safe：回调不再直接 `get_conn_store()` 以免 `get_app_data_dir()` panic） | 判别测试 `ensure_does_not_cache_failure_and_recovers_on_retry`（fails-first-then-succeeds init；旧实现永久 Err）。模拟器现场（emulator-5554）：seed 明文 → 启动 → api_key 迁移为 SecretRef（真实 key 进 Keystore）+ 重启幂等。提交 `bc97c1f`（核心）+ `b35095e`（race-safe）+ `c6af230`（属性桥） |
 
 **顺带处理：** runner 的两超时 env 默认从 180s/120s 提到 300s（`STORYFORGE_EVAL_TIMEOUT_SECS`
 harness 预算 + `STORYFORGE_LLM_TIMEOUT_SECS` HTTP 客户端），适配深推理模型长单调用；外部 override
@@ -2217,15 +2217,18 @@ after_max_retries`（第 6 次重放升级 Failed）。
 |---|---|---|
 | 无环境变量时启动 SQLite（全新用户） | PASS | T3：空 APPDATA + 无 env → storyforge.sqlite3 + marker + sqlite-backups，**零 JSON 文件**（无双写） |
 | 旧用户自动迁移（可见产物 + 数据不丢） | PASS | T2：真实 legacy 副本 + 无 env → 自动 cutover（marker schema=8 + authority 绑定 + 备份 manifest + JSON 原样保留）；计数 1/1/16/1/1/1 全对，5 孤儿 turn 跳过，缺集合按空导入 |
-| 新写入只进 SQLite | PASS | T3 零 JSON 文件；T2/T4 全程无 JSON 写入（JSON 文件 mtime 未变） |
-| 显式回退不造成数据倒退/静默丢失 | PASS | T1：env=json + legacy 副本 → JSON 权威（story_clock 修复日志证明 JSON store 加载），零 sqlite/marker 产物；`env=json` + sqlite marker fail-closed 语义不变（测试钉住） |
-| 重启幂等 | PASS | T4：T2 目录无 env 重启 → SQLite 权威（chronicle_compressor SQLite 重放日志），sqlite-backups 未新增（AlreadyCutover，未重跑 cutover） |
+| 新写入只进 SQLite | PASS | T3 零 legacy 数据 JSON（仅 3 个应用配置 JSON：agent_profile_configs/profiles/storage_meta）；T2/T4 全程无 JSON 数据写入（JSON 文件 mtime 未变） |
+| 显式回退不造成数据倒退/静默丢失 | PASS | T1：env=json + legacy 副本 → JSON 权威，零 sqlite/marker 产物（现场 marker/DB/JSON 文件核验；当日运行日志未保留，2026-08-05 Gate 8 审查 P2-E3 修正证据表述）；`env=json` + sqlite marker fail-closed 语义不变（测试钉住） |
+| 重启幂等 | PASS | T4：T2 目录无 env 重启 → SQLite 权威，sqlite-backups 未新增（仅 1 份备份、marker 未变，AlreadyCutover 未重跑；运行日志未保留，2026-08-05 Gate 8 审查 P2-E3 修正证据表述） |
 
 **Android 默认启动抽查（2026-08-05，emulator-5554，补充现场）**：Gate 7 APK（x86_64，
 lib 与构建产物逐字节一致）+ `pm clear` + property 桥禁用（`debug.storyforge.storage_backend=off`）
 + 无 env 启动 → 全新用户直接 SQLite 权威（marker backend=sqlite schema=8 + authority 绑定 +
 sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 T3 同一 `resolve_backend` 默认
 路径（旧 JSON 自动迁移/显式回退变体由桌面现场 + 判别测试覆盖，Android 共享该代码路径）。
+> 2026-08-05 Gate 8 审查 P2-E4 修正：本抽查仅有文字记录与 MANIFEST 互引，无独立
+> 归档产物（logcat/截图/marker dump/APK 均未入 evidence），「lib 逐字节一致」无法
+> 从 evidence 复核——保留为「仅记录」，不视为可独立复核的现场证据。
 
 **候选周期缩减形式的诚实边界**：§12.1.2 的「完整候选周期（一个发布周期）」——
 多周真实使用统计（自动回退率/迁移失败率）无法在本会话完成，以确定性套件 +

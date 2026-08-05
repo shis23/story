@@ -1211,8 +1211,11 @@ mod tests {
 
     #[test]
     fn transaction_rollback_on_fk_violation_mid_import() {
-        // campaigns 引用不存在的 card → FK 失败 → 整单回滚
-        // （布局文件齐全，缺失文件的场景已由 strict-layout 测试覆盖）
+        // Gate 8 审查 P2-A3 语义变更：campaigns 引用不存在的 card（悬空引用）
+        // 在 readiness 快照阶段被过滤+计数（与孤儿行同口径），不再触发 FK
+        // 失败——默认迁移不被卡死。本测试改为验证新语义：导入成功、悬空
+        // campaign 跳过计数、无部分行落库。
+        // （真 FK 回滚机制仍由 production 层与 gate5_fault_matrix 覆盖。）
         let dir = TempDir::new().unwrap();
         write_json(
             &dir.path().join("cards.json"),
@@ -1244,10 +1247,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("conversations")).unwrap();
 
         let mut db = Database::open_in_memory().unwrap();
-        let err = JsonImporter::new(&mut db)
+        let report = JsonImporter::new(&mut db)
             .import_data_dir(dir.path())
-            .unwrap_err();
-        assert!(err.to_string().contains("sqlite") || err.to_string().contains("FOREIGN"));
+            .expect("dangling-card campaign must be skipped, not block import");
+        assert_eq!(report.campaigns, 0);
+        assert_eq!(report.skipped_orphan_rows, 1, "1 个悬空卡 Campaign");
         assert_eq!(table_count(&db, "campaigns").unwrap(), 0);
     }
 
