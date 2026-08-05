@@ -2221,6 +2221,12 @@ after_max_retries`（第 6 次重放升级 Failed）。
 | 显式回退不造成数据倒退/静默丢失 | PASS | T1：env=json + legacy 副本 → JSON 权威（story_clock 修复日志证明 JSON store 加载），零 sqlite/marker 产物；`env=json` + sqlite marker fail-closed 语义不变（测试钉住） |
 | 重启幂等 | PASS | T4：T2 目录无 env 重启 → SQLite 权威（chronicle_compressor SQLite 重放日志），sqlite-backups 未新增（AlreadyCutover，未重跑 cutover） |
 
+**Android 默认启动抽查（2026-08-05，emulator-5554，补充现场）**：Gate 7 APK（x86_64，
+lib 与构建产物逐字节一致）+ `pm clear` + property 桥禁用（`debug.storyforge.storage_backend=off`）
++ 无 env 启动 → 全新用户直接 SQLite 权威（marker backend=sqlite schema=8 + authority 绑定 +
+sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 T3 同一 `resolve_backend` 默认
+路径（旧 JSON 自动迁移/显式回退变体由桌面现场 + 判别测试覆盖，Android 共享该代码路径）。
+
 **候选周期缩减形式的诚实边界**：§12.1.2 的「完整候选周期（一个发布周期）」——
 多周真实使用统计（自动回退率/迁移失败率）无法在本会话完成，以确定性套件 +
 以上现场测试为缩减形式证据，完整周期统计留给发布后的候选构建；§12.1.5
