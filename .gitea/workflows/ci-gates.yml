@@ -249,5 +249,9 @@ jobs:
         run: npm ci
       - name: npm test
         run: npm test
+      # Gate 8 审查 P1-5/D 域 P1-1: vitest 组件套件（tests/components-v2）此前
+      # 只在本地执行，CI 绿灯可掩盖组件回归。
+      - name: npm run test:ui (vitest components)
+        run: npm run test:ui
       - name: npm run build
         run: npm run build

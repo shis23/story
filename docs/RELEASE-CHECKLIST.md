@@ -1,6 +1,6 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-21 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。SQLite 当前事实见 `docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`。
+> 状态：2026-08-05 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。SQLite 当前事实见 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`（`SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md` 为历史审计，已挂「已被取代」横幅）。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 
@@ -143,7 +143,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| A1 构建与安装 | arm64-v8a debug APK；arm64-v8a release unsigned APK；一台 Android 真机 | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`。<br>2. 在已配置 `ANDROID_HOME` / `NDK_HOME` 的机器上运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1 -BuildApk`，或取得候选 APK。<br>3. 安装 debug APK。<br>4. 安装 release unsigned APK 或记录签名阻塞。<br>5. 首次启动。 | host-side smoke 可复现；arm64-v8a debug/release 构建链路可复现；真机可安装或签名阻塞被明确记录；启动不崩溃。 | smoke 输出；Gradle/Tauri 输出；设备型号和 Android 版本；adb logcat 摘要。 | 待真机 |
+| A1 构建与安装 | arm64-v8a debug APK；arm64-v8a release unsigned APK；一台 Android 真机 | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`。<br>2. 在已配置 `ANDROID_HOME` / `NDK_HOME` 的机器上运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1 -BuildApk`，或取得候选 APK。<br>3. 安装 debug APK。<br>4. 安装 release unsigned APK 或记录签名阻塞。<br>5. 首次启动。 | host-side smoke 可复现；arm64-v8a debug/release 构建链路可复现；真机可安装或签名阻塞被明确记录；启动不崩溃。 | smoke 输出；Gradle/Tauri 输出；设备型号和 Android 版本；adb logcat 摘要。 | 待真机（release APK 签名 BLOCKED：无证书，2026-08-05 记录；debug APK 模拟器已装） |
 | A2 文件导入权限 | 一张 ST PNG；一张 ST JSON；Android 系统文件选择器 | 1. 通过系统选择器导入 PNG。<br>2. 通过系统选择器导入 JSON。<br>3. 重启 app 后检查角色仍在。 | capability 收窄后文件读取仍可用；授权路径稳定；导入失败不破坏已有数据。 | adb logcat；app 日志；排障 bundle；失败文件名。 | 待真机 |
 | A3 移动端主流程 | A2 导入的角色；真实或测试 LLM 连接；移动网络/Wi-Fi | 1. 创建 Campaign。<br>2. 写第一轮。<br>3. 查看 Pipeline 和 Campaign 面板。<br>4. 写第二轮。 | Android 端能完成导入、创建 Campaign、写作、查看结果；移动布局不依赖桌面宽屏。 | adb logcat；app 日志；pipeline trace；屏幕录制或截图。 | 待真机 |
 | A4 导出和分享 | A3 的 Campaign；系统分享/保存入口 | 1. 导出排障 bundle。<br>2. 导出 Campaign bundle。<br>3. 用系统 save/share sheet 保存或分享。 | 导出文件可生成、可保存或分享；排障 bundle 包含诊断上下文摘要；不泄露真实 API key。 | 导出文件名和大小；adb logcat；系统分享失败截图。 | 待真机 |

@@ -615,9 +615,53 @@ fn orphan_db_matches_authority(path: &Path, expected_authority_id: &str) -> bool
     bound.as_deref() == Some(expected_authority_id)
 }
 
+/// 启动迁移后对账 marker 的 `schema_version`。
+///
+/// `sqlite_runtime::activate` 会把数据库迁移到最新 schema，版本可能高于
+/// marker 记录值。若不同步回写，下次启动 `inspect_marker` 会因
+/// `version != marker.schema_version` 判 Stale 而拒绝启动（Gate 8 审查
+/// P1-1：任何新 migration 发布后第二次启动即自锁，且「delete the marker」
+/// 指引可能诱导用陈旧 JSON 重建而静默丢弃 SQLite 时代数据）。
+///
+/// 仅在「marker 是 sqlite 权威 且 db 版本更高」时原子回写 marker（保留
+/// authority_id / cutover_nonce / manifest_hash），返回 `Some((旧, 新))`；
+/// 其余情况返回 `None`。db 版本低于 marker 时不动——保持 fail-closed，
+/// 由 `inspect_marker` 判 Stale 交操作者处理。
+pub fn reconcile_marker_schema_version(db_path: &Path) -> Result<Option<(i64, i64)>> {
+    let marker_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(MARKER_FILENAME);
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let mut marker: BackendMarker = serde_json::from_str(&fs::read_to_string(&marker_path)?)
+        .map_err(|e| {
+            SqliteError::Other(format!(
+                "marker corrupt while reconciling schema version: {e}"
+            ))
+        })?;
+    if marker.backend().ok() != Some(StorageBackend::Sqlite) {
+        return Ok(None);
+    }
+    let db = Database::open_readonly(db_path)?;
+    let version = crate::migrations::current_version(&db)?;
+    if version <= marker.schema_version {
+        // 相等 → 无需对账；更旧 → fail-closed，保持 Stale 让操作者处理。
+        return Ok(None);
+    }
+    let old = marker.schema_version;
+    marker.schema_version = version;
+    write_marker_atomically(&marker_path, &marker)?;
+    Ok(Some((old, version)))
+}
+
 /// Verify a database is openable, migrated, and bound to the marker identity.
 fn verify_database_with_marker(db_path: &Path, marker: &BackendMarker) -> Result<()> {
-    let db = Database::open(db_path)?;
+    // 只读探测：启动期检查不得对 marker 所指文件产生任何写副作用（Gate 8
+    // 审查 P2-A1）——读写打开会把外部/他进程文件改为 WAL 并烙上
+    // application_id，与 publish 路径「只读探测、绝不改 PRAGMA」的原则矛盾。
+    let db = Database::open_readonly(db_path)?;
     let version = crate::migrations::current_version(&db)?;
     if version != marker.schema_version {
         return Err(SqliteError::Other(format!(

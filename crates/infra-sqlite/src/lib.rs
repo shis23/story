@@ -34,8 +34,8 @@ pub use backend::{
 pub use connection::{Database, STORYFORGE_APPLICATION_ID};
 pub use cutover::{
     BackendMarker, CutoverDiagnostics, CutoverFault, CutoverOutcome, CutoverPlan, CutoverReport,
-    CutoverRequest, MarkerStatus, inspect_marker, recover_or_verify, run_cutover,
-    run_cutover_with_fault,
+    CutoverRequest, MarkerStatus, inspect_marker, reconcile_marker_schema_version,
+    recover_or_verify, run_cutover, run_cutover_with_fault,
 };
 pub use error::{Result, SqliteError};
 pub use exporter::{

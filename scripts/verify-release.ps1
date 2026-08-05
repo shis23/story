@@ -9,13 +9,19 @@ frontend component tests (vitest), and frontend build.
 
 The secret scan checks Git-tracked files only and excludes target, node_modules,
 frontend/dist, and .git. It reports rule names and locations without echoing
-matching line contents.
+matching line contents. Pass -EvidenceRoot to additionally scan a repo-external
+evidence directory (Gate 8 review P1-2: evidence may hold real proxy keys below
+the long-key threshold).
 
 .PARAMETER DryRun
 Prints the steps and commands without running the release gate checks.
 
 .PARAMETER SecretScanOnly
 Runs only the secret scan step. Useful for quick pre-commit verification.
+
+.PARAMETER EvidenceRoot
+Optional repo-external directory to include in the secret scan (e.g. the
+storyforge-evidence tree). Defaults to $env:STORYFORGE_EVIDENCE_ROOT.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts/verify-release.ps1
@@ -29,7 +35,8 @@ powershell -ExecutionPolicy Bypass -File scripts/verify-release.ps1 -SecretScanO
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [switch]$SecretScanOnly
+    [switch]$SecretScanOnly,
+    [string]$EvidenceRoot
 )
 
 Set-StrictMode -Version 3.0
@@ -148,6 +155,9 @@ try {
     Start-ReleaseStep -Name 'secret scan'
     if ($DryRun) {
         Write-Host 'DRY RUN: scan Git-tracked and untracked build-input files for common secret patterns'
+    } elseif ($EvidenceRoot -or $env:STORYFORGE_EVIDENCE_ROOT) {
+        $scanRoot = if ($EvidenceRoot) { $EvidenceRoot } else { $env:STORYFORGE_EVIDENCE_ROOT }
+        Invoke-ReleaseSecretScan -RepoRoot $repoRoot -EvidenceRoots $scanRoot
     } else {
         Invoke-ReleaseSecretScan -RepoRoot $repoRoot
     }

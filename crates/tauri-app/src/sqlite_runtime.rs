@@ -102,6 +102,18 @@ pub fn activate(db_path: impl AsRef<Path>) -> Result<(), String> {
     let mut db = Database::open(&path).map_err(|e| format!("open sqlite: {e}"))?;
     migrate(&mut db).map_err(|e| format!("migrate sqlite: {e}"))?;
     let _ = current_version(&db).map_err(|e| format!("schema version: {e}"))?;
+    // 迁移可能提升 schema_version：marker 必须同步对账，否则下次启动
+    // inspect_marker 会因版本不等判 Stale 拒绝启动（Gate 8 审查 P1-1）。
+    // 对账失败视为激活失败（fail-closed）：不一致的 marker 本身就是危险态。
+    if let Some((old, new)) = storyforge_infra_sqlite::reconcile_marker_schema_version(&path)
+        .map_err(|e| format!("reconcile marker schema version: {e}"))?
+    {
+        tracing::info!(
+            old_version = old,
+            new_version = new,
+            "marker schema_version reconciled after startup migration"
+        );
+    }
     SQLITE_PATH
         .set(path)
         .map_err(|_| "sqlite path already set".to_string())?;

@@ -1,7 +1,7 @@
 # StoryForge 交接说明
 
 > 更新日期：2026-08-05
-> 代码事实基线：`main@048317d`（Gate 7 完成后）；自动化验证基线以最近一次完整 `verify-release` 记录为准（Release gate passed，2026-08-05）。
+> 代码事实基线：`main@065629e`（Gate 7/8 完成后）；自动化验证基线以最近一次完整 `verify-release` 记录为准（Release gate passed，2026-08-05）。
 > 范围：当前代码事实、证据等级、验证入口与下一优先级。
 > 本专项（后端拆分 + SQLite 收口）的权威结果：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`。
 
@@ -124,7 +124,7 @@ $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 ## 下一优先级
 
 1. Full100 真实模型续跑（Gate 6 唯一剩余阻塞；relay 恢复后 `run-stage.sh full native 100 3500`，预计 ~10 小时）。
-2. Gate 8 文档封存收尾（README/ARCHITECTURE/AUDITS/RELEASE-CHECKLIST 已同步；最终 RESULT 每 Gate 结论）。
+2. ~~Gate 8 文档封存收尾~~ 已完成（2026-08-05，RESULT §37；本清单即封存产物之一）。
 3. 发布后：Gate 7 完整候选周期统计；稳定期后另立计划删除 JSON 生产写路径（§12.1.5）。
 4. Windows runner、Android 真机、签名包（需证书）与真实第三方插件验收。
 5. CoT 三臂 × 80 轮（与 SQLite 收口分账，PLAN §16 排期）。

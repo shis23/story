@@ -53,6 +53,20 @@ impl Database {
         })
     }
 
+    /// 只读打开：绝不应用任何写 PRAGMA（WAL / application_id）。
+    ///
+    /// 用于启动期对 marker 所指 DB 的只读探测（Gate 8 审查 P2-A1）：检查外部
+    /// 或他进程占用的文件时不得产生任何写副作用，也不能把外部库烙上
+    /// StoryForge 标记或改写其 journal 模式。
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { path, conn })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -1,6 +1,6 @@
 # 后端架构拆分与 SQLite 收口：执行结果（2026-07-28 起）
 
-> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS；Gate 4 PASS（2026-07-31）；Gate 5 PASS（三审，2026-08-02）；Gate 6 进行中（§11.1 PASS + §11.3 双平台现场 PASS，Full100 BLOCKED on relay 未 seal）；Gate 7 PASS（缩减形式，2026-08-05，见 §36）；Gate 8 进行中（文档封存）**。
+> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS；Gate 4 PASS（2026-07-31）；Gate 5 PASS（三审，2026-08-02）；Gate 6 进行中（§11.1 PASS + §11.3 双平台现场 PASS，Full100 BLOCKED on relay 未 seal）；Gate 7 PASS（缩减形式，2026-08-05，见 §36）；Gate 8 完成（2026-08-05，见 §37）**。
 >
 > code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 >
@@ -8,7 +8,7 @@
 
 ## 1. Gate 1 交付物
 
-- 根模块 `crates/tauri-app/src/lib.rs` 从 2,455 行降至 1,320 行。
+- 根模块 `crates/tauri-app/src/lib.rs` 从 14,721 行降至 1,320 行。
 - 具体命令实现已归位到 `commands/connections.rs`、`conversations.rs`、`turns.rs`、`writing.rs` 及既有域模块。
 - 根测试文件 `lib_tests.rs` 只保留模块声明、公共夹具和导入；域测试拆到：
   - `lib_tests_campaigns.rs`
@@ -2272,7 +2272,7 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 | 195e919 | fix(storage)：候选周期发现 #1（缺失=空）+ H-3 测试同步（2e39b24 遗留） |
 | 6a4e04a | test(parity)：restart child 显式传 backend env（默认翻转适配） |
 | 048317d | fix(storage)：候选周期发现 #2/#3（CharacterInfo 空串 + 孤儿行跳过 + 单一快照权威） |
-| （待提交） | secret-scan 合成值缩短/文档脱敏（§36.4） |
+| 14d0047 | fix(secret-scan)：合成值缩短/文档脱敏（§36.4） |
 
 ### 36.7 Gate 7 结论
 
@@ -2294,9 +2294,9 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 | Gate | 结论 | 依据 |
 |---|---|---|
 | Gate 0 事实基线 | **PASS** | RESULT §1–4（基线命令清单、契约测试、能力矩阵） |
-| Gate 1 lib.rs 拆分 | **PASS** | §13–14；lib.rs 14,721 → 1,320 行；175/175 命令；前端合同不变 |
-| Gate 2 状态机收敛 | **PASS** | §7–10；5/5 通过条件（verifier 返修后，§28）；accept parity / 共享阶段 / 单一 tool-loop / 单一 postprocess 规则 / typed patch 同一纯函数 |
-| Gate 3 backend facade | **PASS** | §15；命令/应用层 `.is_sqlite()`/`.is_json()` 30 → 0；白名单 {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs} |
+| Gate 1 lib.rs 拆分 | **PASS** | RESULT §1–4 / PLAN §6；lib.rs 14,721 → 1,320 行；175/175 命令；前端合同不变 |
+| Gate 2 状态机收敛 | **PASS** | RESULT §6–13；5/5 通过条件（verifier 返修后）；accept parity / 共享阶段 / 单一 tool-loop / 单一 postprocess 规则 / typed patch 同一纯函数 |
+| Gate 3 backend facade | **PASS** | §15；命令/应用层 `.is_sqlite()`/`.is_json()` 30 → 0；白名单 {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs, startup_recovery.rs} |
 | Gate 4 SQLite 缺口补齐 | **PASS** | §30（一审 INCOMPLETE → 二审 P1-1..P2-6 全关）；Meta UoW / MVU schema apply / Chronicle compressor / story_clock |
 | Gate 5 迁移、等价与恢复 | **PASS** | §33 二审 + §34 三审（10 项阻塞全关）；migration_matrix / reverse_export / 等价套件 / 故障矩阵 |
 | Gate 6 真实证据与平台验收 | **INCOMPLETE（§11.1 PASS + §11.3 双平台 PASS；§11.2 4/5 seal，Full100 BLOCKED on relay）** | §35；r3 58/100 全健康为迄今最完整长程证据；Gate 6 不 seal |
@@ -2330,7 +2330,7 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 | Tauri command 属性/注册 | 175/175 | 175/175 | baseline 脚本实时核验，无重复注册 |
 | 前端唯一 invoke / 缺失后端命令 | 162 / 0 | 162 / 0 | IPC 合同全程未变（Gate 8 复核） |
 | 命令/应用服务层 `.is_sqlite()`/`.is_json()` | 30（Gate 3 前） | 0 | Gate 3 起白名单外为零（静态门禁钉住） |
-| `is_sqlite_active()` 总引用 | 68 | 55 | 余量均在允许白名单（sqlite_runtime/facade 边界） |
+| `is_sqlite_active()` 总引用 | 68（Gate 1 时点） | 2（生产；含测试 6） | baseline 实跑 `activeFlagReferences=2`（sqlite_runtime/facade 边界白名单） |
 | schema/migration | V001–V008 | V001–V008（current_version=8） | 未新增迁移；marker schema_version=8 |
 | 存储默认 | JSON | SQLite（Gate 7） | `StorageBackend::default` / selection / marker-first 决议 |
 

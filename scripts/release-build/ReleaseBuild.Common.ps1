@@ -498,6 +498,11 @@ function Find-ReleaseSecretPatternFindings {
         # Substrings of ordinary identifiers such as "task-authenticate-red-wax-note"
         # or "task-follow-gold-raven-decoy" must not match.
         @{ Name = 'OpenAI-style API key'; Pattern = '(?<![\w-])sk-[A-Za-z0-9_-]{20,}(?![\w-])' },
+        # Short OpenAI-style keys (12-19 chars after "sk-", proxy relays
+        # issuing truncated keys); must contain an uppercase letter to
+        # discriminate real keys from lowercase test values. Gate 8 review
+        # P1-2. Kept in sync with Invoke-ReleaseSecretScan.
+        @{ Name = 'OpenAI-style API key (short)'; Pattern = '(?<![\w-])sk-(?=[A-Za-z0-9_-]{12,19}(?![\w-]))(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{12,19}' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
         @{ Name = 'authorization header'; Pattern = '(?i)(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
         # Bare Bearer tokens without an Authorization: prefix.
@@ -505,13 +510,17 @@ function Find-ReleaseSecretPatternFindings {
         # Quoted secret assignment: real credential bound to a key. Excludes
         # word-substring keys, Rust struct-literal conversions
         # (`secret: "...".into()`), angle-bracket placeholders, English-phrase
-        # values, and sentinel/placeholder markers so test fixtures/docs are
-        # not flagged. Kept in sync with Invoke-ReleaseSecretScan.
-        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' },
+        # values, and sentinel/placeholder markers (incl. NOT-REAL test
+        # fixtures and storyforge-secret:v1: SecretRefs) so test fixtures/docs
+        # are not flagged. Kept in sync with Invoke-ReleaseSecretScan.
+        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|not[_-]?real|storyforge-secret:v1:|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' },
         # Unquoted api-key / token / credential assignments or colon forms.
         # Key must be a standalone word; excludes Rust struct-literal
-        # conversions so fixtures like `api_key: value.into()` are not flagged.
-        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
+        # conversions so fixtures like `api_key: value.into()` are not flagged,
+        # and StoryForge SecretRef values (the "-secret:" substring of
+        # "storyforge-secret:v1:…" must not read as a `secret:` assignment —
+        # its value part starts with "v1:"; real keys never do).
+        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*(?!v1:)[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
     )
 
     $findings = @()
@@ -639,7 +648,11 @@ function Get-ReleaseEvidenceVerifierTrustModel {
 function Invoke-ReleaseSecretScan {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        # 额外扫描根（如 evidence 目录，repo 外）。只扫文本文件，跳过
+        # SQLite/图片/构建产物等二进制；规则与 repo 侧一致（Gate 8 审查
+        # P1-2：evidence 曾藏真实 key 且不在扫描域）。
+        [string[]]$EvidenceRoots = @()
     )
 
     $pathspecs = @(
@@ -659,6 +672,12 @@ function Invoke-ReleaseSecretScan {
         # after a non-word, non-hyphen separator so substrings of ordinary
         # identifiers (e.g. "task-authenticate-red-wax-note") are not matched.
         @{ Name = 'OpenAI-style API key'; Pattern = '(?<![\w-])sk-[A-Za-z0-9_-]{20,}(?![\w-])' },
+        # Short OpenAI-style keys (12-19 chars after "sk-", e.g. proxy relays
+        # issuing truncated keys). Must contain an uppercase letter to
+        # discriminate real high-entropy keys from lowercase test values
+        # (sk-super-secret / sk-smth-1234). Gate 8 review P1-2: the real
+        # proxy key (sk-BX…, 16 chars) is invisible to the {20,} rule.
+        @{ Name = 'OpenAI-style API key (short)'; Pattern = '(?<![\w-])sk-(?=[A-Za-z0-9_-]{12,19}(?![\w-]))(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{12,19}' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
         @{ Name = 'authorization header'; Pattern = '(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
         # Secret assignment: a real credential bound to a key. Exclusions keep
@@ -675,9 +694,10 @@ function Invoke-ReleaseSecretScan {
         #       or carrying sentinel markers (secret_should, should_be_,
         #       placeholder, example, normalized, _test_, dummy, redacted,
         #       changeme, xxxx, sf_secret_, earlyfact, legacy-, embed-,
-        #       process-only, from-shell). Real keys are high-entropy opaque
-        #       strings and never carry these markers or read like English.
-        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
+        #       process-only, from-shell, NOT-REAL, storyforge-secret:v1:
+        #       SecretRef). Real keys are high-entropy opaque strings and
+        #       never carry these markers or read like English.
+        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|not[_-]?real|storyforge-secret:v1:|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
     )
 
 
@@ -772,6 +792,48 @@ function Invoke-ReleaseSecretScan {
             $ruleName = $hit -replace '^secret-pattern:', ''
             $safePath = Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot
             $findings.Add(("untracked {0} at {1}" -f $ruleName, $safePath))
+        }
+    }
+
+    # Gate 8 审查 P1-2: evidence 目录（repo 外）不在 git grep 域，且真实代理
+    # key 长度低于 {20,} 阈值。对每个 evidence root 做文本文件扫描，规则与
+    # repo 侧一致（Find-ReleaseSecretPatternFindings）。二进制产物（SQLite、
+    # WAL、图片、构建产物、超大日志）跳过——它们不是可读文本输入。
+    $evidenceExcludeExts = @('.sqlite3', '-wal', '-shm', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.apk', '.so', '.dll', '.exe', '.zip', '.gz', '.pdf', '.woff', '.woff2', '.ico', '.bin', '.mp4')
+    $evidenceExcludeDirSegments = @('card-shell-cache')
+    $evidenceMaxBytes = 10MB
+    foreach ($evidenceRoot in $EvidenceRoots) {
+        if (-not (Test-Path -LiteralPath $evidenceRoot -PathType Container)) {
+            throw ("Secret scan failed: evidence root does not exist: {0}" -f $evidenceRoot)
+        }
+        $evidenceFiles = @(Get-ChildItem -LiteralPath $evidenceRoot -Recurse -File -ErrorAction Stop)
+        foreach ($file in $evidenceFiles) {
+            $nameLower = $file.Name.ToLowerInvariant()
+            $skip = $false
+            foreach ($ex in $evidenceExcludeExts) {
+                if ($nameLower.EndsWith($ex)) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            # 第三方 webview 缓存目录（jquery/esm/index.html 等）：非用户输入，
+            # unquoted 规则会对其库代码误报。
+            $relSegments = $file.FullName.Substring($evidenceRoot.Length).Split([System.IO.Path]::DirectorySeparatorChar)
+            foreach ($seg in $relSegments) {
+                if ($evidenceExcludeDirSegments -contains $seg) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            if ($file.Length -gt $evidenceMaxBytes) { continue }
+            try {
+                $text = [System.IO.File]::ReadAllText($file.FullName)
+            } catch {
+                # 不可读/二进制内容：跳过，不作为扫描输入。
+                continue
+            }
+            $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
+            foreach ($hit in $patternHits) {
+                # Report rule name + path only; never echo secret values.
+                $ruleName = $hit -replace '^secret-pattern:', ''
+                $findings.Add(("evidence {0} at {1}" -f $ruleName, $file.FullName))
+            }
         }
     }
 
