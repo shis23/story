@@ -74,6 +74,7 @@ fn sqlite_fixture() -> (TempDir, PathBuf) {
     let request = CutoverRequest {
         plan: CutoverPlan::new(&data_dir, &db_path),
         label: "rollback-fixture".into(),
+        allow_json_authoritative_flip: false,
     };
     match run_cutover(&request).unwrap() {
         CutoverOutcome::Completed(_) => {}

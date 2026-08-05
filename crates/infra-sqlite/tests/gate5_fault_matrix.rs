@@ -93,6 +93,7 @@ fn request(dir: &Path) -> CutoverRequest {
     CutoverRequest {
         plan: CutoverPlan::new(dir, dir.join("storyforge.sqlite3")),
         label: "gate5-fault-matrix".into(),
+        allow_json_authoritative_flip: false,
     }
 }
 

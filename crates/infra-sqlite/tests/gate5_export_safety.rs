@@ -64,6 +64,7 @@ fn cutover(dir: &TempDir) -> PathBuf {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "safety".into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
@@ -849,6 +850,7 @@ fn cutover_publishes_atomically_without_probe_rename() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "no-probe".into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));

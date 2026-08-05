@@ -23,12 +23,17 @@ pub struct RetryingClient {
     config: RetryConfig,
 }
 
+/// Retry-After / 指数退避的等待上限（Gate 8 审查 P2-B2）：服务端异常值或
+/// 恶意大值（如 `retry-after: 3600`）不得让请求挂起一小时；取消也无法打断
+/// 一次极长 sleep。
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl RetryingClient {
     pub fn new(inner: Arc<dyn LlmClient>, config: RetryConfig) -> Self {
         Self { inner, config }
     }
 
-    /// 从错误中提取 Retry-After 秒数（若存在）
+    /// 从错误中提取 Retry-After 秒数（若存在），上限 60s。
     fn parse_retry_after(error: &LlmError) -> Option<u64> {
         match error {
             LlmError::RateLimited(msg) => {
@@ -37,12 +42,12 @@ impl RetryingClient {
                     let rest = &msg[idx + "retry-after:".len()..];
                     let num_str = rest.trim().trim_end_matches('s');
                     if let Ok(secs) = num_str.parse::<u64>() {
-                        return Some(secs);
+                        return Some(secs.min(MAX_WAIT.as_secs()));
                     }
                 }
                 // 尝试整个消息是纯数字
                 if let Ok(secs) = msg.trim().parse::<u64>() {
-                    return Some(secs);
+                    return Some(secs.min(MAX_WAIT.as_secs()));
                 }
                 None
             }
@@ -50,10 +55,32 @@ impl RetryingClient {
         }
     }
 
-    /// 计算第 `attempt` 次重试的退避时间（0-indexed）
+    /// 计算第 `attempt` 次重试的退避时间（0-indexed），上限 60s。
     fn backoff_duration(&self, attempt: u32) -> std::time::Duration {
         let ms = self.config.base_backoff_ms.saturating_mul(1u64 << attempt);
-        std::time::Duration::from_millis(ms)
+        std::time::Duration::from_millis(ms).min(MAX_WAIT)
+    }
+
+    /// 退避等待，期间以 ≤100ms 分片轮询 cancel 信号。
+    ///
+    /// 长退避（Retry-After / 指数）不得阻塞取消：cancel 置位后尽快返回
+    /// `LlmError::Cancelled`（Gate 8 审查 P2-B2）。
+    async fn backoff_wait(
+        wait: std::time::Duration,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), LlmError> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if *cancel.borrow() {
+                return Err(LlmError::Cancelled);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let remaining = (deadline - now).min(std::time::Duration::from_millis(100));
+            tokio::time::sleep(remaining).await;
+        }
     }
 }
 
@@ -119,12 +146,8 @@ impl LlmClient for RetryingClient {
                     wait,
                     err_ref,
                 );
-                tokio::time::sleep(wait).await;
-
-                // 检查取消信号（退避期间可能被取消）
-                if *cancel.borrow() {
-                    return Err(LlmError::Cancelled);
-                }
+                // 退避期间感知取消（分片轮询），取消置位立即返回 Cancelled。
+                Self::backoff_wait(wait, &cancel).await?;
             }
 
             // 每次重试都需要新的 cancel receiver（clone）
@@ -326,13 +349,41 @@ mod tests {
     #[test]
     fn parse_retry_after_plain_number() {
         let err = LlmError::RateLimited("429".into());
-        assert_eq!(RetryingClient::parse_retry_after(&err), Some(429));
+        // 429s > 60s 上限（Gate 8 审查 P2-B2），被 cap。
+        assert_eq!(RetryingClient::parse_retry_after(&err), Some(60));
+    }
+
+    #[test]
+    fn parse_retry_after_capped_at_60s() {
+        // 服务端异常/恶意大值不得让请求挂起一小时。
+        let err = LlmError::RateLimited("rate limited retry-after: 3600s".into());
+        assert_eq!(RetryingClient::parse_retry_after(&err), Some(60));
     }
 
     #[test]
     fn parse_retry_after_none() {
         let err = LlmError::RateLimited("rate limited".into());
         assert_eq!(RetryingClient::parse_retry_after(&err), None);
+    }
+
+    #[test]
+    fn backoff_capped_at_60s() {
+        let client = RetryingClient::new(
+            Arc::new(FailNTimesClient::new(0, LlmError::Timeout)),
+            RetryConfig {
+                max_retries: 3,
+                base_backoff_ms: 30_000,
+            },
+        );
+        // 30s → 60s（指数翻倍被上限截断，而非 120s）。
+        assert_eq!(
+            client.backoff_duration(1),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            client.backoff_duration(2),
+            std::time::Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -356,6 +407,35 @@ mod tests {
         assert_eq!(
             client.backoff_duration(2),
             std::time::Duration::from_millis(4000)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_cancel_interrupts_backoff() {
+        // 前 2 次失败触发退避（base 5s → 退避 5s + 10s），但 cancel 在退避
+        // 期间置位：必须快速返回 Cancelled，而不是等完整个退避。
+        let inner = Arc::new(FailNTimesClient::new(2, LlmError::Timeout));
+        let client = RetryingClient::new(
+            inner,
+            RetryConfig {
+                max_retries: 2,
+                base_backoff_ms: 5_000,
+            },
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let start = std::time::Instant::now();
+        cancel_tx.send(true).unwrap();
+        let result = client.chat_stream(&make_request(), tx, cancel_rx).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(LlmError::Cancelled)));
+        // 远小于第一个退避（5s）：取消立即生效，而非等退避结束。
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel should interrupt backoff promptly, took {elapsed:?}"
         );
     }
 }

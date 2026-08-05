@@ -1795,6 +1795,9 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
         let request = CutoverRequest {
             plan: plan.clone(),
             label: "app-startup".to_string(),
+            // 仅 app 层显式 env=sqlite opt-in（JsonAuthoritative → SQLite 翻转）
+            // 才允许基础层翻转权威（Gate 8 审查 P2-A2）。
+            allow_json_authoritative_flip: true,
         };
         let outcome =
             recover_or_verify(&request).map_err(|e| BackendWiringError::Cutover(format!("{e}")))?;
@@ -1918,6 +1921,10 @@ pub enum BackendWiringError {
 
 #[cfg(test)]
 mod tests {
+    /// env 测试串行锁：`STORYFORGE_STORAGE_BACKEND` 是进程级 env var，多个
+    /// 测试并行 set/remove 会互相踩踏（Gate 8 审查 P2-D1）。所有读写该 env
+    /// 的测试必须先获取此锁再操作。
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
     use tempfile::TempDir;
 
@@ -1967,6 +1974,7 @@ mod tests {
 
     #[test]
     fn default_resolution_is_sqlite_fresh_start_without_database_source() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Gate 7：无 env 无 marker 且目录里没有任何 legacy JSON 布局 =
         // 全新用户 → 直接初始化空 SQLite 权威（不导入、不失败）。
         let dir = TempDir::new().unwrap();
@@ -1986,6 +1994,7 @@ mod tests {
 
     #[test]
     fn default_resolution_migrates_legacy_json_automatically() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Gate 7：无 env + 完整 legacy JSON 树 → 自动 cutover，JSON 原样保留。
         let dir = TempDir::new().unwrap();
         sample_source(dir.path());
@@ -2006,6 +2015,7 @@ mod tests {
     #[test]
     fn sqlite_resolution_runs_cutover() {
         let dir = TempDir::new().unwrap();
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         sample_source(dir.path());
         // SAFETY: test-only.
         unsafe {
@@ -2037,6 +2047,7 @@ mod tests {
         // 数据库/marker」由 explicit_json_fallback_touches_no_sqlite_with_
         // legacy_source 覆盖（本测试不 set env，避免与并行测试的 env 竞争）。
         let dir = TempDir::new().unwrap();
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: test-only.
         unsafe {
             std::env::remove_var("STORYFORGE_STORAGE_BACKEND");
@@ -2236,6 +2247,7 @@ mod tests {
         let request = storyforge_infra_sqlite::cutover::CutoverRequest {
             plan,
             label: "marker-first".into(),
+            allow_json_authoritative_flip: false,
         };
         match storyforge_infra_sqlite::cutover::run_cutover(&request).unwrap() {
             storyforge_infra_sqlite::cutover::CutoverOutcome::Completed(_) => {}
@@ -2267,6 +2279,7 @@ mod tests {
     #[test]
     fn valid_sqlite_marker_wins_without_env() {
         // 审查核心 bug：重启后无 env 时，默认后端不得重新启用——
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // 有效 sqlite marker 存在时必须以 SQLite 权威启动（Gate 7 后默认
         // 即 SQLite，本测试继续钉住「marker 优先于任何隐式默认」）。
         let dir = TempDir::new().unwrap();
@@ -2289,6 +2302,7 @@ mod tests {
     #[test]
     fn env_json_with_valid_sqlite_marker_fails_closed() {
         let dir = TempDir::new().unwrap();
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         sample_source(dir.path());
         set_env_sqlite();
         let _ = resolve_backend_inner(dir.path()).unwrap();
@@ -2306,6 +2320,7 @@ mod tests {
     #[test]
     fn stale_marker_refused_for_both_env_values() {
         let dir = TempDir::new().unwrap();
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         sample_source(dir.path());
         // 版本过新的 marker（inspect_marker 判 Stale）。
         let marker = serde_json::json!({
@@ -2342,6 +2357,7 @@ mod tests {
 
     #[test]
     fn json_authoritative_marker_allows_json_and_fresh_sqlite_optin() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         sample_source(dir.path());
         // JsonAuthoritative marker（官方 reverse-cutover 才会写）。
@@ -2379,7 +2395,7 @@ mod tests {
 
     #[test]
     fn empty_dir_with_explicit_sqlite_is_fresh_start() {
-        // Gate 7 语义变更：空目录（无任何 legacy 布局）+ env=sqlite 与默认
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner()); // Gate 7 语义变更：空目录（无任何 legacy 布局）+ env=sqlite 与默认
         // 一致 → 全新用户初始化，不再 fail-closed（旧行为是防「误建空库」，
         // 现由「部分布局 fail-closed」承接该保护）。
         let dir = TempDir::new().unwrap();
@@ -2393,7 +2409,7 @@ mod tests {
 
     #[test]
     fn missing_collections_import_as_empty_like_json_store() {
-        // Gate 7 候选周期发现 #1：JSON `CampaignStore` 用 load_or_default——
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner()); // Gate 7 候选周期发现 #1：JSON `CampaignStore` 用 load_or_default——
         // 缺失文件 = 空集合，正常 legacy 用户可能没有部分集合文件。默认切换
         // 下 cutover 必须同口径（缺失放行），否则正常旧用户被挡在门外。
         let dir = TempDir::new().unwrap();

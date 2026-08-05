@@ -305,6 +305,7 @@ fn bigdata_migration_export_reimport_and_recovery_timings() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "bigdata-migration".into(),
+        allow_json_authoritative_flip: false,
     };
     match recover_or_verify(&request).unwrap() {
         CutoverOutcome::Completed(report) => {

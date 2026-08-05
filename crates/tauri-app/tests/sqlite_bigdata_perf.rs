@@ -436,6 +436,7 @@ async fn bigdata_json_vs_sqlite_op_timings() {
     let cutover = CutoverRequest {
         plan: CutoverPlan::new(sqlite_dir.path(), &db_path),
         label: "gate5-bigdata-ops".into(),
+        allow_json_authoritative_flip: false,
     };
     let t_cutover = Instant::now();
     match recover_or_verify(&cutover).expect("cutover") {

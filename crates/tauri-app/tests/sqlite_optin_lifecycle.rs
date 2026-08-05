@@ -75,6 +75,7 @@ fn sqlite_optin_cutover_write_regenerate_force_accept_and_restart_recovery() {
     let cutover = CutoverRequest {
         plan: CutoverPlan::new(source_dir, &db_path),
         label: "sqlite-optin-lifecycle-test".into(),
+        allow_json_authoritative_flip: false,
     };
     recover_or_verify(&cutover).expect("cutover must produce the SQLite authority");
     sqlite_runtime::activate(&db_path).expect("activate the production SQLite runtime");

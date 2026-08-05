@@ -807,3 +807,85 @@ fn orphan_rows_are_skipped_and_counted_not_blocking() {
     assert_eq!(second.status, ImportStatus::SkippedDuplicate);
     assert_eq!(second.skipped_orphan_rows, 3);
 }
+
+#[test]
+fn campaign_with_dangling_card_id_is_skipped_and_counted_not_blocking() {
+    // Gate 8 审查 P2-A3：JSON `save_card` 按 source_character_id 覆盖去重会
+    // 留下被 Campaign 引用的旧卡 id（悬空引用）。SQLite `campaigns.card_id`
+    // FK 会硬拒绝插入、静默卡死默认迁移——必须与孤儿行同口径跳过并计数。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-live", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([
+            {
+                "id": "camp-ok", "card_id": "card-live", "name": "Main",
+                "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-1", "lineage_id": "lin-1"
+            },
+            {
+                "id": "camp-dangling", "card_id": "card-removed", "name": "Dangling",
+                "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-2", "lineage_id": "lin-2"
+            }
+        ]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-ok", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-2.json"),
+        &json!({
+            "id": "conv-2", "campaign_id": "camp-dangling", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    write_json(&dir.path().join("instances.json"), &json!([]));
+    write_json(&dir.path().join("knowledge.json"), &json!([]));
+    write_json(&dir.path().join("tasks.json"), &json!([]));
+    write_json(&dir.path().join("round_summaries.json"), &json!([]));
+    write_json(&dir.path().join("turns.json"), &json!([]));
+    write_json(&dir.path().join("mvu_translations.json"), &json!([]));
+    write_json(&dir.path().join("compress_jobs.json"), &json!([]));
+    write_json(&dir.path().join("characters.json"), &json!([]));
+    write_json(&dir.path().join("campaign_world_info.json"), &json!([]));
+
+    // readiness：campaign 计数基于过滤后数组。
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path()).unwrap();
+    assert_eq!(report.campaigns, 1, "悬空卡 Campaign 不计入");
+
+    let mut db = Database::open_in_memory().unwrap();
+    let imported = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("悬空卡 Campaign 必须被跳过而不是阻断导入（Gate 8 审查 P2-A3）");
+    assert_eq!(imported.campaigns, 1);
+    assert_eq!(imported.skipped_orphan_rows, 1, "1 个悬空卡 Campaign");
+
+    // 落库只有非孤儿 Campaign（FK 完整性成立）。
+    let campaigns: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(campaigns, 1);
+    let dangling: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM campaigns WHERE card_id = 'card-removed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(dangling, 0);
+
+    // 重跑幂等：同一 hash（去重命中），skipped 统计一致。
+    let second = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .unwrap();
+    assert_eq!(second.status, ImportStatus::SkippedDuplicate);
+    assert_eq!(second.skipped_orphan_rows, 1);
+}

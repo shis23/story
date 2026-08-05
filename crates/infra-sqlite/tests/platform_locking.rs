@@ -108,6 +108,7 @@ fn windows_file_lock_prevents_concurrent_cutover() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "lock-test".into(),
+        allow_json_authoritative_flip: false,
     };
 
     // The cutover should fail because the lock is held.
@@ -143,6 +144,7 @@ fn concurrent_startups_converge_to_valid_database() {
         let request = CutoverRequest {
             plan: CutoverPlan::new(&path1, path1.join("storyforge.sqlite3")),
             label: "concurrent-1".into(),
+            allow_json_authoritative_flip: false,
         };
         run_cutover(&request)
     });
@@ -154,6 +156,7 @@ fn concurrent_startups_converge_to_valid_database() {
         let request = CutoverRequest {
             plan: CutoverPlan::new(&path2, path2.join("storyforge.sqlite3")),
             label: "concurrent-2".into(),
+            allow_json_authoritative_flip: false,
         };
         run_cutover(&request)
     });
@@ -194,6 +197,7 @@ fn temp_db_is_cleaned_up_after_failed_cutover() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "cleanup-test".into(),
+        allow_json_authoritative_flip: false,
     };
 
     // Run a faulted cutover that cleans up the temp.
@@ -220,6 +224,7 @@ fn rename_atomicity_on_windows() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "rename-test".into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
@@ -326,6 +331,7 @@ fn cross_process_cutover_lock_fails_closed_and_recovers() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "cross-process-lock".into(),
+        allow_json_authoritative_flip: false,
     };
 
     // 锁被持有时跑 cutover：Windows 会立刻报错；Unix flock 会阻塞到释放。
@@ -336,6 +342,7 @@ fn cross_process_cutover_lock_fails_closed_and_recovers() {
         let req = CutoverRequest {
             plan: thread_plan,
             label: thread_label,
+            allow_json_authoritative_flip: false,
         };
         tx.send(run_cutover(&req).map_err(|e| e.to_string()))
             .unwrap();
@@ -440,6 +447,7 @@ fn cross_process_shared_authority_lease_blocks_cutover_until_release() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "lease-test".into(),
+        allow_json_authoritative_flip: false,
     };
 
     // child 持有 SHARED 时：cutover 的 EXCLUSIVE 租约必须 fail closed（两平台

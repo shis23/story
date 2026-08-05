@@ -82,6 +82,7 @@ fn make_request(dir: &Path) -> CutoverRequest {
     CutoverRequest {
         plan: make_plan(dir),
         label: "test-cutover".into(),
+        allow_json_authoritative_flip: false,
     }
 }
 
@@ -412,6 +413,7 @@ fn cutover_report_redacts_secret_shaped_labels() {
     let request = CutoverRequest {
         plan: make_plan(dir.path()),
         label: secret_label.clone(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     let report = match outcome {

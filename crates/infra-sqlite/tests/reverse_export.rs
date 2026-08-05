@@ -87,6 +87,7 @@ fn reverse_export_produces_readable_json() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "export-test".into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
@@ -134,6 +135,7 @@ fn reverse_export_redacts_secrets() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "redact-test".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 
@@ -188,6 +190,7 @@ fn reverse_export_does_not_mutate_live_database() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "nomut-test".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 
@@ -212,6 +215,7 @@ fn reverse_export_can_be_reimported() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "reimport-test".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 
@@ -241,6 +245,7 @@ fn reverse_export_refuses_live_db_directory() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "refuse-test".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 
@@ -257,6 +262,7 @@ fn reverse_export_replaces_stale_conversation_files_atomically() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: "atomic-export".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 
@@ -355,6 +361,7 @@ fn cutover_setup(dir: &TempDir) -> PathBuf {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "forbidden-targets".into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
@@ -494,6 +501,7 @@ fn reverse_export_rejects_ancestor_of_live_data_root() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(&data, &db_path),
         label: "ancestor-test".into(),
+        allow_json_authoritative_flip: false,
     };
     run_cutover(&request).unwrap();
 

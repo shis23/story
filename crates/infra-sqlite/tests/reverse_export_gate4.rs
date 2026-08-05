@@ -52,6 +52,7 @@ fn cutover(dir: &TempDir, label: &str) {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
         label: label.into(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = run_cutover(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));

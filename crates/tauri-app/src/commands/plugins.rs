@@ -181,10 +181,12 @@ pub(crate) fn plugin_get_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
+    // 读=读、写=写：仅持 WriteVariables 的插件不得读取实例全部变量（Gate 8
+    // 审查 P2-C1——「任一权限即放行 + 忽略 key 返回全部」使拆分形同虚设）。
     ensure_plugin_any_permission(
         &state.plugin_registry,
         &plugin_id,
-        &[Permission::ReadVariables, Permission::WriteVariables],
+        &[Permission::ReadVariables],
     )?;
     state
         .storage()

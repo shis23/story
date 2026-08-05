@@ -754,6 +754,7 @@ fn migration_retry_is_idempotent() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(cut_dir.path(), &db_path),
         label: "gate5-matrix-retry".into(),
+        allow_json_authoritative_flip: false,
     };
     match recover_or_verify(&request).unwrap() {
         CutoverOutcome::Completed(report) => {
@@ -794,6 +795,7 @@ fn marker_last_and_failure_retention_for_every_stage() {
         let request = CutoverRequest {
             plan: CutoverPlan::new(dir.path(), &db_path),
             label: format!("gate5-fault-{fault:?}"),
+            allow_json_authoritative_flip: false,
         };
 
         let err = run_cutover_with_fault(&request, fault).expect_err("fault must fail");
@@ -1040,6 +1042,7 @@ fn disk_write_failure_leaves_json_authoritative() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "gate5-disk-fail".into(),
+        allow_json_authoritative_flip: false,
     };
     let err = recover_or_verify(&request).expect_err("occupied temp db path must fail");
     assert!(

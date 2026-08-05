@@ -87,6 +87,7 @@ fn production_gateway_preaccept_lifecycle_full_matrix() {
     let cutover = CutoverRequest {
         plan: CutoverPlan::new(source_dir, &db_path),
         label: "sqlite-preaccept-production-lifecycle".into(),
+        allow_json_authoritative_flip: false,
     };
     recover_or_verify(&cutover).expect("cutover");
     sqlite_runtime::activate(&db_path).expect("activate");

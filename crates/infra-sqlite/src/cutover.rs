@@ -135,6 +135,10 @@ pub struct CutoverRequest {
     pub plan: CutoverPlan,
     /// A short label stamped into backup metadata (sanitised).
     pub label: String,
+    /// 是否允许把 JsonAuthoritative marker（reverse-cutover 产物）翻转成
+    /// SQLite 权威（Gate 8 审查 P2-A2）。基础层 API 默认拒绝无确认翻转；
+    /// 仅 app 层在显式 env=sqlite opt-in 时置 true。
+    pub allow_json_authoritative_flip: bool,
 }
 
 /// Outcome of a cutover attempt.
@@ -844,7 +848,17 @@ pub fn run_cutover_with_fault(
             let report = audit_sqlite_authoritative(plan, schema_version, manifest_hash)?;
             return Ok(CutoverOutcome::AlreadyCutover(report));
         }
-        MarkerStatus::JsonAuthoritative | MarkerStatus::Absent => {
+        MarkerStatus::JsonAuthoritative => {
+            // JSON 权威（reverse-cutover 产物）：翻转成 SQLite 必须显式
+            // opt-in（Gate 8 审查 P2-A2）——基础层 API 不得在无确认时翻转
+            // 权威，避免未来 CLI/命令调用方静默改写用户存储选择。
+            if !request.allow_json_authoritative_flip {
+                return Err(SqliteError::Other(
+                    "marker claims JSON authority; flipping to SQLite requires explicit opt-in (allow_json_authoritative_flip)".into(),
+                ));
+            }
+        }
+        MarkerStatus::Absent => {
             // Proceed with cutover.
         }
         MarkerStatus::Stale { reason } => {
@@ -882,7 +896,16 @@ pub fn run_cutover_with_fault(
             let report = audit_sqlite_authoritative(plan, schema_version, manifest_hash)?;
             return Ok(CutoverOutcome::AlreadyCutover(report));
         }
-        MarkerStatus::JsonAuthoritative | MarkerStatus::Absent => {}
+        MarkerStatus::JsonAuthoritative => {
+            // 加锁后再查：JsonAuthoritative 翻转同样要求显式 opt-in
+            // （Gate 8 审查 P2-A2，与 pre-lock 检查同口径）。
+            if !request.allow_json_authoritative_flip {
+                return Err(SqliteError::Other(
+                    "marker claims JSON authority after lock; flipping requires explicit opt-in (allow_json_authoritative_flip)".into(),
+                ));
+            }
+        }
+        MarkerStatus::Absent => {}
         MarkerStatus::Stale { reason } => {
             // 三审3：加锁后再查——孤儿 DB 属于本次 cutover 才允许继续。
             if orphan_belongs_to_this_cutover(plan) {

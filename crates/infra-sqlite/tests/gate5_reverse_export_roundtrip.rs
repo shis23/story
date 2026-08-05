@@ -324,6 +324,7 @@ fn reverse_export_full_data_roundtrip_restores_equivalent_final_state() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "gate5-roundtrip".into(),
+        allow_json_authoritative_flip: false,
     };
     match recover_or_verify(&request).unwrap() {
         CutoverOutcome::Completed(report) => {
@@ -400,6 +401,7 @@ fn reverse_export_refuses_when_pending_preaccept_outbox_exists() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "gate5-roundtrip-refuse".into(),
+        allow_json_authoritative_flip: false,
     };
     recover_or_verify(&request).unwrap();
     let db = Database::open(&db_path).unwrap();
@@ -435,6 +437,7 @@ fn reverse_export_classifies_readonly_ledgers_explicitly() {
     let request = CutoverRequest {
         plan: CutoverPlan::new(dir.path(), &db_path),
         label: "gate5-roundtrip-ledger".into(),
+        allow_json_authoritative_flip: false,
     };
     recover_or_verify(&request).unwrap();
     let db = Database::open(&db_path).unwrap();

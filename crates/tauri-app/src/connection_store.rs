@@ -164,11 +164,17 @@ impl ConnectionStore {
             }
         });
         if file.connections.len() < before {
+            // 先快照修改前状态——persist 失败时回滚内存，避免「UI 已删但重启
+            // 复活」的分裂态（Gate 8 审查 P2-B7，turn_store 同款模式）。
+            let snapshot = file.clone();
             // 若删除的是活跃连接，清除 active_id
             if file.active_id.as_deref() == Some(id) {
                 file.active_id = None;
             }
-            self.persist(&file)?;
+            if let Err(e) = self.persist(&file) {
+                *file = snapshot;
+                return Err(e);
+            }
             for secret_ref in removed_secret_refs {
                 if let Err(e) = self.secret_store.delete_secret(&secret_ref) {
                     tracing::warn!("删除连接 SecretRef 失败 {secret_ref}: {e}");
@@ -195,8 +201,13 @@ impl ConnectionStore {
                 Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             conn
         };
+        // 快照：persist 失败回滚 last_used_at / active_id（Gate 8 审查 P2-B7）。
+        let snapshot = file.clone();
         file.active_id = Some(id.to_string());
-        self.persist(&file)?;
+        if let Err(e) = self.persist(&file) {
+            *file = snapshot;
+            return Err(e);
+        }
         Ok(Some(conn))
     }
 

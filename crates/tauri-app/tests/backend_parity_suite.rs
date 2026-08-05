@@ -2242,6 +2242,7 @@ async fn backend_parity_equivalent_domain_snapshots() {
     let cutover = CutoverRequest {
         plan: CutoverPlan::new(sqlite_dir.path(), &db_path),
         label: "gate5-parity".into(),
+        allow_json_authoritative_flip: false,
     };
     match recover_or_verify(&cutover).expect("cutover") {
         CutoverOutcome::Completed(report) => {

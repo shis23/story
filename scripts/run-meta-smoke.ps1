@@ -64,9 +64,17 @@ function Invoke-CargoSmoke {
     Push-Location -LiteralPath $RepoRoot
     try {
         Write-Host ("RUN: {0}" -f (Format-Command -Command $command))
-        & $command[0] $command[1..($command.Count - 1)]
-        if ($LASTEXITCODE -ne 0) {
-            throw "Meta smoke step '$Label' failed with exit code $LASTEXITCODE."
+        $output = & $command[0] $command[1..($command.Count - 1)] 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | Out-Host
+        if ($exitCode -ne 0) {
+            throw "Meta smoke step '$Label' failed with exit code $exitCode."
+        }
+        # Gate 8 审查 P2-D4: filter 无匹配时 cargo 报 "0 tests" 且 exit 0，
+        # 脚本会静默假绿——显式断言至少运行 1 个测试。
+        $outputText = $output -join "`n"
+        if ($outputText -match 'running 0 tests' -or $outputText -match 'test result: ok\. 0 passed') {
+            throw "Meta smoke step '$Label' ran 0 tests (filter '$Filter' matched nothing); update or remove the stale filter."
         }
     } finally {
         Pop-Location

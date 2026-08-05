@@ -333,7 +333,8 @@ pub(crate) async fn regenerate_impl(
             response_text,
             orig_text,
         )),
-        Err(e) => Err(TauriCommandError::from(format!("重 roll 失败: {e}"))),
+        // 保留 PipelineError 分类（Gate 8 审查 P2-B6）。
+        Err(e) => Err(TauriCommandError::from(e)),
     }
 }
 
@@ -975,7 +976,7 @@ pub(crate) async fn start_writing(
             .map_err(TauriCommandError::internal)?
             .map(|record| record.campaign.revision)
             .unwrap_or(0);
-        let input_node = start_target.input_node_id.unwrap_or_else(|| {
+        let input_node = start_target.input_node_id.clone().unwrap_or_else(|| {
             tracing::warn!(
                 "Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder"
             );
@@ -990,8 +991,14 @@ pub(crate) async fn start_writing(
         let create_turn = app.storage().save_turn(&record);
         if let Err(e) = create_turn {
             tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
+            // Gate 8 审查 P2-B1：并发 start_writing 的败者已追加 user 消息，
+            // save_turn 因「已有活动 Turn」拒绝——回滚自己的孤儿消息（仅当
+            // 它仍是对话最后一个节点，避免误删胜者已追加的节点）。
+            if let Some(input) = &start_target.input_node_id {
+                rollback_orphaned_user_message(&app, &conversation_id, input);
+            }
             return Err(TauriCommandError::internal(format!(
-                "创建 TurnRecord 失败: {e}"
+                "创建 TurnRecord 失败（可能已有写作在进行中）: {e}"
             )));
         }
         Some(record)
@@ -1193,7 +1200,9 @@ pub(crate) async fn start_writing(
                     });
                 }
                 clear_current_cancel_if(&app, &operation_id);
-                return Err(TauriCommandError::from(format!("写作失败: {e}")));
+                // 保留 PipelineError 分类（retryable/429/超时），不让前端契约丢失
+                // （Gate 8 审查 P2-B6：format! 拍平会把一切变成 Internal）。
+                return Err(TauriCommandError::from(e));
             }
         }
     }
@@ -1221,8 +1230,35 @@ pub(crate) async fn start_writing(
                     record.touch();
                 });
             }
-            Err(TauriCommandError::from(format!("写作失败: {e}")))
+            Err(TauriCommandError::from(e))
         }
+    }
+}
+
+/// 回滚并发败者的孤儿 user 消息（Gate 8 审查 P2-B1）。
+///
+/// 仅当 `input_node_id` 仍是对话的最后一个节点时才截断删除——胜者若已在
+/// 其后追加节点，保守保留（避免误删胜者输入），孤儿消息交由用户手动清理。
+fn rollback_orphaned_user_message(
+    app: &Arc<crate::AppState>,
+    conversation_id: &Id,
+    input_node_id: &Id,
+) {
+    let Some(conv) = app.conv_store.get(conversation_id) else {
+        return;
+    };
+    let is_last = conv
+        .nodes
+        .last()
+        .map(|n| &n.id == input_node_id)
+        .unwrap_or(false);
+    if !is_last {
+        tracing::debug!("孤儿 user 消息非最后节点，保守保留: {input_node_id}");
+        return;
+    }
+    match app.conv_store.truncate_from(conversation_id, input_node_id) {
+        Ok(()) => tracing::info!("已回滚并发败者的孤儿 user 消息: {input_node_id}"),
+        Err(e) => tracing::warn!("回滚孤儿 user 消息失败（保留原样）: {e}"),
     }
 }
 

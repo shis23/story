@@ -8,6 +8,7 @@
     "test:ui": "vitest run",
     "test:all": "npm test && npm run test:ui",
     "smoke:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/run-ui-smoke.ps1",
+    "test:csp": "playwright test -c playwright.csp.config.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },

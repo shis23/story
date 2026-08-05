@@ -81,6 +81,7 @@ fn completed_cutover(dir: &Path) -> CutoverPlan {
     let request = CutoverRequest {
         plan: plan.clone(),
         label: "marker-reconcile-test".to_string(),
+        allow_json_authoritative_flip: false,
     };
     let outcome = recover_or_verify(&request).unwrap();
     assert!(matches!(outcome, CutoverOutcome::Completed(_)));
@@ -208,4 +209,49 @@ fn reconcile_is_noop_for_json_authoritative_marker() {
     );
     let after = read_marker(dir.path());
     assert_eq!(after["backend"], serde_json::json!("json"));
+}
+
+#[test]
+fn json_authoritative_flip_requires_explicit_optin() {
+    use storyforge_infra_sqlite::cutover::{CutoverOutcome, run_cutover};
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let plan = make_plan(dir.path());
+    let json_marker = serde_json::json!({
+        "version": 1,
+        "backend": "json",
+        "schema_version": 0,
+        "manifest_hash": "",
+        "created_at": "2026-07-13T00:00:00Z"
+    });
+    write_marker(dir.path(), &json_marker);
+
+    // 无 opt-in：基础层必须拒绝翻转 JSON 权威（Gate 8 审查 P2-A2）。
+    let request = CutoverRequest {
+        plan: plan.clone(),
+        label: "no-optin".to_string(),
+        allow_json_authoritative_flip: false,
+    };
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().contains("opt-in"),
+        "must demand explicit opt-in, got: {err}"
+    );
+    assert!(
+        !dir.path().join("storyforge.sqlite3").exists(),
+        "no DB may be created without opt-in"
+    );
+
+    // 显式 opt-in（app 层 env=sqlite 映射）：翻转成功。
+    let request = CutoverRequest {
+        plan,
+        label: "optin".to_string(),
+        allow_json_authoritative_flip: true,
+    };
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
 }

@@ -138,6 +138,17 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
 
     // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝
     // （含孤儿行——存在但损坏仍 fail-closed）。
+    //
+    // Gate 8 审查 P2-A3：Campaign 引用的 card_id 在源 cards 中不存在（JSON
+    // `save_card` 按 source_character_id 覆盖去重会留下悬空引用）→ 与孤儿行
+    // 同口径先跳过并计数，再按过滤后的 campaigns 派生 campaign_ids——否则
+    // importer 的 `campaigns.card_id` FK 硬失败会让默认迁移卡死且无诊断。
+    let card_ids: HashSet<String> = cards
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let mut skipped: Vec<(&'static str, usize)> = Vec::new();
+    let campaigns = filter_campaigns_without_card(campaigns, &card_ids, &mut skipped);
     let campaign_ids: HashSet<String> = campaigns
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
@@ -160,7 +171,6 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     strict_validate_world_info(&world_info, &campaign_ids)?;
 
     // Gate 7 发现 #3：孤儿行过滤（父对象在源数据中不存在 = JSON 应用不可达）。
-    let mut skipped: Vec<(&'static str, usize)> = Vec::new();
     let instances = filter_orphan_rows(
         "instances",
         instances,
@@ -309,6 +319,33 @@ fn filter_orphan_rows_counted(
         }
     }
     (kept, skipped_count)
+}
+
+/// Campaign 卡存在性过滤：`card_id` 在源 cards 中不存在的 Campaign 与孤儿行
+/// 同口径跳过并计数（Gate 8 审查 P2-A3）——JSON `save_card` 覆盖去重可留下
+/// 悬空卡引用，SQLite `campaigns.card_id` FK 会硬拒绝并静默卡死默认迁移。
+fn filter_campaigns_without_card(
+    campaigns: Vec<Value>,
+    card_ids: &HashSet<String>,
+    skipped: &mut Vec<(&'static str, usize)>,
+) -> Vec<Value> {
+    let mut kept = Vec::with_capacity(campaigns.len());
+    let mut dropped = 0usize;
+    for campaign in campaigns {
+        let card_id = campaign
+            .get("card_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if card_ids.contains(card_id) {
+            kept.push(campaign);
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        skipped.push(("campaigns_no_card", dropped));
+    }
+    kept
 }
 
 /// Read-only dry-run over a JSON source tree. Must not open/write a live DB.

@@ -298,16 +298,25 @@ function Invoke-SmokeSuite {
         $prevErrorPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            & $executable @arguments 2>&1 | Out-Host
+            $output = & $executable @arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            $output | Out-Host
         } finally {
             $ErrorActionPreference = $prevErrorPreference
         }
-        $exitCode = $LASTEXITCODE
     } finally {
         Pop-Location
     }
 
     $suiteEndedAt = Get-Date
+    # Gate 8 审查 P2-D4: filter 无匹配时 cargo 报 "0 tests" 且 exit 0，
+    # 脚本会静默假绿——显式断言至少运行 1 个测试。
+    if ($null -ne $output) {
+        $outputText = $output -join "`n"
+        if ($outputText -match 'running 0 tests' -or $outputText -match 'test result: ok\. 0 passed') {
+            throw "Suite $SuiteName ran 0 tests (filter '$filter' matched nothing); update or remove the stale filter."
+        }
+    }
     if ($exitCode -eq 0) {
         if ($SuiteName -eq 'm5' -or $SuiteName -eq 'eval' -or $SuiteName -eq 'endurance') {
             # M5/eval 是真实模型探索性探针：exit 0 = 探针执行通过，不等于完整验收通过
