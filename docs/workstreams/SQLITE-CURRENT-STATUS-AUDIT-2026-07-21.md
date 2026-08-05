@@ -1,5 +1,9 @@
 # SQLite 当前状态审计（2026-07-21）
 
+> **⚠️ 本审计是 2026-07-21 的历史快照，已被后端收口专项取代：**
+> SQLite 默认切换（Gate 7）、双平台现场验收（§11.3）、真实模型证据边界（§35）
+> 与兼容退场语义（§36）以 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`
+> 为准；本文保留作历史证据，不再作为当前状态权威。
 > 状态：代码事实审计；**不是**真实模型 Full100 封存报告  
 > 审计 HEAD：`bf36e04`（`fix(eval): serialize provider dispatch retries`）  
 > 工作树：`main` clean  

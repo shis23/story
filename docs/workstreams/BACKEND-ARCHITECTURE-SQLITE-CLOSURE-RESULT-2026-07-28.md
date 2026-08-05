@@ -1,6 +1,6 @@
 # 后端架构拆分与 SQLite 收口：执行结果（2026-07-28 起）
 
-> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS；Gate 4 PASS（2026-07-31）**；Gate 5–8 尚未完成。
+> 状态：**Gate 1 PASS；Gate 2 PASS；Gate 3 PASS；Gate 4 PASS（2026-07-31）；Gate 5 PASS（三审，2026-08-02）；Gate 6 进行中（§11.1 PASS + §11.3 双平台现场 PASS，Full100 BLOCKED on relay 未 seal）；Gate 7 PASS（缩减形式，2026-08-05，见 §36）；Gate 8 进行中（文档封存）**。
 >
 > code-under-test：`main@a2e8d7e` 加 Gate 3 完成提交（未 push；SHA 以 git log 为准）。
 >
@@ -2167,3 +2167,209 @@ editor_reasoning 开头文本（"我们需要输出合并后的正文..."）未�
 SQLite 权威 / 世界信息被动安全）在 58 turn、564 次真实调用中**全部验证到位**。2 个缺口均为
 边缘安全探测的覆盖范围问题，不影响主链路的功能正确性，待 Full100 完整跑到 turn 80+ 后补全。
 
+
+## 36. Gate 7 执行（默认切换与兼容退场，2026-08-05）
+
+> 计划门：PLAN §12。执行于 Gate 6 §11.3 双平台现场 PASS 之后，按用户指示启动
+> （Gate 6 的 Full100 仍 BLOCKED on relay，Gate 6 未 seal——本节如实保留该状态，
+> 不把 Gate 6 写成 PASS，不因 Gate 7 开始而声称 Gate 6 完成）。
+> code-under-test：`e2ed65d` 之上 7 个提交（§36.6），未 amend 历史提交，未 push。
+
+### 36.1 默认切换实现
+
+- **backend.rs**：`StorageBackend` serde 默认、`BackendSelection::resolve`、
+  `PinnedBackend::resolve` 全部翻转为 `Sqlite`——无任何显式选择时 = SQLite。
+- **cutover.rs 全新用户分支**：无 marker 且目录里没有任何 legacy JSON 布局文件
+  （7 核心文件 + conversations/ + 可选集合 + active_campaign.json 全缺）= 空白
+  新用户，直接初始化空 SQLite 权威（空库 + 身份绑定 + completed import_runs +
+  备份检查点 + 校验 + 原子发布 + marker），与正式 cutover 共用同一套锁/租约/
+  发布/审计机制；中断恢复用「已迁移空库的确定性 hash」派生身份（`empty_db_
+  content_hash`，in-memory migrate + recompute），`orphan_belongs_to_this_
+  cutover` 支持 fresh 目录续跑。部分布局（有文件但缺核心）仍 fail-closed。
+- **storage_backend.rs**：`MarkerStatus::Absent` 分支改为「env=json 显式回退走
+  JSON，否则 run_sqlite」（旧 JSON 自动迁移 / 全新用户初始化）；`run_json`
+  显式构造 Json pinned（`PinnedBackend::resolve` 默认已翻转）；`JsonAuthoritative`
+  marker 与 `SqliteAuthoritative` marker 语义不变（含 env=json + sqlite marker
+  fail-closed）。
+
+### 36.2 候选周期发现（桌面现场驱动，全部有判别测试 + 现场证明）
+
+| # | 发现 | 现场证据 | 修复 | 判别测试 |
+|---|---|---|---|---|
+| 1 | 核心布局文件「必需」规则与 JSON store 的 `load_or_default`（缺失 = 空）不一致——正常 legacy 用户（如本机真实数据）没有 knowledge/tasks/round_summaries.json，默认切换会把他们挡在门外 | 真实 legacy 副本（缺 3 个集合文件）无 env 启动自动迁移成功 | readiness + importer 核心文件改「缺失 = 空」（存在但损坏仍 fail-closed） | `missing_layout_file_imports_as_empty_like_json_store`、`missing_collections_import_as_empty_like_json_store`（cutover/tauri-app 两处） |
+| 2 | `CharacterInfo` 镜像校验用 `req_str`（非空），而 JSON 应用模型是普通 `String`（允许空）——真实角色 description 为空被拒 | 真实 legacy 副本首次无 env 启动 fail-closed（`characters[0]: description must not be empty`），修复后迁移成功 | `req_str_allow_empty`（必填 + 字符串类型，允许空串），类型错误/缺字段仍拒 | `empty_character_info_strings_import_like_json_app`（空串通过）+ 既有 `malformed_character_info_is_rejected`（类型错仍拒） |
+| 3 | 孤儿行：已删除 campaign 的残留 turn/实例等，JSON 应用按 campaign 列出时不可达（等价不存在），SQLite FK 拒绝插入 → 全量拒绝阻断迁移 | 真实 legacy 副本含 5 个孤儿 turn（引用已删 campaign），修复后跳过 + 计数，其余数据完整导入 | readiness/importer 收敛为单一快照权威 `build_import_snapshot`：读取 → 严格校验（原始数组）→ 孤儿过滤（campaign/conversation 父缺失）→ 同口径 hash（过滤后数组，verify 的 check_count/content-hash 可比）；跳过数进 `ImportReport`/`CutoverReport.skipped_orphan_rows` + tracing | `orphan_rows_are_skipped_and_counted_not_blocking`（跳过 + 计数 + 幂等 + 落库 FK 完整） |
+
+**附带发现（Gate 7 确定性门禁暴露的既有问题，非 Gate 7 引入）**：`2e39b24`
+（2026-08-04 review 修复，H-3）把启动恢复的 `CampaignNotFound` 改为「首次即
+Failed」并引入 `recovery_retries` 计数器，但没更新钉旧契约的测试、也没测重试
+升级路径——`cargo test --workspace` 复现失败（a6fb8a3 绿 / 2e39b24 红，二分定位）。
+已把测试同步到 H-3 新契约并补 `transient_recovery_errors_upgrade_to_failed_
+after_max_retries`（第 6 次重放升级 Failed）。
+
+### 36.3 桌面现场（候选周期缩减形式，`storyforge-evidence/gate7-2026-08-05/field/`）
+
+隔离方式：Windows 数据目录跟随 `APPDATA` env，用 field/t{1,2,3}-appdata 隔离，
+**真实 AppData\StoryForge 未被触碰**；legacy 数据 = 真实用户树的完整副本
+（1 卡/1 局/16 实例/1 角色[空 description]/1 会话/1 世界书/5 孤儿 turn/缺 3 集合文件）。
+
+| 验收点（§12.3） | 现场结果 | 证据 |
+|---|---|---|
+| 无环境变量时启动 SQLite（全新用户） | PASS | T3：空 APPDATA + 无 env → storyforge.sqlite3 + marker + sqlite-backups，**零 JSON 文件**（无双写） |
+| 旧用户自动迁移（可见产物 + 数据不丢） | PASS | T2：真实 legacy 副本 + 无 env → 自动 cutover（marker schema=8 + authority 绑定 + 备份 manifest + JSON 原样保留）；计数 1/1/16/1/1/1 全对，5 孤儿 turn 跳过，缺集合按空导入 |
+| 新写入只进 SQLite | PASS | T3 零 JSON 文件；T2/T4 全程无 JSON 写入（JSON 文件 mtime 未变） |
+| 显式回退不造成数据倒退/静默丢失 | PASS | T1：env=json + legacy 副本 → JSON 权威（story_clock 修复日志证明 JSON store 加载），零 sqlite/marker 产物；`env=json` + sqlite marker fail-closed 语义不变（测试钉住） |
+| 重启幂等 | PASS | T4：T2 目录无 env 重启 → SQLite 权威（chronicle_compressor SQLite 重放日志），sqlite-backups 未新增（AlreadyCutover，未重跑 cutover） |
+
+**候选周期缩减形式的诚实边界**：§12.1.2 的「完整候选周期（一个发布周期）」——
+多周真实使用统计（自动回退率/迁移失败率）无法在本会话完成，以确定性套件 +
+以上现场测试为缩减形式证据，完整周期统计留给发布后的候选构建；§12.1.5
+（稳定期后另立计划删除 JSON 生产写路径）明确推迟，不在本 Gate 执行。
+
+### 36.4 确定性门禁（§11.1 清单在 Gate 7 代码上全绿）
+
+- `cargo fmt --all -- --check` exit 0（含清理 HEAD 上既存格式漂移，独立提交 d9a51a2）
+- `cargo clippy --workspace --all-targets -- -D warnings` exit 0
+- `cargo test --workspace` exit 0（含 2e39b24 H-3 测试陈旧修复后的全量）
+- §11.1 目标套件：sqlite_optin_lifecycle / sqlite_preaccept_production_lifecycle /
+  sqlite_meta_lifecycle / sqlite_mvu_translations / endurance_sqlite_deterministic /
+  m5_production_evidence 全绿
+- 前端 IPC 合同 `node --test frontend/tests/tauri-command-contract.test.mjs` 8/8
+- `verify-release.ps1`：secret-scan（修掉 §11.3 后引入的 2 个合成 `sk-` 测试值与
+  2 处文档引用，同 §35.1 先例）+ fmt + clippy + workspace test + 前端
+  npm test/test:ui/build → **Release gate passed**
+- 新增/翻转判别测试：storage_backend 15（默认 sqlite/自动迁移/fresh/损坏
+  fail-closed/显式回退/marker 语义）+ cutover fresh 6 + importer_diagnostics
+  （findings #1/#2/#3）等
+
+### 36.5 兼容退场（§12.1.4 保留清单，逐项确认）
+
+- JSON importer：保留（`JsonImporter` + `build_import_snapshot` 单一权威）
+- SQLite → JSON reverse export：保留（未触碰 reverse_export/rollback 路径；
+  `JsonAuthoritative` marker 语义不变）
+- 迁移备份：保留（sqlite-backups/ 每次 cutover 生成 manifest + db，现场 T2 核验）
+- 显式紧急回退：保留（`STORYFORGE_STORAGE_BACKEND=json` + Android
+  `debug.storyforge.storage_backend` 属性桥；`env=json` 在 sqlite marker 下
+  fail-closed 而非静默回退）
+- §12.2 禁止项核对：不删除旧 JSON（T2 JSON 原样）；无备份不自动重试破坏性迁移
+  （cutover 全流程在备份检查点之后才发布）；不遇错静默建空库（缺失放行、损坏/
+  部分布局 fail-closed）；不双写（T3 零 JSON 文件 + SQLite facade 不构造 JSON
+  writer 的既有断言）
+
+### 36.6 提交列表（e2ed65d 之上，7 个）
+
+| SHA | 内容 |
+|---|---|
+| d9a51a2 | style(rustfmt)：清理既有格式漂移（未触碰 Gate 7 文件的机械重排，独立提交） |
+| e7f3f04 | feat(storage)：Gate 7 默认切换（backend 默认翻转 + fresh-start + Absent 分支 + run_json pinned） |
+| 7125bc4 | fix(storage)：删重复文档片段（clippy doc_lazy_continuation）+ retry_migration 桌面死代码门控 |
+| 195e919 | fix(storage)：候选周期发现 #1（缺失=空）+ H-3 测试同步（2e39b24 遗留） |
+| 6a4e04a | test(parity)：restart child 显式传 backend env（默认翻转适配） |
+| 048317d | fix(storage)：候选周期发现 #2/#3（CharacterInfo 空串 + 孤儿行跳过 + 单一快照权威） |
+| （待提交） | secret-scan 合成值缩短/文档脱敏（§36.4） |
+
+### 36.7 Gate 7 结论
+
+**PASS（缩减形式）**——§12.3 四条件逐项现场满足（§36.3 表）；§12.1.1 开发/测试
+构建默认 SQLite + JSON 显式回退已落地；§12.1.3 双平台 Gate 6 通过后默认化（桌面
+现场 + Android 同路径代码）；§12.1.4 兼容退场清单保留（§36.5）；§12.1.2 完整
+候选周期与 §12.1.5 删除 JSON 生产写路径为发布后/稳定期后事项，如实留白。
+**Gate 6 状态不变：Full100 BLOCKED on relay，Gate 6 不 seal；Gate 8 文档封存
+在下一步执行。**
+
+## 37. Gate 8 执行（文档与最终封存，2026-08-05）
+
+> 计划门：PLAN §13。同步 README / ARCHITECTURE / ARCHITECTURE-AUDIT /
+> DOCS-CODE-AUDIT / HANDOFF / ROADMAP / RELEASE-CHECKLIST / SQLite 状态审计 /
+> M5 结果 / 本专项 RESULT，删除或标记过期口径（§37.2）；本节为最终封存矩阵。
+
+### 37.1 每 Gate 终态矩阵
+
+| Gate | 结论 | 依据 |
+|---|---|---|
+| Gate 0 事实基线 | **PASS** | RESULT §1–4（基线命令清单、契约测试、能力矩阵） |
+| Gate 1 lib.rs 拆分 | **PASS** | §13–14；lib.rs 14,721 → 1,320 行；175/175 命令；前端合同不变 |
+| Gate 2 状态机收敛 | **PASS** | §7–10；5/5 通过条件（verifier 返修后，§28）；accept parity / 共享阶段 / 单一 tool-loop / 单一 postprocess 规则 / typed patch 同一纯函数 |
+| Gate 3 backend facade | **PASS** | §15；命令/应用层 `.is_sqlite()`/`.is_json()` 30 → 0；白名单 {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs} |
+| Gate 4 SQLite 缺口补齐 | **PASS** | §30（一审 INCOMPLETE → 二审 P1-1..P2-6 全关）；Meta UoW / MVU schema apply / Chronicle compressor / story_clock |
+| Gate 5 迁移、等价与恢复 | **PASS** | §33 二审 + §34 三审（10 项阻塞全关）；migration_matrix / reverse_export / 等价套件 / 故障矩阵 |
+| Gate 6 真实证据与平台验收 | **INCOMPLETE（§11.1 PASS + §11.3 双平台 PASS；§11.2 4/5 seal，Full100 BLOCKED on relay）** | §35；r3 58/100 全健康为迄今最完整长程证据；Gate 6 不 seal |
+| Gate 7 默认切换与兼容退场 | **PASS（缩减形式）** | §36；§12.3 四条件现场满足；候选周期统计与 §12.1.5 留待发布后 |
+| Gate 8 文档与最终封存 | **PASS（本节）** | §37.2–37.5 |
+
+### 37.2 文档同步清单（Gate 8）
+
+- `README.md`：当前状态/技术栈改为「默认 SQLite + JSON 显式回退」，M5 证据行更新
+  （45/100 历史 → Gate 6 4/5 seal + Full100 续跑）。
+- `docs/ARCHITECTURE.md`：原则 5 与存储后端章节改为 SQLite 默认；Postprocess 边界
+  改为共享服务已抽出；发布边界与技术债更新（Gitea Linux runner 已投入运行、
+  Android 模拟器 + Windows 现场 PASS、真机/签名仍缺）。
+- `docs/HANDOFF.md`：重写为 Gate 7 后事实（SQLite 默认、证据矩阵、下一优先级、
+  交接约束更新为「默认已是 SQLite，保留兼容退场」）。
+- `docs/RELEASE-CHECKLIST.md`：L7/L8 状态更新（4/5 seal + Full100 BLOCKED；共享
+  Postprocess 服务已抽出）；§8 增加 Gate 7 兼容退场发布义务（保留 importer /
+  reverse export / 备份 / 显式回退至少一个发布周期）。
+- `docs/ROADMAP.md` / `docs/ARCHITECTURE-AUDIT.md` / `docs/DOCS-CODE-AUDIT.md`：
+  核对无「默认 JSON」「尚未抽出」等过期口径，无需改动（历史段保持）。
+- `docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`：加「已被本专项
+  RESULT 取代」横幅，保留为历史证据。
+- PLAN/RESULT 状态行：Gate 6 进行中（Full100 BLOCKED）、Gate 7 PASS（缩减形式）、
+  Gate 8 完成。
+
+### 37.3 规模与分支点前后对比
+
+| 指标 | Gate 0 基线 | 当前 | 说明 |
+|---|---|---|---|
+| `lib.rs` 行数 | 14,721（Gate 1 起点） | 1,502 | Gate 1 终态 1,320；此后 +182（Android 属性桥/ndk 重试/接线），仍远低于 2,500 门槛 |
+| Tauri command 属性/注册 | 175/175 | 175/175 | baseline 脚本实时核验，无重复注册 |
+| 前端唯一 invoke / 缺失后端命令 | 162 / 0 | 162 / 0 | IPC 合同全程未变（Gate 8 复核） |
+| 命令/应用服务层 `.is_sqlite()`/`.is_json()` | 30（Gate 3 前） | 0 | Gate 3 起白名单外为零（静态门禁钉住） |
+| `is_sqlite_active()` 总引用 | 68 | 55 | 余量均在允许白名单（sqlite_runtime/facade 边界） |
+| schema/migration | V001–V008 | V001–V008（current_version=8） | 未新增迁移；marker schema_version=8 |
+| 存储默认 | JSON | SQLite（Gate 7） | `StorageBackend::default` / selection / marker-first 决议 |
+
+### 37.4 测试命令与真实结果（Gate 8 复核）
+
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings`
+  / `cargo test --workspace`：全绿（Gate 7 提交后复核）。
+- §11.1 目标套件（sqlite_optin_lifecycle / sqlite_preaccept_production_lifecycle /
+  sqlite_meta_lifecycle / sqlite_mvu_translations / endurance_sqlite_deterministic /
+  m5_production_evidence）：全绿。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8/8。
+- `verify-release.ps1`：secret-scan + fmt + clippy + workspace test + 前端
+  npm test / test:ui / build → **Release gate passed**（2026-08-05）。
+- `node scripts/architecture/backend-baseline.mjs`：175/175、162 invokes、0 missing、
+  lib.rs 1,502 行。
+
+### 37.5 未完成项与回滚方式（诚实清单）
+
+**未完成（不因 Gate 7/8 而消失）：**
+
+1. **Gate 6 Full100 真实模型长程证据**——BLOCKED on relay 间歇不稳定（r3 58/100
+   全健康，§35.8）。续跑：relay 恢复后
+   `bash /c/Users/Predator/storyforge-evidence/gate6-2026-08-02/run-stage.sh full native 100 3500`
+   （预计 ~10 小时 + 付费调用，需另行确认费用）。Gate 6 因此不 seal。
+2. **Gate 7 完整候选周期统计**（§12.1.2 自动回退率/迁移失败率）——发布后候选构建
+   收集；**删除 JSON 生产写路径**（§12.1.5）——稳定期后另立计划。
+3. **release APK 签名**——无证书，BLOCKED（RELEASE-CHECKLIST 记录）。
+4. **Android 真机 / Windows runner / 第三方插件 iframe / 真实卡 Gold 档兼容**——
+   现场矩阵外事项，按 RELEASE-CHECKLIST 排队。
+5. **CoT 三臂 × 80 轮**等 PLAN §16 排除项——单独排期，不与本专项混做。
+
+**回滚方式（默认切换后的安全出口，全部保留且经过验证）：**
+
+- `STORYFORGE_STORAGE_BACKEND=json` 显式回退（无 marker 时）；sqlite marker 在握
+  时 env=json fail-closed（须先 reverse export 或删 marker 重置，绝不静默回退）。
+- SQLite → JSON reverse export（staging + atomic publish，可重新导入）。
+- 每次 cutover 的 sqlite-backups/ 备份检查点（manifest + db）。
+- `JsonAuthoritative` marker 语义：官方 reverse-cutover 后 JSON 权威，env=sqlite
+  仍可重新 forward cutover。
+- 旧 JSON 全程未被删除（cutover 只读源 + 备份）。
+
+### 37.6 终态
+
+- worktree：clean（Gate 8 提交后）。
+- HEAD：Gate 8 文档提交；未 push（本地 ahead of origin/main）。
+- 远端/CI：Linux Gitea runner 已投入运行但本专项未触发远端 workflow；Windows
+  runner 未验证；CI 终态以 RELEASE-CHECKLIST 记录为准。
+- 本专项总提交：Gate 1–8 全部独立提交，未 amend 任何历史提交。
