@@ -170,6 +170,17 @@ pub(crate) fn get_conn_store() -> Arc<ConnectionStore> {
         .clone()
 }
 
+// On Android, the ndk-context needed by android_native_keyring_store is
+// initialized asynchronously from the webview's JNI thread (see setup hook).
+// The JNI callback sets this flag once ndk-context is ready; a setup-spawned
+// task polls it and then retries the plaintext→SecretRef migration on a normal
+// thread, after APP_DATA_DIR and the global ConnectionStore exist. We cannot
+// call get_conn_store() from the JNI callback itself because that callback can
+// run during webview bring-up, before setup has populated APP_DATA_DIR
+// (get_app_data_dir() would panic).
+#[cfg(target_os = "android")]
+static NDK_CONTEXT_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 static CARD_STUDIO_STORE: OnceLock<card_studio_store::CardStudioStore> = OnceLock::new();
 
 pub(crate) fn get_card_studio_store() -> &'static card_studio_store::CardStudioStore {
@@ -1120,7 +1131,6 @@ pub fn run() {
                             static CTX_REF: std::sync::OnceLock<
                                 Option<jni::objects::GlobalRef>,
                             > = std::sync::OnceLock::new();
-                            let already = CTX_REF.get().is_some();
                             CTX_REF.get_or_init(|| {
                                 let global = env.new_global_ref(activity).ok()?;
                                 let vm = env.get_java_vm().ok()?;
@@ -1138,18 +1148,14 @@ pub fn run() {
                                 }
                                 Some(global)
                             });
-                            // ndk-context is now initialized (first time only). The
-                            // ConnectionStore constructed during AppState::new_with_backend
-                            // above already ran its first migration attempt against an
-                            // uninitialized Keystore and fail-closed to plaintext.
-                            // ensure_native_store no longer caches that Err, so retrying
-                            // migration here (on the webview thread, after ndk-context is
-                            // ready) actually moves the seeded plaintext API key into the
-                            // Keystore and rewrites connections.json with a SecretRef.
-                            // Idempotent; errors are warned-and-kept-plaintext inside.
-                            if !already {
-                                get_conn_store().retry_migration();
-                            }
+                            // Signal that ndk-context is ready. The retry task spawned
+                            // in setup polls this flag and runs the plaintext→SecretRef
+                            // migration on a normal thread (not this JNI thread), where
+                            // it can safely call get_conn_store() once APP_DATA_DIR is
+                            // populated. We must NOT touch get_conn_store() here: this
+                            // callback can run during webview bring-up, before setup has
+                            // set APP_DATA_DIR, and get_app_data_dir() would panic.
+                            let _ = NDK_CONTEXT_READY.set(());
                         });
                     });
                 }
@@ -1197,6 +1203,38 @@ pub fn run() {
             );
             storyforge_app_logging::init_tracing(app_state.log_store.clone());
             app.manage(app_state.clone());
+
+            // Eagerly initialize the global ConnectionStore OnceLock so that any
+            // later get_conn_store() call (including the ndk-context retry task
+            // spawned below) reuses this instance instead of lazily constructing
+            // one through get_app_data_dir(). At this point APP_DATA_DIR is set
+            // and the data dir exists, so construction is safe.
+            #[cfg(target_os = "android")]
+            {
+                let _ = get_conn_store();
+                // Spawn a task that waits for the ndk-context-ready flag (set from
+                // the webview JNI callback) and then retries the plaintext→SecretRef
+                // migration. The first migration attempt ran inside
+                // AppState::new_with_backend before ndk-context was ready and fail-
+                // closed to plaintext; ensure_native_store no longer caches that
+                // Err, so this retry actually moves seeded keys into the Keystore.
+                std::thread::spawn(move || {
+                    // Poll (bounded) for the JNI callback to set the flag.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while NDK_CONTEXT_READY.get().is_none() {
+                        if std::time::Instant::now() > deadline {
+                            tracing::warn!(
+                                "ndk-context 就绪信号 10s 内未到达，跳过本次 keystore 迁移重试"
+                            );
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    // APP_DATA_DIR is set and CONN_STORE is initialized (both done
+                    // in setup, which has returned by the time this thread schedules).
+                    get_conn_store().retry_migration();
+                });
+            }
 
             // 三审9：单一公共启动恢复入口（幂等重放 Committing 态 Turn + 标记非
             // terminal 活动 Turn + 补挂 preaccept 恢复 + 重放 ChronicleCompressor）。
