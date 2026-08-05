@@ -549,15 +549,6 @@ fn new_fresh_run_id() -> String {
     format!("fresh-{nanos:x}")
 }
 
-///
-/// 重新计算源 JSON 的 manifest hash（与正式 cutover 同一 readiness 路径），派生
-/// authority_id（与 `new_authority_identity` 同一确定性公式），再用只读探测查
-/// 孤儿 DB 的 authority_binding 是否匹配。
-///
-/// - 匹配 → 这是本次 cutover 的中断残留，可恢复（`run_cutover` 继续，发布时
-///   `owned_by_storyforge_readonly` 让旧 DB 让位）。
-/// - 不匹配 / 打不开 → 非本次 cutover 的孤儿 DB（不同 data_dir 或不同源派生），
-///   必须 fail closed（绝不静默覆盖）。
 /// 三审3：判断 marker 缺失时残留的孤儿 DB 是否**属于本次 cutover**。
 ///
 /// 重新计算源 JSON 的 manifest hash（与正式 cutover 同一 readiness 路径），派生
