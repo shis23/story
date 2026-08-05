@@ -1742,7 +1742,7 @@ export 产物。
 | `verify-release.ps1`（含 secret-scan + fmt + clippy + test + 前端 npm test/test:ui/build） | exit 0；`Release gate passed.` |
 
 **执行中定位的缺陷（§11.1 阻塞，已修）：** `verify-release.ps1` 的 secret-scan
-在 `gate5_export_safety.rs:368/421` 命中合成测试值 `sk-super-secret-9876543210`
+在 `gate5_export_safety.rs:368/421` 命中合成测试值 `sk-…`（合成测试值，已按 §35.1 先例脱敏）
 （`sk-` 后 23 字符，命中边界感知 OpenAI-key 规则 `sk-[A-Za-z0-9_-]{20,}`）。该值是
 rollback-lossless / diagnostic-redacts 判别测试的有意 fixture，非真实密钥。修复：
 缩短为 `sk-test-fixture-x9`（`sk-` 后 15 字符，不再命中规则），保留 `sk-` 前缀以维持
@@ -1947,7 +1947,7 @@ debug APK 默认开启）用原始 WebSocket + CDP `Runtime.evaluate` 直接驱�
 
 | # | 缺陷 | 根因 | 修复 | 判别测试 |
 |---|---|---|---|---|
-| 1 | `verify-release.ps1` secret-scan 误报 `gate5_export_safety` 的合成 `sk-` fixture | 测试值 `sk-super-secret-9876543210`（`sk-` 后 23 字符）命中 OpenAI-key 规则 `sk-[A-Za-z0-9_-]{20,}` | 缩短为 `sk-test-fixture-x9`（`sk-` 后 15 字符，不命中规则），保留 `sk-` 前缀维持判别力 | 两测试（rollback-lossless / diagnostic-redacts）仍绿；secret-scan 干净。提交 `9c23173` |
+| 1 | `verify-release.ps1` secret-scan 误报 `gate5_export_safety` 的合成 `sk-` fixture | 测试值 `sk-…`（合成测试值，已按 §35.1 先例脱敏）（`sk-` 后 23 字符）命中 OpenAI-key 规则 `sk-[A-Za-z0-9_-]{20,}` | 缩短为 `sk-test-fixture-x9`（`sk-` 后 15 字符，不命中规则），保留 `sk-` 前缀维持判别力 | 两测试（rollback-lossless / diagnostic-redacts）仍绿；secret-scan 干净。提交 `9c23173` |
 | 2 | Canary 3 turn 2 fail-closed：harness schedule 要求 `徽章`(selective)/`账本`(both) 但 fixture 无对应 world-info 条目 | `cot_three_arm_80turn_v1.json` 的 selective/both 条目键是 玻璃蛾/黑伞/倒悬钟 等，无 `徽章`/`账本` | 在 fixture 加 2 个中性、不耦合 probe 的 world-info 条目（`wi-selective-harbor-badge` 键 `徽章`；`wi-both-ledger-procedure` 键 `账本`） | Canary3 turn 2/3 全绿；deterministic 套件 36/36 不破。提交 `1c1fc4e` |
 | 3 | Stability 30 多次 fail-closed：relay 瞬态 5xx/超时的错误体偶然含 `storage`/`authority` 字样被误判 Fatal | `classify_write_failure` 的 fatal-keyword 扫描（为捕获 StoryForge 内部 storage/authority 错）误命中 relay 转发的错误体 incidental 词 | LLM 错误包装（稳定 thiserror 前缀 `LLM 错误: 服务端错误 (5xx)`/`超时`/`速率限制 (429)`/`HTTP 请求失败`）先于 incidental-keyword 扫描判为 Transient；内部 StoryForge storage/authority（非 LLM 包装）仍 Fatal | 判别测试：relay 5xx 带 `storage`/`authority` → Transient（旧实现 Fatal）；内部 `storage timeout during authority write` → 仍 Fatal。提交 `b438d6f` |
 | 4 | Stability 30 turn 11 fail-closed：`DerivationFailed`（记账推导失败项）被包装成 `nonretryable_accept:` | `format_accept_error_for_runner` 把所有非 QualityBlocked 的 AcceptError 都包成 `nonretryable_accept:`；但 DerivationFailed 设计上可重试（生产 UX「只有记账推导失败的待采纳草稿可以重试」） | 新增 `retryable_derivation_failed:` 前缀路由 DerivationFailed，经 write-retry 循环重试（fresh draft 可能推导干净）；force_accept 在 endurance 从不用，持续失败的推导仍耗尽预算诚实 fail-closed | 判别测试：`retryable_derivation_failed:` → QualityBlocked（旧实现 Fatal）。提交 `f070933` |

@@ -210,7 +210,8 @@ mod tests {
     fn resolve_secret_value_passes_plaintext_through() {
         let store = SystemSecretStore::new("test-plaintext-passthrough");
         // Plaintext (not a secret ref) → returned as-is, no store access.
-        let plain = "sk-plaintext-fallback-key";
+        // 合成值保持 sk- 前缀但短于 secret-scan 的 20 字符阈值（§35.1 先例）。
+        let plain = "sk-plainkey";
         let resolved = resolve_secret_value(plain, &store).unwrap();
         assert_eq!(resolved, plain);
     }
@@ -220,7 +221,7 @@ mod tests {
     /// key that happens to start with "sk-" must NOT be treated as a ref.
     #[test]
     fn plaintext_starting_with_sk_is_not_treated_as_secret_ref() {
-        let val = "sk-something-1234567890";
+        let val = "sk-smth-1234";
         assert!(!is_secret_ref(val));
         assert!(val.starts_with("sk-"));
     }
