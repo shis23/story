@@ -1708,6 +1708,13 @@ impl ParityDriver {
             "STORYFORGE_RESTART_BACKEND",
             if self.sqlite { "sqlite" } else { "json" },
         );
+        // Gate 7：SQLite 是默认后端（无 env 即 sqlite）。子进程必须显式
+        // 继承父进程所处阶段的 backend，否则 JSON 阶段会因新默认解析成
+        // sqlite，破坏「子进程决议与父进程阶段一致」的检查意图。
+        cmd.env(
+            "STORYFORGE_STORAGE_BACKEND",
+            if self.sqlite { "sqlite" } else { "json" },
+        );
         cmd.env("STORYFORGE_RESTART_TURN_IDS", turn_ids.join(","));
         let output = match cmd.output() {
             Ok(out) => out,
