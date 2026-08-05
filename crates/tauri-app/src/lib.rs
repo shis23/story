@@ -415,6 +415,39 @@ fn get_app_data_dir() -> PathBuf {
         .unwrap_or_else(|error| panic!("failed to initialize application data directory: {error}"))
 }
 
+/// Android-only: read the `debug.storyforge.storage_backend` system property
+/// via the libc `__system_property_get` FFI (no extra crate). Returns the value
+/// only if it is a recognized backend token (`json`/`sqlite`); anything else
+/// (including unset) yields `None`, so this never perturbs production behavior.
+/// Used solely to feed the same `STORYFORGE_STORAGE_BACKEND` env var the
+/// production resolver reads, because `am start` cannot inherit a caller env.
+#[cfg(target_os = "android")]
+fn read_debug_storage_backend_property() -> Option<String> {
+    unsafe extern "C" {
+        fn __system_property_get(
+            name: *const std::os::raw::c_char,
+            value: *mut std::os::raw::c_char,
+        ) -> std::os::raw::c_int;
+    }
+    let key = b"debug.storyforge.storage_backend\0";
+    // 32 bytes is more than enough for "json"/"sqlite"; the recognized tokens
+    // are validated below, so anything longer is rejected anyway.
+    let mut buf = [0i8; 32];
+    // SAFETY: `key` is a NUL-terminated C string; `buf` is a 32-byte buffer.
+    // __system_property_get writes the property value + NUL and returns its
+    // length (≤ PROP_VALUE_MAX). We only read `n` bytes back out.
+    let n = unsafe { __system_property_get(key.as_ptr() as *const _, buf.as_mut_ptr()) };
+    if n <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..n as usize].iter().map(|&b| b as u8).collect();
+    let val = String::from_utf8(bytes).ok()?;
+    match val.trim() {
+        "json" | "sqlite" => Some(val.trim().to_string()),
+        _ => None,
+    }
+}
+
 fn initialize_app_data_dir(framework_data_dir: Option<&Path>) -> Result<PathBuf, String> {
     let exe_parent = std::env::current_exe()
         .ok()
@@ -1178,6 +1211,25 @@ pub fn run() {
             // Resolve storage backend before any store recovery. JSON remains
             // default; explicit SQLite selection activates a fail-closed,
             // process-owned production boundary (no dual-write).
+            //
+            // Android-only debug bridge: the launch environment cannot be set
+            // from adb (am start does not inherit the caller's env), so to allow
+            // on-device field verification of the SQLite opt-in / JSON→SQLite
+            // cutover we also honor the system property
+            // `debug.storyforge.storage_backend` (json|sqlite). It only feeds the
+            // same env var the production code already reads; it adds no new
+            // authority path and is a no-op on release builds where the property
+            // is unset. Set with: adb shell setprop debug.storyforge.storage_backend sqlite
+            #[cfg(target_os = "android")]
+            {
+                if std::env::var("STORYFORGE_STORAGE_BACKEND").is_err() {
+                    if let Some(val) = read_debug_storage_backend_property() {
+                        // SAFETY: single-threaded setup before any store reads the
+                        // env var; no concurrent access exists yet.
+                        unsafe { std::env::set_var("STORYFORGE_STORAGE_BACKEND", val) };
+                    }
+                }
+            }
             let resolution = storage_backend::resolve_backend(&data_dir)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             tracing::info!(
