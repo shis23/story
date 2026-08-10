@@ -474,7 +474,10 @@ test('host handler routes plugin APIs through plugin-scoped backend commands', a
   ])
 })
 
-test('host handler maps plugin LLM generation to start_writing intent', async () => {
+test('host handler rejects llm.generate as unsupported', async () => {
+  // Gate 8 复评：后端 start_writing 的 on_event 是必填 Channel，插件沙箱
+  // 无法提供——llm.generate 必须显式报错，而不是 invoke 一个注定失败（缺
+  // 必填 Channel 反序列化报错）的调用。旧测试固化了「只传 intent」的错误契约。
   const plugin = { id: 'plugin-a', permissions: ['CallLlm'] }
   const source = {
     posted: [],
@@ -482,9 +485,9 @@ test('host handler maps plugin LLM generation to start_writing intent', async ()
       this.posted.push({ message, targetOrigin })
     },
   }
-  const calls = []
-  const handler = createHostHandler(plugin, async (command, params) => {
-    calls.push({ command, params })
+  let invoked = false
+  const handler = createHostHandler(plugin, async () => {
+    invoked = true
     return { text: 'generated' }
   })
 
@@ -499,23 +502,10 @@ test('host handler maps plugin LLM generation to start_writing intent', async ()
     source,
     origin: 'https://plugin.example',
   })
-  await handler({
-    data: {
-      type: MSG_REQUEST,
-      pluginId: 'plugin-a',
-      id: 'llm-2',
-      method: 'llm.generate',
-      params: { intent: 'object intent' },
-    },
-    source,
-    origin: 'https://plugin.example',
-  })
 
-  assert.deepEqual(calls, [
-    { command: 'start_writing', params: { intent: 'raw prompt' } },
-    { command: 'start_writing', params: { intent: 'object intent' } },
-  ])
-  assert.equal(source.posted[0].message.result.text, 'generated')
+  assert.equal(invoked, false, 'llm.generate 不得调用后端 start_writing')
+  assert.ok(source.posted[0].message.error, '必须返回错误')
+  assert.ok(source.posted[0].message.error.includes('不支持'), source.posted[0].message.error)
 })
 
 test('host handler separates read and write variable permissions', async () => {

@@ -311,11 +311,22 @@ function Invoke-SmokeSuite {
 
     $suiteEndedAt = Get-Date
     # Gate 8 review P2-D4: cargo reports "0 tests" with exit 0 when a
-    # filter matches nothing; fail instead of silently passing.
+    # filter matches nothing; fail instead of silently passing. This package
+    # has many auto-discovered test binaries (one per tests/*.rs, no [[test]]
+    # declarations), so `cargo test -p harness-real-llm <filter>` runs ALL of
+    # them and non-matching binaries legitimately print "running 0 tests".
+    # Only treat the run as empty when NO binary executed any test
+    # (passed + failed == 0 across every "test result:" line).
     if ($null -ne $output) {
         $outputText = $output -join "`n"
-        if ($outputText -match 'running 0 tests' -or $outputText -match 'test result: ok\. 0 passed') {
-            throw "Suite $SuiteName ran 0 tests (filter '$filter' matched nothing); update or remove the stale filter."
+        $totalPassed = 0
+        $totalFailed = 0
+        foreach ($m in [regex]::Matches($outputText, 'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed')) {
+            $totalPassed += [int]$m.Groups[2].Value
+            $totalFailed += [int]$m.Groups[3].Value
+        }
+        if ($totalPassed -eq 0 -and $totalFailed -eq 0) {
+            throw "Suite $SuiteName ran 0 tests (filter '$filter' matched nothing across all test binaries); update or remove the stale filter."
         }
     }
     if ($exitCode -eq 0) {

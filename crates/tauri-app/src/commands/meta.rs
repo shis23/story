@@ -327,7 +327,7 @@ pub(crate) async fn meta_chat(
     });
 
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let turn = storyforge_app_meta::meta_chat(
+    let turn = match storyforge_app_meta::meta_chat(
         &runtime,
         &mut conv,
         app.meta_session.clone(),
@@ -336,7 +336,19 @@ pub(crate) async fn meta_chat(
         progress_tx,
     )
     .await
-    .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    {
+        Ok(turn) => turn,
+        Err(e) => {
+            // Gate 8 复评：失败路径也必须把对话放回 map——否则 LLM/工具错误
+            // 后前端下一轮报「对话不存在」，本轮 user 消息与历史被静默丢弃。
+            let conv_id = conv.id.clone();
+            app.meta_conversations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(conv_id, conv);
+            return Err(TauriCommandError::internal(e.to_string()));
+        }
+    };
 
     // 把新提议的 patch 同步进 AppState.meta_patches（前端可用 meta_accept_patch 采纳）
     if let Some(patch) = &turn.new_patch {

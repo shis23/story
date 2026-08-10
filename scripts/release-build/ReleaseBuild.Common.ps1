@@ -518,9 +518,11 @@ function Find-ReleaseSecretPatternFindings {
         # Key must be a standalone word; excludes Rust struct-literal
         # conversions so fixtures like `api_key: value.into()` are not flagged,
         # and StoryForge SecretRef values (the "-secret:" substring of
-        # "storyforge-secret:v1:…" must not read as a `secret:` assignment —
-        # its value part starts with "v1:"; real keys never do).
-        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*(?!v1:)[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
+        # "storyforge-secret:v1:..." must not read as a `secret:` assignment -
+        # its value starts with "v1:" (optionally after the storyforge-secret:
+        # prefix); real keys never do). Kept in sync with
+        # Invoke-ReleaseSecretScan (tracked config-file scan).
+        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*(?!(?:storyforge-secret:)?v1:)[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
     )
 
     $findings = @()
@@ -649,9 +651,10 @@ function Invoke-ReleaseSecretScan {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RepoRoot,
-        # 额外扫描根（如 evidence 目录，repo 外）。只扫文本文件，跳过
-        # SQLite/图片/构建产物等二进制；规则与 repo 侧一致（Gate 8 审查
-        # P1-2：evidence 曾藏真实 key 且不在扫描域）。
+        # Extra scan roots (e.g. evidence directories, outside the repo). Only
+        # text files are scanned; SQLite/images/build artifacts etc. are
+        # skipped as binary; rules match the repo side (Gate 8 review P1-2:
+        # evidence previously hid a real key outside the scan domain).
         [string[]]$EvidenceRoots = @()
     )
 
@@ -676,10 +679,16 @@ function Invoke-ReleaseSecretScan {
         # issuing truncated keys). Must contain an uppercase letter to
         # discriminate real high-entropy keys from lowercase test values
         # (sk-super-secret / sk-smth-1234). Gate 8 review P1-2: the real
-        # proxy key (sk-BX…, 16 chars) is invisible to the {20,} rule.
+        # proxy key (sk-BX..., 16 chars) is invisible to the {20,} rule.
         @{ Name = 'OpenAI-style API key (short)'; Pattern = '(?<![\w-])sk-(?=[A-Za-z0-9_-]{12,19}(?![\w-]))(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{12,19}' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
-        @{ Name = 'authorization header'; Pattern = '(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
+        # Kept in sync with Find-ReleaseSecretPatternFindings: the tracked
+        # scan must not be weaker than the untracked/evidence scan. (?i) is
+        # required so a lowercase `authorization: Bearer <token>` header
+        # committed to a tracked file cannot bypass the release gate.
+        @{ Name = 'authorization header'; Pattern = '(?i)(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
+        # Bare Bearer tokens without an Authorization: prefix.
+        @{ Name = 'bare bearer token'; Pattern = '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}' },
         # Secret assignment: a real credential bound to a key. Exclusions keep
         # test fixtures/docs from being flagged WITHOUT weakening real-key
         # detection:
@@ -697,7 +706,23 @@ function Invoke-ReleaseSecretScan {
         #       process-only, from-shell, NOT-REAL, storyforge-secret:v1:
         #       SecretRef). Real keys are high-entropy opaque strings and
         #       never carry these markers or read like English.
-        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|not[_-]?real|storyforge-secret:v1:|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
+        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|not[_-]?real|storyforge-secret:v1:|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' },
+        # Unquoted assignment: identical regex to the untracked/evidence Find
+        # set, but the tracked git-grep scan applies it only to config/script-
+        # shaped files (see $configOnlyPaths below). On Rust/JS source the
+        # pattern false-positives on idioms like `let secret = ...` or
+        # `api_key: conn.api_key.clone()`, so it cannot run over the whole
+        # tracked tree without breaking the release gate.
+        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*(?!(?:storyforge-secret:)?v1:)[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
+    )
+
+    # Files where unquoted secret assignments carry real signal: config and
+    # script formats, not Rust/JS/TS source. Git pathspec globs match at any
+    # depth (a leading ':' denotes a pathspec magic; (glob) matches across /).
+    $configOnlyPaths = @(
+        ':(glob)*.json', ':(glob)*.yaml', ':(glob)*.yml', ':(glob)*.toml',
+        ':(glob)*.sh', ':(glob)*.ps1', ':(glob)*.psm1', ':(glob)*.ini',
+        ':(glob)*.conf', ':(glob)*.cfg', ':(glob)*.env', ':(glob)*.properties'
     )
 
 
@@ -709,12 +734,18 @@ function Invoke-ReleaseSecretScan {
 
     foreach ($target in $scanTargets) {
         foreach ($rule in $rules) {
+            # Only the unquoted-assignment rule is restricted to config/script
+            # files; all other rules scan the full tracked tree.
+            $rulePaths = $pathspecs
+            if ($rule.Name -eq 'unquoted secret assignment') {
+                $rulePaths = $configOnlyPaths
+            }
             $prevEap = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
                 # PCRE2 (-P) is required for the boundary-aware lookbehind/lookahead
                 # on the OpenAI-style key pattern. git 2.53 compiles in PCRE2.
-                $output = & git -C $RepoRoot grep @($target.Args) -n -I -P -e $($rule.Pattern) -- @pathspecs 2>&1
+                $output = & git -C $RepoRoot grep @($target.Args) -n -I -P -e $($rule.Pattern) -- @rulePaths 2>&1
                 $exitCode = $LASTEXITCODE
             } finally {
                 $ErrorActionPreference = $prevEap
@@ -795,10 +826,12 @@ function Invoke-ReleaseSecretScan {
         }
     }
 
-    # Gate 8 审查 P1-2: evidence 目录（repo 外）不在 git grep 域，且真实代理
-    # key 长度低于 {20,} 阈值。对每个 evidence root 做文本文件扫描，规则与
-    # repo 侧一致（Find-ReleaseSecretPatternFindings）。二进制产物（SQLite、
-    # WAL、图片、构建产物、超大日志）跳过——它们不是可读文本输入。
+    # Gate 8 review P1-2: evidence directories (outside the repo) are not in
+    # the git grep domain, and real proxy keys are shorter than the {20,}
+    # threshold. Scan each evidence root as text files, with rules identical to
+    # the repo side (Find-ReleaseSecretPatternFindings). Binary artifacts
+    # (SQLite, WAL, images, build outputs, oversized logs) are skipped -- they
+    # are not readable text inputs.
     $evidenceExcludeExts = @('.sqlite3', '-wal', '-shm', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.apk', '.so', '.dll', '.exe', '.zip', '.gz', '.pdf', '.woff', '.woff2', '.ico', '.bin', '.mp4')
     $evidenceExcludeDirSegments = @('card-shell-cache')
     $evidenceMaxBytes = 10MB
@@ -814,8 +847,8 @@ function Invoke-ReleaseSecretScan {
                 if ($nameLower.EndsWith($ex)) { $skip = $true; break }
             }
             if ($skip) { continue }
-            # 第三方 webview 缓存目录（jquery/esm/index.html 等）：非用户输入，
-            # unquoted 规则会对其库代码误报。
+            # Third-party webview cache directories (jquery/esm/index.html etc.):
+            # not user input; the unquoted rule false-positives on their library code.
             $relSegments = $file.FullName.Substring($evidenceRoot.Length).Split([System.IO.Path]::DirectorySeparatorChar)
             foreach ($seg in $relSegments) {
                 if ($evidenceExcludeDirSegments -contains $seg) { $skip = $true; break }
@@ -825,7 +858,7 @@ function Invoke-ReleaseSecretScan {
             try {
                 $text = [System.IO.File]::ReadAllText($file.FullName)
             } catch {
-                # 不可读/二进制内容：跳过，不作为扫描输入。
+                # Unreadable/binary content: skip, do not treat as scan input.
                 continue
             }
             $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
@@ -1859,7 +1892,7 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
     Pure-PowerShell structural validation of a Gitea/GitHub Actions workflow YAML.
 
     .DESCRIPTION
-    Heuristic only — not a real YAML parser. Used solely as an emergency fallback
+    Heuristic only - not a real YAML parser. Used solely as an emergency fallback
     when explicitly allowed. Production validation must use PyYAML or a Node YAML
     parser.
     #>
@@ -2860,7 +2893,7 @@ function Test-ReleaseEvidencePackage {
         }
 
         # Reverse exact-set: every present artifact must be covered by exactly one
-        # staged subject (and therefore by provenance once staged↔prov binding holds).
+        # staged subject (and therefore by provenance once staged<->prov binding holds).
         foreach ($srcKey in @($artifactBySource.Keys)) {
             if (-not $mappedSources.ContainsKey($srcKey)) {
                 Add-SafeEvidenceError -Message ("present manifest artifact has no staged subject/provenance coverage: {0}" -f (Protect-ReleasePath -Text $srcKey -RepoRoot $evidenceRoot))

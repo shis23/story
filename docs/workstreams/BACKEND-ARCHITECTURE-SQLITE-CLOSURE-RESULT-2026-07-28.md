@@ -8,7 +8,7 @@
 
 ## 1. Gate 1 交付物
 
-- 根模块 `crates/tauri-app/src/lib.rs` 从 14,721 行降至 1,320 行。
+- 根模块 `crates/tauri-app/src/lib.rs` 从拆分前实测 19,775 行降至 1,320 行（14,721 为 Writing 子批中途 checkpoint 值，非起点）。
 - 具体命令实现已归位到 `commands/connections.rs`、`conversations.rs`、`turns.rs`、`writing.rs` 及既有域模块。
 - 根测试文件 `lib_tests.rs` 只保留模块声明、公共夹具和导入；域测试拆到：
   - `lib_tests_campaigns.rs`
@@ -32,7 +32,7 @@
 | `lib.rs` 行数 | 1,320 |
 | Tauri command 属性 | 175 |
 | 注册命令 | 175 |
-| 前端唯一 invoke | 162 |
+| 前端唯一 invoke | 171（Gate 8 复评后口径：扫描全部 frontend/src 的静态 invoke、plugin-bridge `command:` 动态表、shellDoc `._invoke` 与 .vue 直调；旧值 162 仅扫 tauri-api.js） |
 | 前端缺失后端命令 | 0 |
 | SQLite active flag references | 68 |
 
@@ -438,7 +438,7 @@ Gate 2（业务状态机与重复编排收敛）按计划 §7 分 8 个子批执
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
 - `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
 - `git diff --check`：通过。
-- 命令属性/注册 **175/175**，前端唯一 invoke **162**，缺失后端命令 **0**——IPC 合同未改。
+- 命令属性/注册 **175/175**，前端唯一 invoke **171**（Gate 8 复评后全 src 扫描口径；旧 162 仅扫 tauri-api.js），缺失后端命令 **0**——IPC 合同未改。
 
 ### 12.6 未削弱项最终核对
 
@@ -733,7 +733,7 @@ Gate 3 计划 §8.1 允许「trait 或启动时选择的 **enum-dispatched struc
   通过）；backend 分派只在 facade / backend_workflows / sqlite_runtime；SQLite
   活跃时四个 JSON writer 无构造机会（facadeSelectedWriterConstructors=4 不变）；
   `applicationMethodFlagReferences=0` 不变。
-- 前端 IPC 合同未改：命令 175/175、invoke 162、0 missing；前端契约测试 8/8。
+- 前端 IPC 合同未改：命令 175/175、invoke 171（Gate 8 复评后全 src 口径）、0 missing；前端契约测试 8/8。
 - JSON 路径行为未变：typed patch JSON 写盘（全局锁 + 逐 action）、MVU JSON apply、
   JSON compressor worker、WorldInfo JSON 文件路径全部保留原语义；既有 JSON 测试
   全绿。
@@ -2297,7 +2297,7 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 | Gate | 结论 | 依据 |
 |---|---|---|
 | Gate 0 事实基线 | **PASS** | RESULT §1–4（基线命令清单、契约测试、能力矩阵） |
-| Gate 1 lib.rs 拆分 | **PASS** | RESULT §1–4 / PLAN §6；lib.rs 14,721 → 1,320 行；175/175 命令；前端合同不变 |
+| Gate 1 lib.rs 拆分 | **PASS** | RESULT §1–4 / PLAN §6；lib.rs 拆分前实测 19,775 → 1,320 行；175/175 命令；前端合同不变 |
 | Gate 2 状态机收敛 | **PASS** | RESULT §6–13；5/5 通过条件（verifier 返修后）；accept parity / 共享阶段 / 单一 tool-loop / 单一 postprocess 规则 / typed patch 同一纯函数 |
 | Gate 3 backend facade | **PASS** | §15；命令/应用层 `.is_sqlite()`/`.is_json()` 30 → 0；白名单 {lib.rs, storage_backend.rs, sqlite_runtime.rs, backend_workflows.rs, startup_recovery.rs} |
 | Gate 4 SQLite 缺口补齐 | **PASS** | §30（一审 INCOMPLETE → 二审 P1-1..P2-6 全关）；Meta UoW / MVU schema apply / Chronicle compressor / story_clock |
@@ -2329,7 +2329,7 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 
 | 指标 | Gate 0 基线 | 当前 | 说明 |
 |---|---|---|---|
-| `lib.rs` 行数 | 14,721（Gate 1 起点） | 1,502 | Gate 1 终态 1,320；此后 +182（Android 属性桥/ndk 重试/接线），仍远低于 2,500 门槛 |
+| `lib.rs` 行数 | 19,775（Gate 1 起点，拆分前实测） | 1,502 | Gate 1 终态 1,320；14,721 为 Writing 子批 checkpoint 值；此后 +182（Android 属性桥/ndk 重试/接线），仍远低于 2,500 门槛 |
 | Tauri command 属性/注册 | 175/175 | 175/175 | baseline 脚本实时核验，无重复注册 |
 | 前端唯一 invoke / 缺失后端命令 | 162 / 0 | 162 / 0 | IPC 合同全程未变（Gate 8 复核） |
 | 命令/应用服务层 `.is_sqlite()`/`.is_json()` | 30（Gate 3 前） | 0 | Gate 3 起白名单外为零（静态门禁钉住） |
@@ -2347,7 +2347,7 @@ sqlite-backups/），零 legacy JSON 数据文件（无双写）——与桌面 
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：8/8。
 - `verify-release.ps1`：secret-scan + fmt + clippy + workspace test + 前端
   npm test / test:ui / build → **Release gate passed**（2026-08-05）。
-- `node scripts/architecture/backend-baseline.mjs`：175/175、162 invokes、0 missing、
+- `node scripts/architecture/backend-baseline.mjs`：175/175、171 invokes（Gate 8 复评后全 src 口径；旧 162 仅 tauri-api.js）、0 missing、
   lib.rs 1,502 行。
 
 ### 37.5 未完成项与回滚方式（诚实清单）

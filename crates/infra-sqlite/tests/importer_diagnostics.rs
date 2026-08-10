@@ -621,33 +621,42 @@ fn world_info_identical_payloads_distinct_campaigns_hash_differently() {
 }
 
 #[test]
-fn world_info_for_unknown_campaign_is_rejected() {
+fn world_info_for_unknown_campaign_is_skipped_and_counted() {
+    // Gate 8 复评：world_info 孤儿（campaign 不存在于源数据）与孤儿行同口径
+    // 跳过+计数——不得阻断默认迁移（原语义整体拒绝，与 P2-A3「被丢对象不
+    // 阻塞」冲突）。合法 campaign 的世界书仍正常落库。
     let dir = TempDir::new().unwrap();
     empty_but_valid_layout(dir.path());
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
     write_json(
         &dir.path().join("campaigns.json"),
         &json!([{ "id": "camp-a", "card_id": "card-1", "name": "A",
                   "created_at": "2026-07-13T00:00:00Z" }]),
     );
-    // 幽灵 campaign 的世界书文件：campaign_id 无对应 Campaign → 拒绝。
+    // 幽灵 campaign 的世界书文件：campaign_id 无对应 Campaign → 跳过并计数。
     write_json(
         &dir.path().join("campaign_world_info").join("ghost.json"),
         &json!({ "entries": [], "source": "native", "metadata": {} }),
     );
+    // 合法 campaign 的世界书保留。
+    write_json(
+        &dir.path().join("campaign_world_info").join("camp-a.json"),
+        &json!({ "entries": [], "source": "native", "metadata": {} }),
+    );
 
     let mut db = Database::open_in_memory().unwrap();
-    let err = JsonImporter::new(&mut db)
+    let imported = JsonImporter::new(&mut db)
         .import_data_dir(dir.path())
-        .expect_err("world-info for an unknown campaign must be rejected");
-    match err {
-        SqliteError::CorruptImportInput(msg) => {
-            assert!(
-                msg.contains("ghost") || msg.contains("campaign"),
-                "error must mention the unknown campaign, got: {msg}"
-            );
-        }
-        other => panic!("expected CorruptImportInput, got {other}"),
-    }
+        .expect("orphan world-info must be skipped, not block the import");
+    assert_eq!(imported.skipped_orphan_rows, 1, "1 个孤儿 world_info");
+    let world_info: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM campaign_world_info", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(world_info, 1, "合法 world_info 必须落库");
 }
 
 // ─── 三审6：Campaign 引用不存在的会话文件必须拒绝（区分空白新用户与部分丢失）───
@@ -656,8 +665,15 @@ fn world_info_for_unknown_campaign_is_rejected() {
 fn campaign_referencing_missing_conversation_is_rejected() {
     // 三审6：campaigns.json 引用了 conv-missing，但 conversations/ 里没有该文件
     // （部分文件丢失）→ importer 必须拒绝，绝不静默当作无会话导入。
+    // Gate 8 复评：必须是「有效 Campaign」（card 存在）才触发该拒绝——悬空卡
+    // Campaign 本身会被丢弃，其缺失会话不再阻断（见
+    // dangling_card_campaign_with_missing_conversation_is_skipped_not_blocking）。
     let dir = TempDir::new().unwrap();
     empty_but_valid_layout(dir.path());
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
     write_json(
         &dir.path().join("campaigns.json"),
         &json!([{
@@ -888,4 +904,156 @@ fn campaign_with_dangling_card_id_is_skipped_and_counted_not_blocking() {
         .unwrap();
     assert_eq!(second.status, ImportStatus::SkippedDuplicate);
     assert_eq!(second.skipped_orphan_rows, 1);
+}
+
+#[test]
+fn dangling_card_campaign_with_world_info_is_skipped_not_blocking() {
+    // Gate 8 复评：被 P2-A3 丢弃的悬空卡 Campaign 若仍带 campaign_world_info
+    // 文件，其 world_info 孤儿必须跳过+计数而不是 hard-fail（原顺序先
+    // strict_validate_world_info 会因孤儿 world_info 整体拒绝默认迁移）。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-live", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-dangling", "card_id": "card-removed", "name": "Dangling",
+            "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-2", "lineage_id": "lin-2"
+        }]),
+    );
+    write_json(
+        &dir.path()
+            .join("campaign_world_info")
+            .join("camp-dangling.json"),
+        &json!({ "entries": [] }),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-2.json"),
+        &json!({
+            "id": "conv-2", "campaign_id": "camp-dangling", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    for name in [
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+        "mvu_translations.json",
+        "compress_jobs.json",
+        "characters.json",
+        "campaign_world_info.json",
+    ] {
+        write_json(&dir.path().join(name), &json!([]));
+    }
+
+    let imported = JsonImporter::new(&mut Database::open_in_memory().unwrap())
+        .import_data_dir(dir.path())
+        .expect("悬空卡 Campaign 的 world_info 孤儿必须跳过而不是阻断导入");
+    assert_eq!(imported.campaigns, 0);
+    assert_eq!(
+        imported.skipped_orphan_rows, 2,
+        "1 悬空卡 Campaign + 1 孤儿 world_info"
+    );
+}
+
+#[test]
+fn dangling_card_campaign_with_missing_conversation_is_skipped_not_blocking() {
+    // Gate 8 复评：verify_campaign_conversation_references 移到悬空卡过滤之后
+    // ——被丢弃对象的缺失会话引用不得阻断默认迁移（原顺序对原始 campaigns
+    // 校验，悬空卡 Campaign 的缺失 conversation 文件会整体拒绝导入）。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-live", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([
+            {
+                "id": "camp-ok", "card_id": "card-live", "name": "Main",
+                "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-1", "lineage_id": "lin-1"
+            },
+            {
+                "id": "camp-dangling", "card_id": "card-removed", "name": "Dangling",
+                "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-missing", "lineage_id": "lin-2"
+            }
+        ]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-ok", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    for name in [
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+        "mvu_translations.json",
+        "compress_jobs.json",
+        "characters.json",
+        "campaign_world_info.json",
+    ] {
+        write_json(&dir.path().join(name), &json!([]));
+    }
+
+    let imported = JsonImporter::new(&mut Database::open_in_memory().unwrap())
+        .import_data_dir(dir.path())
+        .expect("悬空卡 Campaign 的缺失会话引用必须跳过而不是阻断导入");
+    assert_eq!(imported.campaigns, 1);
+    assert_eq!(imported.skipped_orphan_rows, 1, "1 个悬空卡 Campaign");
+}
+
+#[test]
+fn campaign_with_missing_card_id_fails_closed() {
+    // Gate 8 复评：领域模型 Campaign.card_id 必填；缺失/空是畸形数据，与
+    // 「悬空引用→孤儿跳过」严格区分，必须 fail-closed（旧实现把缺失 card_id
+    // 当空串静默并入孤儿丢弃）。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([{
+            "id": "camp-malformed", "name": "NoCard",
+            "created_at": "2026-07-01T00:00:00Z", "conversation_id": "conv-1", "lineage_id": "lin-1"
+        }]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-malformed", "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z", "nodes": []
+        }),
+    );
+    for name in [
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+        "mvu_translations.json",
+        "compress_jobs.json",
+        "characters.json",
+        "campaign_world_info.json",
+    ] {
+        write_json(&dir.path().join(name), &json!([]));
+    }
+
+    let err = JsonImporter::new(&mut Database::open_in_memory().unwrap())
+        .import_data_dir(dir.path())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("card_id"),
+        "缺失 card_id 必须 fail-closed，got: {err}"
+    );
 }

@@ -486,14 +486,47 @@ fn normalize_models_url(base_url: &str) -> String {
     }
 }
 
+/// 剥离文本中 URL 的 userinfo（`scheme://user:pass@host/…` → `scheme://***@host/…`）。
+///
+/// reqwest 错误 Display 含完整 URL；`base_url` 可能内嵌凭据（user:pass@host），
+/// 错误信息会经 app-logging 落日志与导出包。Gate 8 复评：与 `fetch_models` 日志
+/// 的 `rsplit('@')` 同目标，但这里作用于任意含 URL 的错误文本，不依赖 URL 位置。
+pub fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        out.push_str(&rest[..pos + 3]);
+        rest = &rest[pos + 3..];
+        // authority 段到第一个 /、?、# 或空白为止；@ 属于 authority 的一部分，
+        // rfind('@') 找到后把其前内容替换为 ***。
+        let auth_end = rest
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let authority = &rest[..auth_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &rest[auth_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 分类 reqwest 传输错误
 fn classify_reqwest_error(e: &reqwest::Error) -> LlmError {
+    // 错误 Display 含完整 URL（含 base_url 内嵌的 user:pass）——落日志/导出
+    // 包前脱敏（Gate 8 复评，与 fetch_models 日志脱敏同目标）。
+    let detail = redact_url_userinfo(&e.to_string());
     if e.is_timeout() {
         LlmError::Timeout
     } else if e.is_connect() {
-        LlmError::Http(format!("连接失败: {e}"))
+        LlmError::Http(format!("连接失败: {detail}"))
     } else {
-        LlmError::Http(format!("请求失败: {e}"))
+        LlmError::Http(format!("请求失败: {detail}"))
     }
 }
 
@@ -533,6 +566,31 @@ mod tests {
     use super::*;
     use storyforge_domain::Id;
     use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
+
+    #[test]
+    fn redact_url_userinfo_strips_embedded_credentials() {
+        // Gate 8 复评：base_url 内嵌 user:pass 时，错误文本中的完整 URL 必须
+        // 脱敏（连接失败会经 app-logging 落日志/导出包）。
+        assert_eq!(
+            redact_url_userinfo("error sending request for url (https://user:pass@host/v1/models)"),
+            "error sending request for url (https://***@host/v1/models)"
+        );
+        // 无 userinfo 的 URL 原样保留。
+        assert_eq!(
+            redact_url_userinfo("error sending request for url (https://api.example.com/v1)"),
+            "error sending request for url (https://api.example.com/v1)"
+        );
+        // 纯 token 形态（无冒号）同样剥离。
+        assert_eq!(
+            redact_url_userinfo("connect to https://tok123@host:8443 failed"),
+            "connect to https://***@host:8443 failed"
+        );
+        // 多 URL / 文本混杂。
+        assert_eq!(
+            redact_url_userinfo("a https://u1:p1@h1/x then https://u2:p2@h2/y"),
+            "a https://***@h1/x then https://***@h2/y"
+        );
+    }
 
     fn make_client(model: &str) -> HttpLlmClient {
         make_client_with_params(model, SamplingParams::default())

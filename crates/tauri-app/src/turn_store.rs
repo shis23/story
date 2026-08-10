@@ -386,6 +386,56 @@ mod tests {
         );
     }
 
+    /// Gate 8 复评：abandon_turn 的 CAS 谓词——Committing（accept 已开始副作用）
+    /// 与全部终态不可放弃；只有纯活动态可放弃。旧实现无条件置 Abandoned 且先
+    /// 软删变体，并发 accept 赢下（Committing→Committed）时会毁掉已 Final 正文。
+    #[test]
+    fn abandon_predicate_rejects_committing_and_terminal_turns() {
+        let store = temp_store();
+        let abandon_predicate =
+            |r: &TurnRecord| r.status.is_active() && !r.status.has_side_effects_started();
+
+        for status in [
+            TurnStatus::Committing,
+            TurnStatus::Committed,
+            TurnStatus::Degraded,
+            TurnStatus::Failed,
+            TurnStatus::Abandoned,
+        ] {
+            let record = make_record(&format!("camp-{status:?}"));
+            let turn_id = record.turn_id.clone();
+            store.create_turn(record).unwrap();
+            store
+                .with_turn_mut(&turn_id, |r| r.status = status.clone())
+                .unwrap();
+            let applied = store
+                .mutate_if(&turn_id, abandon_predicate, |r| {
+                    r.status = TurnStatus::Abandoned;
+                })
+                .unwrap();
+            assert!(!applied, "{status:?} 不可放弃");
+            assert_eq!(store.get_turn(&turn_id).unwrap().status, status);
+        }
+
+        // 纯活动态（AwaitingAcceptance）可放弃。
+        let record = make_record("camp-active");
+        let turn_id = record.turn_id.clone();
+        store.create_turn(record).unwrap();
+        store
+            .with_turn_mut(&turn_id, |r| r.status = TurnStatus::AwaitingAcceptance)
+            .unwrap();
+        let applied = store
+            .mutate_if(&turn_id, abandon_predicate, |r| {
+                r.status = TurnStatus::Abandoned;
+            })
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            store.get_turn(&turn_id).unwrap().status,
+            TurnStatus::Abandoned
+        );
+    }
+
     /// Phase A 契约：accept CAS 与 postprocess 写回争用时，
     /// 已进入 Committing 的 Turn 不能被 postprocess 条件写回覆盖。
     #[test]

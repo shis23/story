@@ -1,7 +1,7 @@
 # StoryForge 交接说明
 
-> 更新日期：2026-08-05
-> 代码事实基线：`main@065629e`（Gate 7/8 完成后）；自动化验证基线以最近一次完整 `verify-release` 记录为准（Release gate passed，2026-08-05）。
+> 更新日期：2026-08-10
+> 代码事实基线：`main@065629e`（Gate 7/8 完成）加 Gate 8 复评修复 `accc648` 之后的审查修复批次（未 push）；自动化验证基线以最近一次完整 `verify-release` 记录为准（Release gate passed，2026-08-05）。
 > 范围：当前代码事实、证据等级、验证入口与下一优先级。
 > 本专项（后端拆分 + SQLite 收口）的权威结果：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`。
 

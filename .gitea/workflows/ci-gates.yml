@@ -253,5 +253,11 @@ jobs:
       # 只在本地执行，CI 绿灯可掩盖组件回归。
       - name: npm run test:ui (vitest components)
         run: npm run test:ui
+      # Gate 8 复评 F 域 P2: 真实 Chromium CSP 门禁此前只存在于 package.json，
+      # 未接入任何自动门禁——jsdom/字符串级 CSP 检查无法覆盖真实浏览器强制行为。
+      - name: npm run test:csp (real Chromium CSP)
+        run: |
+          npx playwright install chromium
+          npm run test:csp
       - name: npm run build
         run: npm run build

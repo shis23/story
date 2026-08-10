@@ -2358,34 +2358,45 @@ mod tests {
     #[test]
     fn json_authoritative_marker_allows_json_and_fresh_sqlite_optin() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = TempDir::new().unwrap();
-        sample_source(dir.path());
-        // JsonAuthoritative marker（官方 reverse-cutover 才会写）。
-        let marker = serde_json::json!({
-            "version": 1,
-            "backend": "json",
-            "schema_version": 0,
-            "manifest_hash": "",
-            "created_at": "2026-07-13T00:00:00Z"
-        });
-        std::fs::write(
-            dir.path().join("storyforge.backend.json"),
-            serde_json::to_vec_pretty(&marker).unwrap(),
-        )
-        .unwrap();
+        // hold_process_shared_lease 是进程级 OnceLock：先对同一 data_dir 解析
+        // JSON 会钉死其 shared 租约，同进程内后续 cutover（exclusive 升级）必然
+        // fail-closed。因此「JSON 解析」与「JSON→SQLite 翻转」必须用独立
+        // data_dir，测试才与全量套件的运行顺序无关（孤立跑也能过）。
+        let marker_json = |dir: &std::path::Path| {
+            let marker = serde_json::json!({
+                "version": 1,
+                "backend": "json",
+                "schema_version": 0,
+                "manifest_hash": "",
+                "created_at": "2026-07-13T00:00:00Z"
+            });
+            std::fs::write(
+                dir.join("storyforge.backend.json"),
+                serde_json::to_vec_pretty(&marker).unwrap(),
+            )
+            .unwrap();
+        };
 
+        // JsonAuthoritative marker（官方 reverse-cutover 才会写）：无 env 与
+        // env=json 均按 JSON 权威解析，不创建 DB/marker 改写。
+        let dir_json = TempDir::new().unwrap();
+        sample_source(dir_json.path());
+        marker_json(dir_json.path());
         clear_env();
-        let json_default = resolve_backend_inner(dir.path()).unwrap();
+        let json_default = resolve_backend_inner(dir_json.path()).unwrap();
         assert!(!json_default.is_sqlite(), "JSON marker + no env → JSON");
-
         set_env_json();
-        let json_explicit = resolve_backend_inner(dir.path()).unwrap();
+        let json_explicit = resolve_backend_inner(dir_json.path()).unwrap();
         assert!(!json_explicit.is_sqlite(), "JSON marker + env=json → JSON");
         clear_env();
 
-        // env=sqlite：合法的全新 opt-in，可重跑 cutover。
+        // env=sqlite：合法的全新 opt-in，可重跑 cutover（独立 data_dir，避免
+        // 进程级 shared 租约被上面 JSON 解析钉死）。
+        let dir_flip = TempDir::new().unwrap();
+        sample_source(dir_flip.path());
+        marker_json(dir_flip.path());
         set_env_sqlite();
-        let sqlite = resolve_backend_inner(dir.path()).unwrap();
+        let sqlite = resolve_backend_inner(dir_flip.path()).unwrap();
         assert!(
             sqlite.is_sqlite(),
             "JSON marker + env=sqlite is a legitimate fresh opt-in"
@@ -2439,6 +2450,7 @@ mod tests {
     fn corrupt_legacy_file_fails_closed_instead_of_fresh_start() {
         // 有数据但坏了（文件存在且不可解析）绝不当作空集合静默吞掉：
         // 必须 fail-closed 并给出可操作错误（§12.2「不遇错静默创建空数据库」）。
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         write_json(
             &dir.path().join("cards.json"),
@@ -2464,6 +2476,7 @@ mod tests {
         // 权威启动，不创建数据库/marker、不改动 JSON（无数据倒退）。
         // 注意：JSON→SQLite 的后续切换是跨进程场景（JSON 进程持 SHARED
         // 租约，进程内 cutover 必须 fail-closed——由 lease 设计保证）。
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         sample_source(dir.path());
         set_env_json();

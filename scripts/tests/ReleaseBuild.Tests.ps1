@@ -539,11 +539,72 @@ Describe 'ReleaseBuild secret scan helper' {
         ($findings -join ' ') | Should Not Match ([regex]::Escape($ent))
         ($findings -join ' ') | Should Match 'secret assignment'
     }
+
+    # Gate 8 P1-2 short-key rule: real proxy keys are 12-19 chars after "sk-"
+    # and contain an uppercase letter; all-lowercase synthetic test values must
+    # stay invisible. Values are never echoed in assertions.
+    It 'flags a short real-shaped sk- key (12-19 chars, uppercase present)' {
+        $short = 'sk-' + 'Bx' + ('a' * 14)
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("api_key=`"$short`""))
+        ($findings -join ' ') | Should Match 'OpenAI-style API key \(short\)'
+    }
+
+    It 'does not flag an all-lowercase short sk- fixture value' {
+        $lower = 'sk-' + ('a' * 16)
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("api_key=`"$lower`""))
+        ($findings -join ' ') | Should Not Match 'OpenAI-style API key'
+    }
+
+    It 'flags a lowercase authorization header with a bearer token' {
+        # Variable name avoids the scan's own keyword rule: `token = '<26
+        # chars>'` in source would itself be flagged as a secret assignment.
+        $val = 'abcdefghijklmnopqrstuvwxyz01'
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("authorization: bearer $val"))
+        ($findings -join ' ') | Should Match 'authorization header'
+    }
+
+    It 'flags a bare Bearer token without an Authorization prefix' {
+        $val = 'abcdefghijklmnopqrstuvwxyz01'
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("Bearer $val"))
+        ($findings -join ' ') | Should Match 'bare bearer token'
+    }
+
+    It 'does not flag a storyforge-secret:v1: SecretRef as unquoted assignment' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text 'api_key: storyforge-secret:v1:llm-connection:abc')
+        ($findings -join ' ') | Should Not Match 'unquoted secret assignment'
+    }
+
+    It 'flags an unquoted high-entropy assignment without echoing it' {
+        $ent = 'kQ7mP2xR9sV4tW8zY1' + 'dJ3'
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("api_key=$ent"))
+        ($findings -join ' ') | Should Match 'unquoted secret assignment'
+        ($findings -join ' ') | Should Not Match ([regex]::Escape($ent))
+    }
 }
 
 Describe 'ReleaseBuild dry-run contract' {
     It 'formats commands without executing them' {
         $formatted = Format-ReleaseCommand -Command @('cargo', 'build', '--release')
         $formatted | Should Be 'cargo build --release'
+    }
+}
+
+Describe 'ReleaseBuild script encoding safety' {
+    It 'keeps release PowerShell sources ASCII-only (PS 5.1 ANSI safety)' {
+        # Windows PowerShell 5.1 reads UTF-8-no-BOM scripts as ANSI (cp936);
+        # certain CJK comment sequences can swallow newlines and break parsing.
+        # Gate 8 review fixed 3 smoke scripts; the shared release file still
+        # held 187 non-ASCII chars. All release .ps1 sources must stay ASCII.
+        $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+        $offenders = @()
+        Get-ChildItem -Path (Join-Path $repoRoot 'scripts') -Recurse -Filter '*.ps1' -File | ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            $nonAscii = $false
+            foreach ($b in $bytes) {
+                if ($b -ge 0x80) { $nonAscii = $true; break }
+            }
+            if ($nonAscii) { $offenders += $_.FullName }
+        }
+        $offenders | Should BeNullOrEmpty
     }
 }

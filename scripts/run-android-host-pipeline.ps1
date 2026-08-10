@@ -127,6 +127,20 @@ function Invoke-AndroidHostCommand {
         if ($code -ne 0 -and -not $AllowFail) {
             Assert-ReleaseExitCode -ExitCode $code -StepName $Name
         }
+        # False-green guard: a cargo test filter that matches nothing exits 0
+        # with "0 tests"; fail instead of silently passing (Gate 8 review P2-D4).
+        if ($code -eq 0 -and $Command[0] -eq 'cargo' -and ($Command -contains 'test')) {
+            $text = $output -join "`n"
+            $passed = 0
+            $failed = 0
+            foreach ($m in [regex]::Matches($text, 'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed')) {
+                $passed += [int]$m.Groups[2].Value
+                $failed += [int]$m.Groups[3].Value
+            }
+            if ($passed -eq 0 -and $failed -eq 0) {
+                throw "Step '$Name' ran 0 tests; update or remove the stale filter."
+            }
+        }
         return @{ ExitCode = $code; Lines = $lines }
     } finally {
         Pop-Location

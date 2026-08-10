@@ -133,8 +133,10 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     let compress_jobs = read_compress_jobs_array(data_dir)?;
     let characters = read_characters_array(data_dir)?;
 
-    // 三审6：Campaign 引用的 conversation_id 必须有对应会话文件（与 importer 同口径）。
-    verify_campaign_conversation_references(&campaigns, &conversations)?;
+    // 三审6 语义保留：Campaign 引用的 conversation_id 必须有对应会话文件
+    // （与 importer 同口径）——但移到悬空卡过滤之后：被丢弃对象（悬空卡
+    // Campaign）的缺失会话引用不得阻塞默认迁移（与 P2-A3「被丢对象不阻塞」
+    // 同语义，Gate 8 复评修正）。
 
     // 审查一.6：严格校验（镜像 domain/store 类型）。任何畸形条目 → 整体拒绝
     // （含孤儿行——存在但损坏仍 fail-closed）。
@@ -143,6 +145,8 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     // `save_card` 按 source_character_id 覆盖去重会留下悬空引用）→ 与孤儿行
     // 同口径先跳过并计数，再按过滤后的 campaigns 派生 campaign_ids——否则
     // importer 的 `campaigns.card_id` FK 硬失败会让默认迁移卡死且无诊断。
+    // Gate 8 复评：card_id 缺失/空是畸形（领域必填），fail-closed，不并入
+    // 孤儿跳过。
     let card_ids: HashSet<String> = cards
         .iter()
         .filter_map(|c| {
@@ -157,7 +161,7 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
         })
         .collect();
     let mut skipped: Vec<(&'static str, usize)> = Vec::new();
-    let campaigns = filter_campaigns_without_card(campaigns, &card_ids, &mut skipped);
+    let campaigns = filter_campaigns_without_card(campaigns, &card_ids, &mut skipped)?;
     let campaign_ids: HashSet<String> = campaigns
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
@@ -166,6 +170,7 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
+    verify_campaign_conversation_references(&campaigns, &conversations)?;
     strict_validate_entries("cards", &cards, &campaign_ids)?;
     strict_validate_entries("campaigns", &campaigns, &campaign_ids)?;
     strict_validate_entries("instances", &instances, &campaign_ids)?;
@@ -177,6 +182,19 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
     strict_validate_entries("mvu_translations", &mvu_translations, &campaign_ids)?;
     strict_validate_entries("compress_jobs", &compress_jobs, &campaign_ids)?;
     strict_validate_entries("characters", &characters, &campaign_ids)?;
+    // Gate 8 复评：world_info 孤儿先过滤后严格校验——悬空卡 Campaign（已被
+    // P2-A3 丢弃）若仍带 campaign_world_info 文件，按其 campaign_id 不在
+    // 过滤后集合而同口径跳过+计数，不得让默认迁移卡死（原顺序先
+    // strict_validate_world_info 会因孤儿 world_info 硬失败）。
+    let world_info_total = world_info.len();
+    let world_info: Vec<(String, Value)> = world_info
+        .into_iter()
+        .filter(|(campaign_id, _)| campaign_ids.contains(campaign_id))
+        .collect();
+    let skipped_world_info = world_info_total - world_info.len();
+    if skipped_world_info > 0 {
+        skipped.push(("world_info", skipped_world_info));
+    }
     strict_validate_world_info(&world_info, &campaign_ids)?;
 
     // Gate 7 发现 #3：孤儿行过滤（父对象在源数据中不存在 = JSON 应用不可达）。
@@ -220,15 +238,6 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
         true,
         &mut skipped,
     );
-    let world_info_total = world_info.len();
-    let world_info: Vec<(String, Value)> = world_info
-        .into_iter()
-        .filter(|(campaign_id, _)| campaign_ids.contains(campaign_id))
-        .collect();
-    let skipped_world_info = world_info_total - world_info.len();
-    if skipped_world_info > 0 {
-        skipped.push(("world_info", skipped_world_info));
-    }
     let (compress_jobs, skipped_jobs) =
         filter_orphan_rows_counted(compress_jobs, &campaign_ids, &conversation_ids, false);
     if skipped_jobs > 0 {
@@ -337,15 +346,27 @@ fn filter_campaigns_without_card(
     campaigns: Vec<Value>,
     card_ids: &HashSet<String>,
     skipped: &mut Vec<(&'static str, usize)>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>> {
     let mut kept = Vec::with_capacity(campaigns.len());
     let mut dropped = 0usize;
     for campaign in campaigns {
         let card_id = campaign
             .get("card_id")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .unwrap_or_default();
-        if card_ids.contains(card_id) {
+        if card_id.is_empty() {
+            // 领域模型 Campaign.card_id 必填；缺失/空是畸形数据，与「引用不
+            // 存在的卡」（P2-A3 孤儿语义）严格区分，必须 fail-closed。
+            let camp_id = campaign
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            return Err(SqliteError::CorruptImportInput(format!(
+                "campaign {camp_id} has missing/empty card_id; expected a reference to an existing card"
+            )));
+        }
+        if card_ids.contains(&card_id) {
             kept.push(campaign);
         } else {
             dropped += 1;
@@ -354,7 +375,7 @@ fn filter_campaigns_without_card(
     if dropped > 0 {
         skipped.push(("campaigns_no_card", dropped));
     }
-    kept
+    Ok(kept)
 }
 
 /// Read-only dry-run over a JSON source tree. Must not open/write a live DB.

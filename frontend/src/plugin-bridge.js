@@ -195,7 +195,11 @@ export const API_METHODS = {
   'chat.save':        { permission: null,              command: null },
   'ui.popup':         { permission: null,              command: null },
   'ui.requestHeaders':{ permission: null,              command: null },
-  'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ intent: p.intent ?? p.prompt ?? '' }) },
+  // Gate 8 复评：后端 start_writing 的 on_event 是必填 Channel，插件沙箱
+  // 无法提供事件通道——该 API 在生产必然失败（Tauri 参数反序列化缺必填
+  // Channel 直接报错）。显式标记 unsupported，返回清晰错误而非 invoke 一个
+  // 注定失败的调用（旧测试曾固化「只传 intent」的错误契约）。
+  'llm.generate':     { permission: 'CallLlm', command: null, unsupported: 'llm.generate 不支持：start_writing 需要宿主注入 onEvent 事件通道，插件通道无法提供；请使用宿主写作流程' },
 }
 
 function requiredPermissions(method) {
@@ -1843,7 +1847,15 @@ export function createHostHandler(plugin, invoke, options = {}) {
       return
     }
 
-    // 调用 Tauri 后端
+    // 调用 Tauri 后端（unsupported/null command 方法显式报错，不 invoke）
+    if (method.unsupported || !method.command) {
+      postResponse(event, {
+        type: MSG_RESPONSE,
+        id: data.id,
+        error: method.unsupported || `方法 ${data.method} 在当前宿主不支持`,
+      })
+      return
+    }
     try {
       const params = method.params ? method.params(data.params || {}, plugin.id) : {}
       const result = await invoke(method.command, params)

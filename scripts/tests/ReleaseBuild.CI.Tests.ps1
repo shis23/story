@@ -589,7 +589,7 @@ Describe 'ReleaseBuild secret scan untracked inputs' {
             & git add README.md
             & git commit -m 'init' --quiet | Out-Null
             $big = Join-Path $repo 'oversized-input.bin'
-            # 2 MiB + 1 byte — must fail closed, not skip.
+            # 2 MiB + 1 byte - must fail closed, not skip.
             $bytes = New-Object byte[] (2MB + 1)
             [System.IO.File]::WriteAllBytes($big, $bytes)
             { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw

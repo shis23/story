@@ -2050,7 +2050,10 @@ fn seal_scans_hidden_tmp_and_nested_snapshot_for_secrets() {
     ));
 
     let _ = fs::remove_file(run_dir.join(".hidden_secret"));
-    fs::write(run_dir.join("notes.tmp"), "Bearer abcdefghijklmnop").unwrap();
+    // Bearer token payload (<16 chars so the repo secret-scan bare-bearer rule
+    // does not flag this fixture; the evidence ForbiddenPayload check keys on
+    // the "bearer " substring and still rejects it).
+    fs::write(run_dir.join("notes.tmp"), "Bearer abcdefgh").unwrap();
     let err = seal_run(
         &run_dir,
         SealOptions {

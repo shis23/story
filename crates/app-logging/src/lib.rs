@@ -108,7 +108,13 @@ impl LlmCallDetail {
             cached_tokens: self.cached_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             latency_ms: self.latency_ms,
-            error: self.error.clone(),
+            // Gate 8 复评：错误文本可能含 reqwest 完整 URL（base_url 内嵌
+            // userinfo 时带 user:pass）——导出前同样脱敏，与 request/response
+            // 一致，避免连接失败把凭据写进日志导出包。
+            error: self
+                .error
+                .as_deref()
+                .map(storyforge_infra_llm::http_client::redact_url_userinfo),
         }
     }
 }

@@ -21,6 +21,19 @@ function listRustSources(root) {
   return sources.sort()
 }
 
+function listFrontendSources(root) {
+  const sources = []
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) visit(entryPath)
+      else if (entry.isFile() && /\.(?:js|mjs|vue)$/.test(entry.name)) sources.push(entryPath)
+    }
+  }
+  visit(root)
+  return sources.sort()
+}
+
 export function extractRegisteredCommands(source) {
   const match = source.match(/tauri::generate_handler!\[([\s\S]*?)\]\s*\)\s*\.run/)
   if (!match) throw new Error('tauri::generate_handler! registration block not found')
@@ -40,7 +53,17 @@ export function extractCommandAttributes(source) {
 }
 
 export function extractFrontendInvokes(source) {
-  return [...source.matchAll(/\binvoke\(\s*['"]([^'"]+)['"]/g)].map((match) => match[1])
+  const found = []
+  // Direct invoke('cmd', ...) in JS/Vue script blocks.
+  for (const m of source.matchAll(/\binvoke\(\s*['"]([^'"]+)['"]/g)) found.push(m[1])
+  // shellDoc / adapter wrappers call this._invoke('cmd', ...).
+  for (const m of source.matchAll(/\._invoke\(\s*['"]([^'"]+)['"]/g)) found.push(m[1])
+  // Dynamic command tables (plugin-bridge.js API_METHODS) declare command: '...'.
+  // (?<![\w]) keeps `command:` from matching inside `slash_command:`.
+  for (const m of source.matchAll(/(?<![\w])command:\s*['"]([^'"]+)['"]/g)) found.push(m[1])
+  // Only well-formed command identifiers count; dynamic concatenations like
+  // `_invoke(' + commandName + ', ...)` are not statically resolvable.
+  return found.filter((name) => /^[a-z_][a-z0-9_]*$/.test(name))
 }
 
 export function extractSqliteReferences(source) {
@@ -81,7 +104,13 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   const apiSource = readUtf8(apiPath)
   const cargoSource = readUtf8(cargoPath)
   const registered = extractRegisteredCommands(libSource)
-  const frontend = extractFrontendInvokes(apiSource)
+  // Gate 8 复评：前端 invoke 扫描覆盖全部 frontend/src（tauri-api.js 静态
+  // invoke、shellDoc/adapter 的 ._invoke、plugin-bridge.js 的 command: 动态
+  // 表、.vue 直调），不再只看单一文件。
+  const frontendSourceRoot = path.join(repoRoot, 'frontend', 'src')
+  const frontend = listFrontendSources(frontendSourceRoot).flatMap((filePath) =>
+    extractFrontendInvokes(readUtf8(filePath)),
+  )
   const registeredSet = new Set(registered)
   const frontendSet = new Set(frontend)
   const sqlite = extractSqliteReferences(productionBackendSource)

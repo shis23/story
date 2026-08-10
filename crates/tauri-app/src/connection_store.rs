@@ -75,6 +75,9 @@ impl ConnectionStore {
     /// 保存连接（新建或更新）
     pub fn save(&self, connection: LlmConnection) -> Result<StoredConnection, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Gate 8 审查 P2-B7 同款快照：persist 失败必须回滚内存，避免
+        // 「内存已改/磁盘未变」的分裂态。覆盖更新与新增两条分支。
+        let snapshot = file.clone();
 
         // 若已存在同 id，更新；否则新增
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -86,7 +89,10 @@ impl ConnectionStore {
             existing.connection = stored_connection.clone();
             existing.last_used_at = Some(now.clone());
             let updated = existing.clone();
-            self.persist(&file)?;
+            if let Err(e) = self.persist(&file) {
+                *file = snapshot;
+                return Err(e);
+            }
             return Ok(updated);
         }
 
@@ -97,7 +103,10 @@ impl ConnectionStore {
             last_used_at: None,
         };
         file.connections.push(stored.clone());
-        self.persist(&file)?;
+        if let Err(e) = self.persist(&file) {
+            *file = snapshot;
+            return Err(e);
+        }
         Ok(stored)
     }
 
@@ -151,6 +160,10 @@ impl ConnectionStore {
     /// 删除连接（若是活跃的，同时清除 active_id）
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // 先快照修改前状态——persist 失败时回滚内存，避免「UI 已删但重启
+        // 复活」的分裂态（Gate 8 审查 P2-B7，turn_store 同款模式）。快照
+        // 必须在 retain 之前取，否则回滚后连接仍是被删状态。
+        let snapshot = file.clone();
         let before = file.connections.len();
         let mut removed_secret_refs = Vec::new();
         file.connections.retain(|c| {
@@ -164,9 +177,6 @@ impl ConnectionStore {
             }
         });
         if file.connections.len() < before {
-            // 先快照修改前状态——persist 失败时回滚内存，避免「UI 已删但重启
-            // 复活」的分裂态（Gate 8 审查 P2-B7，turn_store 同款模式）。
-            let snapshot = file.clone();
             // 若删除的是活跃连接，清除 active_id
             if file.active_id.as_deref() == Some(id) {
                 file.active_id = None;
@@ -191,6 +201,9 @@ impl ConnectionStore {
     /// 返回对应的 LlmConnection（供调用方构造 client）。
     pub fn set_active(&self, id: &str) -> Result<Option<LlmConnection>, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // 快照：persist 失败回滚 last_used_at / active_id（Gate 8 审查
+        // P2-B7）。取在一切内存修改之前，回滚语义才完整。
+        let snapshot = file.clone();
         let conn = {
             let stored = match file.connections.iter_mut().find(|c| c.id == id) {
                 Some(s) => s,
@@ -201,8 +214,6 @@ impl ConnectionStore {
                 Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             conn
         };
-        // 快照：persist 失败回滚 last_used_at / active_id（Gate 8 审查 P2-B7）。
-        let snapshot = file.clone();
         file.active_id = Some(id.to_string());
         if let Err(e) = self.persist(&file) {
             *file = snapshot;
@@ -443,6 +454,46 @@ mod tests {
         let conn = store.set_active("deepseek-active").unwrap().unwrap();
         assert_eq!(conn.api_key, "sk-test");
         assert_eq!(store.active_connection().unwrap().api_key, "sk-test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_failure_rolls_back_memory_for_save_delete_set_active() {
+        // Gate 8 审查 P2-B7 判别测试：persist 失败时 save（更新/新增）、
+        // delete、set_active 的内存态必须全部回滚——旧实现（快照在 retain
+        // 之后取、save 分支无快照）会在内存/磁盘间留下分裂态，本测试在
+        // 故障注入下 RED。
+        let (store, _secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("c1")).unwrap();
+        store.save(make_conn("c2")).unwrap();
+        store.set_active("c2").unwrap();
+
+        // 故障注入：把 connections.json 原地替换为目录，后续 persist 必失败。
+        let path = store.path.clone();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+
+        // 1) save 更新分支失败 → 内存保留旧值（last_used_at 不变）。
+        let before_update = store.get("c1").unwrap().last_used_at.clone();
+        assert!(store.save(make_conn("c1")).is_err());
+        assert_eq!(store.get("c1").unwrap().last_used_at, before_update);
+        assert_eq!(store.list().len(), 2);
+
+        // 2) save 新增分支失败 → 不新增（旧实现 push 后 persist 失败会残留）。
+        assert!(store.save(make_conn("c3")).is_err());
+        assert_eq!(store.list().len(), 2);
+        assert!(store.get("c3").is_none());
+
+        // 3) set_active 失败 → active 仍是 c2。
+        assert!(store.set_active("c1").is_err());
+        assert_eq!(store.active_connection().unwrap().id.as_str(), "c2");
+
+        // 4) delete 失败 → c2 仍在内存（旧实现快照在 retain 后取，回滚不恢复）。
+        assert!(store.delete("c2").is_err());
+        assert_eq!(store.list().len(), 2);
+        assert!(store.get("c2").is_some());
+        assert_eq!(store.active_connection().unwrap().id.as_str(), "c2");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

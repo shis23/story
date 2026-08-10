@@ -174,8 +174,29 @@ function Invoke-NativeStep {
         }
 
         Write-Host ("RUN: {0}" -f (Format-Command -Command $Command))
-        & $executable @arguments
-        $exitCode = $LASTEXITCODE
+        if ($executable -eq 'cargo' -and ($arguments -contains 'test')) {
+            # Capture cargo test output so a filter that matches nothing
+            # ("running 0 tests", exit 0) is caught instead of silently passing
+            # (Gate 8 review P2-D4).
+            $captured = & $executable @arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            $captured | Out-Host
+            if ($exitCode -eq 0) {
+                $text = $captured -join "`n"
+                $passed = 0
+                $failed = 0
+                foreach ($m in [regex]::Matches($text, 'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed')) {
+                    $passed += [int]$m.Groups[2].Value
+                    $failed += [int]$m.Groups[3].Value
+                }
+                if ($passed -eq 0 -and $failed -eq 0) {
+                    throw "Step '$Name' ran 0 tests; update or remove the stale filter."
+                }
+            }
+        } else {
+            & $executable @arguments
+            $exitCode = $LASTEXITCODE
+        }
         if ($exitCode -ne 0) {
             throw "Step '$Name' failed with exit code $exitCode."
         }

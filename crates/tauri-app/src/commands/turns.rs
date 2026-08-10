@@ -694,6 +694,35 @@ pub(crate) async fn abandon_turn(
         .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::validation("没有活动 Turn 可以放弃".to_string()))?;
 
+    // Gate 8 复评：先 CAS 把 Turn 置 Abandoned——谓词要求「仍在活动态且未开始
+    // 提交副作用」（排除 Committing/已终态）。旧实现先软删变体、后无条件
+    // update_turn_record 置 Abandoned：若并发 Accept 已赢下（CAS→Committing→
+    // Committed），abandon 的软删会把已 Final 的正文变体标 Discarded、Turn 被
+    // 回退成 Abandoned——已提交故事被静默还原。CAS 成功后 accept 的
+    // AwaitingAcceptance→Committing 不可能再通过，软删才安全。
+    let abandoned = state
+        .storage()
+        .mutate_turn_if(
+            &turn.turn_id,
+            |record| record.status.is_active() && !record.status.has_side_effects_started(),
+            |record| {
+                record.status = storyforge_domain::turn::TurnStatus::Abandoned;
+                for att in &mut record.attempts {
+                    if att.status.is_active() {
+                        att.status = storyforge_domain::turn::AttemptStatus::Discarded;
+                    }
+                }
+                record.touch();
+            },
+        )
+        .map_err(TauriCommandError::internal)?;
+
+    if !abandoned {
+        return Err(TauriCommandError::validation(
+            "Turn 已进入提交或终态，无法放弃（可能已被并发 Accept 接管）".to_string(),
+        ));
+    }
+
     // 把 input user 变体和所有未 accept 的 AI 变体标记 Discarded
     let conv_store = state.conv_store.clone();
     let turn_clone = turn.clone();
@@ -714,18 +743,6 @@ pub(crate) async fn abandon_turn(
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("Abandon Turn 任务失败: {e}")))?
-    .map_err(TauriCommandError::internal)?;
-
-    // 标记 Turn Abandoned
-    update_turn_record(state.storage(), &turn.turn_id, |record| {
-        record.status = storyforge_domain::turn::TurnStatus::Abandoned;
-        for att in &mut record.attempts {
-            if att.status.is_active() {
-                att.status = storyforge_domain::turn::AttemptStatus::Discarded;
-            }
-        }
-        record.touch();
-    })
     .map_err(TauriCommandError::internal)?;
 
     Ok(())

@@ -255,3 +255,35 @@ fn json_authoritative_flip_requires_explicit_optin() {
         MarkerStatus::SqliteAuthoritative { .. }
     ));
 }
+
+#[test]
+fn stale_marker_from_newer_binary_refused_even_with_matching_orphan() {
+    // Gate 8 复评：Stale 若因「marker 版本过新」（更新的二进制已写入权威），
+    // 即使孤儿 DB 身份匹配（orphan_belongs_to_this_cutover 为真）也必须
+    // 无条件拒绝续跑——旧二进制不得在更新二进制的权威上重发布陈旧 JSON
+    // 覆盖新版 DB（跨版本降级）。旧实现只凭身份匹配就放行续跑。
+    use storyforge_infra_sqlite::cutover::run_cutover;
+    let dir = TempDir::new().unwrap();
+    let plan = completed_cutover(dir.path());
+
+    // 模拟「更新二进制的 marker」：版本号超过当前支持的 MARKER_VERSION。
+    let mut marker = read_marker(dir.path());
+    marker["version"] = serde_json::json!(storyforge_infra_sqlite::cutover::MARKER_VERSION + 1);
+    write_marker(dir.path(), &marker);
+
+    // 孤儿 DB 身份匹配（同一 source 派生），但版本过新的 Stale 必须拒绝。
+    assert!(matches!(inspect_marker(&plan), MarkerStatus::Stale { .. }));
+    let request = CutoverRequest {
+        plan: plan.clone(),
+        label: "stale-version".to_string(),
+        allow_json_authoritative_flip: false,
+    };
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().contains("stale") || err.to_string().contains("newer"),
+        "version-too-new Stale must be refused, got: {err}"
+    );
+    // 拒绝后不得改动 marker / DB（无副作用）。
+    let after = read_marker(dir.path());
+    assert_eq!(after["version"], marker["version"]);
+}

@@ -590,6 +590,22 @@ fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
     orphan_db_matches_authority(&plan.db_path, &authority_id)
 }
 
+/// Stale marker 是否属于「本次二进制可理解的中断 cutover 残留」。
+///
+/// Gate 8 复评：仅三种原因允许走身份恢复——① `database file is missing`
+/// （BeforePublish 中断）、② `database verification failed`（AfterPublish 中断、
+/// marker↔DB 不匹配）、③ `marker absent but a StoryForge database…`
+/// （marker 写入前中断，DB 残留权威绑定）。版本过新 / 损坏 / 版本 0 / 后端未知
+/// 等一律无条件拒绝——它们可能是**更新的二进制**写入的权威，旧二进制绝不可凭
+/// 身份匹配重发布陈旧 JSON 覆盖新版 DB（跨版本降级）。
+/// `orphan_belongs_to_this_cutover` 只验 DB 的 authority_id，无法区分「同一次
+/// cutover 的中断」与「更新二进制在旧数据上的权威」，故此处先按原因收紧。
+fn is_recoverable_stale(reason: &str) -> bool {
+    reason.contains("database file is missing")
+        || reason.contains("database verification failed")
+        || reason.contains("marker absent but a StoryForge database")
+}
+
 /// 只读探测：孤儿 DB 的 authority_binding.authority_id 是否等于给定身份。
 fn orphan_db_matches_authority(path: &Path, expected_authority_id: &str) -> bool {
     if !path.exists() {
@@ -864,7 +880,9 @@ pub fn run_cutover_with_fault(
         MarkerStatus::Stale { reason } => {
             // 三审3：孤儿 DB（中断的 cutover 残留）若属于本次 cutover（同身份），
             // 允许恢复继续；否则 fail closed（绝不静默覆盖无关/未知 DB）。
-            if orphan_belongs_to_this_cutover(plan) {
+            // Gate 8 复评：先按原因收紧——版本过新/损坏等不可恢复 Stale 一律
+            // 拒绝（旧二进制不得在更新二进制的权威上重发布陈旧 JSON）。
+            if is_recoverable_stale(&reason) && orphan_belongs_to_this_cutover(plan) {
                 // 本次 cutover 的中断残留 → 继续（发布时让位旧 DB）。
             } else {
                 return Err(SqliteError::Other(format!(
@@ -908,7 +926,8 @@ pub fn run_cutover_with_fault(
         MarkerStatus::Absent => {}
         MarkerStatus::Stale { reason } => {
             // 三审3：加锁后再查——孤儿 DB 属于本次 cutover 才允许继续。
-            if orphan_belongs_to_this_cutover(plan) {
+            // Gate 8 复评：与 pre-lock 同口径，先按原因收紧。
+            if is_recoverable_stale(&reason) && orphan_belongs_to_this_cutover(plan) {
                 // 继续。
             } else {
                 return Err(SqliteError::Other(format!(

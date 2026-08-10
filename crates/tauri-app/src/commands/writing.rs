@@ -1200,6 +1200,11 @@ pub(crate) async fn start_writing(
                     });
                 }
                 clear_current_cancel_if(&app, &operation_id);
+                // Gate 8 复评：失败路径也回滚本次写作追加的 user 消息（仅当仍
+                // 是最后节点）——否则重试会再 append 一条，对话出现重复输入节点。
+                if let Some(input) = &start_target.input_node_id {
+                    rollback_orphaned_user_message(&app, &conversation_id, input);
+                }
                 // 保留 PipelineError 分类（retryable/429/超时），不让前端契约丢失
                 // （Gate 8 审查 P2-B6：format! 拍平会把一切变成 Internal）。
                 return Err(TauriCommandError::from(e));
@@ -1229,6 +1234,11 @@ pub(crate) async fn start_writing(
                     record.failure_reason = Some(format!("写作失败: {e}"));
                     record.touch();
                 });
+            }
+            // Gate 8 复评：回滚本次 user 消息（is_last 守卫）——失败后重试不
+            // 得留下重复输入节点。
+            if let Some(input) = &start_target.input_node_id {
+                rollback_orphaned_user_message(&app, &conversation_id, input);
             }
             Err(TauriCommandError::from(e))
         }

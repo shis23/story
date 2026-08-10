@@ -18,7 +18,9 @@ test('Gate 0 command registration baseline is stable', () => {
   assert.deepEqual(baseline.backend.duplicateRegisteredCommands, [])
   assert.equal(baseline.backend.commandAttributes, 175)
   assert.equal(baseline.backend.registeredCommandCount, 175)
-  assert.equal(baseline.frontend.uniqueInvokeCount, 162)
+  // Gate 8 复评：扫描覆盖全部 frontend/src（tauri-api.js 静态 invoke +
+  // plugin-bridge command: 动态表 + shellDoc ._invoke + .vue 直调）。
+  assert.equal(baseline.frontend.uniqueInvokeCount, 171)
 })
 
 test('Gate 0 command registration matches the complete ordered snapshot', () => {

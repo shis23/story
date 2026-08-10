@@ -172,6 +172,10 @@ try {
     Invoke-NativeStep -Name 'cargo test --workspace' -WorkingDirectory $repoRoot -Command @('cargo', 'test', '--workspace')
     Invoke-NativeStep -Name 'frontend npm.cmd test' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'test')
     Invoke-NativeStep -Name 'frontend npm.cmd run test:ui (vitest)' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'test:ui')
+    # Gate 8 review F domain P2: the real Chromium CSP gate previously lived
+    # only in package.json and ran in no automatic gate; wire it in so real
+    # browser enforcement is covered, not just jsdom/string-level CSP checks.
+    Invoke-NativeStep -Name 'frontend npm.cmd run test:csp (Chromium)' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'test:csp')
     Invoke-NativeStep -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
 
     Write-Host ''
