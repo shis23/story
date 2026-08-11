@@ -20,7 +20,7 @@ GRADLE = pathlib.Path("crates/tauri-app/gen/android/app/build.gradle.kts")
 
 # 注入到 android { } 块开头：读 key.properties，存在则建 release signingConfig。
 SIGNING_BLOCK = """    // CI: release signing config (reads gen/android/key.properties)
-    val sfKeyProps = java.util.Properties().apply {
+    val sfKeyProps = Properties().apply {
         val kf = rootProject.file("key.properties")
         if (kf.exists()) kf.inputStream().use { load(it) }
     }
