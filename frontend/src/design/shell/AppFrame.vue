@@ -44,7 +44,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', syncDesktopBreakpoint
         class="w-[min(100vw,var(--layout-sidebar))] bg-bg flex flex-col min-h-0"
         :class="isDesktop
           ? 'shrink-0 border-r border-line'
-          : 'fixed inset-y-0 left-0 z-[var(--z-drawer)] border-r border-line shadow-float'"
+          : 'fixed top-[env(safe-area-inset-top)] bottom-0 left-0 z-[var(--z-drawer)] border-r border-line shadow-float'"
       >
         <slot name="sidebar" :docked="isDesktop" />
       </aside>
@@ -74,7 +74,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', syncDesktopBreakpoint
     ></div>
     <div
       v-if="inspectorOpen"
-      class="fixed inset-y-0 right-0 z-[var(--z-drawer)] w-[min(100vw,var(--layout-inspector))] bg-surface border-l border-line shadow-float flex flex-col"
+      class="fixed top-[env(safe-area-inset-top)] bottom-0 right-0 z-[var(--z-drawer)] w-[min(100vw,var(--layout-inspector))] bg-surface border-l border-line shadow-float flex flex-col"
     >
       <slot name="inspector" />
     </div>

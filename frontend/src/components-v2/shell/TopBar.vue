@@ -18,7 +18,7 @@ const subtitle = computed(() => {
 
 <template>
   <header
-    class="story-topbar relative isolate grid h-[52px] shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 border-b border-line px-3 sm:px-4"
+    class="story-topbar relative isolate grid h-[calc(52px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 border-b border-line px-3 sm:px-4"
   >
     <!-- 左侧留白槽：窄窗显示菜单，桌面仍为标题保留对称空间。 -->
     <div class="col-start-1 flex min-w-0 items-center justify-start">
@@ -145,8 +145,8 @@ const subtitle = computed(() => {
 
 .story-topbar-icon {
   display: inline-flex;
-  width: 2.125rem;
-  height: 2.125rem;
+  width: 2.75rem;
+  height: 2.75rem;
   align-items: center;
   justify-content: center;
   border: 1px solid transparent;
