@@ -14,9 +14,29 @@ node_modules/
 crates/tauri-app/gen/android/
 
 # 运行时数据（含 API key，绝不提交）
+# data/local/ 收纳本地私人创作素材：角色卡、文风工具、私人 png 等
 data/
 *.log
 logs/
+
+# 本地凭据 / 密钥（绝不提交）
+.env*
+.env.local
+*.keystore
+*.jks
+*.p12
+*.pfx
+google-services.json
+play-services-*.json
+*.cer
+*.crt
+
+# 本地数据库文件误入防御（data/ 已整体忽略，这里是散落文件兜底）
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-journal
 
 # 编辑器/系统
 .vscode/
@@ -25,10 +45,11 @@ logs/
 .DS_Store
 Thumbs.db
 
-# ZCode 工具会话产物（plans/todo 等，不进版本库）
+# AI 工具会话产物与本地配置（不进版本库）
 .zcode/
+.claude/
 
-# 临时/测试文件
+# 临时/调试文件
 _test_out.txt
 _dbg.txt
 _all_rs.txt
@@ -36,22 +57,50 @@ _rs.txt
 _mvu_inspect.png
 _analyze_mvu.cjs
 .card_arg
-test-card.png
-test-card-seraphina.png
 *.png.bak
-cfs-mvu-tavern-helper-script.json
+
+# 根目录散落的测试图/卡片素材（私人评测产物；
+# 子目录如 crates/tauri-app/icons/ 不受影响）
+/*.png
+/*.jpg
+/*.jpeg
 artifacts/
-【梁元】lunareclipse 2.0.json
-双人成行 V7.0—长风渡（Agent版）.json
-test-card-multi-b2.png
 
 # local extracts / scratch
 tmp/
-
-# 用户卡片素材（本地评测/写卡材料，绝不入库）
-卿卿 (33).png
-写卡知识库.json
-明月秋青-V10086.json
-明月秋青写卡预设-标准+辅食.json
-明月小说文风蒸馏总结工具.zip
 .worktrees/
+
+# ─────────────────────────────────────────────────────────────
+# 以下为公开仓库发布清理（2026-08-11）：内部开发文档从版本库移除，
+# 本地保留但不再追踪。git rm --cached 后用这些规则防止再次入库。
+# ─────────────────────────────────────────────────────────────
+
+# AI 内部指令 / 代码审查记录（根目录）
+/CLAUDE.md
+/CODE-REVIEW-*.md
+
+# 内部过程文档：审计 / 审查 / 计划 / 交接 / 调研
+docs/ARCHITECTURE-AUDIT.md
+docs/AUDIT-FIX-*.md
+docs/B1-GUI-INVESTIGATION-*.md
+docs/CODE-ARCHITECTURE.md
+docs/DOCS-CODE-AUDIT.md
+docs/FRONTEND-DECOUPLING-AND-PLAN.md
+docs/FRONTEND-REBUILD-*.md
+docs/FRONTEND-REWORK-*.md
+docs/FULL-AUDIT-REPORT.md
+docs/HANDOFF.md
+docs/HARNESS-FINDINGS-*.md
+docs/PHASE8-FOLLOWUP-ISSUES.md
+docs/PLAN-*.md
+docs/PRODUCT-REVIEW-*.md
+docs/REGRESSION-COVERAGE.md
+docs/ST-EVENTS-COVERAGE.md
+docs/VISUAL-REDESIGN-*.md
+
+# 内部工作流 / 归档 / 设计稿预览 / 运维（整目录）
+docs/workstreams/
+docs/archive/
+docs/效果预览/
+docs/superpowers/
+docs/operations/

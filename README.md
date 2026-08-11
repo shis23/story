@@ -17,7 +17,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 
 - 多角色 Campaign 写作、重 roll、QualityGate、1× Editor auto-fix、私密知识归属门禁与 Editor redaction 已接入。
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
-- M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康），仍在续跑中（见 docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md §35）。
+- M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康），仍在续跑中。
 - **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
 - 发布脚本、Gitea workflow、导入兼容矩阵和插件兼容矩阵已具备确定性门禁；真实 GUI、Gitea runner、Android 真机和完整生产 Postprocess 证据仍未关闭。
 
@@ -78,12 +78,8 @@ docs                       当前规格、架构、验收和历史归档
 
 ## 当前权威文档
 
-- [交接说明](docs/HANDOFF.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [Agent 接口](docs/AGENT_INTERFACES.md)
 - [Memory / Context Compiler 规格](docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 - [Prompt / Cache 架构优化记录](docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md)
 - [发布检查清单](docs/RELEASE-CHECKLIST.md)
-- [M5 100-turn 结果](docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-RESULT.md)
-
-历史计划和旧架构快照位于 [docs/archive](docs/archive/README.md)。
