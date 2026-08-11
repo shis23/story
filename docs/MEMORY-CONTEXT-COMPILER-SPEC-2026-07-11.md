@@ -540,7 +540,7 @@ compress_batch_id?
 
 ### M5 endurance 记录（2026-07-14，脱敏）
 
-权威结果：`docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-RESULT.md`。
+脱敏摘要见下表（详细结果文档已不随仓库分发）。
 
 | 阶段 | Accept | Calls | Epoch | 结论 |
 | --- | ---: | ---: | ---: | --- |
@@ -583,7 +583,6 @@ compress_batch_id?
 | **本文件** | 记忆/Context **v1.0 权威规格** |
 | `docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md` | 总架构；落地以本文件为准 |
 | `docs/ARCHITECTURE.md` | 模块边界链接 |
-| `docs/HANDOFF.md` | 下一优先级 |
 | `docs/AGENT_INTERFACES.md` | Agent/工具对照 §6–7 |
 | `docs/DATA_MODEL.md` | Chronicle / RoundSummary / ArchivedSummary 主从 |
 

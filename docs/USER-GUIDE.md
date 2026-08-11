@@ -170,7 +170,7 @@ Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embed
 
 这些边界用于降低误解：发布候选可以跑主流程和常见兼容场景，但不要把它描述成正式全量 ST 运行时。
 
-**校对状态**：已核对代码。所列兼容范围与 ROADMAP Phase 5、HANDOFF、PLAN-ST-IMPORT-EXPORT.md、PLAN-PLUGIN-MVU.md 的已实现范围一致。边界声明与 HANDOFF 的诚实约束（"不承诺完整 ST 99 事件全集"等）一致。
+**校对状态**：已核对代码。所列兼容范围与 ROADMAP Phase 5 的已实现范围一致。边界声明保留诚实约束（不承诺完整 ST 99 事件全集等）。
 
 ## 10. 本地数据与备份
 

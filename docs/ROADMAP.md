@@ -26,9 +26,7 @@
 - 同名角色不会把知识或变量写串。
 - 无 active campaign 时走明确 fallback，而不是隐式混用状态。
 
-详细计划见：
-
-- `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）
+（该阶段已完成；详细执行计划文档已不随仓库分发。）
 
 ## Phase 2: 信息隔离和状态闭环
 
@@ -61,10 +59,7 @@
 - ✅ 知识传播引擎方向 5 MVP（2026-07-06）：`PropagationPolicy::Private`、postprocess `propagation` 解析、private+broadcast 拒绝和来源私有知识阻断已落地；仍需真实 LLM 对抗评测。
 - ✅ 知识传播引擎方向 4 MVP（2026-07-06）：`ToldByOther`/广播写入会用 `source_knowledge_id` 链接来源角色已有匹配知识，知识面板展示 A→B→C 传话链；仍需真实 LLM 行为评测和语义匹配增强。
 
-详细计划见：
-
-- `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档） 的阶段 5-6。
-- 隔离加固详情见 `docs/HARNESS-FINDINGS-2026-06-18.md`。
+（该阶段已完成；详细执行计划文档已不随仓库分发。）
 
 ## Phase 3: Meta Agent 维护层
 
@@ -89,7 +84,7 @@
 - ✅ Meta patch 不直接越权改数据（propose → preview → accept 才写盘）。
 - ✅ Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
 
-详细计划见 `docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md`（已归档）。统一 tool 注册中心见 `docs/archive/2026-06-18-phase3-meta-tasks/PLAN-TOOL-REGISTRY.md`（已实现并归档）。
+（该阶段已完成；详细执行计划文档已不随仓库分发。）
 
 ## Phase 4: 前端工作台重构
 
@@ -112,7 +107,7 @@
 - ✅ 调试用户能看到每个 Agent 的输入输出摘要（阶段 4 trace 用 display name）。
 - ✅ 移动端不依赖桌面宽屏才能操作主流程（阶段 6）。
 
-详细计划见 `docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`（已归档）。
+（该阶段已完成；详细执行计划文档已不随仓库分发。）
 
 ## Phase 5: ST 兼容和导入/导出
 
@@ -137,10 +132,7 @@
 - ✅ StoryForge 内部多角色 Campaign 不强行退化为单角色卡。
 - ✅ Campaign 可导出为 ST 卡 PNG + 共享 lorebook + StoryForge JSON bundle。
 
-详细计划：
-
-- `docs/PLAN-PLUGIN-MVU.md` 覆盖 MVU 状态栏、schema preview 和 JS fallback。
-- `docs/PLAN-ST-IMPORT-EXPORT.md` 覆盖 ST 导入保真 + Campaign 导出（T4/T5 已实现）。
+（该阶段已完成；详细执行计划文档已不随仓库分发。）
 
 已知限制（非阻塞）：
 
@@ -154,7 +146,7 @@
 
 ## Phase 6: Android 打磨
 
-**状态：已启动**（约 20%，2026-07-06 已完成 arm64-v8a debug/release 构建基线；详见 `DOCS-CODE-AUDIT.md` 和 `PLAN-ANDROID.md`）
+**状态：已启动**（约 20%，2026-07-06 已完成 arm64-v8a debug/release 构建基线）
 
 目标：把桌面调试能力收束为移动端可用体验。
 
@@ -172,7 +164,7 @@
 - 长会话不会明显卡顿。
 - 出错时能导出足够排查的信息。
 
-详细计划见 `docs/PLAN-ANDROID.md`。
+（该阶段进行中；详细执行计划文档已不随仓库分发。）
 
 ## Phase 7: 收口、验收和发布准备
 
@@ -193,7 +185,7 @@
 - 测试者能按 checklist 完成发布前检查。
 - 项目有明确的 post-mainline 优先级，不再无序扩张。
 
-详细计划见 `docs/PLAN-POST-MAINLINE.md`。
+（详细执行计划文档已不随仓库分发。）
 
 ## Phase 8: 前端架构重构
 
@@ -219,4 +211,4 @@
 - ✅ 构建产物 422KB，仅存已知 Vite dynamic import warning。
 - ✅ 契约红线全部保留：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`；`tauri-api.js`/`plugin-bridge.js`/`utils/*.js` 签名零改动。
 
-详细计划见 `docs/FRONTEND-REBUILD-2026-07-08.md`（执行手册）与 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。
+详细计划见 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。

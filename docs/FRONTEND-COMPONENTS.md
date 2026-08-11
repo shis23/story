@@ -3,7 +3,7 @@
 > 更新日期：2026-07-21  
 > 用途：**组件 / 能力 / 信息架构地图**，给视觉重设计与出图（含 gpt-image）当输入。  
 > **不是**现有 UI 的视觉规范，也**不要**照抄当前颜色、字号、间距、阴影、卡片密度。  
-> 生图效果稿目录：`docs/效果预览/`（`inbox` → `selected` / `rejected`，见该目录 README）。
+> （历史效果稿已不随仓库分发。）
 
 ## 0. 视觉重设计立场（2026-07-21）
 
@@ -277,7 +277,7 @@ Screens: (1) first-run empty (2) writing in progress (3) finished message with v
 | Meta / ST / Config / Debug | `meta/*` `st/*` `config/*` `debug/*` |
 | 契约未迁入 v2 | `components/PluginHost.vue`、`components/MvuJsRuntime.vue`（宿主/runtime，不是视觉主角） |
 
-历史 Phase 8 执行手册：`docs/FRONTEND-REBUILD-2026-07-08.md`（工程迁移用，不作出图风格输入）。
+（Phase 8 前端重构执行手册已不随仓库分发。）
 - `npm run build`：422KB 产物。
 - 契约红线：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode` 全部保留。
 

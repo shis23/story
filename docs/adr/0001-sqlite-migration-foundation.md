@@ -119,7 +119,7 @@ v1 schema 以稳定 ID 主键支撑上述边界；本线只提供事务原语，
 - 不切换默认后端
 - 不机械翻译全部 JSON store
 - 不改 M5 harness / Phase B 评估 / 桌面发布证据
-- 不修改 `docs/HANDOFF.md`
+- 不修改 HANDOFF 交接文档（历史文件，已不随仓库分发）
 
 ## 后果
 
