@@ -432,7 +432,7 @@ fn read_debug_storage_backend_property() -> Option<String> {
     let key = b"debug.storyforge.storage_backend\0";
     // 32 bytes is more than enough for "json"/"sqlite"; the recognized tokens
     // are validated below, so anything longer is rejected anyway.
-    let mut buf = [0i8; 32];
+    let mut buf: [std::os::raw::c_char; 32] = [0; 32];
     // SAFETY: `key` is a NUL-terminated C string; `buf` is a 32-byte buffer.
     // __system_property_get writes the property value + NUL and returns its
     // length (≤ PROP_VALUE_MAX). We only read `n` bytes back out.
