@@ -30,6 +30,15 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - 默认 SQLite/WAL 存储；JSON 保留为显式回退与迁移/反向导出源。
 - 关键词、向量、ContextEpoch 与 Chronicle A/B/C 记忆路径。
 
+## 下载预编译版本
+
+到 [Releases](https://github.com/shis23/story/releases) 下载最新版：
+
+- **Windows**：`*-setup.exe`（NSIS 安装器）或 `*.msi`，双击安装。首次运行若有 SmartScreen 警告，点「更多信息 → 仍要运行」即可（EXE 未做代码签名，开源项目常见）。
+- **Android**：`*-arm64-*-release.apk`，允许「安装未知来源应用」后安装（仅支持 arm64 设备）。
+
+每个版本附 `SHA256SUMS.txt` 校验和。
+
 ## 快速启动
 
 环境要求：Windows 11、Node.js v24+、Rust stable（edition 2024）。

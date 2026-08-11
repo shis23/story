@@ -1,0 +1,252 @@
+name: release
+
+# 构建 Windows（exe/msi/nsis 安装器）+ Android（arm64 release APK）并发布到 GitHub Release。
+#
+# 触发：
+#   - push v* tag  → 构建 + 自动发 GitHub Release（带 release notes）
+#   - workflow_dispatch → 仅构建并上传 artifact，不发 Release（用于调试）
+#
+# 首次使用前需配置 4 个 GitHub Secret（APK 签名用）：
+#   ANDROID_KEYSTORE_BASE64    base64 编码的 release keystore 文件内容
+#   ANDROID_KEYSTORE_PASSWORD  keystore 密码
+#   ANDROID_KEY_ALIAS          key 别名（如 storyforge）
+#   ANDROID_KEY_PASSWORD       key 密码
+# 生成 keystore 见 scripts/ci-patch-android-signing.py 同级的发布说明。
+# Windows EXE 当前未签名（首次运行有 SmartScreen 警告，README 已说明）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # softprops/action-gh-release 创建 Release 需要
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # 发布构建不中途取消
+
+env:
+  TAURI_CLI_VERSION: '2.11.2'
+  NODE_VERSION: '22'
+  NDK_VERSION: '27.1.12297006'
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Windows: MSI + NSIS 安装器
+  # ────────────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install pinned tauri-cli
+        shell: pwsh
+        run: |
+          cargo install tauri-cli --locked --version $env:TAURI_CLI_VERSION --force
+          $ver = (cargo tauri --version) -join "`n"
+          if ($ver -notmatch [regex]::Escape($env:TAURI_CLI_VERSION)) {
+            throw "Expected tauri-cli $($env:TAURI_CLI_VERSION), got: $ver"
+          }
+
+      - name: Build Windows bundle (msi + nsis)
+        run: cargo tauri build --ci
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $stage = "staging/windows"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $msi = Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" -ErrorAction Stop
+          $nsis = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*.exe" -ErrorAction Stop
+          if (-not $msi) { throw "No MSI produced under target/release/bundle/msi" }
+          if (-not $nsis) { throw "No NSIS exe produced under target/release/bundle/nsis" }
+          Copy-Item $msi.FullName -Destination $stage
+          Copy-Item $nsis.FullName -Destination $stage
+          # SHA-256 sidecar
+          Get-ChildItem $stage -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Out-File -Encoding ascii -Append "$stage/SHA256SUMS.txt"
+          }
+          Write-Host "Windows artifacts:"
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: staging/windows/*
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────
+  # Android: arm64 release APK（签名）
+  # ────────────────────────────────────────────────────────────
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          echo "y" | sdkmanager "ndk;${{ env.NDK_VERSION }}"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> "$GITHUB_ENV"
+
+      - name: Install Rust + aarch64 Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install pinned tauri-cli
+        run: |
+          cargo install tauri-cli --locked --version "$TAURI_CLI_VERSION" --force
+          cargo tauri --version
+
+      - name: Generate Android project
+        working-directory: crates/tauri-app
+        run: cargo tauri android init
+
+      - name: Decode keystore + write key.properties
+        working-directory: crates/tauri-app/gen/android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is not set. See release.yml header for setup."
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > storyforge-release.jks
+          {
+            echo "storeFile=storyforge-release.jks"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > key.properties
+          echo "keystore bytes: $(wc -c < storyforge-release.jks)"
+
+      - name: Patch build.gradle.kts with release signingConfig
+        run: python3 scripts/ci-patch-android-signing.py
+
+      - name: Build signed release APK (arm64)
+        working-directory: crates/tauri-app
+        run: cargo tauri android build --target aarch64 --ci --split-per-abi --apk
+
+      - name: Collect Android artifacts
+        run: |
+          stage="staging/android"
+          mkdir -p "$stage"
+          # 签名后 release APK 不再带 -unsigned 后缀
+          apk=$(find crates/tauri-app/gen/android/app/build/outputs/apk -name "*arm64*-release.apk" -type f | head -1)
+          if [ -z "$apk" ]; then
+            apk=$(find crates/tauri-app/gen/android/app/build/outputs/apk -name "*release*.apk" -type f | head -1)
+          fi
+          if [ -z "$apk" ]; then
+            echo "::error::No release APK produced"
+            find crates/tauri-app/gen/android/app/build/outputs/apk -type f || true
+            exit 1
+          fi
+          cp "$apk" "$stage/"
+          (cd "$stage" && sha256sum *.apk > SHA256SUMS.txt)
+          echo "Android artifacts:"
+          ls -la "$stage"
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: staging/android/*
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────
+  # Release: 汇总产物发 GitHub Release（仅 tag 触发）
+  # ────────────────────────────────────────────────────────────
+  release:
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: release/windows
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-artifacts
+          path: release/android
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            - **Windows**：下载 `*-setup.exe`（NSIS 安装器）或 `*.msi`，双击安装。
+              首次运行可能有 SmartScreen 警告，点「更多信息 → 仍要运行」即可（EXE 未做代码签名）。
+            - **Android**：下载 `*-arm64-*-release.apk`，手机允许「安装未知来源应用」后安装。
+              仅支持 arm64（主流 Android 手机）。
+
+            构建详情见 Actions 运行记录；每个产物都有 `SHA256SUMS.txt` 校验。
+          files: |
+            release/windows/*
+            release/android/*
