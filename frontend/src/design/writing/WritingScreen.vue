@@ -97,7 +97,7 @@ const hasReview = computed(() => {
   )
 })
 
-const forward = (name) => (p) => emit(name, p)
+const forward = (name, payload) => emit(name, payload)
 </script>
 
 <template>
@@ -143,16 +143,16 @@ const forward = (name) => (p) => emit(name, p)
             :content-component="contentComponent"
             :subagent-roles-by-message="subagentRolesByMessage"
             @cancel="emit('cancel')"
-            @reroll="forward('reroll')"
-            @reroll-user="forward('reroll-user')"
-            @switch-variant="forward('switch-variant')"
-            @edit-variant="forward('edit-variant')"
-            @accept-variant="forward('accept-variant')"
-            @retry-postprocess="forward('retry-postprocess')"
-            @dismiss-receipt="forward('dismiss-receipt')"
-            @delete-variant="forward('delete-variant')"
-            @add-variant="forward('add-variant')"
-            @branch="forward('branch')"
+            @reroll="forward('reroll', $event)"
+            @reroll-user="forward('reroll-user', $event)"
+            @switch-variant="forward('switch-variant', $event)"
+            @edit-variant="forward('edit-variant', $event)"
+            @accept-variant="forward('accept-variant', $event)"
+            @retry-postprocess="forward('retry-postprocess', $event)"
+            @dismiss-receipt="forward('dismiss-receipt', $event)"
+            @delete-variant="forward('delete-variant', $event)"
+            @add-variant="forward('add-variant', $event)"
+            @branch="forward('branch', $event)"
           >
             <template #after-messages>
               <slot name="after-messages" />
