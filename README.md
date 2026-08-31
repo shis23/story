@@ -41,7 +41,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 
 ## 快速启动
 
-环境要求：Windows 11、Node.js v24+、Rust stable（edition 2024）。
+环境要求：Windows 11、Node.js v22+（CI 钉 22.12.0；`node --test` glob 语法需 v22 起）、Rust stable（edition 2024）。
 
 ```powershell
 cd frontend

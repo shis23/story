@@ -146,7 +146,7 @@
 
 ## Phase 6: Android 打磨
 
-**状态：已启动**（约 20%，2026-07-06 已完成 arm64-v8a debug/release 构建基线）
+**状态：主体完成**（2026-08 收口：Slice 1 数据目录 fail-closed 重构已合并，见 `docs/workstreams/ANDROID-PHASE6-SLICE1-RESULT-2026-07-27.md`；Android 模拟器 15 项现场验收 PASS 见 `docs/HANDOFF.md` §11.3。剩余为真机回归与发布级打磨。）
 
 目标：把桌面调试能力收束为移动端可用体验。
 
@@ -164,7 +164,7 @@
 - 长会话不会明显卡顿。
 - 出错时能导出足够排查的信息。
 
-（该阶段进行中；详细执行计划文档已不随仓库分发。）
+（该阶段剩余项为真机回归；详细执行计划文档已不随仓库分发。）
 
 ## Phase 7: 收口、验收和发布准备
 
@@ -212,3 +212,11 @@
 - ✅ 契约红线全部保留：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`；`tauri-api.js`/`plugin-bridge.js`/`utils/*.js` 签名零改动。
 
 详细计划见 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。
+
+## Phase 8 之后（2026-09-01 注记）
+
+本 ROADMAP 的阶段划分止于 Phase 8（前端重构，已完成）。Phase 8 之后的演进不再以本文阶段推进，当前状态与后续入口见：
+
+- `docs/HANDOFF.md` —— 权威交接文档（SQLite 生产后端 Gate 7、发布 CI、Card Studio、card-shell、MVU 等进展）。
+- `docs/workstreams/` —— 活跃专线（release / SQLite / card-shell / CoT 等）。
+- `docs/DOCS-CODE-AUDIT.md` —— 代码事实权威（含 2026-09-01 增量）。

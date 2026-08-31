@@ -1,0 +1,2 @@
+# 2026-09-01: Linux 侧脚本必须 LF——CRLF 的 shebang（#!/usr/bin/env bash）在 CI 上直接报错
+*.sh text eol=lf

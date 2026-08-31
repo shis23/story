@@ -1,6 +1,6 @@
 # StoryForge 用户指南（发布候选）
 
-> **文档状态**：2026-07-08，发布候选。本文面向首次使用者，覆盖使用前准备、导入 ST PNG/JSON、创建 Campaign、写第一轮、查看状态、失败排障、导出、兼容/降级边界、本地数据与备份。
+> **文档状态**：2026-07-08 初版，2026-09-01 复核修订（导出入口文案、SQLite 默认后端）。本文面向首次使用者，覆盖使用前准备、导入 ST PNG/JSON、创建 Campaign、写第一轮、查看状态、失败排障、导出、兼容/降级边界、本地数据与备份。
 >
 > **校对状态**：各章节末尾标注了"校对状态"——`已核对代码` 表示与当前代码事实一致；`待补截图` 表示需要真实 UI 截图证据后填写。
 >
@@ -120,7 +120,7 @@ StoryForge 提供两种导出方式，入口在 Campaign 面板的"导出"区域
 用于备份、迁移、排障复现或分享 StoryForge 内部 Campaign 状态。
 
 1. 打开目标 Campaign。
-2. 在 Campaign 面板的"导出"区域点击 **`JSON Bundle`** 按钮（导出过程中按钮变为`导出中…`）。
+2. 在 Campaign 面板的"导出"区域点击 **`导出 Bundle`** 按钮（导出过程中状态提示为 `正在导出 Bundle…`）。
 3. 保存生成的 StoryForge JSON（文件名由 Tauri 文件对话框指定）。
 4. 记录 StoryForge 版本、导出时间和 Campaign 名称。
 5. 如需排障，同时到 LogPanel 点击 📦 按钮导出排障 bundle。
@@ -129,7 +129,7 @@ StoryForge 提供两种导出方式，入口在 Campaign 面板的"导出"区域
 
 用于与 SillyTavern 或其他 ST 兼容工具交换角色数据。
 
-1. 在 Campaign 面板的"导出"区域点击 **`ST 卡 PNG`** 按钮。
+1. 在 Campaign 面板的"导出"区域点击 **`导出 ST`** 按钮（状态提示为 `正在导出 ST 卡…`）。
 2. 每个角色保存为独立的 ST 兼容 PNG。
 
 ### 排障 bundle
@@ -144,9 +144,9 @@ StoryForge 提供两种导出方式，入口在 Campaign 面板的"导出"区域
 
 Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embedder 配置文件应只保存 `storyforge-secret:v1:*` 形式的引用，真实 key 由系统凭据库存储。
 
-> 📷 **待补截图**：Campaign 面板"导出"区域（JSON Bundle / ST 卡 PNG 两个按钮）。（发布前补，文件放 `docs/images/`）
+> 📷 **待补截图**：Campaign 面板"导出"区域（导出 ST / 导出 Bundle 两个按钮）。（发布前补，文件放 `docs/images/`）
 
-**校对状态**：已核对代码。按钮文案 `JSON Bundle` / `ST 卡 PNG` / 排障 bundle 📦 均与 frontend 代码一致。
+**校对状态**：已核对代码（2026-09-01 复核）。按钮文案 `导出 Bundle` / `导出 ST` / 排障 bundle 📦（title="导出 bundle"）均与 frontend 代码一致。
 
 ## 9. ST 兼容/降级边界
 
@@ -178,8 +178,10 @@ StoryForge 以本地数据为主。应用不应被视为云同步或唯一备份
 
 桌面端：
 
-- 应用数据目录由 StoryForge/Tauri 管理。Windows 桌面端数据目录为 `%APPDATA%\StoryForge`（即 `C:\Users\<用户名>\AppData\Roaming\StoryForge`），包含各 store JSON 文件（cards、campaigns、instances、knowledge、tasks、round_summaries、mvu_translations、connections、global_regex_scripts 等）。
-- 正常使用时不要在应用运行中手工移动、复制或覆盖内部 store 文件。
+- 应用数据目录由 StoryForge/Tauri 管理。Windows 桌面端数据目录为 `%APPDATA%\StoryForge`（即 `C:\Users\<用户名>\AppData\Roaming\StoryForge`）。
+- 自 Gate 7（2026-08-05）起，默认存储后端为 SQLite：主数据在单一数据库文件 `storyforge.sqlite3` 中（角色卡、Campaign、实例、知识、任务、总结、MVU 翻译、会话等都在其内），同目录可能有 `sqlite-backups/` 备份目录。设置环境变量 `STORYFORGE_STORAGE_BACKEND=json` 可回退到旧的 JSON 目录后端（此时才会看到 cards.json、campaigns.json 等 store 文件）。
+- 连接与 embedder 配置（`connections.json`、`embed.json`）仍为独立 JSON 文件；真实 API key 只存系统凭据库，文件里只有 `storyforge-secret:v1:*` 引用。
+- 正常使用时不要在应用运行中手工移动、复制或覆盖数据库文件或内部 store 文件。
 - 测试版、开发版或复现失败时，尽量使用单独的测试数据目录；正式写作使用稳定的正式数据目录。
 - 排障 bundle 会记录 data、log、conversation 等路径摘要，帮助定位问题，但不应导出真实 API key。
 - 升级前建议导出 Campaign bundle；遇到失败时再保留一份排障 bundle。
@@ -197,7 +199,7 @@ Android：
 - 不要手工复制或公开含真实凭据的系统文件；也不要把 `connections.json`、`embed.json` 当作凭据备份。
 - 如果迁移失败，停止写入并保留旧目录；不要用新空目录覆盖旧数据。
 
-**校对状态**：已核对代码。数据目录的 `get_app_data_dir()` 返回 Windows `%APPDATA%\StoryForge`；各 store JSON 文件名与 `campaign_store.rs`、`connection_store.rs` 等实现一致。Android 数据目录未在本机确认，mark 为待真机。
+**校对状态**：已核对代码（2026-09-01 复核）。数据目录的 `get_app_data_dir()` 返回 Windows `%APPDATA%\StoryForge`；默认 SQLite 后端（`storyforge.sqlite3`，`storage_backend.rs` marker 优先解析）与 `STORYFORGE_STORAGE_BACKEND=json` 回退均与当前实现一致；`connections.json` / `embed.json` 文件名与 `connection_store.rs` 等实现一致。Android 数据目录未在本机确认，mark 为待真机。
 
 ## 11. 首次使用检查
 

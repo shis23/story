@@ -134,7 +134,7 @@
 | `CharacterListPanel` | 兼容入口的角色卡列表。 |
 | `CampaignList` | 某张卡下的 Campaign 列表；设 active、打开详情。 |
 | `NewCampaignForm` | 选卡、选开场白、命名、创建并开始。 |
-| `CampaignDetailTabs` | instances / knowledge / tasks / summaries 分页。 |
+| `CampaignDetailTabs` | instances / variables / knowledge / world info / tasks / summaries 分页（2026-09-01：6 个子 tab）。 |
 | `InstancesTab` | 实例列表、临时实例升格、变量编辑。 |
 | `InstanceVariableEditor` | bool/number/json/text 变量编辑。 |
 | `KnowledgeTab` | 知识列表、来源、传话链、private/封口标记。 |
@@ -174,7 +174,7 @@
 | --- | --- |
 | `ConnectionConfigPanel` | LLM / embedder 配置、SecretRef 状态、测试连接。 |
 | `PresetPanel` | prompt preset、regex scripts、active preset。 |
-| `AgentConfigCard` | 当前 PromptProfile / Agent 配置摘要入口。 |
+| ~~`AgentConfigCard`~~ | 已删除（Phase 8 清理）：PromptProfile 摘要入口不存在了，PromptProfile 命令/wrapper 保留但暂无前端 UI。 |
 | `AgentProfileManager` | AgentRunConfig、tool whitelist、开关、校验错误。 |
 | `PluginPanel` | 插件列表、启停、权限、错误。 |
 | `PluginHostFrame` | iframe 插件宿主、slot mount、ready / error。 |
@@ -271,13 +271,13 @@ Screens: (1) first-run empty (2) writing in progress (3) finished message with v
 
 | 区域 | 代表文件 |
 | --- | --- |
-| Shell | `shell/AppShell.vue` `TopBar.vue` `PrimarySidebar.vue` `InspectorDrawer.vue` `PanelHost.vue` |
+| Shell | `shell/TopBar.vue` `PrimarySidebar.vue` `InspectorDrawer.vue` `PanelHost.vue`（`AppShell.vue` 从未接线，2026-09-01 已删除） |
 | Writing | `writing/ConversationViewport.vue` `ChatMessage.vue` `StreamingMessage.vue` `ProcessReview.vue` `Composer.vue` … |
-| Campaign | `campaign/CampaignPanel.vue` 与 4 个 `*Tab.vue`、`CardLibrary.vue`、`NewCampaignForm.vue` |
+| Campaign | `campaign/CampaignPanel.vue` 与 6 个 `*Tab.vue`、`CardLibrary.vue`、`NewCampaignForm.vue` |
 | Meta / ST / Config / Debug | `meta/*` `st/*` `config/*` `debug/*` |
 | 契约未迁入 v2 | `components/PluginHost.vue`、`components/MvuJsRuntime.vue`（宿主/runtime，不是视觉主角） |
 
 （Phase 8 前端重构执行手册已不随仓库分发。）
-- `npm run build`：422KB 产物。
+- `npm run build`：422KB 产物（2026-07-08 时点数据；2026-09-01 复核 minified ~590KB/gzip ~169KB，随功能增长属预期）。
 - 契约红线：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode` 全部保留。
 
