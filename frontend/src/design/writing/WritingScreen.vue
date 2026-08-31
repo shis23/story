@@ -160,6 +160,16 @@ const forward = (name, payload) => emit(name, payload)
           </StoryPage>
           <div class="mx-auto w-full max-w-[760px] px-4 sm:px-8 pb-6">
             <ProcessTimeline v-if="hasReview" :pipeline="pipeline" :generation-mode="generationMode" />
+            <!-- 失败态提示条：StreamingBody 只在生成中渲染、ProcessTimeline 只在 done
+                 渲染，error 态原本完全不可见（2026-08-31 验收：待采纳时提交静默无反馈） -->
+            <div
+              v-if="pipeline?.state === 'error'"
+              role="alert"
+              class="flex items-start gap-2 rounded-lg border border-err/40 bg-err/5 px-3.5 py-2.5 text-xs text-err"
+            >
+              <span aria-hidden="true" class="shrink-0">⚠</span>
+              <span class="min-w-0 break-words">{{ pipeline.stateLabel || '生成失败' }}</span>
+            </div>
           </div>
         </template>
       </template>

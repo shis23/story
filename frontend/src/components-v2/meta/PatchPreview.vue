@@ -8,6 +8,7 @@ import {
 import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 // 待采纳的（非类型化）Patch 列表：meta_list_pending_patches / meta_accept_patch / meta_dismiss_patch。
 // 原始 MetaPanel 右侧栏「📝 待采纳 Patch」区块迁移。
@@ -25,7 +26,7 @@ async function load() {
     patches.value = await metaListPendingPatches()
     emit('patch-count-change', patches.value.length)
   } catch (e) {
-    error.value = '加载待采纳 Patch 失败: ' + e
+    error.value = '加载待采纳 Patch 失败: ' + errorText(e)
     emit('error', error.value)
   }
 }
@@ -38,7 +39,7 @@ async function handleAccept(patchId) {
     await metaAcceptPatch(patchId)
     await load()
   } catch (e) {
-    error.value = '采纳失败: ' + e
+    error.value = '采纳失败: ' + errorText(e)
     emit('error', error.value)
   }
 }
@@ -49,7 +50,7 @@ async function handleDismiss(patchId) {
     await metaDismissPatch(patchId)
     await load()
   } catch (e) {
-    error.value = '忽略失败: ' + e
+    error.value = '忽略失败: ' + errorText(e)
     emit('error', error.value)
   }
 }

@@ -8,6 +8,7 @@
  */
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { logQuery, logClear, logExportBundle } from '../../tauri-api.js'
+import { errorText } from '../../utils/errorText.js'
 import Tabs from '../ui/Tabs.vue'
 import Select from '../ui/Select.vue'
 import IconButton from '../ui/IconButton.vue'
@@ -134,8 +135,24 @@ async function loadLogs({ quiet = false } = {}) {
 
 async function handleClear() {
   const kind = activeTab.value === 'all' ? null : activeTab.value
-  await logClear(kind)
+  try {
+    await logClear(kind)
+    setExportStatus('已清空日志')
+  } catch (e) {
+    console.error('清空日志失败:', e)
+    setExportStatus('清空失败: ' + errorText(e))
+    return
+  }
   await loadLogs()
+}
+
+const exportStatus = ref('')
+let exportStatusTimer = null
+
+function setExportStatus(text) {
+  exportStatus.value = text
+  if (exportStatusTimer) clearTimeout(exportStatusTimer)
+  exportStatusTimer = setTimeout(() => { exportStatus.value = '' }, 6000)
 }
 
 async function handleExport() {
@@ -149,11 +166,13 @@ async function handleExport() {
       filters: [{ name: 'JSON', extensions: ['json'] }],
     })
     if (filePath) {
-      const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
-      await writeBinaryFile(filePath, data)
+      const { writeFile } = await import('@tauri-apps/plugin-fs')
+      await writeFile(filePath, data)
+      setExportStatus('已导出日志 bundle')
     }
   } catch (e) {
     console.error('导出失败:', e)
+    setExportStatus('导出失败: ' + errorText(e))
   }
 }
 
@@ -174,6 +193,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  if (exportStatusTimer) clearTimeout(exportStatusTimer)
 })
 
 defineExpose({ loadLogs })
@@ -196,6 +216,11 @@ defineExpose({ loadLogs })
         </IconButton>
       </div>
     </header>
+    <p
+      v-if="exportStatus"
+      class="text-[11px]"
+      :class="exportStatus.includes('失败') ? 'text-red-500' : 'text-emerald-500'"
+    >{{ exportStatus }}</p>
 
     <Tabs v-model="activeTab" :tabs="tabs" @update:model-value="onTabChange">
       <div class="flex items-end gap-2 mb-3 min-w-0">

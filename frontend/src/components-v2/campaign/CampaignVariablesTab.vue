@@ -21,6 +21,7 @@ import {
 } from '../../utils/campaignDisplay.js'
 import LoadingState from '../ui/LoadingState.vue'
 import Button from '../ui/Button.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true },
@@ -99,7 +100,7 @@ async function load() {
     }))
     instanceGroups.value = groups
   } catch (e) {
-    if (token === loadToken) error.value = String(e)
+    if (token === loadToken) error.value = errorText(e)
   } finally {
     if (token === loadToken) loading.value = false
   }
@@ -168,7 +169,7 @@ async function addGlobalVariable() {
     showAddGlobal.value = false
     await load()
   } catch (e) {
-    await alertDialog(`新增变量失败：${e}`)
+    await alertDialog(`新增变量失败：${errorText(e)}`)
   } finally {
     addingGlobal.value = false
   }
@@ -183,7 +184,7 @@ async function syncCardSchema() {
     syncMessage.value = added > 0 ? `已补充 ${added} 项` : '已是最新'
     await load()
   } catch (e) {
-    await alertDialog(`同步卡片变量失败：${e}`)
+    await alertDialog(`同步卡片变量失败：${errorText(e)}`)
   } finally {
     syncingSchema.value = false
   }
@@ -200,7 +201,7 @@ async function persist(variable, rawValue, scope, instanceId = null) {
     }
     variable.value = parsed
   } catch (e) {
-    await alertDialog(`设置变量失败：${e}`)
+    await alertDialog(`设置变量失败：${errorText(e)}`)
   }
 }
 

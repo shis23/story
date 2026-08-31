@@ -20,7 +20,8 @@ test('Gate 0 command registration baseline is stable', () => {
   assert.equal(baseline.backend.registeredCommandCount, 175)
   // Gate 8 复评：扫描覆盖全部 frontend/src（tauri-api.js 静态 invoke +
   // plugin-bridge command: 动态表 + shellDoc ._invoke + .vue 直调）。
-  assert.equal(baseline.frontend.uniqueInvokeCount, 171)
+  // 2026-09-01 全量审查：移除零引用 wrapper softDeleteVariant/archiveConversation → 171→169。
+  assert.equal(baseline.frontend.uniqueInvokeCount, 169)
 })
 
 test('Gate 0 command registration matches the complete ordered snapshot', () => {

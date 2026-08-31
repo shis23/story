@@ -11,9 +11,10 @@
  *   { kind, pluginId, pluginName, event, stage, status, durationMs,
  *     changedKeys, inputSummary, outputSummary, error }
  */
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import { usePluginStore } from '../../stores/index.js'
 import { exportPromptHookAudit } from '../../utils/promptHookAudit.js'
+import { errorText } from '../../utils/errorText.js'
 import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
@@ -26,14 +27,24 @@ const plugin = usePluginStore()
 // ─── 倒序(最新在上) ───
 const records = computed(() => plugin.promptHookAuditRecords.slice().reverse())
 
-// ─── 展开行(按索引) ───
+// ─── 展开行（按 record 身份键）───
+// records 是倒序快照，新审计记录会让全部索引位移——按下标展开会静默串行，
+// 改用 record 的稳定身份键（pluginId+correlationId+recordedAt）。
 const expanded = ref(new Set())
-function toggleExpand(index) {
+function recordKey(record) {
+  return `${record.pluginId || ''}|${record.correlationId || ''}|${record.recordedAt || ''}`
+}
+function toggleExpand(row) {
+  const key = recordKey(record)
   const next = new Set(expanded.value)
-  if (next.has(index)) next.delete(index)
-  else next.add(index)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
   expanded.value = next
 }
+
+onUnmounted(() => {
+  if (exportStatusTimer) clearTimeout(exportStatusTimer)
+})
 
 // ─── status → Badge variant ───
 function statusVariant(status) {
@@ -63,6 +74,15 @@ function summaryJson(summary) {
 }
 
 // ─── 导出 ───
+const exportStatus = ref('')
+let exportStatusTimer = null
+
+function setExportStatus(text) {
+  exportStatus.value = text
+  if (exportStatusTimer) clearTimeout(exportStatusTimer)
+  exportStatusTimer = setTimeout(() => { exportStatus.value = '' }, 6000)
+}
+
 async function handleExport() {
   try {
     const json = exportPromptHookAudit(plugin.promptHookAuditRecords)
@@ -73,11 +93,13 @@ async function handleExport() {
       filters: [{ name: 'JSON', extensions: ['json'] }],
     })
     if (filePath) {
-      const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
-      await writeBinaryFile(filePath, data)
+      const { writeFile } = await import('@tauri-apps/plugin-fs')
+      await writeFile(filePath, data)
+      setExportStatus('已导出审计记录')
     }
   } catch (e) {
     console.error('导出审计失败:', e)
+    setExportStatus('导出失败: ' + errorText(e))
   }
 }
 
@@ -121,6 +143,11 @@ const columns = [
         导出
       </Button>
     </header>
+    <p
+      v-if="exportStatus"
+      class="text-[11px]"
+      :class="exportStatus.startsWith('导出失败') ? 'text-red-500' : 'text-emerald-500'"
+    >{{ exportStatus }}</p>
 
     <EmptyState
       v-if="records.length === 0"
@@ -163,10 +190,10 @@ const columns = [
           <IconButton
             size="sm"
             variant="ghost"
-            :title="expanded.has(index) ? '收起' : '展开'"
-            @click="toggleExpand(index)"
+            :title="expanded.has(recordKey(row)) ? '收起' : '展开'"
+            @click="toggleExpand(row)"
           >
-            <span class="text-xs transition-transform" :class="expanded.has(index) ? 'rotate-90' : ''">▶</span>
+            <span class="text-xs transition-transform" :class="expanded.has(recordKey(row)) ? 'rotate-90' : ''">▶</span>
           </IconButton>
           <IconButton
             size="sm"
@@ -183,7 +210,7 @@ const columns = [
     <!-- 展开详情:inputSummary / outputSummary / error -->
     <div
       v-for="(row, index) in records"
-      v-show="expanded.has(index)"
+      v-show="expanded.has(recordKey(row))"
       :key="`detail-${index}`"
       class="bg-surface-2 rounded-lg border border-line p-3 space-y-3"
     >

@@ -37,7 +37,7 @@
  *   - loadSidebarPlugins()         App.vue:113-127
  *   - setupConsoleForwarding()     App.vue:402-412
  */
-import { ref, computed, onMounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import AppFrame from './design/shell/AppFrame.vue'
 import PrimarySidebar from './components-v2/shell/PrimarySidebar.vue'
 import TopBar from './components-v2/shell/TopBar.vue'
@@ -101,7 +101,8 @@ import {
 } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
-import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
+import { errorText } from './utils/errorText.js'
+import { persistShellVariableWrite } from './utils/shellVariableOutbox.js'
 import {
   takeShellVariableProposal,
   upsertShellVariableProposal,
@@ -220,8 +221,6 @@ const cardShellCharacterId = ref(null)
 // L7-A：重型 TH 应用（≥30K inline_js）拆给写作面 HeavyShellDock 可见挂载；
 // 隐藏运行时只跑常规逻辑脚本（拆分器：utils/heavyShellApps.js）。
 const cardShellSplit = computed(() => splitHeavyThShells(cardShellShells.value))
-const shellVarAudit = createVariableWriteAudit(40)
-const shellVarAuditTick = ref(0)
 const openingShellArmed = ref(false)
 
 function armCardShellOpening() {
@@ -245,9 +244,13 @@ const showCardShellOpening = computed(() => shouldShowOpeningShell({
   messageCount: writing.messages.length,
   isWriting: writing.isWriting,
 }))
-const openingShellPresentation = computed(() => getOpeningShellPresentation(
-  typeof window !== 'undefined' ? window.innerHeight : 900,
-))
+// window.innerHeight 非响应式：computed 直读只在其它依赖变化时重算，
+// 旋转/缩放后会拿到过期高度。用 resize 监听的 ref 承载（同 AppFrame 做法）。
+const viewportHeight = ref(typeof window !== 'undefined' ? window.innerHeight : 900)
+function onViewportResize() {
+  viewportHeight.value = window.innerHeight
+}
+const openingShellPresentation = computed(() => getOpeningShellPresentation(viewportHeight.value))
 const openingShellChatSeed = computed(() => {
   if (!showCardShellOpening.value) return null
   // Campaign 态一律用卡自己的 greetings：writing.greetingOptions 来自遗留
@@ -311,10 +314,6 @@ const shellVarApplyBusy = ref(false)
 function onShellVarWrite(payload) {
   const before = shellVarProposals.value
   shellVarProposals.value = upsertShellVariableProposal(before, payload)
-  if (shellVarProposals.value !== before) {
-    shellVarAudit.push({ key: payload?.key, ok: null, scope: 'proposed', error: null })
-    shellVarAuditTick.value++
-  }
 }
 
 async function persistShellProposal(proposal) {
@@ -336,24 +335,23 @@ async function persistShellProposal(proposal) {
     setCharacterVariable,
     log: (level, message) => logAppendFrontend(level, message),
   })
-  shellVarAudit.push({
-    key: proposal.key,
-    ok: result.ok,
-    scope: result.scope,
-    error: result.error || null,
-  })
-  shellVarAuditTick.value++
   return result
 }
 
+// 应用失败时提案必须留在确认条上（写入结果 {ok:false} 不抛异常，静默移除
+// 等于既没写进去又丢了唯一入口）；成功才从列表摘除。
 async function applyShellVarProposal(id) {
   if (shellVarApplyBusy.value) return
   const { proposal, rest } = takeShellVariableProposal(shellVarProposals.value, id)
   if (!proposal) return
   shellVarApplyBusy.value = true
   try {
-    shellVarProposals.value = rest
-    await persistShellProposal(proposal)
+    const result = await persistShellProposal(proposal)
+    if (result.ok) {
+      shellVarProposals.value = rest
+    } else {
+      await alertDialog(`应用变量提案失败（${proposal.key}，提案已保留）: ${errorText(result.error)}`)
+    }
   } finally {
     shellVarApplyBusy.value = false
   }
@@ -363,8 +361,6 @@ function rejectShellVarProposal(id) {
   const { proposal, rest } = takeShellVariableProposal(shellVarProposals.value, id)
   if (!proposal) return
   shellVarProposals.value = rest
-  shellVarAudit.push({ key: proposal.key, ok: false, scope: 'rejected', error: null })
-  shellVarAuditTick.value++
 }
 
 async function applyAllShellVarProposals() {
@@ -372,9 +368,21 @@ async function applyAllShellVarProposals() {
   shellVarApplyBusy.value = true
   try {
     const pending = shellVarProposals.value
-    shellVarProposals.value = []
+    let rest = pending
+    const failed = []
     for (const proposal of pending) {
-      await persistShellProposal(proposal)
+      const { proposal: p, rest: next } = takeShellVariableProposal(rest, proposal.id)
+      if (!p) continue
+      const result = await persistShellProposal(p)
+      if (result.ok) {
+        rest = next
+      } else {
+        failed.push(`${p.key}: ${errorText(result.error)}`)
+      }
+    }
+    shellVarProposals.value = rest
+    if (failed.length) {
+      await alertDialog(`批量应用完成，${failed.length} 项失败（提案已保留）:\n${failed.join('\n')}`)
     }
   } finally {
     shellVarApplyBusy.value = false
@@ -382,14 +390,15 @@ async function applyAllShellVarProposals() {
 }
 
 function rejectAllShellVarProposals() {
-  for (const proposal of shellVarProposals.value) {
-    shellVarAudit.push({ key: proposal.key, ok: false, scope: 'rejected', error: null })
-  }
   shellVarProposals.value = []
-  shellVarAuditTick.value++
 }
 
+// 单调 token 守卫：换卡/换 Campaign 的两次 refresh 并发时，慢的旧响应不得
+// 覆盖新上下文（历史打开会话、campaign-changed 与 handleSelectChar 可交错）。
+let cardShellRefreshToken = 0
+
 async function refreshCardShellManifest() {
+  const token = ++cardShellRefreshToken
   cardShellStatusUrl.value = null
   cardShellOpeningUrl.value = null
   cardShellOpeningGreetings.value = []
@@ -412,6 +421,7 @@ async function refreshCardShellManifest() {
   if (target.kind === 'campaign-card') {
     try {
       const card = await getCard(target.cardId)
+      if (token !== cardShellRefreshToken) return
       characterId = card?.source_character_id || null
       cardShellOpeningGreetings.value = buildGreetingOptionsFromDetail(card)
     } catch (e) {
@@ -424,6 +434,7 @@ async function refreshCardShellManifest() {
   cardShellLoading.value = true
   try {
     const m = await getCardShellManifest(characterId)
+    if (token !== cardShellRefreshToken) return
     cardShellStatusUrl.value = m?.status_bar_url || null
     // 优先首页；无则自定义开局
     cardShellOpeningUrl.value = m?.opening_home_url || m?.opening_custom_url || null
@@ -435,7 +446,7 @@ async function refreshCardShellManifest() {
   } catch (e) {
     console.error('getCardShellManifest:', e)
   } finally {
-    cardShellLoading.value = false
+    if (token === cardShellRefreshToken) cardShellLoading.value = false
   }
 }
 
@@ -544,7 +555,9 @@ async function onOpeningShellApplied(payload) {
           await applyCampaignOpening(campaign.activeCampaign.id, selection.content)
         } catch (e) {
           console.error('applyCampaignOpening:', e)
-          logAppendFrontend('warn', `开场选择落库失败: ${e}`)
+          logAppendFrontend('warn', `开场选择落库失败: ${e}`).catch(() => {})
+          // 静默失败会让下一轮生成回退到旧开场，用户必须知情
+          await alertDialog('开场选择已显示，但落库失败（下一轮生成仍将使用旧开场）: ' + errorText(e))
         }
       }
     } else if ((writing.messages || []).length === 0 && writing.writingMode === 'legacy') {
@@ -562,18 +575,23 @@ async function onOpeningShellApplied(payload) {
 }
 
 // 3. conversation —— 会话装配 / 历史 / 打开 / 删除（注入范围外依赖）
+// pluginBridge 注入 AppV2 实例：conversation 路径与写作路径共享 prompt hook 记账。
 const conversation = useConversation({
+  pluginBridge,
   loadInstanceNameMap,
   loadCharDetail,
   applySelectedOpeningMessage: greeting.applySelectedOpeningMessage,
-  onConversationOpened: disarmCardShellOpening,
+  onConversationOpened: () => {
+    disarmCardShellOpening()
+    // 切换会话后回填该 Campaign 的活动 Turn 质量报告（此前只在启动时回填）
+    hydrateActiveTurnQuality()
+  },
 })
 const {
   applyConversation,
   loadConversationHistory,
   handleDeleteConversation,
   openConversation,
-  startNewConversation,
 } = conversation
 
 // 4. pipeline —— 流水线事件 reducer（注入 scrollToBottom）
@@ -667,7 +685,7 @@ const { openNewCampaignDialog } = newCampaignForm
     mvuInteractionMappings,
     mvuInteractionBusy,
     dispatchMvuInteraction,
-  } = useMvuStatusPanel({ startWriting })
+  } = useMvuStatusPanel({ startWriting, alertDialog })
 
   // 10. history screen adapter —— design/history 纯展示层接线
   const { screenProps: historyScreenProps, screenEvents: historyScreenEvents } =
@@ -701,7 +719,7 @@ const { openNewCampaignDialog } = newCampaignForm
       continueWriting: continueActiveCampaignWriting,
     })
 
-  // 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）
+  // 活动 Turn 质量报告回填（刷新后 ProcessTimeline 仍可显示）
   async function hydrateActiveTurnQuality() {
   const campaignId = campaign.activeCampaign?.id
   if (!campaignId || writing.isWriting) return
@@ -713,13 +731,52 @@ const { openNewCampaignDialog } = newCampaignForm
   }
 }
 
+  // campaign-changed（CampaignPanel set-active/创建/删除）后的上下文重绑：
+  // 只换 active 指针会把「消息 + currentConversationId」留在旧活动上，下一次
+  // startWriting 将以旧会话 + 新活动的组合发往后端（2026-09-01 全量审查 P2）。
+  async function handleCampaignChanged(c) {
+    campaign.activeCampaign = c
+    await loadInstanceNameMap()
+    await refreshCardShellManifest()
+    if (!c?.id) return
+    await hydrateActiveTurnQuality()
+    const boundCampaignId = campaign.conversationHistory.find(
+      (conv) => conv.id === campaign.currentConversationId,
+    )?.campaign_id
+    if (boundCampaignId !== c.id) {
+      // 打开新活动的最近会话；无会话则清空正文回到开场态（不切视图，面板仍在前景）
+      const latest = findLatestCampaignConversation(campaign.conversationHistory, c.id)
+      if (latest) {
+        await openConversation(latest)
+      } else {
+        writing.messages = []
+        campaign.currentConversationId = null
+        armCardShellOpening()
+      }
+    }
+  }
+
+  // 历史打开/删除会话等路径只改 activeCampaign、不经过 campaign-changed：
+  // 统一 watch id 变化刷新壳 manifest（refresh 带 token 守卫，重复触发安全）。
+  watch(
+    () => campaign.activeCampaign?.id,
+    () => { refreshCardShellManifest() },
+  )
+
 // ─── 初始化（App.vue:388-399） ───
 onMounted(async () => {
+  window.addEventListener('resize', onViewportResize)
   try { ui.appVersion = await getVersion() } catch (e) { console.error('getVersion:', e) }
   await refreshActiveConnection()
   await loadConversationHistory()
   try {
     campaign.activeCampaign = await getActiveCampaign()
+    // SQLite 后端 active 指针仅进程内（ActiveCampaignPersistence Degraded，
+    // 2026-08-31 B4 验收发现）：重启后为空时从最近会话恢复工作上下文——
+    // 等价于用户手动「打开会话」，同时把后端 active 指针一并重建。
+    if (!campaign.activeCampaign && campaign.conversationHistory.length > 0) {
+      await openConversation(campaign.conversationHistory[0])
+    }
     await loadInstanceNameMap()
     await hydrateActiveTurnQuality()
     await refreshCardShellManifest()
@@ -727,6 +784,10 @@ onMounted(async () => {
   await loadSidebarPlugins()
   setupConsoleForwarding()
   broadcastPluginEvent(ST_EVENT_TYPES.APP_READY, chatEventPayload({ version: ui.appVersion }))
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', onViewportResize)
 })
 </script>
 
@@ -904,7 +965,7 @@ onMounted(async () => {
         ref="campaignPanelRef"
         :initial-tab="ui.campaignPanelTab"
         @close="ui.showCampaignPanel = false; ui.showSidebar = true"
-        @campaign-changed="(c) => { campaign.activeCampaign = c; loadInstanceNameMap(); refreshCardShellManifest() }"
+        @campaign-changed="handleCampaignChanged"
       />
 
       <!-- Meta 面板 -->
@@ -934,16 +995,11 @@ onMounted(async () => {
         @close="ui.showAgentProfile = false; ui.showSidebar = true"
       />
 
-      <!-- ═══ 新建 Campaign 表单（Overlay,消费 useNewCampaignForm composable） ═══ -->
+      <!-- ═══ 新建 Campaign 表单（Overlay；form 为上方 useNewCampaignForm 实例，
+           单一状态源：组件不再自建 composable，避免每次打开重复 listCards/getCard） ═══ -->
       <NewCampaignForm
         :show="newCampaignForm.showNewCampaignForm.value"
-        :load-instance-name-map="loadInstanceNameMap"
-        :apply-conversation="applyConversation"
-        :broadcast-plugin-event="broadcastPluginEvent"
-        :load-conversation-history="loadConversationHistory"
-        :refresh-card-shell-manifest="refreshCardShellManifest"
-        :opening-shell-started="armCardShellOpening"
-        :alert-dialog="alertDialog"
+        :form="newCampaignForm"
         @update:show="(v) => { newCampaignForm.showNewCampaignForm.value = v }"
         @close="newCampaignForm.showNewCampaignForm.value = false"
       />

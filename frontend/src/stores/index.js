@@ -1,8 +1,5 @@
-import { createPinia } from 'pinia'
-
-// 全局 Pinia 实例工厂。
-// main.js 切换到 AppV2 时:createApp(AppV2).use(createPinia()).mount('#app')
-export const pinia = createPinia()
+// Pinia 实例由 main.js 自建（createApp(AppV2).use(createPinia())），
+// 此处仅作 store re-export 汇总入口，不再额外导出无人消费的全局实例。
 
 // 阶段 1:4 个 store re-export
 export { useCampaignStore } from './campaign.js'

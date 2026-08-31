@@ -14,6 +14,7 @@ import Select from '../ui/Select.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import Overlay from '../ui/Overlay.vue'
+import { errorText } from '../../utils/errorText.js'
 
 // MVU 卡片分析：选卡 → meta_analyze_mvu_card → 显示翻译列表 → 预览/应用 schema。
 // 成功 apply 后 emit('mvu-applied')，由 MetaPanel 冒泡到 AppV2 触发 CampaignPanel 刷新。
@@ -60,6 +61,7 @@ onMounted(async () => {
     cards.value = await listCards()
   } catch (e) {
     console.error('加载角色卡失败:', e)
+    error.value = '加载角色卡失败: ' + errorText(e)
   }
   await refreshMvuList()
 })
@@ -69,6 +71,7 @@ async function refreshMvuList() {
     mvuTranslations.value = await metaListMvuTranslations()
   } catch (e) {
     console.error('加载 MVU 列表失败:', e)
+    error.value = '加载 MVU 列表失败: ' + errorText(e)
   }
 }
 
@@ -88,7 +91,7 @@ async function handleAnalyze(cardId) {
     activeDetail.value = detail
     await refreshMvuList()
   } catch (e) {
-    error.value = 'MVU 分析失败: ' + e
+    error.value = 'MVU 分析失败: ' + errorText(e)
     emit('error', error.value)
   } finally {
     analyzingCardId.value = null
@@ -106,7 +109,7 @@ async function handlePreviewApply(sourceId, sourceName) {
     const previews = await metaPreviewMvuApply(sourceId)
     applyPreviews.value = previews || []
   } catch (e) {
-    error.value = 'MVU apply 预览失败: ' + e
+    error.value = 'MVU apply 预览失败: ' + errorText(e)
     emit('error', error.value)
     applyPreviewSource.value = null
   } finally {
@@ -126,7 +129,7 @@ async function handleApplySchema(definitionId) {
     // 通知父组件刷新 Campaign 变量 —— 触发 refreshActiveDetailTab 链
     emit('mvu-applied')
   } catch (e) {
-    error.value = '应用 schema 失败: ' + e
+    error.value = '应用 schema 失败: ' + errorText(e)
     emit('error', error.value)
   } finally {
     applyingDefId.value = null

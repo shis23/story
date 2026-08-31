@@ -199,6 +199,9 @@ export function usePipeline(handlers = {}) {
         }
         break
       case 'error':
+        // 事件流报错但 invoke 可能仍正常 resolve：置 error 态供成功路径甄别，
+        // 否则「已完成」会覆盖错误标签（WritingScreen 失败提示条读 state==='error'）。
+        writing.pipeline.state = 'error'
         writing.pipeline.stateLabel = `错误: ${event.data.message}`
         break
       case 'state_changed':

@@ -25,6 +25,7 @@ import {
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import Input from '../ui/Input.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   /** optional { characterId, brief } to auto-open revise project */
@@ -170,7 +171,7 @@ async function openProject(id) {
     allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
     syncDraftFromProject()
   } catch (e) {
-    await alertDialog('打开项目失败: ' + e)
+    await alertDialog('打开项目失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -196,7 +197,7 @@ async function deleteProjectById(id, name = '') {
     await refreshProjects()
     statusText.value = '项目已删除'
   } catch (e) {
-    await alertDialog('删除失败: ' + e)
+    await alertDialog('删除失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -261,7 +262,7 @@ async function exportStJson() {
       statusText.value += `（警告 ${compiled.warnings.length} 条）`
     }
   } catch (e) {
-    await alertDialog('导出失败: ' + e)
+    await alertDialog('导出失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -278,7 +279,7 @@ async function runExportGate() {
       : '出卡质量闸门：存在未过项，见下方报告'
   } catch (e) {
     gateReport.value = null
-    await alertDialog('出卡质量闸门运行失败: ' + e)
+    await alertDialog('出卡质量闸门运行失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -320,7 +321,7 @@ async function exportStPng() {
       statusText.value = `已下载 ST PNG：${fileName}`
     }
   } catch (e) {
-    await alertDialog('PNG 导出失败: ' + e)
+    await alertDialog('PNG 导出失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -351,7 +352,7 @@ async function selectStage(stageId) {
     syncDraftFromProject()
     statusText.value = `已切换到阶段：${stageId}`
   } catch (e) {
-    await alertDialog('切换阶段失败: ' + e)
+    await alertDialog('切换阶段失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -373,7 +374,7 @@ async function createProject() {
     syncDraftFromProject()
     statusText.value = '已创建写卡项目（明月秋青方法论 pack）'
   } catch (e) {
-    await alertDialog('创建失败: ' + e)
+    await alertDialog('创建失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -393,7 +394,7 @@ async function createFromCharacter(characterId, brief = '') {
     // revise flow lands on review
     checkReport.value = await cardstudioRunChecks(created.id)
   } catch (e) {
-    await alertDialog('打开修订项目失败: ' + e)
+    await alertDialog('打开修订项目失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -418,7 +419,7 @@ async function createFromNovel() {
     syncDraftFromProject()
     statusText.value = `已创建小说改编项目（摘录 ${created?.novel_excerpts?.length || 0} 段），可点「AI 预填」`
   } catch (e) {
-    await alertDialog('创建小说项目失败: ' + e)
+    await alertDialog('创建小说项目失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -436,7 +437,7 @@ async function prefillFromNovel() {
     statusText.value = '小说预填完成：已进入检查阶段，可局部重跑各阶段精修'
     checkReport.value = await cardstudioRunChecks(project.value.id)
   } catch (e) {
-    await alertDialog('小说预填失败: ' + e)
+    await alertDialog('小说预填失败: ' + errorText(e))
     try {
       project.value = await cardstudioGetProject(project.value.id)
       syncDraftFromProject()
@@ -464,7 +465,7 @@ async function saveArtifacts() {
     syncDraftFromProject()
     statusText.value = '产物已保存'
   } catch (e) {
-    await alertDialog('保存失败: ' + e)
+    await alertDialog('保存失败: ' + errorText(e))
   } finally {
     busy.value = false
   }
@@ -479,7 +480,7 @@ async function completeManual() {
     syncDraftFromProject()
     statusText.value = `阶段 ${currentStage.value} 已完成`
   } catch (e) {
-    await alertDialog(String(e))
+    await alertDialog(errorText(e))
   } finally {
     busy.value = false
   }
@@ -496,7 +497,7 @@ async function runStage() {
     userNote.value = ''
     statusText.value = `阶段 ${currentStage.value} 生成完成（若已推进，请看阶段轨）`
   } catch (e) {
-    await alertDialog(String(e))
+    await alertDialog(errorText(e))
     try {
       project.value = await cardstudioGetProject(project.value.id)
       syncDraftFromProject()
@@ -518,7 +519,7 @@ async function runChecks() {
       ? `规则检查通过（${checkReport.value.score ?? '-'} 分）`
       : `规则检查未通过（${checkReport.value.score ?? '-'} 分）`
   } catch (e) {
-    await alertDialog(String(e))
+    await alertDialog(errorText(e))
   } finally {
     busy.value = false
   }
@@ -535,7 +536,7 @@ async function runReview(useLlm = true) {
       ? `审查通过（${checkReport.value.score ?? '-'} 分 · ${checkReport.value.source || 'rule'}）`
       : `审查未通过（${checkReport.value.score ?? '-'} 分 · ${checkReport.value.source || 'rule'}）`
   } catch (e) {
-    await alertDialog(String(e))
+    await alertDialog(errorText(e))
   } finally {
     busy.value = false
   }
@@ -555,7 +556,7 @@ async function importCompiled() {
       : `已导入角色卡：${result.character?.name || ''}（card ${result.card_id}）`
     emit('imported', result)
   } catch (e) {
-    await alertDialog(String(e))
+    await alertDialog(errorText(e))
   } finally {
     busy.value = false
   }
@@ -574,7 +575,7 @@ async function goLibraryAfterImport(withExtract) {
       await extractCharacters(extractId, { force: true })
       statusText.value = '角色识别完成'
     } catch (e) {
-      await alertDialog('角色识别失败（卡已导入，可稍后在卡库重试）: ' + e)
+      await alertDialog('角色识别失败（卡已导入，可稍后在卡库重试）: ' + errorText(e))
     } finally {
       busy.value = false
     }

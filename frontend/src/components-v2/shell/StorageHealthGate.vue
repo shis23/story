@@ -5,6 +5,8 @@
 // tmp 自动恢复的事件只作提示条展示，可直接关闭。
 import { onMounted, ref, computed } from 'vue'
 import { storageHealthAcknowledge, storageHealthReport } from '../../tauri-api.js'
+import { alertDialog } from '../../components/base/BaseDialog.js'
+import { errorText } from '../../utils/errorText.js'
 
 const incidents = ref([])
 const dismissedInfo = ref(false)
@@ -34,7 +36,9 @@ async function acknowledge(incident) {
     await storageHealthAcknowledge(incident.path)
     await refresh()
   } catch (e) {
+    // 全屏拦截门的唯一出口按钮：失败必须可见，否则用户被永远困在门里
     console.error('storageHealthAcknowledge:', e)
+    await alertDialog('解除存储保护失败（文件仍处于只读保护）: ' + errorText(e))
   } finally {
     busyPath.value = ''
   }

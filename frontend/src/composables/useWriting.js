@@ -19,6 +19,7 @@
 import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
 import { useUiStore } from '../stores/ui.js'
+import { errorText } from '../utils/errorText.js'
 import {
   startWriting as apiStartWriting,
   cancelWriting as apiCancelWriting,
@@ -181,8 +182,11 @@ export function useWriting(options = {}) {
         variantStatus: 'Draft',
       }))
 
-      writingStore.pipeline.state = 'done'
-      writingStore.pipeline.stateLabel = '已完成'
+      // 事件流已置 error（usePipeline 'error' 分支）时不得覆盖为「已完成」
+      if (writingStore.pipeline.state !== 'error') {
+        writingStore.pipeline.state = 'done'
+        writingStore.pipeline.stateLabel = '已完成'
+      }
       writingStore.showPipeline = false // 写作完成，收起 StreamingMessage（成文消息已 push）
       loadInstanceNameMap() // 刷新实例名映射（可能新增临时实例）
       scrollToBottom()
@@ -195,7 +199,7 @@ export function useWriting(options = {}) {
       const cancelled = isPromptHookCancelledError(err)
       if (cancelled) writingStore.showPipeline = false
       writingStore.pipeline.state = cancelled ? 'idle' : 'error'
-      writingStore.pipeline.stateLabel = cancelled ? '已停止' : `失败: ${err}`
+      writingStore.pipeline.stateLabel = cancelled ? '已停止' : `失败: ${errorText(err)}`
     } finally {
       writingStore.isWriting = false
     }
@@ -214,6 +218,9 @@ export function useWriting(options = {}) {
       writingStore.pipeline.stateLabel = '正在停止…'
     } catch (e) {
       console.error('取消失败:', e)
+      // 停止失败必须可见：否则 stateLabel 停留在上一次的文案上，用户无从得知
+      writingStore.pipeline.state = 'error'
+      writingStore.pipeline.stateLabel = `停止失败: ${errorText(e)}`
     }
   }
 

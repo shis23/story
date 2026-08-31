@@ -19,13 +19,17 @@ import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
 import { useUiStore } from '../stores/ui.js'
 import { usePluginBridge } from './usePluginBridge.js'
+import { errorText } from '../utils/errorText.js'
 
 export function useConversation(handlers = {}) {
   const writing = useWritingStore()
   const campaign = useCampaignStore()
   const ui = useUiStore()
-  // 广播 / payload 函数来自 usePluginBridge。
-  const { broadcastChatChanged, broadcastPluginEvent, chatEventPayload } = usePluginBridge()
+  // 广播 / payload 函数来自 usePluginBridge。AppV2 注入自身实例，使
+  // prompt hook 的 generation/cancel 记账与写作路径共享同一份状态；
+  // 独立调用方（测试）保留自建实例的回退。
+  const { broadcastChatChanged, broadcastPluginEvent, chatEventPayload } =
+    handlers.pluginBridge || usePluginBridge()
 
   // 范围外依赖(由调用方注入):App.vue 里这些函数属于开场白/实例名映射/角色详情逻辑,
   // 不在本 composable 迁移范围。签名见下方注释。
@@ -41,6 +45,9 @@ export function useConversation(handlers = {}) {
   // 复用点:恢复对话、重 roll 后刷新、删除后刷新(单一事实源,避免前端臆测 variant 数组)。
   function applyConversation(conv) {
     campaign.currentConversationId = conv.id
+    // 换会话后旧会话的采纳小票/质量态不得滞留（MessageItem 按 nodeId 匹配，
+    // 同 id 复用时会把上一局的收据显示到新会话消息上）
+    writing.pendingReceipt = null
     writing.messages = conv.nodes
       // 隐藏「所有 variant 都 Discarded」的 node(删除后该消息整体消失)
       .filter((node) => node.variants.some((v) => v.status !== 'Discarded'))
@@ -106,7 +113,7 @@ export function useConversation(handlers = {}) {
       }
     } catch (e) {
       console.error('删除活动失败:', e)
-      await alertDialog('删除活动失败: ' + e)
+      await alertDialog('删除活动失败: ' + errorText(e))
     }
   }
 
@@ -116,7 +123,6 @@ export function useConversation(handlers = {}) {
       const conv = await getConversation(convSummary.id)
       if (!conv) return
 
-      onConversationOpened(convSummary)
       applyConversation(conv)
       campaign.currentConversationId = convSummary.id
       ui.showHistory = false
@@ -151,8 +157,12 @@ export function useConversation(handlers = {}) {
         campaignId: convSummary.campaign_id || null,
         characterId: conv.character_id || null,
       }))
+      // 上下文切换完成后再回调（ disarm 开场壳 / 回填质量报告等都需要
+      // activeCampaign 已同步为新会话的 Campaign，放在前面会读到旧值）
+      onConversationOpened(convSummary)
     } catch (e) {
       console.error('打开对话失败:', e)
+      await alertDialog('打开对话失败: ' + errorText(e))
     }
   }
 

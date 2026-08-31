@@ -84,11 +84,7 @@ fn frontend_file_dialog_usage_has_matching_capabilities() {
         ),
         ("@tauri-apps/plugin-dialog", "ask", "dialog:allow-ask"),
         ("@tauri-apps/plugin-fs", "readFile", "fs:allow-read-file"),
-        (
-            "@tauri-apps/plugin-fs",
-            "writeBinaryFile",
-            "fs:allow-write-file",
-        ),
+        ("@tauri-apps/plugin-fs", "writeFile", "fs:allow-write-file"),
     ];
 
     for (plugin, helper, permission) in required {
@@ -99,7 +95,18 @@ fn frontend_file_dialog_usage_has_matching_capabilities() {
     }
 
     for unsupported in [
-        "readDir", "mkdir", "exists", "remove", "rename", "copyFile", "stat", "lstat",
+        "readDir",
+        "mkdir",
+        "exists",
+        "remove",
+        "rename",
+        "copyFile",
+        "stat",
+        "lstat",
+        // plugin-fs v1-only helper names：v2 已改名 writeFile/readFile，
+        // 误用会在运行时以 "undefined is not a function" 静默炸掉导出链路（2026-08-31 B6 缺陷）
+        "writeBinaryFile",
+        "readBinaryFile",
     ] {
         assert!(
             !frontend_imports_helper(&frontend, "@tauri-apps/plugin-fs", unsupported),

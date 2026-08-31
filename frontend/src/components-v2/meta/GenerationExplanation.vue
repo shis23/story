@@ -7,6 +7,7 @@ import Badge from '../ui/Badge.vue'
 import CodeBlock from '../ui/CodeBlock.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 // 生成溯源：读 lastConversationNode，调 meta_explain_generation 展示 trace/provenance。
 // props.lastConversationNode = { conversation_id, node_id }（可能为 null）
@@ -33,7 +34,7 @@ async function handleExplain() {
       explainGeneration: metaExplainGeneration,
     })
   } catch (e) {
-    error.value = '生成溯源失败: ' + e
+    error.value = '生成溯源失败: ' + errorText(e)
     emit('error', error.value)
   } finally {
     loading.value = false

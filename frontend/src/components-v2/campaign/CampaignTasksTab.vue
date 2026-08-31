@@ -11,6 +11,7 @@ import Textarea from '../ui/Textarea.vue'
 import Select from '../ui/Select.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -38,7 +39,7 @@ async function load() {
     const filter = statusFilter.value || null
     tasks.value = await listTasks(props.campaignId, filter)
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
   } finally {
     loading.value = false
   }
@@ -66,7 +67,7 @@ async function handleCreateTask() {
     await load()
     emit('refresh')
   } catch (e) {
-    await alertDialog('创建任务失败: ' + e)
+    await alertDialog('创建任务失败: ' + errorText(e))
   }
 }
 
@@ -76,7 +77,7 @@ async function handleCompleteTask(taskId) {
     await load()
     emit('refresh')
   } catch (e) {
-    await alertDialog('完成任务失败: ' + e)
+    await alertDialog('完成任务失败: ' + errorText(e))
   }
 }
 
@@ -88,7 +89,7 @@ async function handleAbandonTask(taskId) {
     await load()
     emit('refresh')
   } catch (e) {
-    await alertDialog('放弃任务失败: ' + e)
+    await alertDialog('放弃任务失败: ' + errorText(e))
   }
 }
 

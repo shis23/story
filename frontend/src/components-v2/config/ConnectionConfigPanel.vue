@@ -19,6 +19,7 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import { errorText } from '../../utils/errorText.js'
 import {
   normalizeOptionalMaxTokens,
   normalizeReasoningMode,
@@ -245,7 +246,7 @@ async function handleFetchModels() {
       openModelMenu()
     }
   } catch (e) {
-    error.value = '拉取失败：' + e
+    error.value = '拉取失败：' + errorText(e)
   } finally {
     fetchingModels.value = false
   }
@@ -265,7 +266,7 @@ async function loadTemplates() {
     templates.value = await listConnectionTemplates()
     if (templates.value.length) applyTemplate(templates.value[0])
   } catch (e) {
-    error.value = '加载模板失败: ' + e
+    error.value = '加载模板失败: ' + errorText(e)
   }
 }
 
@@ -273,7 +274,7 @@ async function loadConnections() {
   try {
     connections.value = await listConnections()
   } catch (e) {
-    error.value = '加载连接失败: ' + e
+    error.value = '加载连接失败: ' + errorText(e)
   }
 }
 
@@ -345,7 +346,7 @@ async function startEdit(id) {
     fetchedModels.value = []
     showAdvanced.value = true
   } catch (e) {
-    error.value = '加载连接失败: ' + e
+    error.value = '加载连接失败: ' + errorText(e)
   } finally {
     loadingEdit.value = false
   }
@@ -378,7 +379,7 @@ async function handleTest() {
       reasoning: form.reasoning,
     })
   } catch (e) {
-    testResult.value = { success: false, message: String(e) }
+    testResult.value = { success: false, message: errorText(e) }
   } finally {
     testing.value = false
   }
@@ -447,7 +448,7 @@ async function handleSave() {
     resetFormToCreateDefaults()
     emit('changed')
   } catch (e) {
-    error.value = (isEditing.value ? '更新失败: ' : '保存失败: ') + e
+    error.value = (isEditing.value ? '更新失败: ' : '保存失败: ') + errorText(e)
   } finally {
     saving.value = false
   }
@@ -464,7 +465,7 @@ async function handleDelete(id) {
     await loadConnections()
     emit('changed')
   } catch (e) {
-    error.value = '删除失败: ' + e
+    error.value = '删除失败: ' + errorText(e)
   }
 }
 
@@ -474,7 +475,7 @@ async function handleSetActive(id) {
     await loadConnections()
     emit('changed')
   } catch (e) {
-    error.value = '切换失败: ' + e
+    error.value = '切换失败: ' + errorText(e)
   }
 }
 </script>

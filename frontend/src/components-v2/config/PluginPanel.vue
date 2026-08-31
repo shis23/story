@@ -8,6 +8,7 @@ import Badge from '../ui/Badge.vue'
 import Toggle from '../ui/Toggle.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const emit = defineEmits(['close'])
 
@@ -18,6 +19,7 @@ const installJson = ref('')
 const installing = ref(false)
 const installError = ref('')
 const installSuccess = ref(false)
+const loadError = ref('')
 /** 防止 Toggle 连点造成重入 */
 const togglingId = ref(null)
 
@@ -26,10 +28,12 @@ async function loadPlugins() {
   try {
     const list = await listPlugins()
     plugins.value = Array.isArray(list) ? list : []
+    loadError.value = ''
   } catch (e) {
     console.error('加载插件列表失败:', e)
     plugins.value = []
-    // 浏览器无 Tauri 时不弹窗卡死，仅控制台
+    loadError.value = '加载插件列表失败: ' + errorText(e)
+    // 浏览器无 Tauri 时仅面板内提示，不弹窗卡死
   } finally {
     loading.value = false
   }
@@ -47,7 +51,7 @@ async function doInstall() {
     showInstall.value = false
     await loadPlugins()
   } catch (e) {
-    installError.value = String(e)
+    installError.value = errorText(e)
   } finally {
     installing.value = false
   }
@@ -60,7 +64,7 @@ async function doUninstall(plugin) {
     await uninstallPlugin(plugin.id)
     await loadPlugins()
   } catch (e) {
-    await alertDialog('卸载失败: ' + e)
+    await alertDialog('卸载失败: ' + errorText(e))
   }
 }
 
@@ -74,7 +78,7 @@ async function toggleEnabled(plugin, next) {
     const row = plugins.value.find((p) => p.id === plugin.id)
     if (row) row.enabled = target
   } catch (e) {
-    await alertDialog('操作失败: ' + e)
+    await alertDialog('操作失败: ' + errorText(e))
     await loadPlugins()
   } finally {
     togglingId.value = null
@@ -119,6 +123,7 @@ onMounted(loadPlugins)
 
     <!-- 插件列表：不用 DataList 套卡片（避免双层边框 + 点击层干扰 Toggle） -->
     <div class="p-4 space-y-3">
+      <div v-if="loadError" class="text-xs text-err break-words">{{ loadError }}</div>
       <LoadingState v-if="loading" label="加载插件…" />
 
       <EmptyState

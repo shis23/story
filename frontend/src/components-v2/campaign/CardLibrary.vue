@@ -17,6 +17,7 @@ import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import WorldInfoReadonlyPanel from './WorldInfoReadonlyPanel.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const emit = defineEmits(['open-campaigns', 'open-studio', 'revise-card'])
 
@@ -61,7 +62,7 @@ async function handleExtract(card) {
     expandedCardId.value = result.id
     cardDetail.value = await getCard(result.id)
   } catch (e) {
-    await alertDialog('角色识别失败: ' + e)
+    await alertDialog('角色识别失败: ' + errorText(e))
   } finally {
     extractingCardId.value = null
   }

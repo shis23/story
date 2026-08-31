@@ -18,6 +18,7 @@ import {
   getCharacter,
 } from '../tauri-api.js'
 import { ST_EVENT_TYPES } from '../plugin-bridge.js'
+import { errorText } from '../utils/errorText.js'
 
 /**
  * @param {{
@@ -82,12 +83,12 @@ export function useCharacterImport(options = {}) {
         applySelectedOpeningMessage()
       } catch (e) {
         console.error('角色识别失败（不影响导入，可在 Campaign 面板重试）:', e)
-        uiStore.importError = '角色识别失败（可在 Campaign 面板重试）: ' + String(e)
+        uiStore.importError = '角色识别失败（可在 Campaign 面板重试）: ' + errorText(e)
       } finally {
         uiStore.extracting = null
       }
     } catch (err) {
-      uiStore.importError = String(err)
+      uiStore.importError = errorText(err)
     }
   }
 

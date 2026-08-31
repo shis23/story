@@ -523,8 +523,7 @@ export async function startWriting(intent, characterId, onEvent, conversationId,
 }
 
 /**
- * 取消当前运行的写作流水线
- * @returns {Promise<boolean>} 是否有运行中的写作被取消
+ * 提交 prompt hook 的执行结果（消息数组或错误）给后端挂起的请求
  */
 export async function pluginPromptHookResult(requestId, messages, error = null) {
   if (isTauri()) {
@@ -536,6 +535,10 @@ export async function pluginPromptHookResult(requestId, messages, error = null) 
   }
 }
 
+/**
+ * 取消当前运行的写作流水线
+ * @returns {Promise<boolean>} 是否有运行中的写作被取消
+ */
 export async function cancelWriting() {
   if (isTauri()) {
     return await invoke('cancel_writing')
@@ -630,13 +633,6 @@ export async function acceptVariant(
   }
 }
 
-/** 软删除当前变体（→ Discarded） */
-export async function softDeleteVariant(conversationId, nodeId) {
-  if (isTauri()) {
-    return await invoke('soft_delete_variant', { conversationId, nodeId })
-  }
-}
-
 /** 删除指定消息及其后所有消息（截断对话 = 撤销从这条开始的写作） */
 export async function deleteMessageFrom(conversationId, nodeId) {
   if (isTauri()) {
@@ -726,14 +722,6 @@ export async function getEmbedConfig() {
     return await invoke('get_embed_config')
   }
   return null
-}
-
-/** 手动触发对话归档 */
-export async function archiveConversation(conversationId) {
-  if (isTauri()) {
-    return await invoke('archive_conversation', { conversationId })
-  }
-  return 0
 }
 
 // ─── Meta Agent 命令 ──────────────────────────────────────────────────────
@@ -1700,17 +1688,4 @@ Seraphina 站在那里，银色的长发被雨水浸透，水珠沿着发梢滴�
 *她伸出手指，轻轻触碰你的掌心。那一刻的温度，足以温暖此后所有漫长的雨季。*`
 
 // ─── W8 MVU JS Runtime API ───────────────────────────────────────────────
-
-/**
- * MVU WebView 运行时状态
- *
- * 实际可用性由 Rust 侧 WebViewMvuRuntime.is_available() 报告（始终 true）。
- * 前端侧通过 MvuJsRuntime.vue 的 iframe 就绪状态判断。
- * 此函数作为前端 API 入口供其他模块查询。
- */
-export function getMvuRuntimeStatus() {
-  // 通过 DOM 查询 MvuJsRuntime 的 iframe 是否已加载
-  // 实际使用中，上层代码通过 listen('mvu:execute') 等事件直接通信
-  return { available: true, note: 'WebView runtime (iframe sandbox)' }
-}
 

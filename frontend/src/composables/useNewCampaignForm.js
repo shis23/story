@@ -31,6 +31,7 @@ import { ST_EVENT_TYPES } from '../plugin-bridge.js'
 import { buildGreetingOptionsFromDetail } from '../utils/campaignGreetingOptions.js'
 import { preferredCampaignCard } from '../utils/campaignCardStatus.js'
 import { assistantRoleLabel } from '../utils/roleLabel.js'
+import { errorText } from '../utils/errorText.js'
 
 /**
  * @param {{
@@ -104,9 +105,10 @@ export function useNewCampaignForm(options = {}) {
     }
   }
 
-  // 来源 App.vue:572-609
+  // 来源 App.vue:572-609。返回 true/false：调用方（NewCampaignForm）据此决定
+  // 是否关闭弹层——失败时保持打开，保住用户已填的名称与选卡。
   async function handleCreateCampaign() {
-    if (!newCampaignCardId.value || !newCampaignName.value.trim()) return
+    if (!newCampaignCardId.value || !newCampaignName.value.trim()) return false
     creatingCampaign.value = true
     try {
       const result = await createCampaign(
@@ -146,9 +148,11 @@ export function useNewCampaignForm(options = {}) {
       openingShellStarted(result.conversation_id || null)
       uiStore.showHistory = false // 切到写作视图
       await loadConversationHistory()
+      return true
     } catch (e) {
       console.error('创建 Campaign 失败:', e)
-      await alertDialog('创建 Campaign 失败: ' + e)
+      await alertDialog('创建 Campaign 失败: ' + errorText(e))
+      return false
     } finally {
       creatingCampaign.value = false
     }

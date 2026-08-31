@@ -19,6 +19,7 @@ import Input from '../ui/Input.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import Overlay from '../ui/Overlay.vue'
 import Textarea from '../ui/Textarea.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -80,7 +81,7 @@ async function load() {
   try {
     instances.value = await listInstances(props.campaignId)
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
   } finally {
     loading.value = false
   }
@@ -117,7 +118,7 @@ async function openAddCharacter() {
     addMode.value = availableDefinitions.value.length > 0 ? 'card' : 'custom'
   } catch (e) {
     showAddCharacter.value = false
-    await alertDialog('加载可添加角色失败: ' + e)
+    await alertDialog('加载可添加角色失败: ' + errorText(e))
   } finally {
     addOptionsLoading.value = false
   }
@@ -136,7 +137,7 @@ async function finishAddingCharacter(payload) {
     await load()
     emit('refresh')
   } catch (e) {
-    await alertDialog('添加角色失败: ' + e)
+    await alertDialog('添加角色失败: ' + errorText(e))
   } finally {
     addingCharacter.value = false
   }
@@ -272,7 +273,7 @@ async function handleVariableChange(instanceId, key, value, varType) {
       instanceMvuStatusBar.value = null
     }
   } catch (e) {
-    await alertDialog('设置变量失败: ' + e)
+    await alertDialog('设置变量失败: ' + errorText(e))
   }
 }
 
@@ -286,7 +287,7 @@ async function handlePromoteTemporary(inst) {
     await load()
     emit('refresh')
   } catch (e) {
-    await alertDialog('升格失败: ' + e)
+    await alertDialog('升格失败: ' + errorText(e))
   } finally {
     promotingInstanceId.value = null
   }

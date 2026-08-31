@@ -19,6 +19,7 @@ import Select from '../ui/Select.vue'
 import Input from '../ui/Input.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true },
@@ -77,7 +78,7 @@ async function load() {
       else expandedIndex.value = null
     }
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
   } finally {
     loading.value = false
   }
@@ -138,7 +139,7 @@ async function openEdit(entry) {
       const dto = await getCampaignWorldInfoEntry(props.campaignId, entry.index)
       if (dto) full = { ...entry, ...dto, content_truncated: false }
     } catch (e) {
-      await alertDialog('加载完整正文失败: ' + e)
+      await alertDialog('加载完整正文失败: ' + errorText(e))
     }
   }
   fillDraft(full)
@@ -167,7 +168,7 @@ async function handleAdd() {
     showAdd.value = false
     await load()
   } catch (e) {
-    await alertDialog('新增失败: ' + e)
+    await alertDialog('新增失败: ' + errorText(e))
   } finally {
     adding.value = false
   }
@@ -180,7 +181,7 @@ async function handleRouteChange(route) {
     await setCampaignWorldInfoRoute(props.campaignId, expandedIndex.value, route)
     await load()
   } catch (e) {
-    await alertDialog('改路由失败: ' + e)
+    await alertDialog('改路由失败: ' + errorText(e))
   }
 }
 
@@ -195,7 +196,7 @@ async function handleDelete(entry) {
     if (expandedIndex.value === entry.index) expandedIndex.value = null
     await load()
   } catch (e) {
-    await alertDialog('删除失败: ' + e)
+    await alertDialog('删除失败: ' + errorText(e))
   }
 }
 
@@ -219,7 +220,7 @@ async function handleSave() {
     })
     await load()
   } catch (e) {
-    await alertDialog('保存失败: ' + e)
+    await alertDialog('保存失败: ' + errorText(e))
   } finally {
     saving.value = false
   }

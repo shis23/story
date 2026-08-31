@@ -36,6 +36,7 @@ import {
 import { ST_EVENT_TYPES } from '../plugin-bridge.js'
 import { makeForkCampaignName } from '../utils/forkCampaignName.js'
 import { assistantRoleLabel } from '../utils/roleLabel.js'
+import { errorText } from '../utils/errorText.js'
 
 /**
  * @param {{
@@ -52,6 +53,7 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   startWriting?: (intent: string, skipLocalPush?: boolean) => Promise<void>,
  *   beginPromptHookGeneration?: () => number,
  *   regenerateApi?: (request: object, onEvent?: (event: object) => void) => Promise<unknown>,
+ *   editVariantApi?: (conversationId: string, nodeId: string, newContent: string) => Promise<unknown>,
  *   acceptVariantApi?: (conversationId: string, nodeId: string, forceAccept?: boolean, selectedMutationIndices?: number[] | null) => Promise<unknown>,
  *   getActiveTurnReceiptApi?: (campaignId: string, nodeId: string) => Promise<object | null>,
  *   retryActiveTurnPostprocessApi?: (campaignId: string, nodeId: string) => Promise<object | null>,
@@ -76,6 +78,7 @@ export function useMessageVariants(options = {}) {
   const startWriting = options.startWriting || (() => { console.error('useMessageVariants: startWriting 未注入') })
   const beginPromptHookGeneration = options.beginPromptHookGeneration || (() => 0)
   const regenerateApi = options.regenerateApi || apiRegenerate
+  const editVariantApi = options.editVariantApi || apiEditVariant
   const acceptVariantApi = options.acceptVariantApi || apiAcceptVariant
   const getActiveTurnReceiptApi = options.getActiveTurnReceiptApi || apiGetActiveTurnReceipt
   const retryActiveTurnPostprocessApi =
@@ -123,6 +126,8 @@ export function useMessageVariants(options = {}) {
 
   // 来源 App.vue:822-883 handleReroll
   async function handleReroll({ messageId, kind, hint }) {
+    // 与 handleRerollUser/handleBranch 同款防重入：非 UI 调用方双发 regenerate 会产生重复 variant
+    if (writingStore.isWriting) return
     // 找到消息
     const msg = writingStore.messages.find((m) => m.id === messageId)
     if (!msg) return
@@ -183,17 +188,19 @@ export function useMessageVariants(options = {}) {
       void result
     } catch (err) {
       writingStore.pipeline.state = 'error'
-      writingStore.pipeline.stateLabel = `重 roll 失败: ${err}`
+      writingStore.pipeline.stateLabel = `重 roll 失败: ${errorText(err)}`
     } finally {
       writingStore.isWriting = false
     }
   }
 
   // 来源 App.vue:888-903 handleEditVariant
+  // 返回 true/false（事件链单监听时 Promise 会回传到 MessageItem.saveEdit，
+  // false = 保持编辑器打开）；链路未回传时按成功处理（维持旧行为）。
   async function handleEditVariant({ nodeId, newContent }) {
-    if (!campaignStore.currentConversationId) return
+    if (!campaignStore.currentConversationId) return false
     try {
-      await apiEditVariant(campaignStore.currentConversationId, nodeId, newContent)
+      await editVariantApi(campaignStore.currentConversationId, nodeId, newContent)
       const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
@@ -202,8 +209,11 @@ export function useMessageVariants(options = {}) {
         })
         broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(nodeId, { reason: 'edit' }))
       }
+      return true
     } catch (e) {
       console.error('编辑失败:', e)
+      await alertDialog('编辑失败（内容未保存，请重试）: ' + errorText(e))
+      return false
     }
   }
 
@@ -230,8 +240,9 @@ export function useMessageVariants(options = {}) {
           return
         }
       } catch (error) {
+        // 小票拉取失败不应吞掉用户的采纳意图：提示后走直接采纳路径
         console.error('读取采纳小票失败:', error)
-        return
+        await alertDialog('读取采纳小票失败，将直接尝试采纳: ' + errorText(error))
       }
     }
     // Keep the normal quality-gate attempt distinct from its later force retry.
@@ -342,7 +353,7 @@ export function useMessageVariants(options = {}) {
       writingStore.showPipeline = false
     } catch (e) {
       console.error('删除失败:', e)
-      await alertDialog('删除失败: ' + e)
+      await alertDialog('删除失败: ' + errorText(e))
     }
   }
 
@@ -400,7 +411,7 @@ export function useMessageVariants(options = {}) {
       scrollToBottom()
     } catch (err) {
       writingStore.pipeline.state = 'error'
-      writingStore.pipeline.stateLabel = `重 roll 失败: ${err}`
+      writingStore.pipeline.stateLabel = `重 roll 失败: ${errorText(err)}`
     } finally {
       writingStore.isWriting = false
     }
@@ -446,7 +457,7 @@ export function useMessageVariants(options = {}) {
       }))
     } catch (e) {
       console.error('创建分支失败:', e)
-      await alertDialog('创建分支失败: ' + e)
+      await alertDialog('创建分支失败: ' + errorText(e))
     }
   }
 
@@ -472,6 +483,7 @@ export function useMessageVariants(options = {}) {
       }
     } catch (e) {
       console.error('分支失败:', e)
+      await alertDialog('添加分支失败: ' + errorText(e))
     }
   }
 
@@ -489,6 +501,7 @@ export function useMessageVariants(options = {}) {
       }))
     } catch (e) {
       console.error('切换变体失败:', e)
+      await alertDialog('切换变体失败: ' + errorText(e))
     }
   }
 

@@ -11,6 +11,7 @@ import {
 } from '../../tauri-api.js'
 import { promptDialog, confirmDialog } from '../../components/base/BaseDialog.js'
 import { cleanForSave, safeFileName } from '../../utils/agentProfileConfig.js'
+import { errorText } from '../../utils/errorText.js'
 import PanelHost from '../shell/PanelHost.vue'
 import Tabs from '../ui/Tabs.vue'
 import Input from '../ui/Input.vue'
@@ -77,7 +78,7 @@ async function refresh() {
       editing.value = await getAgentProfileConfig(target.id)
     }
   } catch (e) {
-    errorMsg.value = '加载失败: ' + e
+    errorMsg.value = '加载失败: ' + errorText(e)
   } finally {
     loading.value = false
   }
@@ -88,7 +89,7 @@ async function selectProfile(id) {
     editing.value = await getAgentProfileConfig(id)
     activeTab.value = 'edit'
   } catch (e) {
-    errorMsg.value = '读取配置失败: ' + e
+    errorMsg.value = '读取配置失败: ' + errorText(e)
   }
 }
 
@@ -99,7 +100,7 @@ async function makeActive(id) {
     await setActiveAgentProfileConfig(id)
     await refresh()
   } catch (e) {
-    errorMsg.value = '切换活跃配置失败: ' + e
+    errorMsg.value = '切换活跃配置失败: ' + errorText(e)
   } finally {
     saving.value = false
   }
@@ -125,7 +126,7 @@ async function duplicate(id) {
     editing.value = await getAgentProfileConfig(newConfig.id)
     activeTab.value = 'edit'
   } catch (e) {
-    errorMsg.value = '复制失败: ' + e
+    errorMsg.value = '复制失败: ' + errorText(e)
   }
 }
 
@@ -142,7 +143,7 @@ async function removeProfile(id) {
     if (editing.value && editing.value.id === id) editing.value = null
     await refresh()
   } catch (e) {
-    errorMsg.value = '删除失败: ' + e
+    errorMsg.value = '删除失败: ' + errorText(e)
   } finally {
     saving.value = false
   }
@@ -164,7 +165,7 @@ async function save() {
     editing.value = await getAgentProfileConfig(cleaned.id)
     await refresh()
   } catch (e) {
-    errorMsg.value = '保存失败: ' + e
+    errorMsg.value = '保存失败: ' + errorText(e)
   } finally {
     saving.value = false
   }
@@ -184,10 +185,10 @@ async function exportProfile() {
     })
     if (!filePath) return
 
-    const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
-    await writeBinaryFile(filePath, new TextEncoder().encode(json))
+    const { writeFile } = await import('@tauri-apps/plugin-fs')
+    await writeFile(filePath, new TextEncoder().encode(json))
   } catch (e) {
-    errorMsg.value = '导出失败: ' + e
+    errorMsg.value = '导出失败: ' + errorText(e)
   } finally {
     saving.value = false
   }
@@ -213,7 +214,7 @@ async function importProfile() {
       activeTab.value = 'edit'
     }
   } catch (e) {
-    errorMsg.value = '导入失败: ' + e
+    errorMsg.value = '导入失败: ' + errorText(e)
   } finally {
     saving.value = false
   }

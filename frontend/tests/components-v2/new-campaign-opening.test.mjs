@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import NewCampaignForm from '../../src/components-v2/campaign/NewCampaignForm.vue'
+import { useNewCampaignForm } from '../../src/composables/useNewCampaignForm.js'
 
 const OverlayStub = { template: '<section><slot /></section>' }
 const ButtonStub = {
@@ -43,15 +44,20 @@ describe('NewCampaignForm opening handoff', () => {
   it('arms the opening shell when a new Campaign creates its first conversation', async () => {
     const openingShellStarted = vi.fn()
     const refreshCardShellManifest = vi.fn()
+    // 2026-09-01 起组件消费调用方（AppV2）持有的同一 form 实例（单一状态源），
+    // 回调经 composable 注入，组件本身只接收 { show, form }
+    const form = useNewCampaignForm({
+      openingShellStarted,
+      refreshCardShellManifest,
+      loadInstanceNameMap: vi.fn(),
+      applyConversation: vi.fn(),
+      broadcastPluginEvent: vi.fn(),
+      loadConversationHistory: vi.fn(),
+    })
     const wrapper = mount(NewCampaignForm, {
       props: {
         show: false,
-        openingShellStarted,
-        refreshCardShellManifest,
-        loadInstanceNameMap: vi.fn(),
-        applyConversation: vi.fn(),
-        broadcastPluginEvent: vi.fn(),
-        loadConversationHistory: vi.fn(),
+        form,
       },
       global: {
         stubs: {
@@ -63,8 +69,11 @@ describe('NewCampaignForm opening handoff', () => {
       },
     })
 
-    await wrapper.setProps({ show: true })
+    // AppV2 的打开入口：openNewCampaignDialog 置 show + 加载卡列表
+    await form.openNewCampaignDialog()
     await flushPromises()
+    await wrapper.setProps({ show: form.showNewCampaignForm.value })
+
     await wrapper.get('input').setValue('新测试')
     await wrapper.findAll('button').at(-1).trigger('click')
     await flushPromises()

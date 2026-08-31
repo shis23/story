@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   metaHealthCheck,
   metaProposeCampaignRepairs,
@@ -20,6 +20,7 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 // Campaign 健康检查 + 类型化修复建议（第三轮闭环）。
 // 原始 MetaPanel 右侧栏的「🩺 Campaign 体检」+「🔧 修复建议」两个区块合并。
@@ -53,7 +54,7 @@ async function handleHealthCheck() {
     healthIssues.value = sortHealthIssues(result)
     healthRan.value = true
   } catch (e) {
-    error.value = '体检失败: ' + e
+    error.value = '体检失败: ' + errorText(e)
     emit('error', error.value)
   } finally {
     healthLoading.value = false
@@ -72,7 +73,7 @@ async function handleProposeRepairs() {
       previewTypedPatch: metaPreviewTypedPatch,
     })
   } catch (e) {
-    error.value = '生成修复方案失败: ' + e
+    error.value = '生成修复方案失败: ' + errorText(e)
     emit('error', error.value)
   } finally {
     patchesLoading.value = false
@@ -92,6 +93,10 @@ async function refreshTypedPatches() {
     console.warn('刷新 typed patches 失败:', e)
   }
 }
+
+// 面板打开即拉取：上一会话遗留的 pending patch（含 agent 提议）必须可见，
+// 否则重启后无任何入口触达（2026-08-31 B5 验收补强）。
+onMounted(refreshTypedPatches)
 
 async function handleAcceptTypedPatch(patchId) {
   if (!props.activeCampaign?.id) return
@@ -117,7 +122,7 @@ async function handleAcceptTypedPatch(patchId) {
       emit('error', error.value)
     }
   } catch (e) {
-    error.value = '接受修复失败: ' + e
+    error.value = '接受修复失败: ' + errorText(e)
     emit('error', error.value)
   }
 }
@@ -130,7 +135,7 @@ async function handleDismissTypedPatch(patchId) {
       dismissTypedPatch: metaDismissTypedPatch,
     })
   } catch (e) {
-    error.value = '忽略修复失败: ' + e
+    error.value = '忽略修复失败: ' + errorText(e)
     emit('error', error.value)
   }
 }
@@ -210,14 +215,10 @@ defineExpose({ refreshTypedPatches })
         >{{ patchesLoading ? '生成中…' : '生成修复方案' }}</Button>
       </div>
 
-      <div v-if="!healthRan || healthIssues.length === 0" class="text-xs text-ink-soft">
-        先运行体检，有问题时可生成修复方案。
-      </div>
-      <div v-else-if="typedPatches.length === 0 && !patchesLoading" class="text-xs text-ink-soft">
-        点击「生成修复方案」获取类型化 patch。
-      </div>
-
-      <div v-else class="space-y-2">
+      <!-- 有待处理 patch（体检修复或 Meta 对话提议）时优先展示卡片：
+           2026-08-31 B5 验收发现 agent_proposed patch 在「体检无问题」时被
+           下方 v-if 分支吞掉——后端 pending，UI 却无任何入口。 -->
+      <div v-if="typedPatches.length > 0 || patchesLoading" class="space-y-2">
         <div
           v-for="patch in typedPatches"
           :key="patch.id"
@@ -280,6 +281,13 @@ defineExpose({ refreshTypedPatches })
             >忽略</Button>
           </div>
         </div>
+      </div>
+
+      <div v-else-if="!healthRan || healthIssues.length === 0" class="text-xs text-ink-soft">
+        先运行体检，有问题时可生成修复方案；也可在「对话」里让 Meta 助手直接提议修改。
+      </div>
+      <div v-else class="text-xs text-ink-soft">
+        点击「生成修复方案」获取类型化 patch。
       </div>
     </section>
   </div>

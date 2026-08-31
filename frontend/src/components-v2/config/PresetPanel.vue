@@ -21,6 +21,7 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const emit = defineEmits(['close'])
 
@@ -99,7 +100,7 @@ async function handleDelete(preset) {
     }
     await refresh()
   } catch (e) {
-    await alertDialog('删除失败: ' + e)
+    await alertDialog('删除失败: ' + errorText(e))
   }
 }
 
@@ -123,7 +124,7 @@ async function saveEditPrompt(index) {
     editingPrompt.value = null
     editContent.value = ''
   } catch (e) {
-    await alertDialog('保存失败: ' + e)
+    await alertDialog('保存失败: ' + errorText(e))
   } finally {
     saving.value = false
   }
@@ -136,7 +137,7 @@ async function togglePromptEnabled(index) {
     await updatePresetPrompt(expandedId.value, index, null, !prompt.enabled)
     prompt.enabled = !prompt.enabled
   } catch (e) {
-    await alertDialog('操作失败: ' + e)
+    await alertDialog('操作失败: ' + errorText(e))
   } finally {
     saving.value = false
   }
@@ -149,7 +150,7 @@ async function toggleRegexDisabled(index) {
     await updatePresetRegex(expandedId.value, index, !regex.disabled)
     regex.disabled = !regex.disabled
   } catch (e) {
-    await alertDialog('操作失败: ' + e)
+    await alertDialog('操作失败: ' + errorText(e))
   } finally {
     saving.value = false
   }
@@ -172,7 +173,7 @@ async function importGlobalRegexFromSettings() {
     await refreshGlobalRegexScripts()
     await alertDialog(`已导入 ${count} 条全局正则`)
   } catch (e) {
-    await alertDialog('导入全局正则失败: ' + e)
+    await alertDialog('导入全局正则失败: ' + errorText(e))
   } finally {
     importingGlobalRegex.value = false
     saving.value = false
@@ -189,7 +190,7 @@ async function clearGlobalRegex() {
     await clearGlobalRegexScripts()
     globalRegexScripts.value = []
   } catch (e) {
-    await alertDialog('清空全局正则失败: ' + e)
+    await alertDialog('清空全局正则失败: ' + errorText(e))
   } finally {
     saving.value = false
   }
@@ -204,7 +205,7 @@ async function toggleGlobalRegexDisabled(index) {
     await updateGlobalRegex(index, !regex.disabled)
     regex.disabled = !regex.disabled
   } catch (e) {
-    await alertDialog('操作全局正则失败: ' + e)
+    await alertDialog('操作全局正则失败: ' + errorText(e))
   } finally {
     saving.value = false
   }
@@ -215,7 +216,7 @@ async function handleImportAsModules(preset) {
     const count = await importPresetAsModules(preset.id)
     await alertDialog(`已导入 ${count} 条提示词为模块，可在导演 Agent 配置中选择使用`)
   } catch (e) {
-    await alertDialog('导入失败: ' + e)
+    await alertDialog('导入失败: ' + errorText(e))
   }
 }
 
@@ -228,7 +229,7 @@ async function toggleActivePreset(preset) {
       detail.value = await getPreset(preset.id)
     }
   } catch (e) {
-    await alertDialog('操作失败: ' + e)
+    await alertDialog('操作失败: ' + errorText(e))
   } finally {
     saving.value = false
   }

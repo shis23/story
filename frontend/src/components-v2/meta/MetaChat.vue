@@ -10,6 +10,7 @@ import {
 import Button from '../ui/Button.vue'
 import Input from '../ui/Input.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 // Meta 与用户对话区：流式消息 + 工具结果折叠卡。
 // 复用 utils/metaToolResults.js 渲染结构化结果（世界书诊断 / 角色卡诊断 / Patch 提议）。
@@ -29,7 +30,7 @@ onMounted(async () => {
   try {
     conversationId.value = await metaStartConversation()
   } catch (e) {
-    emit('error', '初始化 Meta 对话失败: ' + e)
+    emit('error', '初始化 Meta 对话失败: ' + errorText(e))
   }
 })
 
@@ -78,7 +79,7 @@ async function handleSend() {
     }
     await scrollToBottom()
   } catch (e) {
-    emit('error', '对话失败: ' + e)
+    emit('error', '对话失败: ' + errorText(e))
   } finally {
     loading.value = false
   }

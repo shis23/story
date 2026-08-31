@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { alertDialog, confirmDialog } from '../../components/base/BaseDialog.js'
+import { errorText } from '../../utils/errorText.js'
 import {
   getCard,
   listCampaigns, createCampaign, deleteCampaign, setActiveCampaign, getActiveCampaign, getActiveTurnQuality,
@@ -180,7 +181,7 @@ async function handleCreateCampaign() {
     await refreshCampaigns()
     await handleSetActive(result.id)
   } catch (e) {
-    await alertDialog('创建失败: ' + e)
+    await alertDialog('创建失败: ' + errorText(e))
   } finally {
     creatingCampaign.value = false
   }
@@ -241,7 +242,7 @@ async function handleDeleteCampaign(camp) {
     }
     emit('campaign-changed', activeCampaign.value)
   } catch (e) {
-    await alertDialog('删除活动失败: ' + e)
+    await alertDialog('删除活动失败: ' + errorText(e))
   }
 }
 
@@ -333,8 +334,8 @@ async function saveFileViaDialog(filename, data, mimeType = 'application/octet-s
       filters: [{ name: 'Files', extensions: [filename.split('.').pop() || '*'] }],
     })
     if (filePath) {
-      const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
-      await writeBinaryFile(filePath, data)
+      const { writeFile } = await import('@tauri-apps/plugin-fs')
+      await writeFile(filePath, data)
       return true
     }
     return false
@@ -371,7 +372,7 @@ async function handleExportStCards() {
 
     exportStatus.value = `已保存 ${saved} 个文件`
   } catch (e) {
-    exportStatus.value = '导出失败: ' + e
+    exportStatus.value = '导出失败: ' + errorText(e)
   } finally {
     exporting.value = false
   }
@@ -391,7 +392,7 @@ async function handleExportBundle() {
     const ok = await saveFileViaDialog('campaign-bundle.json', data)
     exportStatus.value = ok ? 'Bundle 导出完成' : '已取消'
   } catch (e) {
-    exportStatus.value = '导出失败: ' + e
+    exportStatus.value = '导出失败: ' + errorText(e)
   } finally {
     exporting.value = false
   }
@@ -430,7 +431,7 @@ async function handleImportBundle() {
     importStatus.value = message
     exportStatus.value = message
   } catch (e) {
-    importStatus.value = '导入失败: ' + e
+    importStatus.value = '导入失败: ' + errorText(e)
   } finally {
     importingBundle.value = false
   }

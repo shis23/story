@@ -5,6 +5,7 @@ import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -23,7 +24,7 @@ async function load() {
   try {
     summaries.value = await listRoundSummaries(props.campaignId)
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
   } finally {
     loading.value = false
   }

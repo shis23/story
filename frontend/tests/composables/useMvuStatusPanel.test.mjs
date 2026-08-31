@@ -237,3 +237,30 @@ test('campaign switch and postprocess running->done both trigger refresh', async
   await flushAsync()
   assert.ok(calls.getCard > afterSwitch, 'postprocess running→done 应触发刷新（变量已更新）')
 })
+
+test('dispatch surfaces failed writes and skips trigger_next_turn (2026-09-01 fix)', async () => {
+  setActivePinia(createPinia())
+  const campaign = useCampaignStore()
+  campaign.activeCampaign = { id: 'camp-1', card_id: 'card-1' }
+  const { apis } = makeApis()
+
+  const hints = []
+  const alerts = []
+  const panel = useMvuStatusPanel({
+    ...apis,
+    persistWriteApi: async (args) => ({ ok: false, scope: 'instance', key: args.key, error: '变量只读' }),
+    startWriting: async (hint) => {
+      hints.push(hint)
+    },
+    alertDialog: async (msg) => alerts.push(msg),
+  })
+  await panel.refreshMvuStatusPanel()
+
+  const outcome = await panel.dispatchMvuInteraction(panel.mvuInteractionMappings.value[0])
+
+  // 写入失败：结果带回 ok:false，且不再触发下一轮生成
+  assert.equal(outcome.results[0].ok, false)
+  assert.deepEqual(hints, [])
+  assert.equal(alerts.length, 1)
+  assert.match(alerts[0], /变量只读/)
+})

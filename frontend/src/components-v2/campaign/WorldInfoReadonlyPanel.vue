@@ -12,6 +12,7 @@ import Select from '../ui/Select.vue'
 import Input from '../ui/Input.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
   /** CharacterStore id（source_character_id） */
@@ -51,7 +52,7 @@ async function load() {
   try {
     book.value = await getCharacterWorldInfo(props.characterId)
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
     book.value = null
   } finally {
     loading.value = false
@@ -100,7 +101,7 @@ async function toggleExpand(entry) {
         expandedContent.value = full.content || ''
       }
     } catch (e) {
-      expandedContent.value = `${entry.content || ''}\n\n[完整正文加载失败] ${e}`
+      expandedContent.value = `${entry.content || ''}\n\n[完整正文加载失败] ${errorText(e)}`
     } finally {
       expanding.value = false
     }

@@ -22,6 +22,7 @@ import {
 import { buildCampaignMvuStatusSections } from '../utils/campaignMvuStatusBar.js'
 import { planMvuInteraction } from '../utils/mvuInteractions.js'
 import { persistShellVariableWrite } from '../utils/shellVariableOutbox.js'
+import { errorText } from '../utils/errorText.js'
 
 export function useMvuStatusPanel(options = {}) {
   const campaign = useCampaignStore()
@@ -35,6 +36,7 @@ export function useMvuStatusPanel(options = {}) {
   const persistWriteApi = options.persistWriteApi || persistShellVariableWrite
   const startWriting = options.startWriting || null
   const logApi = options.logApi || logAppendFrontend
+  const alertDialog = options.alertDialog || null
 
   const mvuStatusSections = ref([])
   const mvuInteractionMappings = ref([])
@@ -129,6 +131,19 @@ export function useMvuStatusPanel(options = {}) {
         )
       }
       if (plan.writes.length) await refreshMvuStatusPanel()
+      // 变量写入失败时不得继续 trigger_next_turn：下一轮会基于旧变量生成，
+      // 且失败本身必须可见（此前 results 被整体忽略，点击按钮静默无效）。
+      const failed = results.filter((r) => r && r.ok === false)
+      if (failed.length) {
+        const detail = failed
+          .map((r) => `${r.key}: ${errorText(r.error)}`)
+          .join('\n')
+        const message = `交互已触发，但 ${failed.length} 项变量写入失败（已跳过下一轮生成）:\n${detail}`
+        console.error('dispatchMvuInteraction:', message)
+        if (alertDialog) await alertDialog(message)
+        else await logApi('error', message)
+        return { plan, results }
+      }
       for (const hint of plan.hints) {
         if (typeof startWriting === 'function' && !writing.isWriting) {
           await startWriting(hint)

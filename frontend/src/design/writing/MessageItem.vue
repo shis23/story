@@ -103,9 +103,11 @@ function startEdit() {
   editContent.value = currentVariant.value?.content ?? ''
   editing.value = true
 }
-function saveEdit() {
-  emit('edit-variant', { nodeId: props.message.id, newContent: editContent.value })
-  editing.value = false
+async function saveEdit() {
+  // 事件链（StoryPage→WritingScreen→adapter）单监听时 emit 会回传 handler 的
+  // Promise：false = 保存失败，编辑器保持打开；链路未回传（undefined）按成功关闭。
+  const result = await emit('edit-variant', { nodeId: props.message.id, newContent: editContent.value })
+  if (result !== false) editing.value = false
 }
 
 // ── 重 roll 菜单 ──
