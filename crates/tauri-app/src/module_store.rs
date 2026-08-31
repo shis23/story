@@ -60,7 +60,7 @@ pub fn module_to_dto(m: &PromptModule, enabled: bool) -> PromptModuleDto {
     }
 }
 
-pub fn profile_to_dto(p: &PromptProfile, _is_active: bool) -> PromptProfileDto {
+pub fn profile_to_dto(p: &PromptProfile) -> PromptProfileDto {
     let mut selections = std::collections::HashMap::new();
     for (role, cats) in &p.selections {
         let role_key = format!("{role:?}");
@@ -232,6 +232,14 @@ impl ModuleStore {
         if custom.len() < before {
             drop(custom);
             self.persist_custom()?;
+            // 一并清理禁用列表残留：悬挂 id 会在未来同 id 模块重用时幽灵禁用
+            let mut disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
+            let disabled_before = disabled.len();
+            disabled.retain(|d| d != id);
+            if disabled.len() != disabled_before {
+                drop(disabled);
+                self.persist_disabled()?;
+            }
             Ok(true)
         } else {
             Ok(false) // 内置模块不能删
@@ -371,11 +379,10 @@ impl ProfileStore {
     /// 获取指定 Profile
     pub fn get(&self, id: &str) -> Option<PromptProfileDto> {
         let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
-        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
         profiles
             .iter()
             .find(|p| p.id.to_string() == id)
-            .map(|p| profile_to_dto(p, active_id.as_deref() == Some(id)))
+            .map(profile_to_dto)
     }
 
     /// 保存/更新 Profile
@@ -391,8 +398,16 @@ impl ProfileStore {
     }
 
     /// 设置活跃 Profile
+    ///
+    /// 校验目标存在后才写指针：与 AgentProfileConfigStore::set_active 一致，
+    /// 否则前端竞态删除后会把悬挂 id 静默持久化（2026-09-01 全量审查修复）。
     pub fn set_active(&self, id: &str) -> Result<(), String> {
         let json = {
+            let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
+            if !profiles.iter().any(|p| p.id.to_string() == id) {
+                return Err(format!("Profile {id} 不存在"));
+            }
+            drop(profiles);
             let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             *active_id = Some(id.to_string());
             serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())

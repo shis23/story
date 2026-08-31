@@ -22,13 +22,23 @@ pub fn inject_tool_prompt(messages: &mut [ChatMessage], tools: &[ToolSpec]) {
 
     let tool_text = format_tool_descriptions(tools);
 
-    // 找最后一条 system 消息追加
-    if let Some(sys_msg) = messages
-        .iter_mut()
-        .rfind(|m| m.role == storyforge_domain::llm::ChatRole::System)
-    {
-        sys_msg.content.push_str("\n\n");
-        sys_msg.content.push_str(&tool_text);
+    // 找最后一条 system 消息追加；无 system 消息（裸续写请求）时把工具说明
+    // 前置到首条消息（保持原角色，&mut [T] 无法插入新元素），否则模型永远
+    // 学不到 <tool_call> 格式，text-fallback 降级会静默失效（2026-09-01 修复）
+    let sys_index = messages
+        .iter()
+        .rposition(|m| m.role == storyforge_domain::llm::ChatRole::System);
+    match sys_index {
+        Some(i) => {
+            let sys_msg = &mut messages[i];
+            sys_msg.content.push_str("\n\n");
+            sys_msg.content.push_str(&tool_text);
+        }
+        None if !messages.is_empty() => {
+            let first = &mut messages[0];
+            first.content = format!("{tool_text}\n\n{}", first.content);
+        }
+        None => {}
     }
 }
 

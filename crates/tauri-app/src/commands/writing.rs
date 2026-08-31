@@ -1156,6 +1156,8 @@ pub(crate) async fn start_writing(
         let pp_runtime = ctx.campaign_runtime.clone();
         let app_for_pp = app.clone();
         let operation_id_for_pp = operation_id.clone();
+        // final_text 所有权移入后台 postprocess，返回值用克隆副本
+        let final_text_for_response = final_text.clone();
         tokio::spawn(async move {
             let result = run_shared_postprocess_background(
                 app_for_pp.storage().clone(),
@@ -1179,37 +1181,19 @@ pub(crate) async fn start_writing(
         });
         // Defer clear_current_cancel to the spawn completion path below.
         // Skip the normal clear for the success path with background postprocess.
-        match result {
-            Ok((orig_text, _provisional_node_id, _provenance)) => {
-                let text = turn_lifecycle::prefer_autofix_response_text(response_text, orig_text);
-                // Prefer the authoritative landed variant id (SQLite UoW may replace provisional).
-                return Ok(serde_json::json!({
-                    "text": text,
-                    "conversation_id": conversation_id.to_string(),
-                    "node_id": landed_draft_node_id.to_string(),
-                    "generation_mode": route_decision.mode,
-                    "generation_route_reason": route_decision.reason,
-                }));
-            }
-            Err(e) => {
-                if let Some(ref turn) = turn_record {
-                    let _ = update_turn_record(app.storage(), &turn.turn_id, |record| {
-                        record.status = storyforge_domain::turn::TurnStatus::Failed;
-                        record.failure_reason = Some(format!("写作失败: {e}"));
-                        record.touch();
-                    });
-                }
-                clear_current_cancel_if(&app, &operation_id);
-                // Gate 8 复评：失败路径也回滚本次写作追加的 user 消息（仅当仍
-                // 是最后节点）——否则重试会再 append 一条，对话出现重复输入节点。
-                if let Some(input) = &start_target.input_node_id {
-                    rollback_orphaned_user_message(&app, &conversation_id, input);
-                }
-                // 保留 PipelineError 分类（retryable/429/超时），不让前端契约丢失
-                // （Gate 8 审查 P2-B6：format! 拍平会把一切变成 Internal）。
-                return Err(TauriCommandError::from(e));
-            }
-        }
+        // （此块位于 `if let Ok(..) = &result` 内，失败路径由函数尾部的第二个
+        // `match result` 统一处理——曾存在的内层 Err 分支在运行时不可达，
+        // 且与真实失败路径重复维护回滚语义，2026-09-01 全量审查移除。）
+        let text =
+            turn_lifecycle::prefer_autofix_response_text(response_text, final_text_for_response);
+        // Prefer the authoritative landed variant id (SQLite UoW may replace provisional).
+        return Ok(serde_json::json!({
+            "text": text,
+            "conversation_id": conversation_id.to_string(),
+            "node_id": landed_draft_node_id.to_string(),
+            "generation_mode": route_decision.mode,
+            "generation_route_reason": route_decision.reason,
+        }));
     }
 
     // No background postprocess path: clear only this operation.

@@ -12,4 +12,6 @@ serde_yaml = "0.9"
 chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+# 反序列化兜底告警走 tracing（GUI 下 eprintln 不可见）
+tracing.workspace = true
 sha2.workspace = true

@@ -104,13 +104,18 @@ impl WorldInfoEntry {
     }
 
     pub fn matches_query(&self, query: &str) -> bool {
+        self.matches_query_lowered(&query.to_lowercase())
+    }
+
+    /// 与 `matches_query` 同语义，但接受调用方预先 lower 的 query——
+    /// 扫描整本世界书时避免每条 entry 重复分配整段小写副本。
+    pub fn matches_query_lowered(&self, query_lower: &str) -> bool {
         if self.disabled {
             return false;
         }
 
-        let query_lower = query.to_lowercase();
-        let primary_matches = any_key_matches(&query_lower, &self.keys);
-        let secondary_matches = any_key_matches(&query_lower, &self.secondary_keys);
+        let primary_matches = any_key_matches(query_lower, &self.keys);
+        let secondary_matches = any_key_matches(query_lower, &self.secondary_keys);
         let has_secondary = self.secondary_keys.iter().any(|k| !k.trim().is_empty());
 
         if !has_secondary {
@@ -187,9 +192,10 @@ impl WorldInfoBook {
     }
 
     pub fn triggered_selective_entries(&self, query: &str) -> Vec<&WorldInfoEntry> {
+        let query_lower = query.to_lowercase();
         self.entries
             .iter()
-            .filter(|e| e.is_selective_route() && e.matches_query(query))
+            .filter(|e| e.is_selective_route() && e.matches_query_lowered(&query_lower))
             .collect()
     }
 

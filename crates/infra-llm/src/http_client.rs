@@ -372,18 +372,38 @@ impl crate::LlmClient for HttpLlmClient {
         }
 
         loop {
+            // 空闲超时在循环顶判定：select 分支带 `if next_deadline > now` guard 时，
+            // deadline 一旦过期该分支被永久禁用，死流保护永远无法触发。
+            if last_chunk_at.elapsed() >= STREAM_IDLE_TIMEOUT {
+                warn!(target: "infra-llm", "stream 空闲超时（{}s 无数据），判定死流", STREAM_IDLE_TIMEOUT.as_secs());
+                return Err(LlmError::Http(format!(
+                    "流式空闲超时（{}s 无 chunk）",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )));
+            }
             // 计算到下次空闲超时的剩余时间
             let next_deadline = last_chunk_at + STREAM_IDLE_TIMEOUT;
             tokio::select! {
                 // 取消信号
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
-                        warn!(target: "infra-llm", "stream cancelled");
-                        return Err(LlmError::Cancelled);
+                changed = cancel.changed() => {
+                    match changed {
+                        // 所有 sender 已 drop：changed() 立即返回 Err，select 会
+                        // 100% CPU 空转（2026-09-01 全量审查修复）——视同取消
+                        Err(_) => {
+                            warn!(target: "infra-llm", "stream cancel watch closed");
+                            return Err(LlmError::Cancelled);
+                        }
+                        Ok(()) => {
+                            if *cancel.borrow() {
+                                warn!(target: "infra-llm", "stream cancelled");
+                                return Err(LlmError::Cancelled);
+                            }
+                        }
                     }
                 }
                 // 空闲超时：90s 无 chunk 判死流，防止连接永久泄漏
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)), if next_deadline > std::time::Instant::now() => {
+                // （deadline 已过时立即完成；正常路径由循环顶的 elapsed 检查先触发）
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => {
                     warn!(target: "infra-llm", "stream 空闲超时（{}s 无数据），判定死流", STREAM_IDLE_TIMEOUT.as_secs());
                     return Err(LlmError::Http(format!("流式空闲超时（{}s 无 chunk）", STREAM_IDLE_TIMEOUT.as_secs())));
                 }
@@ -477,9 +497,9 @@ fn normalize_models_url(base_url: &str) -> String {
     let url = base_url.trim_end_matches('/');
     if url.ends_with("/v1/models") {
         url.to_string()
-    } else if url.ends_with("/v1") {
+    } else if url.ends_with("/v1") || url.ends_with("/v4") {
         format!("{url}/models")
-    } else if url.ends_with("/v1/chat/completions") {
+    } else if url.ends_with("/v1/chat/completions") || url.ends_with("/v4/chat/completions") {
         url.trim_end_matches("/chat/completions").to_string() + "/models"
     } else {
         format!("{url}/v1/models")

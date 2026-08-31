@@ -272,7 +272,16 @@ pub(crate) fn extract_regex_scripts_with_source(
     };
 
     arr.iter()
-        .filter_map(|v| serde_json::from_value::<StRegexScript>(v.clone()).ok())
+        .filter_map(
+            |v| match serde_json::from_value::<StRegexScript>(v.clone()) {
+                Ok(s) => Some(s),
+                // 畸形条目被静默丢弃时无从排查——留 warn 记录原文片段
+                Err(e) => {
+                    tracing::warn!("regex_scripts 条目解析失败（{e}），已跳过: {v}");
+                    None
+                }
+            },
+        )
         .map(|s| {
             // ST placement: [1] = user input, [2] = AI output, [3] = slash
             // command, [5] = world info, [6] = reasoning. Other/deprecated

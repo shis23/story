@@ -217,6 +217,16 @@ pub fn write_st_card_png(
         }
     }
 
+    // 底图块流被截断（无完整 IEND）时上面不会插入 tEXt：必须报错而不是
+    // 产出一张没有 chara 数据的"正常" PNG——那正是导入侧 fail-closed 拒绝的
+    // 损坏形态，静默导出等于制造坏卡（2026-09-01 全量审查修复）。
+    if !inserted {
+        return Err(ImportError::PngError(format!(
+            "底图 PNG 块结构不完整（未找到 IEND），无法嵌入角色卡数据（base len={}）",
+            base.len()
+        )));
+    }
+
     Ok(out)
 }
 

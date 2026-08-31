@@ -4100,9 +4100,10 @@ fn parse_context_package(v: &serde_json::Value) -> ContextPackage {
 /// 生成随机种子
 fn rand_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // 时钟早于 epoch（理论上仅测试环境）时退化为 0，不值得 panic
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64
 }
 

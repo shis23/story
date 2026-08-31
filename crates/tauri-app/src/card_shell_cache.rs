@@ -90,11 +90,6 @@ impl CardShellCache {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
-    }
-
     /// 清空磁盘缓存（L6：未 pin 依赖首取即冻结，需要手动刷新通道）。
     /// 只清 card-shell-cache 目录自身内容，返回清掉的对象数。
     pub fn clear_cache(&self) -> Result<usize, String> {

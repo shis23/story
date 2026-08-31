@@ -108,8 +108,9 @@ impl crate::LlmClient for MockLlmClient {
             let mut cancel = cancel;
             for ch in content.chars() {
                 tokio::select! {
-                    _ = cancel.changed() => {
-                        if *cancel.borrow() {
+                    changed = cancel.changed() => {
+                        // sender 全 drop 时 changed() 立即 Err，无此分支会 100% CPU 空转
+                        if changed.is_err() || *cancel.borrow() {
                             return Err(storyforge_domain::llm::LlmError::Cancelled);
                         }
                     }

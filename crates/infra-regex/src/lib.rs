@@ -6,6 +6,8 @@
 /// - Output: applied after the writer finalizes
 /// - sub-agents do not run regex
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use storyforge_domain::preset::{
     RegexPlacement, RegexScript, ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING,
@@ -42,6 +44,13 @@ pub enum RegexError {
 /// or exponential in pattern structure. This timeout is the hard backstop that turns
 /// a multi-minute UI freeze into a 5s error.
 pub const REGEX_TIMEOUT_SECS: u64 = 5;
+
+/// H-1 补强（2026-09-01 全量审查）：进程级「已超时 (pattern, flags)」集合。
+/// 超时后被 detach 的 worker 线程仍在 CPU 上跑指数回溯（无法杀死），同一
+/// 灾难性脚本每条消息再 apply 一次就再泄漏一个满载线程。首次超时后同 spec
+/// 直接短路返回 Timeout；进程重启即复位，给用户修复卡/preset 的机会。
+static TIMED_OUT_SPECS: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// H-1: trial-compile an ST regex script's `find_regex` + `flags`.
 ///
@@ -152,10 +161,20 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
         )));
     }
     let regex_spec = parse_st_regex_spec(&script.find_regex, &script.flags);
+    let spec_key = (regex_spec.pattern.clone(), regex_spec.flags.clone());
+    let script_name = script.script_name.clone();
+    {
+        let timed_out = TIMED_OUT_SPECS.lock().unwrap_or_else(|p| p.into_inner());
+        if timed_out.contains(&spec_key) {
+            return Err(RegexError::Timeout {
+                script: script_name,
+                timeout: REGEX_TIMEOUT_SECS,
+            });
+        }
+    }
 
     // The worker thread requires `'static` inputs, so clone the owned pieces once
     // and move them in. `text` is capped at 1MB so this clone is bounded.
-    let script_name = script.script_name.clone();
     let thread_name = script_name.clone();
     let text_owned = text.to_string();
     let pattern_owned = regex_spec.pattern.clone();
@@ -192,10 +211,16 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
 
     match result_rx.recv_timeout(Duration::from_secs(REGEX_TIMEOUT_SECS)) {
         Ok(inner) => inner,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RegexError::Timeout {
-            script: thread_name,
-            timeout: REGEX_TIMEOUT_SECS,
-        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            TIMED_OUT_SPECS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(spec_key);
+            Err(RegexError::Timeout {
+                script: thread_name,
+                timeout: REGEX_TIMEOUT_SECS,
+            })
+        }
         // Disconnected without a value = worker panicked before sending. Map to a
         // Compile error so callers see a normal regex failure, not a crash.
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RegexError::Compile(format!(

@@ -311,8 +311,14 @@ pub fn to_st_data(
 ) -> StCharacterData {
     // 从 raw_card_json 反序列化为 base，保留扩展字段
     let mut data: StCharacterData = if !character.raw_card_json.is_null() {
-        serde_json::from_value(character.raw_card_json.clone())
-            .unwrap_or_else(|_| empty_st_data(&character.name))
+        serde_json::from_value(character.raw_card_json.clone()).unwrap_or_else(|e| {
+            // 静默回空白会丢掉全部 ST 扩展字段且无从排查——留 warn 供日志检索
+            tracing::warn!(
+                "角色 {} raw_card_json 反序列化失败（{e}），导出回退为空 ST 数据",
+                character.name
+            );
+            empty_st_data(&character.name)
+        })
     } else {
         empty_st_data(&character.name)
     };

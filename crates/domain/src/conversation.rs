@@ -24,8 +24,8 @@ impl<'de> Deserialize<'de> for MessageNode {
             raw.active_variant.min(raw.variants.len() - 1)
         };
         if clamped != raw.active_variant {
-            eprintln!(
-                "WARN: MessageNode {} active_variant {} out of bounds (variants len={}), clamped to {}",
+            tracing::warn!(
+                "MessageNode {} active_variant {} out of bounds (variants len={}), clamped to {}",
                 raw.id,
                 raw.active_variant,
                 raw.variants.len(),

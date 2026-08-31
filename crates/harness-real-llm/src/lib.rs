@@ -413,7 +413,7 @@ impl HarnessEnv {
         self.active_campaign.lock().unwrap().clone()
     }
 
-    /// 复刻线上 `extract_characters`（tauri-app lib.rs:3970）：跑识别 Agent 建
+    /// 复刻线上 `extract_characters`（tauri-app commands/campaigns.rs）：跑识别 Agent 建
     /// CharacterCard。失败时降级建单角色卡（与线上同行为）。
     pub async fn extract_characters(
         &self,
@@ -489,7 +489,7 @@ impl HarnessEnv {
         stored.card
     }
 
-    /// 复刻线上 `create_campaign`（tauri-app lib.rs:4085）：建 Campaign + 实例化
+    /// 复刻线上 `create_campaign`（tauri-app commands/campaigns.rs）：建 Campaign + 实例化
     /// 所有 Protagonist/Supporting 定义。返回 campaign id（已设为活跃）。
     pub fn create_campaign(
         &self,

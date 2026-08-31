@@ -46,7 +46,7 @@ pub(crate) fn get_active_profile(
     state
         .profile_store
         .get_active()
-        .map(|profile| module_store::profile_to_dto(&profile, true))
+        .map(|profile| module_store::profile_to_dto(&profile))
 }
 
 #[tauri::command]
@@ -74,10 +74,15 @@ pub(crate) fn set_active_profile(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    state
-        .profile_store
-        .set_active(&id)
-        .map_err(|error| TauriCommandError::storage(format!("存储写入失败: {error}")))
+    state.profile_store.set_active(&id).map_err(|error| {
+        // 目标不存在是调用方状态过期（如前端竞态删除），归 not_found
+        // 而不是笼统的 storage 错误，前端才能给出准确提示
+        if error.contains("不存在") {
+            TauriCommandError::not_found(error)
+        } else {
+            TauriCommandError::storage(format!("存储写入失败: {error}"))
+        }
+    })
 }
 
 #[tauri::command]

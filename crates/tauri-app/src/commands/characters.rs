@@ -427,19 +427,17 @@ pub(crate) fn update_world_info_route(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     require_character_commands(state.inner().as_ref(), "update character world info route")?;
-    // 验证路由值合法
-    match route.as_str() {
-        "Constant" | "Selective" | "Both" | "Disabled" => {}
-        other => {
-            return Err(TauriCommandError::from(format!(
-                "无效路由: {other}，应为 Constant/Selective/Both/Disabled"
-            )));
-        }
-    }
+    // 先解析为类型化 LoreRoute 再落库/更新内存：与 world_info 命令共用
+    // parse_lore_route（大小写兼容），且存储与 tool_ctx 消费同一份值，
+    // 不存在「落库字符串与 unreachable! 映射漂移」的隐患（2026-09-01 审查收口）。
+    let parsed_route = crate::commands::world_info::parse_lore_route(route.as_str())?;
+    let route_canonical = crate::commands::world_info::lore_route_to_str(&parsed_route);
 
-    state
-        .storage()
-        .update_character_world_info_route(&character_id, entry_index, &route)?;
+    state.storage().update_character_world_info_route(
+        &character_id,
+        entry_index,
+        &route_canonical,
+    )?;
 
     // 同步更新 tool_ctx 中的世界书路由
     if let Ok(Some(stored)) = state.storage().get_character(&character_id)
@@ -449,13 +447,7 @@ pub(crate) fn update_world_info_route(
         if let Some(ref world_info) = ctx.world_info {
             let mut new_book = (**world_info).clone();
             if let Some(entry) = new_book.entries.get_mut(entry_index) {
-                entry.route = match route.as_str() {
-                    "Constant" => storyforge_domain::world_info::LoreRoute::Constant,
-                    "Selective" => storyforge_domain::world_info::LoreRoute::Selective,
-                    "Both" => storyforge_domain::world_info::LoreRoute::Both,
-                    "Disabled" => storyforge_domain::world_info::LoreRoute::Disabled,
-                    _ => unreachable!(),
-                };
+                entry.route = parsed_route;
             }
             ctx.world_info = Some(Arc::new(new_book));
         }

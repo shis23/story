@@ -103,7 +103,9 @@ impl CampaignRuntimeContext {
         let mut seen: std::collections::HashSet<String> = self
             .instances
             .iter()
-            .flat_map(|inst| [inst.id.as_str().to_string(), inst.name.to_lowercase()])
+            // ID 与名称统一小写去重：混用大小写的实例 ID（"Inst-1" vs "inst-1"）
+            // 曾绕过去重生成重复临时实例（2026-09-01 全量审查修复）
+            .flat_map(|inst| [inst.id.as_str().to_lowercase(), inst.name.to_lowercase()])
             .collect();
 
         for (cid, persona, behavior) in character_specs {

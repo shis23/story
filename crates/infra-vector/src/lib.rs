@@ -298,24 +298,34 @@ impl VectorStore for BruteForceStore {
         let records = self.records.read().unwrap_or_else(|p| p.into_inner());
         // H-7：维度不匹配改为返回错误（之前静默跳过 = 结果集缺条却不报错，损坏记录
         // 污染检索且无法排查）。第一条不匹配即短路返回，调用方可定位并修复损坏记录。
-        let mut scored: Vec<VectorHit> = records
-            .values()
-            .filter(|r| filter.accepts(r))
-            .map(|r| {
-                let score = cosine_similarity(query, &r.vector).ok_or_else(|| {
-                    warn!(
-                        "向量维度不匹配，查询 {} 维 vs 记录 id={} {} 维",
-                        query.len(),
-                        r.id.as_str(),
-                        r.vector.len()
-                    );
-                    VectorError::DimensionMismatch {
-                        expected: query.len(),
-                        actual: r.vector.len(),
-                        id: r.id.to_string(),
-                    }
-                })?;
-                Ok(VectorHit {
+        // 只收集 (score, id) 再取 top-k：全量克隆每条记录（content/keywords/metadata）
+        // 在配额上限（50k × ~4KB）下是 ~200MB 级瞬态分配（2026-09-01 全量审查修复）。
+        let mut scored: Vec<(f32, Id)> = Vec::with_capacity(records.len());
+        for r in records.values().filter(|r| filter.accepts(r)) {
+            let score = cosine_similarity(query, &r.vector).ok_or_else(|| {
+                warn!(
+                    "向量维度不匹配，查询 {} 维 vs 记录 id={} {} 维",
+                    query.len(),
+                    r.id.as_str(),
+                    r.vector.len()
+                );
+                VectorError::DimensionMismatch {
+                    expected: query.len(),
+                    actual: r.vector.len(),
+                    id: r.id.to_string(),
+                }
+            })?;
+            scored.push((score, r.id.clone()));
+        }
+
+        // 按分数降序排序
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        // 二次查表克隆仅 top-k 条赢家
+        let hits = scored
+            .into_iter()
+            .filter_map(|(score, id)| {
+                records.get(&id).map(|r| VectorHit {
                     id: r.id.clone(),
                     content: r.content.clone(),
                     score,
@@ -324,16 +334,8 @@ impl VectorStore for BruteForceStore {
                     metadata: r.metadata.clone(),
                 })
             })
-            .collect::<Result<Vec<_>, VectorError>>()?;
-
-        // 按分数降序排序
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(top_k);
-        Ok(scored)
+            .collect();
+        Ok(hits)
     }
 
     fn search_by_keywords(

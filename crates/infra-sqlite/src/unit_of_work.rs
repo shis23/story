@@ -7,16 +7,12 @@ use crate::error::{Result, SqliteError};
 /// Drop 时若尚未 commit，则 rollback（rusqlite Transaction 默认行为）。
 pub struct UnitOfWork<'conn> {
     tx: Option<rusqlite::Transaction<'conn>>,
-    finished: bool,
 }
 
 impl<'conn> UnitOfWork<'conn> {
     pub fn begin(conn: &'conn mut Connection) -> Result<Self> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(Self {
-            tx: Some(tx),
-            finished: false,
-        })
+        Ok(Self { tx: Some(tx) })
     }
 
     pub fn transaction(&self) -> Result<&rusqlite::Transaction<'conn>> {
@@ -35,14 +31,12 @@ impl<'conn> UnitOfWork<'conn> {
     pub fn commit(mut self) -> Result<()> {
         let tx = self.tx.take().ok_or(SqliteError::UnitOfWorkFinished)?;
         tx.commit()?;
-        self.finished = true;
         Ok(())
     }
 
     pub fn rollback(mut self) -> Result<()> {
         let tx = self.tx.take().ok_or(SqliteError::UnitOfWorkFinished)?;
         tx.rollback()?;
-        self.finished = true;
         Ok(())
     }
 }

@@ -175,7 +175,7 @@ fn with_db<T>(f: impl FnOnce(&Database) -> Result<T, String>) -> Result<T, Strin
 #[doc(hidden)]
 pub fn with_db_raw<T>(f: impl FnOnce(&Database) -> T) -> T {
     let mutex = SQLITE_DB.get().expect("sqlite backend active");
-    let db = mutex.lock().map_err(|_| "poisoned").unwrap();
+    let db = mutex.lock().unwrap_or_else(|p| p.into_inner());
     f(&db)
 }
 

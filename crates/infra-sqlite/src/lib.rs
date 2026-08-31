@@ -1,6 +1,7 @@
 //! StoryForge SQLite 迁移基础。
 //!
-//! 本 crate **默认不启用**为生产后端。它提供：
+//! 自 Gate 7（2026-08-05）起 SQLite 是**默认生产后端**（`backend.rs`）；
+//! JSON 目录后端保留为降级/迁移路径。本 crate 提供：
 //! - 连接与 PRAGMA 管理
 //! - schema_migrations + v1 schema
 //! - UnitOfWork 事务封装

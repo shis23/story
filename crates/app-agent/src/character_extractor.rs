@@ -251,10 +251,6 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
     if defs.is_empty() { None } else { Some(defs) }
 }
 
-// 抑制未用警告：attach_definitions_to_card / merge_schema 等是公开 API
-#[allow(unused_imports)]
-use crate::AgentRuntime as _AgentRuntimeReexport;
-
 // ─── 测试 ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

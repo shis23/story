@@ -91,9 +91,9 @@ impl SseEventAccumulator {
         }
 
         // 解析 data: 字段（SSE 规范：data: 后可带 0 或 1 个空格）
-        // 历史 bug：旧实现 strip_prefix(line, b"data: ") 要求严格 1 个空格，
+        // 历史 bug：旧实现要求严格 1 个空格（`strip_prefix(line, b"data: ")`），
         // 部分代理/服务端发 data:{...} 紧贴格式会被静默丢弃 → 流式内容丢失。
-        if let Some(rest) = strip_prefix(line, b"data:") {
+        if let Some(rest) = line.strip_prefix(b"data:") {
             // strip 至多一个空格（SSE 规范允许 data:value 或 data: value）
             let rest = if rest.first() == Some(&b' ') {
                 &rest[1..]
@@ -337,14 +337,6 @@ fn strip_line_ending(line: &[u8]) -> &[u8] {
         &line[..line.len() - 1]
     } else {
         line
-    }
-}
-
-fn strip_prefix<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    if line.len() >= prefix.len() && &line[..prefix.len()] == prefix {
-        Some(&line[prefix.len()..])
-    } else {
-        None
     }
 }
 

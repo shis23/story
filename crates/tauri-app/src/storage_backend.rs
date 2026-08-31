@@ -2238,23 +2238,6 @@ mod tests {
     }
     // ─── Gate 5 审查一.1：marker 优先于环境变量与默认 JSON ────────────────
 
-    /// 跑一次真实 cutover，得到有效 sqlite marker + DB（source 完备）。
-    /// Wave-1 决议区测试辅助；当前无调用者（clippy -D warnings 死代码）。
-    #[allow(dead_code)]
-    fn cut_over(dir: &Path) {
-        let plan =
-            storyforge_infra_sqlite::cutover::CutoverPlan::new(dir, dir.join(SQLITE_DB_FILENAME));
-        let request = storyforge_infra_sqlite::cutover::CutoverRequest {
-            plan,
-            label: "marker-first".into(),
-            allow_json_authoritative_flip: false,
-        };
-        match storyforge_infra_sqlite::cutover::run_cutover(&request).unwrap() {
-            storyforge_infra_sqlite::cutover::CutoverOutcome::Completed(_) => {}
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
     fn set_env_json() {
         // SAFETY: test-only; no concurrent threads depend on this env var.
         unsafe {

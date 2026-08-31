@@ -137,7 +137,26 @@ impl PluginRegistry {
                             HashMap::new()
                         })
                 }),
-                Err(_) => HashMap::new(),
+                Err(e) => {
+                    // IO 失败（Windows 上 AV/索引器锁是常态）：与 infra-vector 同策略——
+                    // 先试 .tmp 备份，仍失败则保 .corrupt 副本后空表启动。
+                    // 直接空表会让下一次 persist() 把近空注册表覆盖回真文件，
+                    // 永久丢失已安装插件（2026-09-01 全量审查修复）。
+                    tracing::warn!("插件注册表文件读取失败({e})，尝试 .tmp 备份");
+                    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!(
+                                "插件注册表读取失败且无可用备份，文件: {}, IO 错误: {}. 已保存 .corrupt 备份",
+                                path.display(),
+                                e
+                            );
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
+                            HashMap::new()
+                        })
+                }
             }
         } else {
             HashMap::new()
