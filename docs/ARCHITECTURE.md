@@ -161,14 +161,15 @@ JSON 路径的 Turn journal、revision、MutationBatch 和恢复逻辑提供专�
 - Linux Gitea runner 已投入运行；Windows runner 执行尚未验证。
 - Windows bundle、Android APK、签名、GUI 和真机证据必须在 `docs/RELEASE-CHECKLIST.md` 单独记录。
 - 真实模型证据（Gate 6，RESULT §35）：Canary3/Coverage12/TextFallback3/Stability30
-  已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断（r3 跑到 58/100 全健康），
-  续跑中——旧 45/100 Partial Evidence 不复活、不视为 PASS。
+  已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），
+  Gate 6 已按决议关闭（2026-08-31，关闭非 PASS，RESULT §35.9）——旧 45/100 Partial Evidence
+  不复活、不视为 PASS。
 - Android 模拟器现场（§11.3，15 项验收点）与 Windows 桌面现场已 PASS；release
   APK 签名无证书 BLOCKED；Android 真机与第三方插件现场矩阵仍缺。
 
 ## 当前主要技术债
 
-1. Full100 真实模型长程证据（Gate 6 唯一剩余阻塞，relay 恢复后续跑）。
+1. 100-turn 真实模型长程证据与 §35.8.5 两项探测缺口（forbidden_story_facts 检测、MustNotReveal 主动探测）——Gate 6 已关闭非阻塞，如需补全另行立项（RESULT §35.9）。
 2. 完整候选周期统计与 JSON 生产写路径删除（Gate 7 §12.1.2/§12.1.5，发布后/稳定期后）。
 3. Windows runner、Android 真机、release 签名与可离线验证的真实产物证据。
 4. GUI 端到端、第三方插件现场矩阵。
