@@ -106,7 +106,7 @@
 
 > **2026-08-31 桌面 GUI 验收专项（B/S 矩阵 GUI 层）**：隔离 APPDATA + debug exe + WebView2 CDP 驱动 + 真实 LLM（bigmodel GLM-4.7，OpenAI 兼容；key 仅入系统凭据库，`connections.json` 只含 `storyforge-secret:v1` SecretRef）。证据根：`artifacts/fe-acceptance-2026-08-31/`（本机，不入库）。产出：B1/B3/B4 GUI 通过、B2/S1 核心通过、B5/B6 部分通过（见各行）；修复 P1 前端缺陷 `6a0fbd8`（WritingScreen 事件转发丢 payload——消息级 采纳/重 roll/编辑/删除/分支 全链路死按钮）；新发现待修缺陷：①排障 bundle 导出静默失败（B6）②重启后 active Campaign 不自动恢复（B4/B5 受影响）③前一轮 awaiting_acceptance 时新提交点击静默无反馈。附验通过：桌面 lg 布局（>1024px 常驻侧栏）与夜读模式切换。前端门禁随修复重跑：node 476/476、vitest 94/94。
 >
-> **2026-09-01 修复补记**：上述 ①②③ 三个缺陷已在代码层修复并入库（①plugin-fs v2 `writeFile` 改名 + 导出状态反馈 + capabilities 防回归；②AppV2 启动时从最近会话恢复 active；③WritingScreen error 态提示条 + 错误文案 errorText 化；同批见全量审查 `CODE-REVIEW-2026-09-01.md`）。**GUI 复测（B6 导出 roundtrip、S1 bundle roundtrip、B5 patch 闭环）尚未重跑**——沿用 §3 工具链（`npm run build` + `cargo build -p storyforge` 后 CDP 复测），复测通过前各行状态维持"部分通过"。
+> **2026-09-01 修复补记**：上述 ①②③ 三个缺陷已在代码层修复并入库（①plugin-fs v2 `writeFile` 改名 + 导出状态反馈 + capabilities 防回归；②AppV2 启动时从最近会话恢复 active；③WritingScreen error 态提示条 + 错误文案 errorText 化；同批见全量审查——报告为本机根目录 `CODE-REVIEW-2026-09-01.md`，不入库）。**GUI 复测（B6 导出 roundtrip、S1 bundle roundtrip、B5 patch 闭环）尚未重跑**——沿用 §3 工具链（`npm run build` + `cargo build -p storyforge` 后 CDP 复测），复测通过前各行状态维持"部分通过"。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
