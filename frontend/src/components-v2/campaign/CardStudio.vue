@@ -228,13 +228,15 @@ async function exportStJson() {
     let saved = false
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
-      const { writeTextFile } = await import('@tauri-apps/plugin-fs')
+      // writeFile（fs:allow-write-file）而非 writeTextFile：后者映射未授权
+      // 的 fs.write_text_file，会被 scope 拒绝后静默走浏览器下载兜底。
+      const { writeFile } = await import('@tauri-apps/plugin-fs')
       const filePath = await save({
         defaultPath: fileName,
         filters: [{ name: 'ST Character JSON', extensions: ['json'] }],
       })
       if (filePath) {
-        await writeTextFile(filePath, json)
+        await writeFile(filePath, new TextEncoder().encode(json))
         saved = true
         statusText.value = `已导出 ST JSON：${filePath}`
       }

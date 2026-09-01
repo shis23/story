@@ -1107,6 +1107,27 @@ pub fn apply_campaign_context_snapshot(
     tool_guard.reset_chronicle_tool_budget();
 }
 
+/// 激活时把 Campaign runtime 同步进 tool_ctx（无 WritingContext 场景）。
+///
+/// 2026-09-01 B5 复验：Meta 会话的 campaign_runtime 来自 tool_ctx 快照，
+/// 此前只在第一次写作（fill_campaign_context）时填充——重启恢复/手动切换
+/// 活动后、未写作前，Meta 工具一律回答「当前没有 active Campaign」。
+/// 与 apply_campaign_context_snapshot 的 tool_ctx 侧保持同一写入集。
+pub(crate) fn apply_campaign_runtime_to_tool_ctx(
+    state: &AppState,
+    snapshot: CampaignContextSnapshot,
+) {
+    let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+    tool_guard.campaign_runtime = Some(snapshot.runtime);
+    tool_guard.archived_summaries = snapshot
+        .recent_summaries
+        .iter()
+        .map(|s| s.content.clone())
+        .collect();
+    tool_guard.chronicle_summaries = snapshot.chronicle_tool_catalog;
+    tool_guard.reset_chronicle_tool_budget();
+}
+
 /// 在 Context 编译入口刷新 ContextEpochSnapshot 并可选落盘。
 ///
 /// - live_suffix 满 E → rollover（新 overview/band/anchor）

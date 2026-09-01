@@ -107,6 +107,12 @@ fn frontend_file_dialog_usage_has_matching_capabilities() {
         // 误用会在运行时以 "undefined is not a function" 静默炸掉导出链路（2026-08-31 B6 缺陷）
         "writeBinaryFile",
         "readBinaryFile",
+        // 映射到未授权命令的 helper：readTextFile→fs.read_text_file、
+        // writeTextFile→fs.write_text_file，capability 只授权 read_file/write_file
+        //（2026-09-01 S5 roundtrip 实测导入被 scope 拒绝的根因）。若确需文本
+        // 专用命令，先在 default.json 显式加 fs:allow-read-text-file 并同步本测试。
+        "readTextFile",
+        "writeTextFile",
     ] {
         assert!(
             !frontend_imports_helper(&frontend, "@tauri-apps/plugin-fs", unsupported),

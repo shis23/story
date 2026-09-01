@@ -167,8 +167,11 @@ async function importGlobalRegexFromSettings() {
     })
     if (!filePath) return
 
-    const { readTextFile } = await import('@tauri-apps/plugin-fs')
-    const settingsJson = await readTextFile(filePath)
+    // readFile 而非 readTextFile：capability 只授权 fs:allow-read-file
+    //（readTextFile 映射未授权的 fs.read_text_file，会被 scope 拒绝）。
+    const { readFile } = await import('@tauri-apps/plugin-fs')
+    const rawData = await readFile(filePath)
+    const settingsJson = new TextDecoder().decode(rawData)
     const count = await importGlobalRegexSettings(settingsJson)
     await refreshGlobalRegexScripts()
     await alertDialog(`已导入 ${count} 条全局正则`)

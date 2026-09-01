@@ -413,8 +413,12 @@ async function handleImportBundle() {
       return
     }
 
-    const { readTextFile } = await import('@tauri-apps/plugin-fs')
-    const bundleJson = await readTextFile(filePath)
+    // readFile（fs:allow-read-file）而非 readTextFile：后者映射
+    // fs.read_text_file，capability 未授权会被 scope 拒绝（2026-09-01 S5
+    // roundtrip 实测导入失败根因）。
+    const { readFile } = await import('@tauri-apps/plugin-fs')
+    const data = await readFile(filePath)
+    const bundleJson = new TextDecoder().decode(data)
     const result = await importCampaignBundle(bundleJson)
     if (!result?.campaign_id || !result?.card_id) {
       importStatus.value = '导入失败：无返回数据'

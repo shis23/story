@@ -205,8 +205,11 @@ async function importProfile() {
     })
     if (!filePath) return
 
-    const { readTextFile } = await import('@tauri-apps/plugin-fs')
-    const configJson = await readTextFile(filePath)
+    // readFile 而非 readTextFile：readTextFile 映射的 fs.read_text_file
+    // 未在 capability 授权，会被 scope 拒绝（同 CampaignPanel 导入缺陷）。
+    const { readFile } = await import('@tauri-apps/plugin-fs')
+    const rawData = await readFile(filePath)
+    const configJson = new TextDecoder().decode(rawData)
     const imported = await importAgentProfileConfig(configJson)
     await refresh()
     if (imported?.id) {

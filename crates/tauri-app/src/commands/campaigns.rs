@@ -1094,6 +1094,24 @@ pub fn set_active_campaign(
         None
     };
 
+    // 活跃 runtime 快照在取锁前预加载（纯存储读，无本侧锁；失败仅降级为
+    // 「暂不填充」——写作路径的 fill_campaign_context 仍是权威加载点）。
+    // 2026-09-01 B5：没有这份快照，重启恢复/切换活动后 Meta 工具在首次
+    // 写作前一律回答「当前没有 active Campaign」。
+    let prepared_runtime =
+        match crate::backend_workflows::load_campaign_context_snapshot_for_backend(
+            state.storage(),
+            &campaign_id,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "active Campaign runtime 快照加载失败（首次写作前 Meta 工具不可用）: {error}"
+                );
+                None
+            }
+        };
+
     // 世界书已就绪，此刻才提交活跃指针（失败不改指针）。tool_ctx 世界书写入
     // 作为 after_commit 钩子在锁内执行（Gate 4 六审 P1：与指针提交原子，
     // 删除线程无法在指针提交后、世界书写入前插入清指针）。
@@ -1115,6 +1133,9 @@ pub fn set_active_campaign(
         |state, id| {
             if let Some(book) = prepared_book {
                 apply_campaign_world_info_to_tool_ctx(state, id, &book);
+            }
+            if let Some(snapshot) = prepared_runtime {
+                crate::runtime_support::apply_campaign_runtime_to_tool_ctx(state, snapshot);
             }
         },
     )?;
