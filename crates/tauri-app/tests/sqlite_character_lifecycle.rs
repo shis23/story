@@ -377,6 +377,16 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     );
 
     // ─── 4. Bundle 导出：结构与 JSON 路径一致 ──────────────────────────────
+    let campaign_book = storyforge_domain::world_info::WorldInfoBook::from_st(
+        serde_json::from_value(serde_json::json!({
+            "entries": [
+                { "id": 31, "keys": ["rain"], "content": "Rain matters", "constant": true },
+                { "id": 32, "keys": ["gate"], "content": "Gate stays locked", "selective": true }
+            ]
+        }))
+        .unwrap(),
+    );
+    facade.set_world_info(&campaign_id, &campaign_book).unwrap();
     let bundle_json = facade
         .export_campaign_bundle(&campaign_id)
         .expect("export bundle under SQLite");
@@ -511,6 +521,44 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
         imported_instances[0].definition_id.as_ref(),
         Some(&imported_stored.card.character_definitions[0].id)
     );
+
+    {
+        let state = Arc::new(
+            storyforge_lib::AppState::new_with_backend(
+                temp.path().to_path_buf(),
+                Arc::new(facade.clone()),
+            )
+            .unwrap(),
+        );
+        // Same Tauri State wrapper used by the other native command tests.
+        let command_state = unsafe {
+            std::mem::transmute::<
+                &Arc<storyforge_lib::AppState>,
+                tauri::State<'_, Arc<storyforge_lib::AppState>>,
+            >(&state)
+        };
+        let st = storyforge_lib::export_campaign_st_cards(
+            import_result.campaign_id.clone(),
+            command_state,
+        )
+        .unwrap();
+        let shared: storyforge_domain::character::StWorldInfoBook =
+            serde_json::from_str(&st.lorebook_json).unwrap();
+        assert_eq!(
+            shared.entries.len(),
+            3,
+            "campaign book plus acquired knowledge"
+        );
+        assert_eq!(shared.entries[2].id, Some(33), "no worldbook id collision");
+        assert!(!st.cards.is_empty());
+        for file in st.cards {
+            let restored = storyforge_infra_import::import_character_from_png(&file.data).unwrap();
+            let book = restored.embedded_world_info.unwrap().to_st_book();
+            assert_eq!(book.entries.len(), 2);
+            assert_eq!(book.entries[0].content.as_deref(), Some("Rain matters"));
+            assert_eq!(book.entries[1].keys, vec!["gate"]);
+        }
+    }
 
     // 源数据不受影响（导入不覆盖）。
     assert_eq!(

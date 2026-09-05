@@ -432,7 +432,7 @@ pub(crate) fn export_st_card_png(
 /// 策略（用户已定）：每角色一张 PNG + 共享 lorebook。
 /// 共享知识/世界书转 ST lorebook 格式。
 #[tauri::command]
-pub(crate) fn export_campaign_st_cards(
+pub fn export_campaign_st_cards(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignExportResult, TauriCommandError> {
@@ -461,12 +461,33 @@ pub(crate) fn export_campaign_st_cards(
         return Err("Campaign 无角色实例，无法导出".into());
     }
 
-    // 构建共享 lorebook（Campaign 级知识 → ST WorldInfoBook）
+    let campaign_book = state
+        .storage()
+        .get_world_info(&camp_id)
+        .map_err(TauriCommandError::storage)?;
+
+    // Preserve the campaign book, including edits made after card import.
     let shared_knowledge = state
         .storage()
         .list_knowledge(&camp_id)
         .map_err(TauriCommandError::storage)?;
-    let shared_lorebook = knowledge_to_st_book(&shared_knowledge);
+    let mut shared_lorebook = campaign_book.to_st_book();
+    let first_knowledge_id = i64::from(
+        shared_lorebook
+            .entries
+            .iter()
+            .filter_map(|entry| entry.id)
+            .max()
+            .unwrap_or(-1),
+    ) + 1;
+    for (offset, mut entry) in knowledge_to_st_book(&shared_knowledge)
+        .entries
+        .into_iter()
+        .enumerate()
+    {
+        entry.id = i32::try_from(first_knowledge_id + offset as i64).ok();
+        shared_lorebook.entries.push(entry);
+    }
     let shared_lorebook_json =
         serde_json::to_string_pretty(&shared_lorebook).unwrap_or_else(|_| "{}".into());
 
@@ -488,26 +509,29 @@ pub(crate) fn export_campaign_st_cards(
                 .find(|d| d.id == *did)
         });
 
-        let (st_data, spec_version) = if let (Some(character), Some(def)) =
-            (&original_character, definition)
-        {
-            // 有原始 Character → 用 to_st_data（round-trip 保底）
-            let book = character
-                .embedded_world_info
-                .as_ref()
-                .map(|b| b.to_st_book());
-            let data = storyforge_domain::character::to_st_data(character, Some(def), book);
-            (data, character.spec_version.clone())
-        } else if let Some(def) = definition {
-            // 只有 Card + Definition → 用 to_st_data_from_card
-            let data =
-                storyforge_domain::character::to_st_data_from_card(&stored_card.card, def, None);
-            (data, "3.0".into())
-        } else {
-            // 临时角色（无 definition）→ 用 instance 名字构建最小卡
-            let data = storyforge_domain::character::empty_st_data(&inst.name);
-            (data, "3.0".into())
-        };
+        let (st_data, spec_version) =
+            if let (Some(character), Some(def)) = (&original_character, definition) {
+                // 有原始 Character → 用 to_st_data（round-trip 保底）
+                let data = storyforge_domain::character::to_st_data(
+                    character,
+                    Some(def),
+                    Some(campaign_book.to_st_book()),
+                );
+                (data, character.spec_version.clone())
+            } else if let Some(def) = definition {
+                // 只有 Card + Definition → 用 to_st_data_from_card
+                let data = storyforge_domain::character::to_st_data_from_card(
+                    &stored_card.card,
+                    def,
+                    Some(campaign_book.to_st_book()),
+                );
+                (data, "3.0".into())
+            } else {
+                // 临时角色（无 definition）→ 用 instance 名字构建最小卡
+                let mut data = storyforge_domain::character::empty_st_data(&inst.name);
+                data.character_book = Some(campaign_book.to_st_book());
+                (data, "3.0".into())
+            };
 
         let card = storyforge_infra_import::png::make_st_card(st_data, &spec_version);
         let png_bytes =

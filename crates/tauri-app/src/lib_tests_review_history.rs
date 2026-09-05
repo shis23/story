@@ -342,6 +342,59 @@ fn review_bundle_rejects_active_turn_and_invalid_scope_without_writes() {
 }
 
 #[test]
+fn review_bundle_to_st_export_preserves_campaign_worldbook() {
+    use storyforge_domain::character::StWorldInfoBook;
+    use storyforge_domain::world_info::WorldInfoBook;
+    let source = fixture(true);
+    let st_book: StWorldInfoBook = serde_json::from_value(serde_json::json!({
+        "entries": [
+            { "id": 31, "keys": ["rain"], "content": "Rain matters", "constant": true },
+            { "id": 32, "keys": ["gate"], "content": "Gate stays locked", "selective": true }
+        ]
+    }))
+    .unwrap();
+    source
+        .state
+        .storage()
+        .set_world_info(&source.campaign.id, &WorldInfoBook::from_st(st_book))
+        .unwrap();
+    let bundle = source
+        .state
+        .storage()
+        .export_campaign_bundle(&source.campaign.id)
+        .unwrap();
+    {
+        use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
+        let target_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(storage_backend::StorageFacade::new(
+            target_dir.path().to_path_buf(),
+            PinnedBackend::new(StorageBackend::Json, BackendSource::Env),
+        ));
+        let target =
+            Arc::new(AppState::new_with_backend(target_dir.path().to_path_buf(), storage).unwrap());
+        let imported = target
+            .storage()
+            .import_campaign_bundle(serde_json::from_str(&bundle).unwrap(), &target.conv_store)
+            .unwrap();
+        let result = crate::commands::import_export::export_campaign_st_cards(
+            imported.campaign_id,
+            tauri_state_for_test(&target),
+        )
+        .unwrap();
+        let shared: StWorldInfoBook = serde_json::from_str(&result.lorebook_json).unwrap();
+        assert_eq!(shared.entries.len(), 2);
+        assert!(!result.cards.is_empty());
+        for file in result.cards {
+            let restored = storyforge_infra_import::import_character_from_png(&file.data).unwrap();
+            let book = restored.embedded_world_info.unwrap().to_st_book();
+            assert_eq!(book.entries.len(), 2);
+            assert_eq!(book.entries[0].content.as_deref(), Some("Rain matters"));
+            assert_eq!(book.entries[1].keys, vec!["gate"]);
+        }
+    }
+}
+
+#[test]
 fn review_bundle_json_failure_compensates_source_history_and_turns() {
     let f = fixture(true);
     let bundle = f

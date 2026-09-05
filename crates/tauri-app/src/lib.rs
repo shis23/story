@@ -48,7 +48,7 @@ pub use commands::writing::{
 pub use commands::campaigns::set_active_campaign;
 pub use commands::campaigns::set_active_campaign_in_state;
 pub use commands::characters::delete_character;
-pub use commands::import_export::CampaignBundle;
+pub use commands::import_export::{CampaignBundle, export_campaign_st_cards};
 pub use commands::meta::meta_accept_patch;
 pub use commands::meta_typed::{meta_accept_typed_patch, meta_propose_campaign_repairs};
 // Gate 5：后端等价套件（tests/backend_parity_suite.rs）以真实命令驱动 JSON 与

@@ -4,11 +4,11 @@ Runs the StoryForge release gate on Windows PowerShell.
 
 .DESCRIPTION
 Runs the release checks in a fixed fail-fast order:
-secret scan, cargo fmt, cargo clippy, cargo test, frontend unit tests,
-frontend component tests (vitest), and frontend build.
+secret scan, release-helper tests, cargo fmt, cargo clippy, cargo test,
+frontend unit tests, component tests, browser suites and frontend build.
 
-The secret scan checks Git-tracked files only and excludes target, node_modules,
-frontend/dist, and .git. It reports rule names and locations without echoing
+The secret scan checks tracked and untracked build inputs and excludes target,
+node_modules, frontend/dist, and .git. It reports locations without echoing
 matching line contents. Pass -EvidenceRoot to additionally scan a repo-external
 evidence directory (Gate 8 review P1-2: evidence may hold real proxy keys below
 the long-key threshold).
@@ -43,7 +43,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $script:StepNumber = 0
-$TotalSteps = if ($SecretScanOnly) { 1 } else { 7 }
+$TotalSteps = if ($SecretScanOnly) { 1 } else { 11 }
 
 function Find-RepoRoot {
     $start = (Get-Location).ProviderPath
@@ -167,6 +167,7 @@ try {
         exit 0
     }
 
+    Invoke-NativeStep -Name 'release helper contracts (Pester)' -WorkingDirectory $repoRoot -Command @('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repoRoot 'scripts\tests\run-release-build-tests.ps1'))
     Invoke-NativeStep -Name 'cargo fmt --check' -WorkingDirectory $repoRoot -Command @('cargo', 'fmt', '--check')
     Invoke-NativeStep -Name 'cargo clippy --workspace --all-targets -- -D warnings' -WorkingDirectory $repoRoot -Command @('cargo', 'clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
     Invoke-NativeStep -Name 'cargo test --workspace' -WorkingDirectory $repoRoot -Command @('cargo', 'test', '--workspace')
@@ -176,6 +177,8 @@ try {
     # only in package.json and ran in no automatic gate; wire it in so real
     # browser enforcement is covered, not just jsdom/string-level CSP checks.
     Invoke-NativeStep -Name 'frontend npm.cmd run test:csp (Chromium)' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'test:csp')
+    Invoke-NativeStep -Name 'frontend npm.cmd run test:mobile-chrome' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'test:mobile-chrome')
+    Invoke-NativeStep -Name 'frontend npm.cmd run smoke:ui' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'smoke:ui')
     Invoke-NativeStep -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
 
     Write-Host ''

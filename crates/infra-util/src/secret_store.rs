@@ -1,7 +1,7 @@
 //! Secret reference helpers and system credential storage.
 //!
 //! Stores keep only `storyforge-secret:v1:*` references on disk. The concrete
-//! secret value lives in the OS credential store through the `keyring` crate.
+//! secret value lives in the explicitly initialized native `keyring_core` store.
 
 pub const SECRET_REF_PREFIX: &str = "storyforge-secret:v1:";
 pub const DEFAULT_SECRET_SERVICE: &str = "StoryForge";
@@ -34,12 +34,12 @@ impl SystemSecretStore {
         }
     }
 
-    fn entry(&self, secret_ref: &str) -> Result<keyring::Entry, String> {
+    fn entry(&self, secret_ref: &str) -> Result<keyring_core::Entry, String> {
         if !is_secret_ref(secret_ref) {
             return Err(format!("无效 SecretRef: {secret_ref}"));
         }
         ensure_native_store()?;
-        keyring::Entry::new(&self.service, secret_ref)
+        keyring_core::Entry::new(&self.service, secret_ref)
             .map_err(|e| format!("打开系统凭据项失败: {e}"))
     }
 }
@@ -94,9 +94,7 @@ fn init_native_store() -> Result<(), String> {
     // initialized (see tauri-app setup hook), Store::new() succeeds and this
     // catch_unwind is a no-op.
     let store = std::panic::catch_unwind(android_native_keyring_store::Store::new)
-        .map_err(|_| {
-            "Android Keystore 初始化 panic（ndk-context 未初始化），凭据降级为明文".to_string()
-        })?
+        .map_err(|_| "Android Keystore 尚未就绪（ndk-context 未初始化），请稍后重试".to_string())?
         .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
     keyring_core::set_default_store(store);
     Ok(())
@@ -150,7 +148,7 @@ impl SecretStore for SystemSecretStore {
 
     fn delete_secret(&self, secret_ref: &str) -> Result<(), String> {
         match self.entry(secret_ref)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(format!("删除系统凭据失败: {e}")),
         }
     }
@@ -178,6 +176,14 @@ pub fn resolve_secret_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_uses_the_explicitly_initialized_cross_platform_store() {
+        let _: fn(&SystemSecretStore, &str) -> Result<keyring_core::Entry, String> =
+            SystemSecretStore::entry;
+        let store = SystemSecretStore::default();
+        assert!(store.entry("not-a-secret-ref").is_err());
+    }
 
     #[test]
     fn secret_ref_round_trip_shape() {

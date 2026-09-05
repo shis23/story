@@ -357,8 +357,10 @@ pub fn to_st_data(
         }
     }
 
-    // 世界书
-    data.character_book = character_book;
+    // None means no override; an explicit empty book still clears the entries.
+    if let Some(book) = character_book {
+        data.character_book = Some(book);
+    }
 
     // extensions：保留 raw_card_json 的；只有明确的非空运行时 extensions 才覆盖。
     if is_non_empty_json(&character.extensions) {
@@ -410,8 +412,9 @@ pub fn to_st_data_from_card(
         }
     }
 
-    // 世界书
-    data.character_book = character_book;
+    if let Some(book) = character_book {
+        data.character_book = Some(book);
+    }
 
     data
 }
@@ -1086,6 +1089,63 @@ mod multi_character_tests {
         let cb = exported.character_book.unwrap();
         assert_eq!(cb.entries.len(), 1);
         assert_eq!(cb.entries[0].keys, vec!["测试"]);
+    }
+
+    #[test]
+    fn absent_worldbook_override_preserves_raw_card_and_explicit_empty_clears() {
+        let source: StCharacterCard = serde_json::from_value(serde_json::json!({
+            "spec": "chara_card_v3",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Snapshot",
+                "character_book": { "entries": [
+                    { "id": 7, "keys": ["rain"], "content": "Rain matters", "constant": true }
+                ]}
+            }
+        }))
+        .unwrap();
+        let character = Character::from_st_card(source);
+        let card = CharacterCard {
+            id: Id::new(),
+            name: character.name.clone(),
+            source_character_id: character.id.clone(),
+            character_definitions: vec![],
+            campaign_variable_schema: vec![],
+            raw_card_json: character.raw_card_json.clone(),
+            extraction_status: CharacterExtractionStatus::Extracted,
+            extraction_message: None,
+        };
+        let definition = CharacterDefinition {
+            id: Id::new(),
+            card_id: card.id.clone(),
+            name: "Snapshot".into(),
+            persona_prompt: String::new(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+        for data in [
+            to_st_data(&character, None, None),
+            to_st_data_from_card(&card, &definition, None),
+        ] {
+            assert_eq!(
+                data.character_book.unwrap().entries[0].content.as_deref(),
+                Some("Rain matters")
+            );
+        }
+        let empty = StWorldInfoBook {
+            entries: vec![],
+            extra: Default::default(),
+        };
+        assert!(
+            to_st_data_from_card(&card, &definition, Some(empty))
+                .character_book
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

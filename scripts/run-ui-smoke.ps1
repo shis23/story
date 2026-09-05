@@ -29,6 +29,8 @@ if ($Port -le 0) {
 
 $playwrightPackage = Join-Path $frontendDir 'node_modules\@playwright\test\package.json'
 $playwrightBin = Join-Path $frontendDir 'node_modules\.bin\playwright.cmd'
+$playwrightConfig = Join-Path $frontendDir 'playwright.config.mjs'
+$viteBin = Join-Path $frontendDir 'node_modules\vite\bin\vite.js'
 if (-not (Test-Path $playwrightPackage) -or -not (Test-Path $playwrightBin)) {
   $message = @(
     'Playwright dependency is not installed locally; refusing to install from the network.',
@@ -40,13 +42,18 @@ if (-not (Test-Path $playwrightPackage) -or -not (Test-Path $playwrightBin)) {
   exit 2
 }
 
+$nodeBin = (Get-Command node -ErrorAction Stop).Source
+if (-not (Test-Path -LiteralPath $viteBin)) {
+  throw "Vite dependency is not installed locally: $viteBin"
+}
+
 $env:UI_SMOKE_ARTIFACT_DIR = $artifactDir
 $env:PLAYWRIGHT_BASE_URL = "http://127.0.0.1:$Port"
 $server = $null
 
 try {
-  $server = Start-Process -FilePath 'npm.cmd' `
-    -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1', '--port', "$Port", '--strictPort') `
+  $server = Start-Process -FilePath $nodeBin `
+    -ArgumentList @("`"$viteBin`"", '--host', '127.0.0.1', '--port', "$Port", '--strictPort') `
     -WorkingDirectory $frontendDir `
     -RedirectStandardOutput $serverLog `
     -RedirectStandardError $serverErr `
@@ -72,7 +79,7 @@ try {
     throw "Timed out waiting for Vite at $($env:PLAYWRIGHT_BASE_URL)"
   }
 
-  & $playwrightBin test -c playwright.config.mjs
+  & $playwrightBin test -c $playwrightConfig
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0) {
     throw "Playwright UI smoke failed with exit code $exitCode"

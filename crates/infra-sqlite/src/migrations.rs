@@ -22,7 +22,64 @@ impl Migration {
         hasher.update(self.sql.as_bytes());
         hex_encode(hasher.finalize())
     }
+
+    pub(crate) fn matches_checksum(&self, existing: &str) -> bool {
+        let actual = self.checksum();
+        if actual == existing {
+            return true;
+        }
+        // Only the exact LF/CRLF byte variants of released V001-V008 qualify.
+        // Never normalize arbitrary SQL or rewrite an existing database ledger.
+        RELEASED_CHECKSUMS.iter().any(|(version, lf, crlf)| {
+            self.version == *version
+                && (actual == *lf || actual == *crlf)
+                && (existing == *lf || existing == *crlf)
+        })
+    }
 }
+
+const RELEASED_CHECKSUMS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "5dc972fa7537304a3f1dadaa7fc1d8e4206711fc5beba6f34ba6b24c03e6d48e",
+        "1aa3731bf8c92199c4bd7a9bc84cb000c6202e2b8c97d2b2c3dbb697556d89ac",
+    ),
+    (
+        2,
+        "e5822d67ef06be0b2edfd7e1af45c390018220e16025c454435f2cf14f0ad04d",
+        "fe0e78fd90cbcb75e0b5b88d590d2e4657dcd116f77916956efc7e581de0ed07",
+    ),
+    (
+        3,
+        "0a26fdb22ce82f59f461db6d26ccef2d443840e16ee9d45fa331579564315d5e",
+        "bec0d6b902268e901d26e7ffa2d5238d8bc976587c7b8479d244331571b86be8",
+    ),
+    (
+        4,
+        "9a8fe25456895d01a0b3bb51ce66265d3c30a2f403f669e39d3750b25d24c8a7",
+        "de5b20653bc719b2d22bc383b3be8aa388de42550e0a11daa842ba3b86bdf6b0",
+    ),
+    (
+        5,
+        "7cef741e016238083034485ec8842966703d293157122959c6e41159f98c93b3",
+        "e4db97f87c53dbbae4a18437b7fc02ae7e3594910d05bb0c9f228bfe52b45bc9",
+    ),
+    (
+        6,
+        "78a71ea2933bea921de0356f090f1d47a6a8828b1193e792c23b03731bfd320b",
+        "7175d0aafd2b6456ca1d0d2836c00bc34ea383d5edb3bd59279e0918ae5f10c9",
+    ),
+    (
+        7,
+        "54d96a6a73aaf908de066f8d3d456838f9772650badbdb98b2dfb0764faf2399",
+        "8f42f315d2003bd12d795179572167b3f2279438683f64e22d8c274986f8c9a4",
+    ),
+    (
+        8,
+        "bf2100421126db7fb6cbcc5f03c0452ef21fd5623b454df1dab6f2dc2778be8a",
+        "e87ecd3f7f6f9751f0b8761638446ea0540c40d028f03bf557971db922714ccc",
+    ),
+];
 
 /// 内置 migration 列表（单向、编号）。
 pub fn builtin_migrations() -> Vec<Migration> {
@@ -88,7 +145,7 @@ pub fn migrate_with(db: &mut Database, migrations: &[Migration]) -> Result<Vec<i
     for migration in &ordered {
         if let Some(existing) = load_applied(db, migration.version)? {
             let expected = migration.checksum();
-            if existing != expected {
+            if !migration.matches_checksum(&existing) {
                 return Err(SqliteError::MigrationChecksumMismatch {
                     version: migration.version,
                     expected: existing,
@@ -171,7 +228,7 @@ fn apply_one(db: &mut Database, migration: &Migration) -> Result<bool> {
     {
         let tx = uow.transaction()?;
         if let Some(existing) = load_applied_tx(tx, migration.version)? {
-            if existing != checksum {
+            if !migration.matches_checksum(&existing) {
                 return Err(SqliteError::MigrationChecksumMismatch {
                     version: migration.version,
                     expected: existing,
@@ -375,6 +432,74 @@ mod tests {
         assert!(matches!(
             err,
             SqliteError::MigrationChecksumMismatch { version: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn historical_builtin_line_endings_preserve_checksums_and_data() {
+        for style in 0..3 {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::open(dir.path().join("source").join("legacy.sqlite3")).unwrap();
+            migrate(&mut db).unwrap();
+            db.connection().execute(
+                "INSERT INTO character_cards (card_id, name, payload_json) VALUES ('kept', 'Kept', '{}')",
+                [],
+            ).unwrap();
+            let mut checksums = Vec::new();
+            for migration in builtin_migrations() {
+                let lf = migration.sql.replace("\r\n", "\n");
+                let sql = if style == 1 || (style == 2 && migration.version <= 4) {
+                    lf.replace('\n', "\r\n")
+                } else {
+                    lf
+                };
+                let historic = Migration {
+                    sql: Box::leak(sql.into_boxed_str()),
+                    ..migration
+                };
+                let checksum = historic.checksum();
+                db.connection()
+                    .execute(
+                        "UPDATE schema_migrations SET checksum = ?1 WHERE version = ?2",
+                        rusqlite::params![checksum, historic.version],
+                    )
+                    .unwrap();
+                checksums.push((historic.version, checksum));
+            }
+            assert!(migrate(&mut db).unwrap().is_empty(), "style {style}");
+            assert_eq!(
+                db.connection()
+                    .query_row(
+                        "SELECT name FROM character_cards WHERE card_id = 'kept'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "Kept"
+            );
+            for (version, checksum) in checksums {
+                assert_eq!(load_applied(&db, version).unwrap().unwrap(), checksum);
+            }
+            db.connection()
+                .execute("DELETE FROM character_cards WHERE card_id = 'kept'", [])
+                .unwrap();
+            let result =
+                crate::exporter::export_sqlite_to_json(&db, dir.path().join("export")).unwrap();
+            assert_eq!(result.report.schema_version, 8);
+        }
+    }
+
+    #[test]
+    fn historical_compatibility_does_not_accept_edited_builtin_sql() {
+        let mut db = Database::open_in_memory().unwrap();
+        migrate(&mut db).unwrap();
+        let mut migrations = builtin_migrations();
+        migrations[4].sql = Box::leak(
+            format!("{}\n-- unexpected modification\n", migrations[4].sql).into_boxed_str(),
+        );
+        assert!(matches!(
+            migrate_with(&mut db, &migrations).unwrap_err(),
+            SqliteError::MigrationChecksumMismatch { version: 5, .. }
         ));
     }
 

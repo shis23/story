@@ -1,6 +1,6 @@
 # StoryForge 发布检查清单
 
-> 当前候选入口：[`RELEASE-STATUS.md`](RELEASE-STATUS.md)（2026-09-05）。本文保留历史日期和原验收结果；旧「待真机」「签名阻塞」或测试数量不得直接代表当前环境。当前 UI 已有真机顶栏专项证据，但 Android 凭据保存缺陷仍需修复和完整生命周期复验。
+> 当前候选入口：[`RELEASE-STATUS.md`](RELEASE-STATUS.md)（2026-09-06）。本文保留历史日期和原验收结果；旧「待真机」「签名阻塞」或测试数量不得直接代表当前环境。当前门禁命令以第 0 节为准，各专项完成状态以候选入口为准。
 
 > 状态：2026-08-05 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。
 
@@ -36,12 +36,18 @@
 自动化发布闸门必须通过 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 执行并通过。脚本按 fail-fast 顺序运行：
 
 1. `secret scan`：复用 release runner 的 fail-closed helper，扫描 Git-tracked/index 与未跟踪构建输入；只报告规则名和脱敏位置，不回显匹配内容；不可读、枚举失败或超限的未跟踪构建输入必须失败。
-2. `cargo fmt --check`。
-3. `cargo clippy --workspace --all-targets -- -D warnings`。
-4. `cargo test --workspace`。
-5. `cd frontend && npm.cmd test`。
-6. `cd frontend && npm.cmd run build`。
+2. `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\run-release-build-tests.ps1`：四套 Pester 发布脚本和工作流合同测试。
+3. `cargo fmt --check`。
+4. `cargo clippy --workspace --all-targets -- -D warnings`。
+5. `cargo test --workspace`（默认并发测试，不以串行化掩盖并发缺陷）。
+6. `cd frontend && npm.cmd test`。
+7. `cd frontend && npm.cmd run test:ui`。
+8. `cd frontend && npm.cmd run test:csp`。
+9. `cd frontend && npm.cmd run test:mobile-chrome`。
+10. `cd frontend && npm.cmd run smoke:ui`。
+11. `cd frontend && npm.cmd run build`。
 
+- 前置依赖：Pester 3.x/4.x（推荐 4.10.1）、PATH 上的 Python 和 `PyYAML==6.0.2`、前端锁定依赖与 Playwright Chromium。缺依赖、零执行或失败均不能视为通过。
 - `-DryRun` 用于打印上述步骤和命令，不执行 secret scan、Cargo、npm 测试或构建。
 - `-SecretScanOnly` 用于快速执行第 1 步；通过后脚本停止，不继续运行格式化、Clippy、测试或构建。
 - release notes 明确列出仍需人工验证或降级的能力。

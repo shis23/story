@@ -22,7 +22,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
 - M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），Gate 6 已按决议关闭（关闭非 PASS）。
 - **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
-- 已有 Windows 原生、Android 真机基础流程及顶栏专项记录；完整移动端凭据/写作、当前候选安装包和第三方插件验收仍须分别闭合，不能由浏览器测试替代。
+- 本轮 11 步确定性门禁、Windows 原生 IPC、Android 凭据生命周期、世界书往返和保留数据升级已通过。真实模型移动写作、第三方插件、正式分发安装包和远端 CI 仍须分别闭合，不能由调试包或浏览器测试替代。
 
 ## 技术栈
 
@@ -56,6 +56,8 @@ npm run dev
 
 完整确定性门禁：
 
+除上述开发环境外，还需要 Pester 3.x/4.x（推荐固定 4.10.1）、可由 `python` 或 `python3` 调用且安装了 `PyYAML==6.0.2` 的 Python，以及 Playwright Chromium（在 `frontend` 执行 `npx playwright install chromium`）。门禁不会把缺依赖或跳过用例视为通过。
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 ```
@@ -63,6 +65,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 或分别执行：
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\run-release-build-tests.ps1
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

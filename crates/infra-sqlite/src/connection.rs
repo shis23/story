@@ -90,9 +90,25 @@ impl Database {
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Concurrent first opens can deadlock while upgrading the journal lock.
+    // SQLite may return BUSY without calling its busy handler in that case.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5000i64)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     ensure_application_id(conn)?;
@@ -154,5 +170,38 @@ mod tests {
         let db = Database::open(&path).unwrap();
         assert_eq!(db.path(), path.as_path());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn concurrent_first_open_preserves_wal_and_application_identity() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..12 {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("racing.sqlite3");
+            let barrier = Arc::new(Barrier::new(6));
+            let workers: Vec<_> = (0..6)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        Database::open(path)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let db = worker.join().unwrap().unwrap();
+                let journal: String = db
+                    .connection()
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .unwrap();
+                let identity: i32 = db
+                    .connection()
+                    .query_row("PRAGMA application_id", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(journal, "wal");
+                assert_eq!(identity, STORYFORGE_APPLICATION_ID);
+            }
+        }
     }
 }

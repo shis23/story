@@ -727,7 +727,7 @@ fn validate_source_database(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
             .optional()?;
         if let Some(stored) = stored {
             let checksum = migration.checksum();
-            if stored != checksum {
+            if !migration.matches_checksum(&stored) {
                 return Err(SqliteError::Other(format!(
                     "refusing reverse export: migration checksum mismatch for version {}: stored {stored} != expected {checksum}",
                     migration.version
