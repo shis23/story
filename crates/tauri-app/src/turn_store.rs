@@ -99,7 +99,54 @@ impl TurnStore {
             .collect()
     }
 
+    pub fn list_for_campaign(&self, campaign_id: &Id) -> Vec<TurnRecord> {
+        self.turns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|turn| &turn.campaign_id == campaign_id)
+            .cloned()
+            .collect()
+    }
+
     // ─── 写入 ──────────────────────────────────────────────────────────────
+
+    pub fn truncate_uncommitted(
+        &self,
+        conversations: &storyforge_app_conversation::ConversationStore,
+        conversation_id: &Id,
+        node_id: &Id,
+    ) -> Result<(), String> {
+        let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        let before = conversations
+            .get(conversation_id)
+            .ok_or_else(|| "对话不存在".to_string())?;
+        let scoped: Vec<_> = turns
+            .iter()
+            .filter(|t| &t.conversation_id == conversation_id)
+            .cloned()
+            .collect();
+        let (after, changed) =
+            storyforge_domain::history::truncate_uncommitted(&before, &scoped, node_id)?;
+        let mut candidate = turns.clone();
+        for turn in changed {
+            if let Some(record) = candidate.iter_mut().find(|t| t.turn_id == turn.turn_id) {
+                *record = turn;
+            }
+        }
+        // Publish the terminal journal first: a crash must never leave an
+        // active Attempt pointing at text that has already been removed.
+        persist_turns(&self.turns_path, &candidate)?;
+        if let Err(error) = conversations.replace_checked(&before, after) {
+            if let Err(rollback) = persist_turns(&self.turns_path, &turns) {
+                *turns = candidate;
+                return Err(format!("删除失败: {error}; 恢复轮次失败: {rollback}"));
+            }
+            return Err(error.to_string());
+        }
+        *turns = candidate;
+        Ok(())
+    }
 
     /// 创建新 TurnRecord（如果该 Campaign 已有活动 Turn 则拒绝）。
     ///
@@ -255,6 +302,23 @@ impl TurnStore {
             ));
         }
         f()
+    }
+
+    pub(crate) fn with_idle_turn_snapshot<R>(
+        &self,
+        campaign_id: &Id,
+        f: impl FnOnce(Vec<TurnRecord>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        let scoped: Vec<_> = turns
+            .iter()
+            .filter(|t| &t.campaign_id == campaign_id)
+            .cloned()
+            .collect();
+        if scoped.iter().any(|turn| turn.status.is_active()) {
+            return Err("请先结束当前轮次及记忆发布，再导出故事快照".into());
+        }
+        f(scoped)
     }
 
     // ─── 测试辅助 ──────────────────────────────────────────────────────────

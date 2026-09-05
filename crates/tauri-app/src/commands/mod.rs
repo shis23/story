@@ -1,3 +1,4 @@
+pub(crate) mod bundle_runtime;
 pub(crate) mod campaigns;
 pub(crate) mod card_shell;
 pub(crate) mod cards;

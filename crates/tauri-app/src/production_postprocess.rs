@@ -28,8 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use storyforge_app_agent::PostProcessOutcome;
-use storyforge_app_conversation::PartialRollTarget;
-use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
+use storyforge_app_pipeline::{DraftRevisionRequest, PipelineOrchestrator, WritingContext};
 use storyforge_domain::Id;
 use storyforge_domain::agent::{PipelineEvent, RoundSummary};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
@@ -228,16 +227,14 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
             quality_report.error_count(),
             quality_report.warnings.len()
         );
-        let regenerate = RegenerateRequest {
-            conversation_id: conversation_id.clone(),
-            node_id: draft_node_id.clone(),
-            targets: vec![PartialRollTarget::Editor],
-            generation_mode: None,
-            hint: Some(hint),
-            seed: None,
+        let revision = DraftRevisionRequest {
+            text: &original_text,
+            hint: &hint,
+            provenance: original_provenance.as_ref(),
+            context: writing_ctx,
         };
         match pipeline
-            .regenerate(regenerate, writing_ctx, event_tx.clone(), cancel)
+            .revise_draft(revision, event_tx.clone(), cancel)
             .await
         {
             Ok((fixed_text, fixed_provenance)) => {
@@ -276,10 +273,19 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
                         );
                     emit_quality_checked(event_tx, &quality_report);
                 } else {
+                    pipeline.sync_autofix_draft(
+                        conversation_id,
+                        draft_node_id,
+                        fixed_text.clone(),
+                        fixed_provenance.clone(),
+                    )?;
                     final_text = fixed_text;
                     quality_report = fixed_report;
-                    return Ok((final_text, quality_report, Some(fixed_provenance)));
+                    return Ok((final_text, quality_report, fixed_provenance));
                 }
+            }
+            Err(storyforge_app_pipeline::PipelineError::Cancelled) => {
+                return Err(storyforge_app_pipeline::PipelineError::Cancelled);
             }
             Err(error) => {
                 tracing::warn!(

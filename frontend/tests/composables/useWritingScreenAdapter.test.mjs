@@ -94,9 +94,22 @@ test('writing adapter forwards start-writing and wraps delete-variant', async ()
   const { screenEvents } = useWritingScreenAdapter({
     startWriting: (t) => calls.push(['start', t]),
     handleDeleteVariant: (p) => calls.push(['delete', p]),
+    askDialog: async () => true,
   })
   screenEvents['start-writing']('续写：')
   await screenEvents['delete-variant']({ nodeId: 'n1' })
   assert.deepEqual(calls[0], ['start', '续写：'])
   assert.deepEqual(calls[1], ['delete', { nodeId: 'n1' }])
+})
+
+test('delete confirmation fails closed', async () => {
+  const { writing } = setupStores()
+  let deleted = false
+  const { screenEvents } = useWritingScreenAdapter({
+    handleDeleteVariant: () => { deleted = true },
+    askDialog: async () => { throw new Error('Dialog unavailable') },
+  })
+  await screenEvents['delete-variant']({ nodeId: 'n1' })
+  assert.equal(deleted, false)
+  assert.match(writing.pipeline.stateLabel, /未执行删除/)
 })

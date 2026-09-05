@@ -166,7 +166,7 @@ watch(
         aria-modal="true"
         :aria-label="title || 'Dialog'"
         class="fixed inset-0 z-50 flex justify-center bg-black/40 backdrop-blur-sm"
-        :class="[positionClass, isSide ? '' : 'p-0 sm:p-4']"
+        :class="[positionClass, isSide ? '' : 'sf-dialog-viewport']"
         @click.self="onMaskClick"
       >
         <div
@@ -176,12 +176,12 @@ watch(
             widthClass,
             surfaceClass,
             heightClass,
-            isSide ? sideRoundClass : ['max-h-[90vh]', nonSideRoundClass],
+            isSide ? ['sf-safe-screen', sideRoundClass] : ['max-h-full', nonSideRoundClass],
           ]"
           @click.stop
         >
           <!-- 默认顶栏 -->
-          <div v-if="showHeader" class="sticky top-0 z-10 flex items-center gap-3 px-4 py-3 border-b border-line bg-inherit shrink-0">
+          <div v-if="showHeader" class="sf-toolbar sticky top-0 z-10 flex items-center gap-3 px-4 border-b border-line bg-inherit">
             <button
               @click="close"
               class="shrink-0 w-11 h-11 flex items-center justify-center rounded-full text-ink-soft hover:bg-accent-soft transition-colors"

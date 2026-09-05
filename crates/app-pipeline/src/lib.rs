@@ -4,7 +4,9 @@
 /// 实现完整写作流程：用户意图 → 导演 Plan → 子 Agent 并行 → 编剧成文 → 写入对话树。
 use std::sync::Arc;
 
+mod draft_revision;
 pub mod quality_gate;
+pub use draft_revision::DraftRevisionRequest;
 mod sequential_crew;
 mod turn_dossier;
 
@@ -4555,6 +4557,86 @@ mod tests {
         requests: Arc<std::sync::Mutex<Vec<storyforge_domain::llm::ChatRequest>>>,
         fail_marker: Option<String>,
         structured: bool,
+    }
+
+    #[tokio::test]
+    async fn draft_revision_is_mode_independent_single_call_and_does_not_land() {
+        let dir = std::env::temp_dir().join(format!("sf-revision-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(ConversationStore::new(dir.clone()));
+        let conv = store.create_persisted(None, None).unwrap();
+        let node = store
+            .append_ai_draft(&conv.id, "ORIGINAL_DRAFT".into(), None)
+            .unwrap();
+        let ctx = WritingContext::legacy(vec![], None, conv.id.clone());
+        for mode in [
+            GenerationMode::Continuation,
+            GenerationMode::Duet,
+            GenerationMode::SequentialCrew,
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let llm = Arc::new(SelectiveSubagentLlm {
+                requests: requests.clone(),
+                fail_marker: None,
+                structured: false,
+            });
+            let pipeline =
+                PipelineOrchestrator::new(llm, store.clone(), Arc::new(ToolContext::empty()), None);
+            let provenance = Provenance {
+                session_id: Id::new(),
+                plan: None,
+                subagent_results: vec![],
+                profile_id: None,
+                generation_mode: Some(mode),
+                seed: 17,
+                last_hint: None,
+                director_reasoning: Some("original director".into()),
+                writer_reasoning: Some("original writer".into()),
+                editor_reasoning: None,
+            };
+            let (events, mut received) = mpsc::unbounded_channel();
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let (text, revised) = pipeline
+                .revise_draft(
+                    DraftRevisionRequest {
+                        text: "ORIGINAL_DRAFT",
+                        hint: "FIX_REPETITION",
+                        provenance: Some(&provenance),
+                        context: &ctx,
+                    },
+                    events,
+                    cancel,
+                )
+                .await
+                .unwrap();
+            assert!(!text.is_empty());
+            let revised = revised.unwrap();
+            assert_eq!(revised.generation_mode, provenance.generation_mode);
+            assert_eq!(revised.session_id, provenance.session_id);
+            assert_eq!(revised.writer_reasoning, provenance.writer_reasoning);
+            let calls = requests.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].tools.as_ref().is_none_or(Vec::is_empty));
+            let prompt = calls[0]
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(prompt.contains("ORIGINAL_DRAFT") && prompt.contains("FIX_REPETITION"));
+            while let Ok(event) = received.try_recv() {
+                assert!(!matches!(
+                    event,
+                    PipelineEvent::DraftReady { .. } | PipelineEvent::DirectorStarted
+                ));
+            }
+            let unchanged = store.get(&conv.id).unwrap();
+            assert_eq!(unchanged.nodes.len(), 1);
+            assert_eq!(
+                unchanged.find_node(&node).unwrap().active_content(),
+                "ORIGINAL_DRAFT"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     impl SelectiveSubagentLlm {

@@ -148,6 +148,45 @@ pub struct PreacceptRecoverySnapshot {
 pub struct SqlitePreacceptRepository;
 
 impl SqlitePreacceptRepository {
+    pub fn truncate_uncommitted(
+        db: &mut Database,
+        conversation_id: &Id,
+        node_id: &Id,
+        fault: PreacceptFault,
+    ) -> Result<()> {
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let conversation = load_conversation_tx(tx, conversation_id)?;
+        let turns = {
+            let mut query =
+                tx.prepare("SELECT payload_json FROM turns WHERE conversation_id = ?1")?;
+            let rows = query
+                .query_map([conversation_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|row| serde_json::from_str::<TurnRecord>(&row))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let (conversation, turns) =
+            storyforge_domain::history::truncate_uncommitted(&conversation, &turns, node_id)
+                .map_err(SqliteError::Validation)?;
+        write_conversation(tx, &conversation)?;
+        if fault == PreacceptFault::AfterConversation {
+            return Err(SqliteError::Other(
+                "injected failure after history deletion".into(),
+            ));
+        }
+        for turn in turns {
+            write_turn(tx, &turn)?;
+        }
+        if fault == PreacceptFault::BeforeCommit {
+            return Err(SqliteError::Other(
+                "injected failure before history commit".into(),
+            ));
+        }
+        uow.commit()
+    }
+
     pub fn create_draft_attempt(
         db: &mut Database,
         request: DraftAttemptRequest<'_>,

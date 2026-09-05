@@ -234,11 +234,22 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     let card_id = Id::new();
     let campaign_id = Id::new();
     let card_source_id = Id::new();
+    let snapshot_source = facade
+        .save_character(sample_character_info(
+            "Elena snapshot source",
+            Some(card_source_id.to_string()),
+        ))
+        .unwrap();
     let definition_id = Id::new();
-    let conversation = Conversation::new(
-        Some(card_id.as_str().to_string()),
-        Some(campaign_id.clone()),
+    let mut conversation =
+        Conversation::new(Some(snapshot_source.id.clone()), Some(campaign_id.clone()));
+    let input_id = conversation.append_message(
+        storyforge_domain::conversation::Role::User,
+        "Continue".into(),
     );
+    let draft_id = conversation.append_ai_draft("Snapshot body".into(), None);
+    conversation.nodes[1].active_mut().unwrap().status =
+        storyforge_domain::conversation::VariantStatus::Final;
     let conversation_id = conversation.id.clone();
     sqlite_runtime::save_conversation(&conversation).expect("seed conversation");
 
@@ -279,6 +290,23 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     campaign.id = campaign_id.clone();
     campaign.conversation_id = Some(conversation_id.clone());
     sqlite_runtime::save_campaign(&campaign).expect("seed campaign");
+    let mut turn = storyforge_domain::turn::TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        input_id,
+        0,
+    );
+    let mut attempt = storyforge_lib::turn_lifecycle::new_draft_attempt(
+        Id::new(),
+        draft_id.clone(),
+        "Snapshot body",
+        vec![],
+    );
+    attempt.status = storyforge_domain::turn::AttemptStatus::Committed;
+    turn.status = storyforge_domain::turn::TurnStatus::Committed;
+    turn.accepted_attempt_id = Some(attempt.attempt_id.clone());
+    turn.attempts.push(attempt);
+    sqlite_runtime::save_turn(&turn).unwrap();
 
     let instance = CharacterInstance {
         id: Id::new(),
@@ -353,7 +381,15 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
         .export_campaign_bundle(&campaign_id)
         .expect("export bundle under SQLite");
     let exported: serde_json::Value = serde_json::from_str(&bundle_json).expect("bundle JSON");
-    assert_eq!(exported["format_version"], 2);
+    assert_eq!(exported["format_version"], 3);
+    assert_eq!(
+        exported["runtime"]["conversation"]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(exported["runtime"]["turns"].as_array().unwrap().len(), 1);
     assert_eq!(exported["campaign"]["id"], campaign_id.as_str());
     assert_eq!(exported["card"]["id"], card_id.as_str());
     assert_eq!(exported["instances"].as_array().unwrap().len(), 1);
@@ -431,6 +467,39 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     let imported_conversation = conv_store
         .get(&Id::from_str(&import_result.conversation_id))
         .expect("imported conversation visible after invalidate");
+    assert_eq!(
+        imported_conversation.nodes[1].active_content(),
+        "Snapshot body"
+    );
+    assert_ne!(imported_conversation.nodes[1].id, draft_id);
+    assert!(
+        facade
+            .get_character(imported_stored.card.source_character_id.as_str())
+            .unwrap()
+            .is_some()
+    );
+    let reexported: serde_json::Value = serde_json::from_str(
+        &facade
+            .export_campaign_bundle(&imported_campaign_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let imported_turn: storyforge_domain::turn::TurnRecord =
+        serde_json::from_value(reexported["runtime"]["turns"][0].clone()).unwrap();
+    assert_eq!(
+        imported_turn.attempts[0].variant_id,
+        imported_conversation.nodes[1].id
+    );
+    assert_eq!(
+        imported_turn.input_node_id,
+        imported_conversation.nodes[0].id
+    );
+    assert_ne!(imported_turn.turn_id, turn.turn_id);
+    assert!(
+        sqlite_runtime::get_turn(&imported_turn.turn_id)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         imported_conversation.campaign_id.as_ref(),
         Some(&imported_campaign_id)
@@ -554,6 +623,7 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
 
     let pre_rollback_count = sqlite_runtime::list_campaigns().unwrap().len();
     let pre_rollback_card_count = sqlite_runtime::list_card_payloads().unwrap().len();
+    let pre_rollback_character_count = sqlite_runtime::list_characters().unwrap().len();
     assert_eq!(
         sqlite_runtime::list_campaigns().unwrap().len(),
         pre_rollback_count,
@@ -564,6 +634,7 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
         sqlite_runtime::BundleImportFault::AfterCard,
         sqlite_runtime::BundleImportFault::AfterCampaign,
         sqlite_runtime::BundleImportFault::AfterSummaries,
+        sqlite_runtime::BundleImportFault::AfterRuntime,
     ] {
         sqlite_runtime::fail_bundle_import_for_test(fault);
         let err = facade
@@ -583,6 +654,10 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
             sqlite_runtime::list_card_payloads().unwrap().len(),
             pre_rollback_card_count,
             "fault {fault:?} must leave no imported card rows behind"
+        );
+        assert_eq!(
+            sqlite_runtime::list_characters().unwrap().len(),
+            pre_rollback_character_count
         );
     }
 
@@ -617,6 +692,7 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     )
     .expect("bind card to character source id");
 
+    let characters_before_delete = sqlite_runtime::list_characters().unwrap().len();
     facade
         .delete_character(&stored.id)
         .expect("delete character under SQLite");
@@ -626,8 +702,8 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     );
     assert_eq!(
         sqlite_runtime::list_characters().unwrap().len(),
-        0,
-        "character library must be empty after delete"
+        characters_before_delete - 1,
+        "deleting one source must preserve imported sources"
     );
     assert!(
         !facade.delete_character(&stored.id).unwrap()

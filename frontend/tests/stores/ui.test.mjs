@@ -22,6 +22,7 @@ test('ui store 初始状态', () => {
   assert.equal(s.showPluginPanel, false)
   assert.equal(s.showDebugDrawer, false)
   assert.equal(s.showSidebar, false)
+  assert.equal(s.sidebarCollapsed, false)
   assert.equal(s.showConnConfig, false)
   assert.equal(s.showHistory, true)
   assert.equal(s.activeCampaignOverview, true)

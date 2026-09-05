@@ -10,6 +10,8 @@
  * 深度详情（MVU 实例编辑等）通过 #detail 插槽注入；未注入时用 props 列表只读展示。
  */
 import { computed } from 'vue'
+import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/vue'
+import { Ellipsis, FileDown, FileUp, ImageDown, X } from '@lucide/vue'
 
 const props = defineProps({
   campaigns: { type: Array, default: () => [] },
@@ -57,6 +59,11 @@ const tabs = [
 const title = computed(() => props.selectedCampaign?.name || '未选择活动')
 const recentInstances = computed(() => (props.instances || []).slice(0, 6))
 const knowledgePreview = computed(() => (props.knowledge || []).slice(0, 4))
+const fileActions = computed(() => [
+  { event: 'import-bundle', label: props.importing ? '导入中…' : '导入 Bundle', icon: FileUp, disabled: props.importing },
+  { event: 'export-st', label: '导出 ST', icon: ImageDown, disabled: props.exporting || !props.selectedCampaignId || props.mode === 'cards' },
+  { event: 'export-bundle', label: '导出 Bundle', icon: FileDown, disabled: props.exporting || !props.selectedCampaignId || props.mode === 'cards' },
+])
 
 function taskStatusClass(status) {
   const s = String(status || '').toLowerCase()
@@ -69,9 +76,9 @@ function taskStatusClass(status) {
 
 <template>
   <div class="h-full flex flex-col bg-bg">
-    <header class="shrink-0 h-14 px-4 sm:px-6 border-b border-line bg-surface flex items-center gap-3">
+    <header class="sf-toolbar px-3 sm:px-4 border-b border-line bg-surface flex items-center gap-2">
       <div class="min-w-0 flex-1">
-        <div class="text-[11px] text-ink-faint tracking-wide">活动管理</div>
+        <div class="text-[11px] text-ink-faint">活动管理</div>
         <h1 class="text-sm font-semibold text-ink truncate">{{ mode === 'cards' ? '角色卡库' : title }}</h1>
       </div>
 
@@ -90,32 +97,47 @@ function taskStatusClass(status) {
         >角色卡</button>
       </div>
 
+      <div class="hidden sm:flex shrink-0 items-center gap-1">
+        <button
+          v-for="action in fileActions"
+          :key="action.event"
+          type="button"
+          class="sf-toolbar-icon disabled:opacity-40"
+          :aria-label="action.label"
+          :title="action.label"
+          :disabled="action.disabled"
+          @click="emit(action.event)"
+        >
+          <component :is="action.icon" :size="18" aria-hidden="true" />
+        </button>
+      </div>
+      <Menu as="div" class="relative shrink-0 sm:hidden">
+        <MenuButton class="sf-toolbar-icon" aria-label="导入与导出" title="导入与导出">
+          <Ellipsis :size="20" aria-hidden="true" />
+        </MenuButton>
+        <MenuItems class="absolute right-0 top-full z-20 w-48 max-w-[calc(100vw-2rem)] rounded-md border border-line bg-surface p-1 shadow-float focus:outline-none">
+          <MenuItem v-for="action in fileActions" :key="action.event" v-slot="{ active }" :disabled="action.disabled">
+            <button
+              type="button"
+              class="flex min-h-11 w-full items-center gap-3 rounded px-3 text-left text-sm disabled:opacity-40"
+              :class="active ? 'bg-surface-2 text-ink' : 'text-ink-soft'"
+              :disabled="action.disabled"
+              @click="emit(action.event)"
+            >
+              <component :is="action.icon" :size="18" aria-hidden="true" />
+              {{ action.label }}
+            </button>
+          </MenuItem>
+        </MenuItems>
+      </Menu>
       <button
         type="button"
-        class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors"
-        :disabled="importing"
-        @click="emit('import-bundle')"
-      >{{ importing ? '导入中…' : '导入 Bundle' }}</button>
-      <button
-        type="button"
-        class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors disabled:opacity-40"
-        :disabled="exporting || !selectedCampaignId || mode === 'cards'"
-        @click="emit('export-st')"
-      >导出 ST</button>
-      <button
-        type="button"
-        class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors disabled:opacity-40"
-        :disabled="exporting || !selectedCampaignId || mode === 'cards'"
-        @click="emit('export-bundle')"
-      >导出 Bundle</button>
-      <button
-        type="button"
-        class="min-h-8 w-8 rounded-md text-ink-faint hover:bg-surface-2 hover:text-ink transition-colors"
+        class="sf-toolbar-icon transition-colors"
         title="关闭"
         aria-label="关闭"
         @click="emit('close')"
       >
-        <svg class="mx-auto" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        <X :size="18" aria-hidden="true" />
       </button>
     </header>
 
@@ -181,39 +203,41 @@ function taskStatusClass(status) {
         </div>
 
         <div v-else class="p-4 sm:p-6 space-y-5">
-          <div class="flex flex-wrap items-start gap-3">
+          <div class="flex flex-col gap-3 lg:flex-row lg:items-start">
             <div class="min-w-0 flex-1">
-              <h2 class="font-semibold text-[22px] text-ink leading-snug">{{ selectedCampaign.name }}</h2>
+              <h2 class="font-semibold text-lg text-ink leading-snug [overflow-wrap:anywhere]">{{ selectedCampaign.name }}</h2>
               <p class="mt-1 text-xs text-ink-faint">
                 <span v-if="selectedCampaign.story_clock">故事时间 · {{ selectedCampaign.story_clock }}</span>
                 <span v-if="selectedCampaign.story_clock && selectedCampaign.id" class="mx-1">·</span>
                 <span class="font-mono">{{ selectedCampaign.id?.slice?.(0, 8) }}</span>
               </p>
             </div>
-            <button
-              type="button"
-              class="min-h-8 px-3 rounded-md text-xs border border-accent-border text-accent-bright hover:bg-accent-soft transition-colors"
-              @click="emit('set-active', selectedCampaign.id)"
-            >设为当前活动</button>
-            <button
-              type="button"
-              class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors"
-              @click="emit('refresh')"
-            >刷新</button>
-            <button
-              type="button"
-              class="min-h-8 px-3 rounded-md text-xs border border-err/40 text-err hover:bg-err/10 transition-colors"
-              title="删除整局活动（含对话与总结）"
-              @click="emit('delete-campaign', selectedCampaign)"
-            >删除活动</button>
+            <div class="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="min-h-8 px-3 rounded-md text-xs border border-accent-border text-accent-bright hover:bg-accent-soft transition-colors"
+                @click="emit('set-active', selectedCampaign.id)"
+              >设为当前活动</button>
+              <button
+                type="button"
+                class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors"
+                @click="emit('refresh')"
+              >刷新</button>
+              <button
+                type="button"
+                class="min-h-8 px-3 rounded-md text-xs border border-err/40 text-err hover:bg-err/10 transition-colors"
+                title="删除整局活动（含对话与总结）"
+                @click="emit('delete-campaign', selectedCampaign)"
+              >删除活动</button>
+            </div>
           </div>
 
-          <div class="flex items-center gap-1 border-b border-line">
+          <div class="flex items-center gap-1 border-b border-line overflow-x-auto">
             <button
               v-for="t in tabs"
               :key="t.key"
               type="button"
-              class="min-h-10 px-3 text-[13px] border-b-2 -mb-px transition-colors"
+              class="shrink-0 whitespace-nowrap min-h-10 px-3 text-[13px] border-b-2 -mb-px transition-colors"
               :class="detailTab === t.key
                 ? 'border-accent text-accent-bright font-medium'
                 : 'border-transparent text-ink-soft hover:text-ink'"

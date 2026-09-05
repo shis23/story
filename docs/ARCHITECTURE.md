@@ -1,7 +1,7 @@
 # StoryForge 架构说明
 
-> 更新日期：2026-09-01（正文含 2026-08-31 Gate 6 关闭决议；此前版本 2026-08-05）
-> 本文描述当前 `main` 的代码边界。
+> 更新日期：2026-09-05。
+> 本文描述当前源码的代码边界；当前候选的验收状态以 `RELEASE-STATUS.md` 为准，功能存在不等于门禁通过。
 
 ## 架构原则
 
@@ -53,6 +53,8 @@ crates/harness-real-llm
 
 ## 写作与 Turn 生命周期
 
+主界面默认 `continuation`（单笔者），另有 `duet`（对手戏）和 `sequential_crew`（顺序剧组）。旧 `big_scene` 并行编排保留为显式兼容路径。下面的 Director/Subagent/Editor 是剧组路径，不是所有生成模式的固定调用序列。
+
 ```text
 User intent
   -> Tauri adapter
@@ -84,6 +86,17 @@ User intent
 - force accept 的目标终态是 `Degraded`，恢复时不得变回 `Committed`。
 - Campaign / conversation scope 不匹配时必须 fail closed。
 - 接受过程的存储失败必须传播，不允许响应成功而磁盘状态滞后。
+- 已采纳正文及其之前的用户输入构成受保护前缀，编辑、删除、新增或切换变体不能绕过该约束。
+- 删除未采纳正文会放弃对应 Turn/Attempt 并截断所属输入及后续未采纳内容；SQLite 使用单事务，JSON 使用终态日志与普通错误补偿，不宣称断电事务性。
+- 质量自动修订使用模式无关的 `revise_draft`，只运行一次 Editor，不重演角色或创建额外变体；复核通过后才同步正文、hash 和 provenance。
+
+## 故事快照
+
+v3 Campaign Bundle 包含 Conversation（正文/变体）、终态 Turn/Attempt、源角色卡、本局世界书、实例、变量、知识、任务和纪要。导出前要求活动轮次结束，导入校验范围并为身份字段分配新 ID，不改写正文和任意变量值。
+
+末尾分支复用快照导入路径，保留完整故事状态并重映射引用。当前拒绝任意历史节点分支和已采纳历史回滚，避免向历史分支复制未来状态。
+
+v1/v2 仅作为状态交换包兼容，不含完整正文历史。v3 也不包含连接凭据、插件安装、预设、Meta 工作区、MVU 翻译缓存或外部资产；向量索引重建。完整设备迁移仍需要保留应用数据和外部资产。
 
 ## Postprocess 边界
 

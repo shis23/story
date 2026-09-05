@@ -671,6 +671,9 @@ fn json_fork_campaign_bundle_cleanup_on_save_failure() {
     let dir = temp_dir("fork-bundle");
     let state = json_state(dir.path());
     let card = make_card("card-1", true);
+    let mut source_info = sample_character_info("Fork source");
+    source_info.source_character_id = Some(card.source_character_id.to_string());
+    state.storage().save_character(source_info).unwrap();
     state.storage().save_card(card.clone()).unwrap();
     let source = make_campaign(&card.id, "source");
     let source_id = source.id.clone();
@@ -682,7 +685,11 @@ fn json_fork_campaign_bundle_cleanup_on_save_failure() {
     let conversation = state.conv_store.create(None, Some(source_id.clone()));
     let fork_node_id = state
         .conv_store
-        .append_user_message(&conversation.id, "源消息".to_string())
+        .append_ai_draft(&conversation.id, "源消息".to_string(), None)
+        .unwrap();
+    state
+        .conv_store
+        .accept_variant(&conversation.id, &fork_node_id)
         .unwrap();
     let mut bound = state
         .storage()
@@ -709,7 +716,10 @@ fn json_fork_campaign_bundle_cleanup_on_save_failure() {
         to_state(&state),
     )
     .expect_err("fork_campaign must fail when campaigns.json is fenced");
-    assert!(error.to_string().contains("存储写入失败"), "error: {error}");
+    assert!(
+        error.to_string().contains("导入 Campaign 失败"),
+        "error: {error}"
+    );
     storyforge_infra_util::write_fence::unfreeze(&campaigns_path);
 
     // 无孤儿 fork：会话列表只剩源会话；Campaign 列表只剩源 Campaign。

@@ -122,7 +122,7 @@ describe('AppFrame production walkthrough', () => {
   it('mounts AppFrame shell; default history empty matches product routing', async () => {
     await mountApp()
     expect(document.documentElement.classList.contains('dark')).toBe(false)
-    expect(wrapper.find('.h-screen').exists()).toBe(true)
+    expect(wrapper.find('.sf-safe-screen.h-dvh').exists()).toBe(true)
     // showHistory 默认 true 且无 campaign → currentView=history
     expect(wrapper.text()).toContain('还没有写下第一笔')
     expect(wrapper.text()).toContain('StoryForge')
@@ -196,5 +196,41 @@ describe('AppFrame production walkthrough', () => {
     await nextTick()
     const newBtns = wrapper.findAll('button').filter((b) => b.text().includes('新建 Campaign'))
     expect(newBtns.length).toBeGreaterThan(0)
+  })
+
+  it('collapses and restores desktop navigation through the production shell', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 })
+    await mountApp()
+    const ui = useUiStore()
+    await wrapper.get('aside [aria-label="收起侧栏"]').trigger('click')
+    await nextTick()
+    expect(ui.sidebarCollapsed).toBe(true)
+    expect(wrapper.get('aside').isVisible()).toBe(false)
+    await wrapper.get('header [aria-label="展开侧栏"]').trigger('click')
+    await nextTick()
+    expect(ui.sidebarCollapsed).toBe(false)
+    expect(wrapper.get('aside').isVisible()).toBe(true)
+  })
+
+  it.each([
+    ['CampaignPanel', 'showCampaignPanel'],
+    ['CharacterList', 'showCharList'],
+    ['ConnectionConfigPanel', 'showConnConfig'],
+    ['MetaPanel', 'showMetaPanel'],
+    ['PresetPanel', 'showPresetPanel'],
+    ['PluginPanel', 'showPluginPanel'],
+    ['AgentProfileManager', 'showAgentProfile'],
+  ])('closing %s does not unexpectedly open mobile navigation', async (name, state) => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    await mountApp()
+    const ui = useUiStore()
+    ui.showSidebar = false
+    ui[state] = true
+    await flushPromises()
+    await nextTick()
+    wrapper.getComponent({ name }).vm.$emit('close')
+    await flushPromises()
+    expect(ui[state]).toBe(false)
+    expect(ui.showSidebar).toBe(false)
   })
 })

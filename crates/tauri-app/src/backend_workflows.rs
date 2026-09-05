@@ -95,6 +95,22 @@ impl TurnWorkflow {
         }
     }
 
+    pub fn delete_uncommitted_history(
+        &self,
+        conversation_id: &Id,
+        node_id: &Id,
+    ) -> Result<(), String> {
+        if self.storage.is_sqlite() {
+            crate::sqlite_runtime::truncate_uncommitted_history(conversation_id, node_id)?;
+            self.conv_store.invalidate();
+            Ok(())
+        } else {
+            self.storage
+                .json_turn_store("delete uncommitted history")?
+                .truncate_uncommitted(&self.conv_store, conversation_id, node_id)
+        }
+    }
+
     /// Mark the Turn Failed only while it still owns the failed operation:
     /// scope matches the request and the status is still `Generating`.
     ///

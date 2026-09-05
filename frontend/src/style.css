@@ -8,34 +8,40 @@
 @import '@fontsource/jetbrains-mono/400.css';
 @import '@fontsource/jetbrains-mono/500.css';
 
-/* 主题：默认浅色「纸上编辑部」；夜读深色由 <html class="dark"> 触发。 */
+/* Palette and reading mode are independent root attributes. */
 @custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --palette-teal: #227a70;
+  --palette-blue: #466783;
+  --palette-rose: #a23d64;
+  --palette-classic: #9a6425;
+}
 
 @theme {
   /* 断点：xs 窄屏起步 */
   --breakpoint-xs: 30rem;
 
-  /* ── 纸上编辑部（默认）：暖米白纸面 + 暖墨 + 金棕强调 ── */
-  --color-bg: #f6f3ec;
-  --color-surface: #fffdf7;
-  --color-surface-2: #eee9dd;
-  --color-line: #e2dccc;
+  /* Neutral paper, graphite text and a restrained teal accent. */
+  --color-bg: #f4f6f8;
+  --color-surface: #ffffff;
+  --color-surface-2: #edf1f4;
+  --color-line: #dce2e8;
 
-  /* 文字：暖墨三档 */
-  --color-ink: #29241c;
-  --color-ink-soft: #6e6759;
-  --color-ink-faint: #a49c8a;
+  /* Text hierarchy */
+  --color-ink: #20262e;
+  --color-ink-soft: #536170;
+  --color-ink-faint: #627180;
 
-  /* 强调：金棕（赭石），无发光 */
-  --color-accent: #9a6425;
-  --color-accent-bright: #7d4f1a;
-  --color-accent-soft: rgba(154, 100, 37, 0.1);
-  --color-accent-border: rgba(154, 100, 37, 0.34);
+  --color-accent: var(--palette-teal);
+  --color-accent-bright: #176158;
+  --color-accent-soft: rgba(34, 122, 112, 0.09);
+  --color-accent-border: rgba(34, 122, 112, 0.34);
 
   /* 状态色：编辑部调色（墨绿 / 靛蓝灰 / 赭黄 / 赭红） */
   --color-ok: #3e7c4f;
   --color-running: #4a6d9c;
-  --color-wait: #99917e;
+  --color-wait: #71808f;
   --color-warn: #a87b22;
   --color-err: #b0432d;
   /* 别名兜底（早期组件误用 text-error/bg-error） */
@@ -59,8 +65,8 @@
   --radius-xs: 0.125rem;
   --radius-sm: 0.25rem;
   --radius-md: 0.375rem;
-  --radius-lg: 0.625rem;
-  --radius-xl: 1rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.5rem;
 
   /* 弹层层级 */
   --z-overlay: 40;
@@ -78,27 +84,30 @@
 
   /* 统一缓动 */
   --ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --motion-fast: 140ms;
+  --motion-enter: 240ms;
+  --motion-leave: 160ms;
 }
 
-/* ── 夜读深色（.dark）：暖深棕黑，非冷黑 ── */
+/* Night reading keeps the same visual hierarchy. */
 :root.dark {
-  --color-bg: #1b1712;
-  --color-surface: #241f18;
-  --color-surface-2: #2e2820;
-  --color-line: #3a3328;
+  --color-bg: #16191d;
+  --color-surface: #1e2329;
+  --color-surface-2: #282f37;
+  --color-line: #353e48;
 
-  --color-ink: #ece4d3;
-  --color-ink-soft: #a89e8a;
-  --color-ink-faint: #6f6757;
+  --color-ink: #eef2f6;
+  --color-ink-soft: #b0bdca;
+  --color-ink-faint: #8696a7;
 
-  --color-accent: #d2a55e;
-  --color-accent-bright: #e4bd7f;
-  --color-accent-soft: rgba(210, 165, 94, 0.13);
-  --color-accent-border: rgba(210, 165, 94, 0.38);
+  --color-accent: #26786c;
+  --color-accent-bright: #6fc6b7;
+  --color-accent-soft: rgba(111, 198, 183, 0.1);
+  --color-accent-border: rgba(111, 198, 183, 0.38);
 
   --color-ok: #7fae85;
   --color-running: #8aa5c6;
-  --color-wait: #6f6757;
+  --color-wait: #8696a7;
   --color-warn: #cfa055;
   --color-err: #d2745f;
   --color-error: #d2745f;
@@ -108,10 +117,165 @@
   --shadow-rise: 0 2px 6px -2px rgba(0, 0, 0, 0.35), 0 10px 24px -10px rgba(0, 0, 0, 0.4);
 }
 
+:root[data-palette='blue'] {
+  --color-bg: #f3f6f9;
+  --color-surface-2: #eaf0f5;
+  --color-line: #d5e0e8;
+  --color-ink: #24303a;
+  --color-ink-soft: #536473;
+  --color-ink-faint: #657584;
+  --color-accent: var(--palette-blue);
+  --color-accent-bright: #31516d;
+  --color-accent-soft: rgba(70, 103, 131, 0.09);
+  --color-accent-border: rgba(70, 103, 131, 0.34);
+}
+
+:root.dark[data-palette='blue'] {
+  --color-bg: #181c21;
+  --color-surface: #21262c;
+  --color-surface-2: #2b323a;
+  --color-line: #39424c;
+  --color-ink: #eef2f6;
+  --color-ink-soft: #b6c3cf;
+  --color-ink-faint: #96a6b5;
+  --color-accent: #40698c;
+  --color-accent-bright: #9cbfe0;
+  --color-accent-soft: rgba(156, 191, 224, 0.1);
+  --color-accent-border: rgba(156, 191, 224, 0.38);
+}
+
+:root[data-palette='rose'] {
+  --color-bg: #f8f5f7;
+  --color-surface-2: #f2ecef;
+  --color-line: #e6dce2;
+  --color-ink: #30262d;
+  --color-ink-soft: #6c5b65;
+  --color-ink-faint: #7e6b76;
+  --color-accent: var(--palette-rose);
+  --color-accent-bright: #852d50;
+  --color-accent-soft: rgba(162, 61, 100, 0.09);
+  --color-accent-border: rgba(162, 61, 100, 0.34);
+}
+
+:root.dark[data-palette='rose'] {
+  --color-bg: #1c191d;
+  --color-surface: #262128;
+  --color-surface-2: #312a32;
+  --color-line: #443842;
+  --color-ink: #f5edf2;
+  --color-ink-soft: #c6b4c1;
+  --color-ink-faint: #ad98a6;
+  --color-accent: #a54469;
+  --color-accent-bright: #eba2be;
+  --color-accent-soft: rgba(235, 162, 190, 0.1);
+  --color-accent-border: rgba(235, 162, 190, 0.38);
+}
+
+/* Original paper-and-ochre palette from 3b114fe, without restoring old layout. */
+:root[data-palette='classic'] {
+  --color-bg: #f6f3ec;
+  --color-surface: #fffdf7;
+  --color-surface-2: #eee9dd;
+  --color-line: #e2dccc;
+  --color-ink: #29241c;
+  --color-ink-soft: #6e6759;
+  --color-ink-faint: #a49c8a;
+  --color-accent: var(--palette-classic);
+  --color-accent-bright: #7d4f1a;
+  --color-accent-soft: rgba(154, 100, 37, 0.1);
+  --color-accent-border: rgba(154, 100, 37, 0.34);
+  --color-wait: #99917e;
+}
+
+:root.dark[data-palette='classic'] {
+  --color-bg: #1b1712;
+  --color-surface: #241f18;
+  --color-surface-2: #2e2820;
+  --color-line: #3a3328;
+  --color-ink: #ece4d3;
+  --color-ink-soft: #a89e8a;
+  --color-ink-faint: #6f6757;
+  --color-accent: #d2a55e;
+  --color-accent-bright: #e4bd7f;
+  --color-accent-soft: rgba(210, 165, 94, 0.13);
+  --color-accent-border: rgba(210, 165, 94, 0.38);
+  --color-wait: #6f6757;
+  --color-on-accent: #29241c;
+}
+
+/* Legacy filled controls assumed a dark accent; pale gold needs dark ink. */
+:root.dark[data-palette='classic'] :is(.bg-accent.text-white, .hover\:bg-accent.hover\:text-white:hover) {
+  color: var(--color-on-accent);
+}
+
 html, body, #app {
   margin: 0;
   padding: 0;
   height: 100%;
+}
+
+:root {
+  --sf-safe-top: env(safe-area-inset-top, 0px);
+  --sf-safe-right: env(safe-area-inset-right, 0px);
+  --sf-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --sf-safe-left: env(safe-area-inset-left, 0px);
+  --sf-toolbar-height: 52px;
+}
+
+/* Only viewport owners apply insets; their headers never add another copy. */
+.sf-safe-screen {
+  padding: var(--sf-safe-top) var(--sf-safe-right) var(--sf-safe-bottom) var(--sf-safe-left);
+}
+
+.sf-toolbar {
+  height: var(--sf-toolbar-height);
+  flex-shrink: 0;
+  min-width: 0;
+  letter-spacing: 0;
+}
+
+.sf-toolbar-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  color: var(--color-ink-soft);
+  transition:
+    background-color var(--motion-fast) ease,
+    color var(--motion-fast) ease,
+    transform var(--motion-fast) var(--ease-soft);
+}
+
+.sf-toolbar-icon:hover:not(:disabled) {
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+}
+
+.sf-toolbar-icon:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.sf-command {
+  transition: transform var(--motion-fast) var(--ease-soft),
+    background-color var(--motion-fast) ease, color var(--motion-fast) ease,
+    box-shadow var(--motion-fast) ease, opacity var(--motion-fast) ease;
+}
+.sf-command:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.sf-dialog-viewport {
+  padding: var(--sf-safe-top) var(--sf-safe-right) var(--sf-safe-bottom) var(--sf-safe-left);
+}
+
+@media (min-width: 40rem) {
+  .sf-dialog-viewport {
+    padding: max(1rem, var(--sf-safe-top)) max(1rem, var(--sf-safe-right))
+      max(1rem, var(--sf-safe-bottom)) max(1rem, var(--sf-safe-left));
+  }
 }
 
 body {
@@ -128,7 +292,7 @@ body {
 .prose-fiction {
   font-family: var(--font-sans);
   line-height: 1.85;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
 }
 .prose-fiction em { font-style: normal; opacity: 0.82; }
 .prose-fiction strong { font-weight: 600; }
@@ -153,6 +317,64 @@ body {
 .sf-stagger > * {
   animation: sf-rise 0.32s var(--ease-soft) both;
   animation-delay: calc(var(--i, 0) * 28ms);
+}
+
+/* Enter only the content, never the viewport or a full-screen panel header. */
+.sf-view-enter {
+  animation: sf-rise var(--motion-enter) var(--ease-soft);
+}
+
+.sf-fade-enter-active,
+.sf-fade-leave-active {
+  transition: opacity var(--motion-fast) ease;
+}
+.sf-fade-enter-from,
+.sf-fade-leave-to {
+  opacity: 0;
+}
+
+.sf-drawer-left-enter-active,
+.sf-drawer-right-enter-active {
+  transition: transform var(--motion-enter) var(--ease-soft);
+}
+.sf-drawer-left-leave-active,
+.sf-drawer-right-leave-active {
+  transition: transform var(--motion-leave) var(--ease-soft);
+}
+.sf-drawer-left-enter-from,
+.sf-drawer-left-leave-to {
+  transform: translateX(-100%);
+}
+.sf-drawer-right-enter-from,
+.sf-drawer-right-leave-to {
+  transform: translateX(100%);
+}
+
+.sf-disclosure-enter-active,
+.sf-disclosure-leave-active {
+  display: grid;
+  overflow: hidden;
+  transition: grid-template-rows var(--motion-enter) var(--ease-soft),
+    opacity var(--motion-enter) ease;
+}
+.sf-disclosure-enter-from,
+.sf-disclosure-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+.sf-disclosure-enter-to,
+.sf-disclosure-leave-from {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.sf-disclosure-body {
+  min-height: 0;
+  overflow: hidden;
+}
+
+@keyframes sf-writing-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(434%); }
 }
 
 /* ── 焦点态：accent 发光环 ── */
@@ -198,6 +420,14 @@ body {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  .sf-toolbar-icon:active:not(:disabled),
+  .sf-command:active:not(:disabled) {
+    transform: none;
   }
 }

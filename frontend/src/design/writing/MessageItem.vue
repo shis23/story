@@ -17,6 +17,7 @@ import { rerollPolicy } from '../../utils/rerollPolicy.js'
 const props = defineProps({
   message: { type: Object, required: true },
   busy: { type: Boolean, default: false },
+  saveVariant: { type: Function, default: null },
   canBranch: { type: Boolean, default: false },
   /** Product modes reroll the complete pipeline; legacy big-scene keeps artifact-level rerolls. */
   allowPartialReroll: { type: Boolean, default: true },
@@ -35,7 +36,6 @@ const emit = defineEmits([
   'reroll',
   'reroll-user',
   'switch-variant',
-  'edit-variant',
   'accept-variant',
   'retry-postprocess',
   'dismiss-receipt',
@@ -58,6 +58,7 @@ const replayPolicy = computed(() => rerollPolicy(
 ))
 const hasVariants = computed(() => (props.message.variants?.length || 0) > 1)
 const isFinal = computed(() => currentVariant.value?.status === 'final')
+const hasAcceptedVariant = computed(() => props.message.variants.some((v) => v.status === 'final'))
 const receiptSelection = ref({})
 
 watch(
@@ -99,15 +100,27 @@ function confirmReceipt(forceAccept = false) {
 // ── 内联编辑 ──
 const editing = ref(false)
 const editContent = ref('')
+const saving = ref(false)
+const saveError = ref('')
 function startEdit() {
+  if (saving.value) return
   editContent.value = currentVariant.value?.content ?? ''
+  saveError.value = ''
   editing.value = true
 }
 async function saveEdit() {
-  // 事件链（StoryPage→WritingScreen→adapter）单监听时 emit 会回传 handler 的
-  // Promise：false = 保存失败，编辑器保持打开；链路未回传（undefined）按成功关闭。
-  const result = await emit('edit-variant', { nodeId: props.message.id, newContent: editContent.value })
-  if (result !== false) editing.value = false
+  if (saving.value || props.busy) return
+  saving.value = true
+  saveError.value = ''
+  try {
+    const result = await props.saveVariant?.({ nodeId: props.message.id, newContent: editContent.value })
+    if (result === true) editing.value = false
+    else saveError.value = '保存未完成，输入已保留。'
+  } catch {
+    saveError.value = '保存失败，输入已保留。'
+  } finally {
+    saving.value = false
+  }
 }
 
 // ── 重 roll 菜单 ──
@@ -164,10 +177,11 @@ function paragraphs(text) {
     </div>
 
     <div v-if="editing" class="mt-2 rounded-lg border border-accent-border bg-surface p-4 shadow-card">
-      <textarea v-model="editContent" rows="3" class="w-full bg-transparent resize-none text-sm leading-relaxed text-ink focus:outline-none"></textarea>
+      <textarea v-model="editContent" :disabled="saving" rows="3" class="w-full bg-transparent resize-none text-sm leading-relaxed text-ink focus:outline-none"></textarea>
+      <p v-if="saveError" role="alert" class="mt-2 text-xs text-err">{{ saveError }}</p>
       <div class="flex justify-end gap-2 mt-2">
-        <button type="button" @click="editing = false" class="min-h-8 px-3 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
-        <button type="button" @click="saveEdit" class="min-h-8 px-3 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">保存</button>
+        <button type="button" :disabled="saving" @click="editing = false" class="min-h-8 px-3 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
+        <button type="button" :disabled="saving || busy" @click="saveEdit" class="min-h-8 px-3 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">保存</button>
       </div>
     </div>
   </section>
@@ -187,17 +201,18 @@ function paragraphs(text) {
     </div>
 
     <div v-else class="rounded-lg border border-accent-border bg-surface p-4 shadow-card">
-      <textarea v-model="editContent" rows="6" class="w-full bg-transparent resize-none text-[15px] leading-relaxed text-ink focus:outline-none"></textarea>
+      <textarea v-model="editContent" :disabled="saving" rows="6" class="w-full bg-transparent resize-none text-[15px] leading-relaxed text-ink focus:outline-none"></textarea>
+      <p v-if="saveError" role="alert" class="mt-2 text-xs text-err">{{ saveError }}</p>
       <div class="flex justify-end gap-2 mt-3">
-        <button type="button" @click="editing = false" class="min-h-8 px-3 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
-        <button type="button" @click="saveEdit" class="min-h-8 px-3 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">保存</button>
+        <button type="button" :disabled="saving" @click="editing = false" class="min-h-8 px-3 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
+        <button type="button" :disabled="saving || busy" @click="saveEdit" class="min-h-8 px-3 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">保存</button>
       </div>
     </div>
 
     <VariantStrip
       v-if="hasVariants && !editing"
       :message="message"
-      :busy="busy"
+      :busy="busy || hasAcceptedVariant"
       @switch-variant="emit('switch-variant', $event)"
       @accept-variant="emit('accept-variant', $event)"
     />
@@ -257,7 +272,7 @@ function paragraphs(text) {
           </div>
         </div>
 
-        <button type="button" @click="emit('add-variant', { messageId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">添变体</button>
+        <button type="button" @click="emit('add-variant', { nodeId: message.id })" :disabled="busy || hasAcceptedVariant" :title="hasAcceptedVariant ? '已采纳历史请从末尾创建分支' : null" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">添变体</button>
         <button v-if="canBranch" type="button" @click="emit('branch', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">分支</button>
         <button type="button" @click="emit('delete-variant', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md text-ink-faint hover:bg-err/10 hover:text-err disabled:opacity-40 transition-colors">删除</button>
       </div>

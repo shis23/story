@@ -18,4 +18,11 @@ describe('PrimarySidebar runtime placement', () => {
 
     expect(wrapper.get('[data-testid="tavern-helper-sidebar"]').text()).toContain('TavernHelper 6/6')
   })
+
+  it('provides a desktop collapse command separate from navigation closing', async () => {
+    const wrapper = mount(PrimarySidebar, { props: { docked: true } })
+    await wrapper.get('[aria-label="收起侧栏"]').trigger('click')
+    expect(wrapper.emitted('collapse')).toHaveLength(1)
+    expect(wrapper.emitted('close')).toBeUndefined()
+  })
 })

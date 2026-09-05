@@ -29,7 +29,7 @@ const emit = defineEmits(['close'])
       <div class="flex flex-col h-full min-h-0 min-w-0 w-full">
         <div
           v-if="showChrome && (title || $slots.header)"
-          class="shrink-0 h-14 flex items-center justify-between px-4 border-b border-line bg-surface"
+          class="sf-toolbar flex items-center justify-between px-4 border-b border-line bg-surface"
         >
           <slot name="header">
             <h2 class="text-sm font-semibold text-ink truncate">{{ title }}</h2>

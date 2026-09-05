@@ -1448,18 +1448,77 @@ impl StorageFacade {
     }
 
     /// Export the full Campaign bundle JSON. Both backends produce the exact
-    /// same `CampaignBundle` structure (format_version 2).
+    /// same versioned `CampaignBundle` structure.
     pub fn export_campaign_bundle(&self, camp_id: &Id) -> Result<String, TauriCommandError> {
         if self.is_sqlite() {
-            self.export_campaign_bundle_from_sqlite(camp_id)
-        } else {
-            let store = self
-                .json_campaign_store(BackendCapability::ImportExport, "export campaign bundle")?;
-            crate::commands::import_export::export_campaign_bundle_from_store(
-                store,
-                camp_id.clone(),
-            )
+            return self.export_campaign_bundle_from_sqlite(camp_id);
         }
+        self.json_turn_store("export snapshot")
+            .map_err(TauriCommandError::storage)?
+            .with_idle_turn_snapshot(camp_id, |turns| {
+                self.export_campaign_bundle_from_json(camp_id, turns)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(TauriCommandError::storage)
+    }
+
+    fn export_campaign_bundle_from_json(
+        &self,
+        camp_id: &Id,
+        turns: Vec<storyforge_domain::turn::TurnRecord>,
+    ) -> Result<String, TauriCommandError> {
+        let store =
+            self.json_campaign_store(BackendCapability::ImportExport, "export campaign bundle")?;
+        let json = crate::commands::import_export::export_campaign_bundle_from_store(
+            store,
+            camp_id.clone(),
+        )?;
+        let mut bundle: crate::commands::import_export::CampaignBundle =
+            serde_json::from_str(&json).map_err(|e| TauriCommandError::internal(e.to_string()))?;
+        if bundle.campaign.pending_compress_publication.is_some() {
+            return Err(TauriCommandError::validation(
+                "请先结束当前轮次及记忆发布，再导出故事快照",
+            ));
+        }
+        if let Some(conversation_id) = &bundle.campaign.conversation_id {
+            let conversation = ConversationStore::new(self.data_dir.join("conversations"))
+                .get(conversation_id)
+                .ok_or_else(|| {
+                    TauriCommandError::storage("Campaign 正文缺失，拒绝生成不完整快照")
+                })?;
+            let card = bundle
+                .card
+                .as_ref()
+                .ok_or_else(|| TauriCommandError::storage("Campaign 角色卡缺失"))?;
+            let character = self
+                .get_character(card.source_character_id.as_str())
+                .map_err(TauriCommandError::storage)?
+                .ok_or_else(|| TauriCommandError::storage("源角色卡缺失，拒绝生成不完整快照"))?;
+            bundle.runtime = Some(crate::commands::bundle_runtime::BundleRuntime {
+                conversation,
+                character,
+                turns,
+                world_info: self
+                    .get_world_info(camp_id)
+                    .map_err(TauriCommandError::storage)?,
+            });
+            bundle.format_version = 3;
+            crate::commands::bundle_runtime::validate_runtime(&bundle)?;
+        }
+        let after = self
+            .get_campaign(camp_id)
+            .map_err(TauriCommandError::storage)?
+            .ok_or_else(|| TauriCommandError::storage("导出期间 Campaign 已删除"))?;
+        if serde_json::to_value(&after.campaign).ok() != serde_json::to_value(&bundle.campaign).ok()
+        {
+            return Err(TauriCommandError::validation("导出期间故事已变化，请重试"));
+        }
+        crate::commands::import_export::validate_bundle_summary_graph(
+            &bundle.campaign,
+            &bundle.summaries,
+        )?;
+        serde_json::to_string_pretty(&bundle)
+            .map_err(|e| TauriCommandError::internal(e.to_string()))
     }
 
     /// Import a Campaign bundle. JSON path keeps its snapshot-verified
@@ -1475,54 +1534,74 @@ impl StorageFacade {
             let store = self
                 .json_campaign_store(BackendCapability::ImportExport, "import campaign bundle")
                 .map_err(TauriCommandError::validation)?;
-            crate::commands::import_export::import_campaign_bundle_into_store(
-                store, conv_store, bundle,
+            crate::commands::import_export::import_campaign_bundle_into_store_with_runtime(
+                store,
+                conv_store,
+                bundle,
+                Some((
+                    self.json_character_store(BackendCapability::ImportExport, "import snapshot")
+                        .map_err(TauriCommandError::storage)?,
+                    self.json_turn_store("import snapshot")
+                        .map_err(TauriCommandError::storage)?,
+                )),
+                || Ok(()),
             )
         }
+    }
+
+    pub(crate) fn fork_campaign_snapshot(
+        &self,
+        conv_store: &ConversationStore,
+        source_id: &Id,
+        node_id: &Id,
+        name: &str,
+    ) -> Result<crate::commands::campaigns::CampaignSummaryDto, TauriCommandError> {
+        use crate::commands::import_export::*;
+        let bundle: CampaignBundle = serde_json::from_str(&self.export_campaign_bundle(source_id)?)
+            .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+        let runtime = bundle
+            .runtime
+            .as_ref()
+            .ok_or_else(|| TauriCommandError::validation("分支需要完整正文及源角色卡"))?;
+        storyforge_domain::history::require_committed_head(&runtime.conversation, node_id)
+            .map_err(TauriCommandError::validation)?;
+        validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+        let mut rewritten = rewrite_bundle_ids_with_card_policy(bundle, true)?;
+        rewritten.campaign.name = name.into();
+        rewritten.campaign.created_at = chrono::Utc::now().to_rfc3339();
+        rewritten.campaign.fork_from = Some((source_id.clone(), node_id.clone()));
+        let imported = if self.is_sqlite() {
+            import_rewritten_bundle_into_sqlite(conv_store, rewritten)?
+        } else {
+            import_rewritten_bundle_into_store(
+                self.json_campaign_store(BackendCapability::ImportExport, "fork snapshot")
+                    .map_err(TauriCommandError::storage)?,
+                conv_store,
+                rewritten,
+                Some((
+                    self.json_character_store(BackendCapability::ImportExport, "fork snapshot")
+                        .map_err(TauriCommandError::storage)?,
+                    self.json_turn_store("fork snapshot")
+                        .map_err(TauriCommandError::storage)?,
+                )),
+                || Ok(()),
+            )?
+        };
+        let record = self
+            .get_campaign(&Id::from_str(&imported.campaign_id))
+            .map_err(TauriCommandError::storage)?
+            .ok_or_else(|| TauriCommandError::storage("分支写入后不可见"))?;
+        let mut dto = crate::commands::campaigns::CampaignSummaryDto::from(&record.campaign);
+        dto.instance_count = record.instance_count;
+        Ok(dto)
     }
 
     fn export_campaign_bundle_from_sqlite(
         &self,
         camp_id: &Id,
     ) -> Result<String, TauriCommandError> {
-        use crate::commands::import_export::{BUNDLE_FORMAT_VERSION, CampaignBundle};
-
-        let campaign = sqlite_runtime::get_campaign(camp_id)
-            .map_err(TauriCommandError::storage)?
-            .ok_or_else(|| {
-                TauriCommandError::not_found(format!("Campaign 不存在: {}", camp_id.as_str()))
-            })?;
-        let stored_card = match sqlite_runtime::get_card_payload(&campaign.card_id)
-            .map_err(TauriCommandError::storage)?
-        {
-            Some(payload) => Some(serde_json::from_value::<StoredCard>(payload).map_err(|e| {
-                TauriCommandError::storage(format!("角色卡 payload 解析失败: {e}"))
-            })?),
-            None => None,
-        };
-        let instances =
-            sqlite_runtime::list_instances(camp_id).map_err(TauriCommandError::storage)?;
-        let definitions = stored_card
-            .as_ref()
-            .map(|c| c.card.character_definitions.clone())
-            .unwrap_or_default();
-        let knowledge =
-            sqlite_runtime::list_knowledge(camp_id).map_err(TauriCommandError::storage)?;
-        let tasks = sqlite_runtime::list_tasks(camp_id).map_err(TauriCommandError::storage)?;
-        let summaries =
-            sqlite_runtime::list_summaries(camp_id).map_err(TauriCommandError::storage)?;
-
-        let bundle = CampaignBundle {
-            format_version: BUNDLE_FORMAT_VERSION,
-            exported_at: chrono::Utc::now().to_rfc3339(),
-            card: stored_card.map(|c| c.card),
-            campaign,
-            instances,
-            definitions,
-            knowledge,
-            tasks,
-            summaries,
-        };
+        let bundle = sqlite_runtime::export_campaign_snapshot(camp_id)
+            .map_err(TauriCommandError::storage)?;
         serde_json::to_string_pretty(&bundle)
             .map_err(|e| TauriCommandError::internal(format!("Bundle 序列化失败: {e}")))
     }

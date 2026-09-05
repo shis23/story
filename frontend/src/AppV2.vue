@@ -797,14 +797,17 @@ onUnmounted(() => {
   <!-- design/shell AppFrame：纯布局；侧栏/顶栏/调试经 slot 注入；#panels 保留插件 runtime -->
   <AppFrame
     :sidebar-open="ui.showSidebar"
+    :sidebar-collapsed="ui.sidebarCollapsed"
     :inspector-open="ui.showDebugDrawer"
     @update:sidebar-open="(v) => { ui.showSidebar = v }"
+    @update:sidebar-collapsed="(v) => { ui.sidebarCollapsed = v }"
     @update:inspector-open="(v) => { ui.showDebugDrawer = v }"
   >
-    <template #sidebar="{ docked }">
+    <template #sidebar="{ docked, collapseSidebar }">
       <PrimarySidebar
         :docked="docked"
         @close="ui.showSidebar = false"
+        @collapse="collapseSidebar"
         @new-campaign="openNewCampaignDialog"
         @view-history="ui.viewHistory()"
         @open-campaign="ui.openCampaignPanel()"
@@ -831,8 +834,8 @@ onUnmounted(() => {
       </PrimarySidebar>
     </template>
 
-    <template #topbar>
-      <TopBar />
+    <template #topbar="{ docked, sidebarVisible, toggleSidebar }">
+      <TopBar :sidebar-docked="docked" :sidebar-visible="sidebarVisible" @toggle-sidebar="toggleSidebar" />
     </template>
 
     <template #content>
@@ -852,13 +855,13 @@ onUnmounted(() => {
         </template>
       </div>
       <!-- 根据 ui.currentView 切换 overview/history/write -->
-      <div v-if="ui.currentView === 'overview'" class="h-full overflow-y-auto">
+      <div v-if="ui.currentView === 'overview'" key="overview" class="sf-view-enter h-full overflow-y-auto">
         <OverviewScreen
           v-bind="overviewScreenProps"
           v-on="overviewScreenEvents"
         />
       </div>
-      <div v-else-if="ui.currentView === 'history'" class="h-full overflow-y-auto">
+      <div v-else-if="ui.currentView === 'history'" key="history" class="sf-view-enter h-full overflow-y-auto">
         <HistoryScreen
           v-bind="historyScreenProps"
           v-on="historyScreenEvents"
@@ -868,7 +871,7 @@ onUnmounted(() => {
       <WritingScreen
         v-else
         ref="writingScreenRef"
-        class="h-full min-h-0"
+        class="sf-view-enter h-full min-h-0"
         v-bind="writingScreenProps"
         :show-opening="showCardShellOpening"
         v-on="writingScreenEvents"
@@ -935,14 +938,14 @@ onUnmounted(() => {
         />
       </CardShellFloatingStatus>
 
-      <!-- ═══ 管理面板（每个用 ui.show* 控制；close 同时关面板并恢复侧栏） ═══ -->
+      <!-- Closing a panel preserves navigation state, including top-bar entry points. -->
 
       <!-- 角色卡列表（保留原位组件,未迁 v2） -->
       <CharacterList
         v-if="ui.showCharList"
         :active-id="campaign.activeChar?.id"
         @select="handleSelectChar"
-        @close="ui.showCharList = false; ui.showSidebar = true"
+        @close="ui.showCharList = false"
       />
 
       <CharacterCardDetail
@@ -955,7 +958,7 @@ onUnmounted(() => {
       <!-- LLM 连接配置 -->
       <ConnectionConfigPanel
         v-if="ui.showConnConfig"
-        @close="ui.showConnConfig = false; ui.showSidebar = true"
+        @close="ui.showConnConfig = false"
         @changed="refreshActiveConnection"
       />
 
@@ -964,7 +967,7 @@ onUnmounted(() => {
         v-if="ui.showCampaignPanel"
         ref="campaignPanelRef"
         :initial-tab="ui.campaignPanelTab"
-        @close="ui.showCampaignPanel = false; ui.showSidebar = true"
+        @close="ui.showCampaignPanel = false"
         @campaign-changed="handleCampaignChanged"
       />
 
@@ -973,26 +976,26 @@ onUnmounted(() => {
         v-if="ui.showMetaPanel"
         :active-campaign="campaign.activeCampaign"
         :last-conversation-node="lastConversationNode"
-        @close="ui.showMetaPanel = false; ui.showSidebar = true"
+        @close="ui.showMetaPanel = false"
         @mvu-applied="handleMvuApplied"
       />
 
       <!-- 预设面板 -->
       <PresetPanel
         v-if="ui.showPresetPanel"
-        @close="ui.showPresetPanel = false; ui.showSidebar = true"
+        @close="ui.showPresetPanel = false"
       />
 
       <!-- 插件面板（关后刷新侧栏插件） -->
       <PluginPanel
         v-if="ui.showPluginPanel"
-        @close="ui.showPluginPanel = false; ui.showSidebar = true; loadSidebarPlugins()"
+        @close="ui.showPluginPanel = false; loadSidebarPlugins()"
       />
 
       <!-- Agent Profile 配置面板（Phase 8 补挂,P3-5） -->
       <AgentProfileManager
         v-if="ui.showAgentProfile"
-        @close="ui.showAgentProfile = false; ui.showSidebar = true"
+        @close="ui.showAgentProfile = false"
       />
 
       <!-- ═══ 新建 Campaign 表单（Overlay；form 为上方 useNewCampaignForm 实例，

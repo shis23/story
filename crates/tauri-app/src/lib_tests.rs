@@ -12,6 +12,8 @@ mod diagnostics;
 mod import_export;
 #[path = "lib_tests_meta.rs"]
 mod meta;
+#[path = "lib_tests_review_history.rs"]
+mod review_history;
 #[path = "lib_tests_startup.rs"]
 mod startup;
 #[path = "lib_tests_turns.rs"]

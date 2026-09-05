@@ -14,6 +14,7 @@
 import { computed, markRaw } from 'vue'
 import { useWritingStore, useCampaignStore, useUiStore } from '../stores/index.js'
 import { subagentRolesFromProvenance } from '../utils/pipelineTrace.js'
+import { errorText } from '../utils/errorText.js'
 
 /**
  * @param {object} handlers
@@ -83,6 +84,7 @@ export function useWritingScreenAdapter(handlers = {}) {
     showPipeline: writing.showPipeline,
     streamingRoleLabel: writing.streamingRoleLabel,
     canBranch: canBranch.value,
+    saveVariant: (payload) => handlers.handleEditVariant?.(payload) ?? false,
     allowPartialReroll:
       writing.writingMode !== 'campaign' || writing.generationMode === 'big_scene',
     greetingOptions: greetingOptions.value,
@@ -99,14 +101,16 @@ export function useWritingScreenAdapter(handlers = {}) {
 
   async function onDeleteVariant(payload) {
     try {
-      const { ask } = await import('@tauri-apps/plugin-dialog')
-      const ok = await ask('确定删除这条消息？删除后该消息从对话移除。', {
+      const ask = handlers.askDialog || (await import('@tauri-apps/plugin-dialog')).ask
+      const ok = await ask('确定撤回这条消息及其后的所有消息？同一未采纳轮次的输入和草稿会一起撤回。已采纳历史不可直接删除。', {
         title: '删除确认',
         kind: 'warning',
       })
       if (!ok) return
-    } catch {
-      // 非 Tauri / 无 dialog 插件时直接删除（测试与浏览器预览）
+    } catch (error) {
+      writing.pipeline.state = 'error'
+      writing.pipeline.stateLabel = `删除确认失败，未执行删除: ${errorText(error)}`
+      return false
     }
     return handlers.handleDeleteVariant?.(payload)
   }
@@ -122,7 +126,6 @@ export function useWritingScreenAdapter(handlers = {}) {
     reroll: (p) => handlers.handleReroll?.(p),
     'reroll-user': (p) => handlers.handleRerollUser?.(p),
     'switch-variant': (p) => handlers.handleSwitchVariant?.(p),
-    'edit-variant': (p) => handlers.handleEditVariant?.(p),
     'accept-variant': (p) => handlers.handleAcceptVariant?.(p),
     'retry-postprocess': (p) => handlers.handleRetryPostprocess?.(p),
     'dismiss-receipt': () => writing.clearTurnReceipt(),

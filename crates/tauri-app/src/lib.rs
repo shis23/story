@@ -181,15 +181,6 @@ pub(crate) fn get_conn_store() -> Arc<ConnectionStore> {
 #[cfg(target_os = "android")]
 static NDK_CONTEXT_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-static CARD_STUDIO_STORE: OnceLock<card_studio_store::CardStudioStore> = OnceLock::new();
-
-pub(crate) fn get_card_studio_store() -> &'static card_studio_store::CardStudioStore {
-    CARD_STUDIO_STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        card_studio_store::CardStudioStore::new(&data_dir)
-    })
-}
-
 static PRESET_STORE: OnceLock<PresetStore> = OnceLock::new();
 
 fn get_preset_store() -> &'static PresetStore {
@@ -707,6 +698,7 @@ pub struct AppState {
     /// Process-pinned storage authority and capability contract.
     storage: Arc<storage_backend::StorageFacade>,
     pub conv_store: Arc<ConversationStore>,
+    pub(crate) card_studio_store: card_studio_store::CardStudioStore,
     pub log_store: Arc<LogStore>,
     /// 工具上下文（导入角色卡时同步更新，RwLock 支持运行时写入）
     pub tool_ctx: Arc<RwLock<ToolContext>>,
@@ -902,6 +894,7 @@ impl AppState {
             data_dir: data_dir.clone(),
             storage: storage.clone(),
             conv_store,
+            card_studio_store: card_studio_store::CardStudioStore::new(&data_dir),
             turn_workflow,
             log_store,
             tool_ctx,

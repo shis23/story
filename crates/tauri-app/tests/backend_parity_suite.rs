@@ -1729,15 +1729,13 @@ impl ParityDriver {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let report_line = stdout
-            .lines()
-            .find(|line| line.starts_with("STORYFORGE_RESTART_REPORT "))
-            .map(|line| {
-                line.trim_start_matches("STORYFORGE_RESTART_REPORT ")
-                    .to_string()
-            });
+        // Single-threaded libtest can prefix this line with the test name.
+        let report_line = stdout.lines().find_map(|line| {
+            line.split_once("STORYFORGE_RESTART_REPORT ")
+                .map(|(_, json)| json)
+        });
         let report: RestartReport = match report_line {
-            Some(line) => match serde_json::from_str(&line) {
+            Some(line) => match serde_json::from_str(line) {
                 Ok(r) => r,
                 Err(e) => {
                     self.push(

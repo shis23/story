@@ -858,12 +858,7 @@ pub fn fork_campaign(
     )
 }
 
-/// backend-neutral fork：经 facade 读源 Campaign/卡、fork 会话、落 Campaign、
-/// 拷贝实例与世界书（JSON/SQLite 同一语义）。
-///
-/// 三.6：fork bundle 原子性——fork 会话 + Campaign + 实例拷贝 + 世界书拷贝
-/// 全部成功或全部清理。任一后续步骤失败都删除 fork 会话与 fork Campaign
-/// （不留孤儿会话/孤儿 Campaign）；世界书拷贝错误**传播**（旧实现 warn 吞掉）。
+/// Fork only a committed head through the complete snapshot import boundary.
 pub(crate) fn fork_campaign_for_backend(
     storage: &crate::storage_backend::StorageFacade,
     conv_store: &ConversationStore,
@@ -876,110 +871,7 @@ pub(crate) fn fork_campaign_for_backend(
         return Err(TauriCommandError::validation("fork campaign name is empty"));
     }
 
-    let source = storage
-        .get_campaign(&source_campaign_id)
-        .map_err(TauriCommandError::storage)?
-        .map(|record| record.campaign)
-        .ok_or_else(|| {
-            TauriCommandError::not_found(format!("campaign not found: {source_campaign_id}"))
-        })?;
-    if storage
-        .get_card(&source.card_id)
-        .map_err(TauriCommandError::storage)?
-        .is_none()
-    {
-        return Err(TauriCommandError::not_found(format!(
-            "card not found: {}",
-            source.card_id
-        )));
-    }
-
-    let source_conversation_id = source
-        .conversation_id
-        .clone()
-        .or_else(|| conv_store.find_by_campaign(&source.id).map(|c| c.id))
-        .ok_or_else(|| {
-            TauriCommandError::not_found(format!(
-                "source campaign has no conversation: {}",
-                source.id
-            ))
-        })?;
-
-    let mut campaign = storyforge_domain::campaign::Campaign::fork(
-        source.card_id.clone(),
-        name.to_string(),
-        source.id.clone(),
-        fork_node_id.clone(),
-    );
-    campaign.variables = source.variables.clone();
-    campaign.variable_schema = source.variable_schema.clone();
-    // Gate 4：story_clock 唯一权威 = variables；fork 时随 variables 拷贝，
-    // 顶层字段从权威同步，避免双表示残留。
-    campaign.story_clock = source.current_story_clock().to_string();
-
-    let forked_conversation = conv_store
-        .fork_at(&source_conversation_id, campaign.id.clone(), &fork_node_id)
-        .map_err(|e| TauriCommandError::storage(format!("fork conversation failed: {e}")))?;
-    let forked_conversation_id = forked_conversation.id.clone();
-    campaign.conversation_id = Some(forked_conversation.id);
-    let campaign_id = campaign.id.clone();
-
-    // 三.6 补偿：fork bundle 任一步失败 → 删除 fork 会话 + fork Campaign。
-    let cleanup_after_failure = |error: String| -> TauriCommandError {
-        let mut problems = Vec::new();
-        if let Err(delete_err) = conv_store.delete(&forked_conversation_id) {
-            problems.push(format!("清理 fork 会话失败: {delete_err}"));
-        }
-        if let Err(delete_err) = storage.delete_campaign(&campaign_id) {
-            problems.push(format!("清理 fork Campaign 失败: {delete_err}"));
-        }
-        let suffix = if problems.is_empty() {
-            String::new()
-        } else {
-            format!("（补偿清理未完全成功: {}）", problems.join("; "))
-        };
-        TauriCommandError::storage(format!("存储写入失败: {error}{suffix}"))
-    };
-
-    storage
-        .save_campaign(&campaign)
-        .map_err(|e| cleanup_after_failure(format!("save fork campaign failed: {e}")))?;
-
-    let mut instance_count = 0;
-    for mut instance in storage
-        .list_instances(&source.id)
-        .map_err(TauriCommandError::storage)?
-    {
-        instance.id = Id::new();
-        instance.campaign_id = campaign.id.clone();
-        storage
-            .add_instance(&instance)
-            .map_err(|e| cleanup_after_failure(format!("copy fork instance failed: {e}")))?;
-        instance_count += 1;
-    }
-
-    // 本局世界书：fork 时深拷贝源活动书（没有则从卡模板 ensure）。
-    // 失败必须传播并补偿（三.6：不得用 warn 吞掉）。
-    let source_book = storage
-        .get_world_info(&source.id)
-        .map_err(|e| cleanup_after_failure(format!("读取源世界书失败: {e}")))?;
-    if !source_book.entries.is_empty() {
-        storage
-            .set_world_info(&campaign.id, &source_book)
-            .map_err(|e| cleanup_after_failure(format!("fork 拷贝世界书失败: {e}")))?;
-    } else {
-        let card = storage
-            .get_card(&campaign.card_id)
-            .map_err(|e| cleanup_after_failure(format!("读取卡模板失败: {e}")))?;
-        if let Some(card) = card {
-            seed_campaign_world_info_from_card_for_backend(storage, &campaign, &card)
-                .map_err(|e| cleanup_after_failure(format!("fork 惰性种子世界书失败: {e}")))?;
-        }
-    }
-
-    let mut dto = CampaignSummaryDto::from(&campaign);
-    dto.instance_count = instance_count;
-    Ok(dto)
+    storage.fork_campaign_snapshot(conv_store, &source_campaign_id, &fork_node_id, name)
 }
 
 #[tauri::command]

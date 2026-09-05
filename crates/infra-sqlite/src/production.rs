@@ -1391,6 +1391,19 @@ pub(crate) fn write_turn(tx: &Transaction<'_>, turn: &TurnRecord) -> Result<()> 
     Ok(())
 }
 
+/// Insert a terminal audit journal inside a caller-owned snapshot transaction.
+pub fn import_terminal_turn(tx: &Transaction<'_>, turn: &TurnRecord) -> Result<()> {
+    if !turn.status.is_terminal() {
+        return Err(SqliteError::Validation(
+            "snapshot contains an active turn".into(),
+        ));
+    }
+    if load_validated_turn(tx, &turn.turn_id)?.is_some() {
+        return Err(SqliteError::Conflict("snapshot turn already exists".into()));
+    }
+    write_turn(tx, turn)
+}
+
 fn write_instance(tx: &Transaction<'_>, instance: &CharacterInstance) -> Result<()> {
     tx.execute(
         r#"

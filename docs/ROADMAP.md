@@ -217,6 +217,8 @@
 
 本 ROADMAP 的阶段划分止于 Phase 8（前端重构，已完成）。Phase 8 之后的演进不再以本文阶段推进，当前状态与后续入口见：
 
-- `docs/HANDOFF.md` —— 权威交接文档（SQLite 生产后端 Gate 7、发布 CI、Card Studio、card-shell、MVU 等进展）。
-- `docs/workstreams/` —— 活跃专线（release / SQLite / card-shell / CoT 等）。
-- `docs/DOCS-CODE-AUDIT.md` —— 代码事实权威（含 2026-09-01 增量）。
+- `docs/RELEASE-STATUS.md` —— 当前候选的发布范围、门禁和未闭合事项（2026-09-05 起）。
+- `docs/ARCHITECTURE.md` —— 当前代码边界，包括 SQLite 默认后端、三种主界面生成模式、v3 快照和历史保护。
+- `docs/RELEASE-CHECKLIST.md` —— 验收方法和按日期保留的历史记录。
+
+`HANDOFF.md`、`DOCS-CODE-AUDIT.md` 和 `workstreams/` 是本地内部过程材料，公开仓库不保证提供。不要因早期阶段标记完成而把当前候选、真机或第三方插件验收自动视为通过。

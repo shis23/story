@@ -3,17 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <meta name="theme-color" content="#f6f3ec" />
+    <meta name="theme-color" content="#f4f6f8" />
     <title>StoryForge</title>
     <script>
       (function () {
         try {
-          // 默认浅色「纸上编辑部」；用户切换后记 localStorage（夜读深色为 'dark'）
-          var t = localStorage.getItem('storyforge-theme') || 'light';
-          if (t === 'dark') {
-            document.documentElement.classList.add('dark');
-            document.querySelector('meta[name="theme-color"]').setAttribute('content', '#1b1712');
-          }
+          var root = document.documentElement;
+          var t = localStorage.getItem('storyforge-theme') === 'dark' ? 'dark' : 'light';
+          var p = localStorage.getItem('storyforge-palette');
+          root.classList.toggle('dark', t === 'dark');
+          root.dataset.palette = ['teal', 'blue', 'rose', 'classic'].indexOf(p) >= 0 ? p : 'teal';
+          root.style.colorScheme = t;
         } catch (e) {}
       })();
     </script>

@@ -1,32 +1,38 @@
 import { ref, watch } from 'vue'
+import { PALETTE_OPTIONS, readThemePreferences, writeThemePreferences } from './themePreferences.js'
 
-const STORAGE_KEY = 'storyforge-theme'
-// 默认浅色「纸上编辑部」；用户切换后记住选择（夜读深色存为 'dark'）
-const theme = ref(localStorage.getItem(STORAGE_KEY) || 'light')
+const initial = readThemePreferences()
+const theme = ref(initial.theme)
+const palette = ref(initial.palette)
 
-// 应用到 <html> + 同步手机状态栏配色
-function applyTheme(t) {
+function applyTheme() {
+  if (typeof document === 'undefined') return
   const root = document.documentElement
-  if (t === 'dark') root.classList.add('dark')
-  else root.classList.remove('dark')
-  // 手机浏览器顶栏配色跟着主题变
+  root.classList.toggle('dark', theme.value === 'dark')
+  root.dataset.palette = palette.value
+  root.style.colorScheme = theme.value
+  // Read the active CSS token so browser chrome cannot drift from the palette.
   const meta = document.querySelector('meta[name="theme-color"]')
-  if (meta) meta.setAttribute('content', t === 'dark' ? '#1b1712' : '#f6f3ec')
+  const background = getComputedStyle(root).getPropertyValue('--color-bg').trim()
+  if (meta && background) meta.setAttribute('content', background)
 }
 
-// 初始化时立即应用（与 index.html 内联脚本呼应，双保险）
-applyTheme(theme.value)
+applyTheme()
 
-// 注册一次 watcher，避免每次 useTheme() 调用重复注册
-watch(theme, (t) => {
-  applyTheme(t)
-  localStorage.setItem(STORAGE_KEY, t)
-})
+// One application-wide subscription, independent of sidebar visibility.
+watch([theme, palette], () => {
+  applyTheme()
+  writeThemePreferences({ theme: theme.value, palette: palette.value })
+}, { flush: 'sync' })
 
 export function useTheme() {
   function toggle() {
     theme.value = theme.value === 'dark' ? 'light' : 'dark'
   }
 
-  return { theme, toggle }
+  function setPalette(value) {
+    if (PALETTE_OPTIONS.some(option => option.id === value)) palette.value = value
+  }
+
+  return { theme, palette, palettes: PALETTE_OPTIONS, toggle, setPalette }
 }

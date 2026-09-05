@@ -79,6 +79,7 @@ export function useMessageVariants(options = {}) {
   const beginPromptHookGeneration = options.beginPromptHookGeneration || (() => 0)
   const regenerateApi = options.regenerateApi || apiRegenerate
   const editVariantApi = options.editVariantApi || apiEditVariant
+  const addVariantApi = options.addVariantApi || apiAddVariant
   const acceptVariantApi = options.acceptVariantApi || apiAcceptVariant
   const getActiveTurnReceiptApi = options.getActiveTurnReceiptApi || apiGetActiveTurnReceipt
   const retryActiveTurnPostprocessApi =
@@ -195,8 +196,8 @@ export function useMessageVariants(options = {}) {
   }
 
   // 来源 App.vue:888-903 handleEditVariant
-  // 返回 true/false（事件链单监听时 Promise 会回传到 MessageItem.saveEdit，
-  // false = 保持编辑器打开）；链路未回传时按成功处理（维持旧行为）。
+  // 返回 true/false（由 saveVariant Promise 回调传给 MessageItem.saveEdit，
+  // false = 保持编辑器打开）；只有明确返回 true 才退出编辑。
   async function handleEditVariant({ nodeId, newContent }) {
     if (!campaignStore.currentConversationId) return false
     try {
@@ -465,7 +466,7 @@ export function useMessageVariants(options = {}) {
   async function handleAddVariant({ nodeId }) {
     if (!campaignStore.currentConversationId) return
     try {
-      const newIndex = await apiAddVariant(campaignStore.currentConversationId, nodeId, '', null)
+      const newIndex = await addVariantApi(campaignStore.currentConversationId, nodeId, '', null)
       const msg = writingStore.messages.find((m) => m.id === nodeId)
       if (msg) {
         msg.variants.push({

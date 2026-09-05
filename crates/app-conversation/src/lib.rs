@@ -40,6 +40,9 @@ pub enum ConversationError {
     #[error("变体已被丢弃，无法采纳")]
     VariantDiscarded,
 
+    #[error("已采纳历史不能直接修改，请从已提交末尾创建分支")]
+    CommittedHistory,
+
     #[error("external conversation storage error: {0}")]
     ExternalStorage(String),
 }
@@ -52,6 +55,39 @@ pub trait ConversationPersistence: Send + Sync {
     fn load_all(&self) -> Result<Vec<Conversation>, ConversationError>;
     fn save(&self, conversation: &Conversation) -> Result<(), ConversationError>;
     fn delete(&self, id: &Id) -> Result<(), ConversationError>;
+}
+
+fn validate_committed_prefix(
+    original: &Conversation,
+    updated: &Conversation,
+) -> Result<(), ConversationError> {
+    if original.campaign_id.is_none() {
+        return Ok(());
+    }
+    // A lone greeting is still setup. Once writing starts, it becomes part of
+    // the history prefix and can no longer be changed independently.
+    if original.nodes.len() == 1
+        && original.nodes[0]
+            .variants
+            .iter()
+            .all(|v| v.provenance.is_none())
+    {
+        return Ok(());
+    }
+    if let Some(last) = original.nodes.iter().rposition(|node| {
+        node.variants
+            .iter()
+            .any(|v| v.role == Role::Assistant && v.status == VariantStatus::Final)
+    }) {
+        let prefix = updated
+            .nodes
+            .get(..=last)
+            .ok_or(ConversationError::CommittedHistory)?;
+        if serde_json::to_value(prefix)? != serde_json::to_value(&original.nodes[..=last])? {
+            return Err(ConversationError::CommittedHistory);
+        }
+    }
+    Ok(())
 }
 
 // ─── 对话存储（对应设计 §11.3 data/conversations/）─────────────────────────
@@ -196,6 +232,12 @@ impl ConversationStore {
         };
         let mutated = cache[position].clone();
 
+        // Text and variant selection before the committed head belong to the
+        // same state snapshot, including the user intents that produced it.
+        if let Err(error) = validate_committed_prefix(&original, &mutated) {
+            cache[position] = original;
+            return Err(error);
+        }
         if let Err(error) = self.persist(&mutated) {
             cache[position] = original;
             if self.persistence.is_some() {
@@ -244,6 +286,38 @@ impl ConversationStore {
         let mut cache = self.lock_cache();
         cache.push(conv.clone());
         Ok(conv)
+    }
+
+    /// Insert an imported conversation without replacing an existing identity.
+    pub fn insert_persisted(&self, conversation: Conversation) -> Result<(), ConversationError> {
+        self.ensure_loaded()?;
+        let mut cache = self.lock_cache();
+        if cache.iter().any(|c| c.id == conversation.id) {
+            return Err(ConversationError::ExternalStorage(
+                "conversation already exists".into(),
+            ));
+        }
+        self.persist(&conversation)?;
+        cache.push(conversation);
+        Ok(())
+    }
+
+    pub fn replace_checked(
+        &self,
+        expected: &Conversation,
+        replacement: Conversation,
+    ) -> Result<(), ConversationError> {
+        self.with_conversation_mut(&expected.id, |current| {
+            if current.id != replacement.id
+                || serde_json::to_value(&*current)? != serde_json::to_value(expected)?
+            {
+                return Err(ConversationError::ExternalStorage(
+                    "conversation changed; reload before retrying".into(),
+                ));
+            }
+            *current = replacement;
+            Ok(())
+        })
     }
 
     /// 获取对话列表（摘要，card_name 由 Tauri 层联查填充）
@@ -969,6 +1043,73 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("storyforge_test_conv_{}", uuid::Uuid::new_v4()));
         ConversationStore::new(dir)
+    }
+
+    #[test]
+    fn setup_greeting_can_change_until_story_starts() {
+        let store = temp_store();
+        let conv = store.create_persisted(None, Some(Id::new())).unwrap();
+        let opening = store
+            .append_final_message(&conv.id, Role::Assistant, "Opening".into())
+            .unwrap();
+        store
+            .edit_variant(&conv.id, &opening, "Chosen opening".into())
+            .unwrap();
+        store.append_user_message(&conv.id, "Begin".into()).unwrap();
+        assert!(matches!(
+            store.edit_variant(&conv.id, &opening, "Late change".into()),
+            Err(ConversationError::CommittedHistory)
+        ));
+    }
+
+    #[test]
+    fn committed_campaign_prefix_is_immutable_through_all_edit_paths() {
+        for store in [
+            temp_store(),
+            ConversationStore::with_persistence(Arc::new(MemoryPersistence::default())),
+        ] {
+            let conv = store.create_persisted(None, Some(Id::new())).unwrap();
+            let intent = store
+                .append_user_message(&conv.id, "Intent".into())
+                .unwrap();
+            let node = store
+                .append_ai_draft(&conv.id, "First".into(), None)
+                .unwrap();
+            store
+                .add_variant(&conv.id, &node, "Second".into(), None)
+                .unwrap();
+            store.accept_variant(&conv.id, &node).unwrap();
+            let before = serde_json::to_value(store.get(&conv.id)).unwrap();
+            for result in [
+                store
+                    .add_variant(&conv.id, &node, "Unexpected".into(), None)
+                    .map(|_| ()),
+                store.switch_variant(&conv.id, &node, 0),
+                store.edit_variant(&conv.id, &node, "Unexpected".into()),
+                store.edit_variant(&conv.id, &intent, "Unexpected intent".into()),
+                store.edit_variant_with_provenance(&conv.id, &node, "Unexpected".into(), None),
+                store
+                    .replace_active_variant(&conv.id, &node, "Unexpected".into(), None)
+                    .map(|_| ()),
+                store.soft_delete_variant(&conv.id, &node),
+                store.truncate_from(&conv.id, &node),
+            ] {
+                assert!(matches!(result, Err(ConversationError::CommittedHistory)));
+            }
+            assert_eq!(serde_json::to_value(store.get(&conv.id)).unwrap(), before);
+            store.invalidate();
+            assert_eq!(serde_json::to_value(store.get(&conv.id)).unwrap(), before);
+            let pending = store
+                .append_ai_draft(&conv.id, "Next draft".into(), None)
+                .unwrap();
+            store
+                .edit_variant(&conv.id, &pending, "Edited draft".into())
+                .unwrap();
+            store
+                .add_variant(&conv.id, &pending, "Alternate draft".into(), None)
+                .unwrap();
+            store.switch_variant(&conv.id, &pending, 0).unwrap();
+        }
     }
 
     #[test]

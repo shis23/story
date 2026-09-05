@@ -5,7 +5,8 @@
  * 过程（导演/子Agent）默认收成一行状态条；成文正文是唯一主角。
  * contentComponent 由 adapter 注入（生产 = RichContent）。
  */
-import { ref, computed } from 'vue'
+import { ref, computed, useId } from 'vue'
+import { ChevronDown } from '@lucide/vue'
 
 const props = defineProps({
   pipeline: { type: Object, required: true },
@@ -15,6 +16,7 @@ const props = defineProps({
 })
 
 const showProcess = ref(false)
+const detailId = useId()
 
 const editorOutput = computed(() => props.pipeline.editor?.output || '')
 const visibleStage = (stage) => stage && !['idle', 'pending'].includes(stage.status)
@@ -62,7 +64,7 @@ function paragraphs(text) {
 <template>
   <article class="py-5">
     <header class="flex items-center gap-2 mb-2">
-      <span class="text-xs font-medium tracking-wide text-accent">{{ roleLabel }}</span>
+      <span class="min-w-0 truncate text-xs font-medium text-accent">{{ roleLabel }}</span>
       <span class="flex items-center gap-1.5 text-[11px] text-running">
         <span class="w-1.5 h-1.5 rounded-full bg-running animate-pulse"></span>生成中
       </span>
@@ -70,20 +72,25 @@ function paragraphs(text) {
       <button
         type="button"
         @click="showProcess = !showProcess"
+        :aria-expanded="showProcess"
+        :aria-controls="detailId"
         class="ml-auto flex items-center gap-1.5 min-h-7 px-2 rounded-md text-[11px] text-ink-faint hover:text-ink-soft hover:bg-surface-2 transition-colors"
       >
         <span class="flex items-center gap-1">
           <span v-for="s in steps" :key="s.key" class="w-1.5 h-1.5 rounded-full" :class="dotClass(s.status)"></span>
         </span>
         过程 {{ steps.filter((s) => s.status === 'done').length }}/{{ steps.length }}
-        <svg
-          width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+        <ChevronDown
+          :size="12" aria-hidden="true"
           class="transition-transform duration-150" :class="showProcess ? 'rotate-180' : ''"
-        ><path d="M6 9l6 6 6-6"/></svg>
+        />
       </button>
     </header>
 
-    <div v-if="showProcess" class="mb-3 rounded-lg border border-line bg-surface/70 divide-y divide-line overflow-hidden">
+    <Transition name="sf-disclosure">
+    <div v-if="showProcess" :id="detailId">
+    <div class="sf-disclosure-body">
+    <div class="mb-3 rounded-lg border border-line bg-surface/70 divide-y divide-line overflow-hidden">
       <div v-for="s in steps" :key="s.key" class="flex items-center gap-2 px-3 py-2 text-xs">
         <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="dotClass(s.status)"></span>
         <span class="text-ink">{{ s.label }}</span>
@@ -91,6 +98,9 @@ function paragraphs(text) {
         <span class="text-ink-faint truncate">{{ s.detail || '' }}</span>
       </div>
     </div>
+    </div>
+    </div>
+    </Transition>
 
     <div class="prose-fiction text-[15.5px] text-ink">
       <component

@@ -27,6 +27,7 @@
 | `messages` | `writingStore.messages` |
 | `isWriting` / `pipeline` / `showPipeline` / `streamingRoleLabel` | writing store |
 | `canBranch` | campaign 模式 + activeCampaign + conversationId |
+| `saveVariant` | `handleEditVariant(payload): Promise<boolean>`，贯穿 WritingScreen / StoryPage / MessageItem |
 | `greetingOptions` | `canChooseGreeting` 时才传 |
 | `composerDisabled` / `composerPlaceholder` | writingMode |
 | `qualityAcceptHint` | pipeline.quality 派生 |
@@ -47,11 +48,13 @@
 ## 生产接线决策（已落地）
 
 1. RichContent 由 adapter 注入，design 不 import 功能层。
-2. 删除前 adapter 调 tauri `ask`；无 dialog 环境（测试）直接删。
+2. 删除前 adapter 调 tauri `ask`，明确包含后续消息及同轮输入；确认失败不执行删除。测试可注入 `askDialog`。
 3. 重 roll 三级菜单在 MessageItem 内联实现。
 4. `scrollToBottom` 由 WritingScreen expose，AppV2 转发。
 5. Composer 已并入 WritingScreen；AppShell `#composer` 槽可空。
 6. 旧 `components-v2/writing/*` 保留作对照与回退，生产主路径不再引用 Viewport/Composer。
+7. 保存不是 Vue emit 事件，只有 `saveVariant` 回调明确返回 `true` 才退出编辑；返回 `false` 或拒绝时保留输入。
+8. `add-variant` 必须传 `{ nodeId }`；分支只在已采纳末尾显示，后端独立验证并拒绝活动轮次和历史节点。
 
 ## 验收
 

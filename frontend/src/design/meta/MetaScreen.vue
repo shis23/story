@@ -29,7 +29,7 @@ defineEmits(['close', 'change-tab'])
 
 <template>
   <div class="h-full w-full min-w-0 flex flex-col bg-bg">
-    <header class="shrink-0 h-14 px-4 border-b border-line bg-surface flex items-center gap-3 min-w-0">
+    <header class="sf-toolbar px-4 border-b border-line bg-surface flex items-center gap-3">
       <div class="min-w-0 flex-1">
         <div class="text-[11px] text-ink-faint">Meta 助手</div>
         <h1 class="text-sm font-semibold text-ink truncate">
@@ -38,7 +38,7 @@ defineEmits(['close', 'change-tab'])
       </div>
       <button
         type="button"
-        class="shrink-0 min-h-8 w-8 rounded-md text-ink-faint hover:bg-surface-2 hover:text-ink transition-colors"
+        class="sf-toolbar-icon transition-colors"
         title="关闭"
         aria-label="关闭"
         @click="$emit('close')"

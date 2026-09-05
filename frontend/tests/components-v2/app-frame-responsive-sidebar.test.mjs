@@ -20,6 +20,7 @@ function setViewportWidth(width) {
 
 function mountFrame(sidebarOpen = false) {
   const wrapper = mount(AppFrame, {
+    attachTo: document.body,
     props: { sidebarOpen },
     slots: { sidebar: h(SidebarProbe) },
   })
@@ -62,6 +63,27 @@ describe('AppFrame responsive sidebar mounting', () => {
 
     expect(sidebarMounts).toBe(1)
     expect(wrapper.findAll('[data-testid="sidebar-probe"]')).toHaveLength(1)
+  })
+
+  it('honors desktop collapse without unmounting the sidebar runtime', async () => {
+    setViewportWidth(1280)
+    const wrapper = mountFrame(false)
+    expect(wrapper.get('aside').isVisible()).toBe(true)
+    await wrapper.setProps({ sidebarCollapsed: true })
+    expect(wrapper.get('aside').isVisible()).toBe(false)
+    expect(wrapper.get('aside').attributes('inert')).toBeDefined()
+    await wrapper.setProps({ sidebarCollapsed: false })
+    expect(wrapper.get('aside').isVisible()).toBe(true)
+    expect(sidebarMounts).toBe(1)
+  })
+
+  it('clears a stale mobile drawer when the window becomes narrow again', async () => {
+    setViewportWidth(1280)
+    const wrapper = mountFrame(true)
+    setViewportWidth(480)
+    window.dispatchEvent(new Event('resize'))
+    await nextTick()
+    expect(wrapper.emitted('update:sidebarOpen')).toEqual([[false]])
   })
 
   it('does not recreate a sidebar runtime while crossing the responsive breakpoint', async () => {

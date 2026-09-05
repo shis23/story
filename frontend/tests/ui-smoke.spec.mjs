@@ -261,3 +261,45 @@ test('opens the mocked Tauri app and visible panels', async ({ page }) => {
     'list_plugins',
   ]))
 })
+
+test('campaign title and summaries remain readable at desktop and narrow widths', async ({ page }) => {
+  const title = 'ArchitectureReviewCampaignWithAnUnbrokenLongName'
+  const summary = 'A complete summary remains readable across the available width. '.repeat(8)
+  await page.addInitScript(({ title, summary }) => {
+    const invoke = window.__TAURI_INTERNALS__.invoke
+    const campaign = {
+      id: 'layout-campaign', card_id: 'layout-card', name: title,
+      instance_count: 0, conversation_id: 'layout-conversation', story_clock: 'Day 1',
+    }
+    window.__TAURI_INTERNALS__.invoke = (command, args) => {
+      const values = {
+        list_cards: [{ id: 'layout-card', name: 'Layout card', source_character_id: 'layout-source', character_count: 1 }],
+        list_campaigns: [campaign],
+        get_campaign: campaign,
+        list_round_summaries: [{ id: 'layout-summary', turn: 1, content: summary, created_at: '2026-09-05T00:00:00Z' }],
+        list_tasks: [],
+        list_character_knowledge: [],
+      }
+      return command in values ? Promise.resolve(values[command]) : invoke(command, args)
+    }
+  }, { title, summary })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Campaign 管理' }).click()
+  const campaignButton = page.getByRole('button', { name: new RegExp(title) })
+  if (await campaignButton.isVisible()) await campaignButton.click()
+  await expect(page.getByRole('heading', { name: title, exact: true, level: 2 })).toBeVisible()
+  await page.getByRole('button', { name: '总结', exact: true }).click()
+  await expect(page.getByText(summary, { exact: true }).last()).toBeVisible()
+  await page.screenshot({ path: `${artifactDir}/campaign-desktop.png`, fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  const heading = page.getByRole('heading', { name: title, exact: true, level: 2 })
+  const actions = page.getByRole('button', { name: '设为当前活动', exact: true })
+  const h = await heading.boundingBox()
+  const a = await actions.boundingBox()
+  expect(h.y + h.height).toBeLessThanOrEqual(a.y)
+  const mobile = page.getByTestId('summary-mobile')
+  await expect(mobile).toBeVisible()
+  expect((await mobile.locator('p').boundingBox()).width).toBeGreaterThan(250)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.screenshot({ path: `${artifactDir}/campaign-narrow.png`, fullPage: true })
+})

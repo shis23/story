@@ -5,7 +5,8 @@
  * 折叠态：一行摘要（步骤数 + 质量状态）。
  * 展开态：横向步骤条（图标圈 + 连接线 + 标签 + 状态），点步骤看 mono 输出。
  */
-import { ref, computed } from 'vue'
+import { ref, computed, useId } from 'vue'
+import { ChevronDown } from '@lucide/vue'
 
 const props = defineProps({
   pipeline: { type: Object, required: true },
@@ -14,6 +15,7 @@ const props = defineProps({
 
 const expanded = ref(false)
 const openKey = ref(null)
+const detailId = useId()
 
 const visibleStage = (stage) => stage && !['idle', 'pending'].includes(stage.status)
 
@@ -87,10 +89,13 @@ function stepInspectable(step) {
 </script>
 
 <template>
-  <section class="rounded-xl border border-line bg-surface shadow-card overflow-hidden">
+  <section class="border-y border-line overflow-hidden">
     <!-- 折叠态：一行摘要 -->
     <button
+      type="button"
       @click="expanded = !expanded"
+      :aria-expanded="expanded"
+      :aria-controls="detailId"
       class="w-full flex items-center gap-2 px-4 min-h-[42px] text-xs text-ink-soft hover:bg-surface-2/60 transition-colors"
     >
       <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="qualityOk ? 'bg-ok' : 'bg-warn'"></span>
@@ -99,11 +104,14 @@ function stepInspectable(step) {
       <span class="hidden sm:inline text-[10px] text-ink-faint">
         {{ modelStageCount }} 个模型阶段<span v-if="ruleStageCount"> · {{ ruleStageCount }} 次规则检查</span>
       </span>
-      <span class="ml-auto text-[11px] text-ink-faint">{{ expanded ? '收起' : '展开' }}</span>
+      <ChevronDown :size="16" aria-hidden="true" class="ml-auto shrink-0 transition-transform" :class="expanded ? 'rotate-180' : ''" />
     </button>
 
     <!-- 展开态：阶段账本。后处理允许并行，因此不再用误导性的单向连接线。 -->
-    <div v-if="expanded" class="border-t border-line px-4 sm:px-6 py-5">
+    <Transition name="sf-disclosure">
+    <div v-if="expanded" :id="detailId">
+    <div class="sf-disclosure-body">
+    <div class="border-t border-line px-4 sm:px-6 py-5">
       <ol class="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
         <li
           v-for="s in steps"
@@ -112,7 +120,7 @@ function stepInspectable(step) {
         >
           <button
             type="button"
-            class="h-full w-full rounded-xl border bg-bg/70 p-3 text-left transition-all"
+            class="h-full w-full rounded-lg border bg-surface p-3 text-left transition-[border-color,background-color]"
             :class="[
               openKey === s.key ? 'border-accent-border shadow-card' : 'border-line',
               stepInspectable(s) ? 'hover:border-accent-border hover:bg-surface-2' : 'cursor-default',
@@ -144,9 +152,12 @@ function stepInspectable(step) {
         class="mt-4 max-h-56 overflow-y-auto rounded-xl border border-line bg-bg/70 p-4 text-ink-soft whitespace-pre-wrap break-words"
         :class="openStep.key === 'editor' ? 'font-serif text-sm leading-7' : 'font-mono text-[11px] leading-relaxed'"
       >
-        <div class="mb-1 text-[10px] font-medium text-ink-faint uppercase tracking-wider">{{ openStep.label }}</div>
+        <div class="mb-1 text-[10px] font-medium text-ink-faint">{{ openStep.label }}</div>
         {{ openStep.output || openStep.detail }}
       </div>
     </div>
+    </div>
+    </div>
+    </Transition>
   </section>
 </template>

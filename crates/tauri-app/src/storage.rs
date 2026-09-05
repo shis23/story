@@ -23,6 +23,21 @@ pub struct CharacterStore {
 }
 
 impl CharacterStore {
+    pub(crate) fn insert(&self, stored: StoredCharacter) -> Result<(), String> {
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if chars.iter().any(|c| {
+            c.id == stored.id
+                || c.info.source_character_id.is_some()
+                    && c.info.source_character_id == stored.info.source_character_id
+        }) {
+            return Err("角色卡源数据已存在".into());
+        }
+        let mut candidate = chars.clone();
+        candidate.push(stored);
+        self.persist(&candidate)?;
+        *chars = candidate;
+        Ok(())
+    }
     /// 初始化存储（从文件加载或新建）
     pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("characters.json");

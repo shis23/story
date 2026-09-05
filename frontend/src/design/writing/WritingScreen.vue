@@ -28,6 +28,7 @@ const props = defineProps({
   showPipeline: { type: Boolean, default: false },
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
+  saveVariant: { type: Function, default: null },
   allowPartialReroll: { type: Boolean, default: true },
   greetingOptions: { type: Array, default: () => [] },
   selectedGreetingIndex: { type: Number, default: 0 },
@@ -54,7 +55,6 @@ const emit = defineEmits([
   'reroll',
   'reroll-user',
   'switch-variant',
-  'edit-variant',
   'accept-variant',
   'retry-postprocess',
   'dismiss-receipt',
@@ -136,6 +136,7 @@ const forward = (name, payload) => emit(name, payload)
             :show-pipeline="showPipeline"
             :streaming-role-label="streamingRoleLabel"
             :can-branch="canBranch"
+            :save-variant="saveVariant"
             :allow-partial-reroll="allowPartialReroll"
             :generation-mode="generationMode"
             :quality-accept-hint="qualityAcceptHint"
@@ -146,7 +147,6 @@ const forward = (name, payload) => emit(name, payload)
             @reroll="forward('reroll', $event)"
             @reroll-user="forward('reroll-user', $event)"
             @switch-variant="forward('switch-variant', $event)"
-            @edit-variant="forward('edit-variant', $event)"
             @accept-variant="forward('accept-variant', $event)"
             @retry-postprocess="forward('retry-postprocess', $event)"
             @dismiss-receipt="forward('dismiss-receipt', $event)"

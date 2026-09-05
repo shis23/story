@@ -54,13 +54,14 @@ async function clearShellCache() {
 
 <template>
   <div class="flex flex-col h-full w-full min-w-0 bg-surface border-l border-line">
-    <div class="shrink-0 h-14 flex items-center justify-between px-4 border-b border-line">
+    <div class="sf-toolbar flex items-center justify-between px-4 border-b border-line">
       <span class="font-semibold text-ink text-sm">调试</span>
       <button
         type="button"
-        class="w-9 h-9 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
+        class="sf-toolbar-icon transition-colors"
         @click="ui.showDebugDrawer = false"
         aria-label="关闭"
+        title="关闭"
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>

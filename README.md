@@ -15,11 +15,14 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 
 ## 当前状态
 
+- 当前源码版本为 `0.1.1`。发布范围、当前验收和未闭合项目统一见 [发布状态](docs/RELEASE-STATUS.md)；历史 PASS 不代表后续工作区改动已验收。
+- 主界面提供续写（默认）、对手戏和顺序剧组三种生成模式；旧并行 `big_scene` 保留为后端兼容模式，不是每轮都运行完整剧组。
 - 多角色 Campaign 写作、重 roll、QualityGate、1× Editor auto-fix、私密知识归属门禁与 Editor redaction 已接入。
+- v3 Campaign Bundle 保存正文、变体、终态轮次、源角色卡和本局状态；它是单局故事快照，不是完整应用备份。已采纳历史不可直接改写，当前仅支持已采纳末尾分支。
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
 - M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），Gate 6 已按决议关闭（关闭非 PASS）。
 - **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
-- 发布脚本、Gitea workflow、导入兼容矩阵和插件兼容矩阵已具备确定性门禁；真实 GUI、Gitea runner、Android 真机和完整生产 Postprocess 证据仍未关闭。
+- 已有 Windows 原生、Android 真机基础流程及顶栏专项记录；完整移动端凭据/写作、当前候选安装包和第三方插件验收仍须分别闭合，不能由浏览器测试替代。
 
 ## 技术栈
 
@@ -46,11 +49,10 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 ```powershell
 cd frontend
 npm ci
-npm run build
-
-cd ..
-cargo tauri dev
+npm run dev
 ```
+
+另开一个终端运行 `cargo tauri dev`，工作目录为 `crates/tauri-app`。Vite 使用端口 `1420`；纯浏览器预览不提供真实 Tauri 后端能力。构建安装包前先在 `frontend` 执行 `npm run build`。
 
 完整确定性门禁：
 
@@ -66,6 +68,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cd frontend
 npm.cmd test
+npm.cmd run test:ui
+npm.cmd run test:csp
+npm.cmd run test:mobile-chrome
+npm.cmd run smoke:ui
 npm.cmd run build
 ```
 
@@ -92,3 +98,4 @@ docs                       当前规格、架构、验收和历史归档
 - [Memory / Context Compiler 规格](docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 - [Prompt / Cache 架构优化记录](docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md)
 - [发布检查清单](docs/RELEASE-CHECKLIST.md)
+- [当前发布状态](docs/RELEASE-STATUS.md)

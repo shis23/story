@@ -76,13 +76,15 @@ describe('writing pipeline presentation', () => {
     for (const shortcut of ['润色', '扩写', '改写', '总结']) {
       expect(wrapper.text()).not.toContain(shortcut)
     }
-    expect(shell.classes()).toContain('rounded-xl')
+    expect(wrapper.classes()).toContain('rounded-lg')
+    expect(shell.classes().some(name => name.startsWith('rounded'))).toBe(false)
     expect(shell.classes()).toContain('mb-3')
     expect(shell.classes()).not.toContain('border')
-    expect(shell.classes()).not.toContain('border-line')
+    expect(shell.classes()).toContain('border-t')
     expect(textarea.classes()).toContain('composer-textarea')
     expect(textarea.classes()).toContain('border-0')
     expect(textarea.attributes('aria-label')).toBe('写作意图')
     expect(textarea.attributes('placeholder')).toBe('描述下一步想写什么…')
+    expect(wrapper.findAll('[aria-pressed="true"]')).toHaveLength(1)
   })
 })

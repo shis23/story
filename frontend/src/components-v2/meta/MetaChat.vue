@@ -189,7 +189,7 @@ function patchProposalResult(msg) {
     </div>
 
     <!-- 输入条：固定在对话区底部（= 抽屉底） -->
-    <div class="shrink-0 border-t border-line bg-surface p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+    <div class="shrink-0 border-t border-line bg-surface p-3">
       <div class="flex gap-2 items-end">
         <Input
           v-model="userInput"

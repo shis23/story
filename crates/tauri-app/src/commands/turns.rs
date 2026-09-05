@@ -758,8 +758,8 @@ pub(crate) fn delete_message_from(
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
-        .conv_store
-        .truncate_from(&conv_id, &nid)
+        .turn_workflow
+        .delete_uncommitted_history(&conv_id, &nid)
         .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 

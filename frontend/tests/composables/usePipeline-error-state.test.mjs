@@ -41,6 +41,34 @@ test('cancelWriting failure surfaces in stateLabel instead of being swallowed', 
   assert.match(writing.pipeline.stateLabel, /无运行中的流水线/)
 })
 
+test('Tauri cancelled DTO stops writing without an error banner', async () => {
+  const { writing, campaign } = setupStores()
+  campaign.activeCampaign = { id: 'campaign-1', name: 'Test' }
+  campaign.currentConversationId = 'conversation-1'
+  writing.activeConnection = { id: 'conn-1' }
+  const { startWriting } = useWriting({
+    startWritingApi: async () => { throw { type: 'cancelled' } },
+  })
+  await startWriting('Continue')
+  assert.equal(writing.pipeline.state, 'idle')
+  assert.equal(writing.pipeline.stateLabel, '已停止')
+  assert.equal(writing.isWriting, false)
+  assert.equal(writing.showPipeline, false)
+})
+
+test('late cancel acknowledgement does not overwrite the terminal stopped label', async () => {
+  const { writing } = setupStores()
+  writing.isWriting = true
+  const { cancelWriting } = useWriting({
+    cancelWritingApi: async () => {
+      writing.isWriting = false
+      writing.pipeline.stateLabel = '已停止'
+    },
+  })
+  await cancelWriting()
+  assert.equal(writing.pipeline.stateLabel, '已停止')
+})
+
 test('startWriting success does not overwrite an error state set by the event stream', async () => {
   const { writing, campaign } = setupStores()
   campaign.activeCampaign = { id: 'campaign-1', name: '测试档案' }

@@ -390,7 +390,10 @@ async function handleExportBundle() {
     }
     const data = new TextEncoder().encode(json)
     const ok = await saveFileViaDialog('campaign-bundle.json', data)
-    exportStatus.value = ok ? 'Bundle 导出完成' : '已取消'
+    const hasHistory = JSON.parse(json).format_version >= 3
+    exportStatus.value = ok
+      ? (hasHistory ? '故事快照已导出（不含凭据、插件和外部资源文件）' : '状态交换包已导出（不含正文，不可用作完整故事备份）')
+      : '已取消'
   } catch (e) {
     exportStatus.value = '导出失败: ' + errorText(e)
   } finally {
@@ -431,7 +434,8 @@ async function handleImportBundle() {
     selectedCampaignId.value = result.campaign_id
     await handleSetActive(result.campaign_id)
     activeTab.value = 'detail'
-    const message = `导入完成：${result.instance_count} 个角色，${result.knowledge_count} 条知识`
+    const message = [`导入完成：${result.instance_count} 个角色，${result.knowledge_count} 条知识`,
+      ...(result.warnings || [])].join(' ')
     importStatus.value = message
     exportStatus.value = message
   } catch (e) {

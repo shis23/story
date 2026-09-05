@@ -21,7 +21,7 @@ const sizeClass = {
 }
 function classes() {
   return [
-    'inline-flex items-center justify-center gap-1.5 transition-colors duration-150 select-none',
+    'sf-command inline-flex items-center justify-center gap-1.5 select-none',
     'disabled:opacity-40 disabled:cursor-not-allowed',
     variantClass[props.variant] || variantClass.default,
     sizeClass[props.size] || sizeClass.md,

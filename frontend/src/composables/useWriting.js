@@ -19,7 +19,7 @@
 import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
 import { useUiStore } from '../stores/ui.js'
-import { errorText } from '../utils/errorText.js'
+import { errorText, isCancelledError } from '../utils/errorText.js'
 import {
   startWriting as apiStartWriting,
   cancelWriting as apiCancelWriting,
@@ -196,7 +196,7 @@ export function useWriting(options = {}) {
         writingStore.messages = writingStore.messages.filter((m) => m.id !== userMsgId)
       }
       writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
-      const cancelled = isPromptHookCancelledError(err)
+      const cancelled = isCancelledError(err) || isPromptHookCancelledError(err)
       if (cancelled) writingStore.showPipeline = false
       writingStore.pipeline.state = cancelled ? 'idle' : 'error'
       writingStore.pipeline.stateLabel = cancelled ? '已停止' : `失败: ${errorText(err)}`
@@ -215,7 +215,7 @@ export function useWriting(options = {}) {
         console.error('取消 prompt hook 失败:', hookCancelError)
       }
       await cancelWritingApi()
-      writingStore.pipeline.stateLabel = '正在停止…'
+      if (writingStore.isWriting) writingStore.pipeline.stateLabel = '正在停止…'
     } catch (e) {
       console.error('取消失败:', e)
       // 停止失败必须可见：否则 stateLabel 停留在上一次的文案上，用户无从得知

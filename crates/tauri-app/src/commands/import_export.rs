@@ -24,6 +24,8 @@ pub(crate) const BUNDLE_FORMAT_VERSION: u32 = 2;
 /// StoryForge Campaign 完整 JSON Bundle
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CampaignBundle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime: Option<super::bundle_runtime::BundleRuntime>,
     pub(crate) format_version: u32,
     pub(crate) exported_at: String,
     /// v2 起保留完整 CharacterCard，便于跨设备导入后继续开新档。
@@ -136,13 +138,22 @@ pub(crate) fn read_bundle_disk_snapshot_strict(
     data_dir: &std::path::Path,
     conversations_dir: &std::path::Path,
 ) -> Result<BundleStoreSnapshot, String> {
+    // CampaignStore reads repair the derived story_clock field from variables.
+    // Compare the same canonical representation, while keeping every other
+    // durable field strict (including the authoritative variable itself).
+    let mut campaigns: Vec<storyforge_domain::campaign::Campaign> =
+        serde_json::from_value(read_json_collection_strict::<
+            storyforge_domain::campaign::Campaign,
+        >(&data_dir.join("campaigns.json"))?)
+        .map_err(|e| e.to_string())?;
+    for campaign in &mut campaigns {
+        campaign.repair_story_clock_authority();
+    }
     Ok(BundleStoreSnapshot {
         cards: read_json_collection_strict::<campaign_store::StoredCard>(
             &data_dir.join("cards.json"),
         )?,
-        campaigns: read_json_collection_strict::<storyforge_domain::campaign::Campaign>(
-            &data_dir.join("campaigns.json"),
-        )?,
+        campaigns: value_of(campaigns, "campaigns")?,
         instances: read_json_collection_strict::<storyforge_domain::campaign::CharacterInstance>(
             &data_dir.join("instances.json"),
         )?,
@@ -376,6 +387,7 @@ pub(crate) fn validate_bundle_summary_graph(
 /// StoryForge Campaign Bundle 导入结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignImportResult {
+    pub warnings: Vec<String>,
     pub campaign_id: String,
     pub card_id: String,
     pub conversation_id: String,
@@ -547,6 +559,7 @@ pub(crate) fn export_campaign_bundle_from_store(
     let summaries = store.list_summaries(&camp_id);
 
     let bundle = CampaignBundle {
+        runtime: None,
         format_version: BUNDLE_FORMAT_VERSION,
         exported_at: chrono::Utc::now().to_rfc3339(),
         card: stored_card.as_ref().map(|c| c.card.clone()),
@@ -591,27 +604,54 @@ pub(crate) fn import_campaign_bundle_into_sqlite(
     conv_store: &ConversationStore,
     bundle: CampaignBundle,
 ) -> Result<CampaignImportResult, TauriCommandError> {
-    if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
+    if bundle.format_version == 0 || bundle.format_version > 3 {
         return Err(TauriCommandError::validation(format!(
             "不支持的 Campaign Bundle 版本: {}",
             bundle.format_version
         )));
     }
     validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+    super::bundle_runtime::validate_runtime(&bundle)?;
 
     let rewritten = rewrite_bundle_ids(bundle)?;
+    import_rewritten_bundle_into_sqlite(conv_store, rewritten)
+}
+
+fn bundle_import_warnings(has_runtime: bool) -> Vec<String> {
+    if has_runtime {
+        vec!["已恢复故事快照；向量索引将重建。连接凭据、插件、预设及外部资源文件不在包内。".into()]
+    } else {
+        vec!["旧版状态交换包不含正文与轮次，不能恢复完整故事。请保留原设备数据；源角色卡仅按包内可用资料恢复。".into()]
+    }
+}
+
+pub(crate) fn import_rewritten_bundle_into_sqlite(
+    conv_store: &ConversationStore,
+    rewritten: RewrittenBundle,
+) -> Result<CampaignImportResult, TauriCommandError> {
     let mut campaign = rewritten.campaign;
-    let conversation = storyforge_domain::conversation::Conversation::new(
-        Some(rewritten.card.id.as_str().to_string()),
-        Some(campaign.id.clone()),
-    );
+    let source = rewritten
+        .runtime
+        .as_ref()
+        .map(|r| r.character.clone())
+        .unwrap_or_else(|| super::bundle_runtime::legacy_source(&rewritten.card));
+    let conversation = rewritten
+        .runtime
+        .as_ref()
+        .map(|r| r.conversation.clone())
+        .unwrap_or_else(|| {
+            storyforge_domain::conversation::Conversation::new(
+                Some(source.id.clone()),
+                Some(campaign.id.clone()),
+            )
+        });
     campaign.conversation_id = Some(conversation.id.clone());
     let mut rewritten_summaries = rewritten.rewritten_summaries;
     for summary in &mut rewritten_summaries {
         summary.conversation_id = conversation.id.clone();
     }
 
-    crate::sqlite_runtime::import_campaign_bundle_into_db(
+    crate::sqlite_runtime::import_campaign_bundle_with_runtime_into_db(
         &conversation,
         &rewritten.card,
         &campaign,
@@ -619,6 +659,8 @@ pub(crate) fn import_campaign_bundle_into_sqlite(
         &rewritten.rewritten_knowledge,
         &rewritten.rewritten_tasks,
         &rewritten_summaries,
+        Some((&source, rewritten.runtime.as_ref())),
+        rewritten.reuse_card,
     )
     .map_err(|e| TauriCommandError::storage(format!("导入 Campaign Bundle 失败: {e}")))?;
 
@@ -632,6 +674,7 @@ pub(crate) fn import_campaign_bundle_into_sqlite(
     );
 
     Ok(CampaignImportResult {
+        warnings: bundle_import_warnings(rewritten.runtime.is_some()),
         campaign_id: campaign.id.as_str().to_string(),
         card_id: rewritten.card.id.as_str().to_string(),
         conversation_id: conversation.id.as_str().to_string(),
@@ -642,6 +685,7 @@ pub(crate) fn import_campaign_bundle_into_sqlite(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn import_campaign_bundle_into_store(
     store: &campaign_store::CampaignStore,
     conv_store: &ConversationStore,
@@ -659,6 +703,8 @@ pub(crate) struct RewrittenBundle {
     pub rewritten_knowledge: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>,
     pub rewritten_tasks: Vec<storyforge_domain::story_task::StoryTask>,
     pub rewritten_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    pub runtime: Option<super::bundle_runtime::BundleRuntime>,
+    pub reuse_card: bool,
 }
 
 /// 纯函数：为导入生成全新 ID 并重写全部内部引用（card / campaign /
@@ -668,12 +714,37 @@ pub(crate) struct RewrittenBundle {
 pub(crate) fn rewrite_bundle_ids(
     bundle: CampaignBundle,
 ) -> Result<RewrittenBundle, TauriCommandError> {
+    rewrite_bundle_ids_with_card_policy(bundle, false)
+}
+
+pub(crate) fn rewrite_bundle_ids_with_card_policy(
+    bundle: CampaignBundle,
+    reuse_card: bool,
+) -> Result<RewrittenBundle, TauriCommandError> {
     use std::collections::HashMap;
 
     let old_campaign_id = bundle.campaign.id.clone();
-    let new_card_id = Id::new();
+    let new_card_id = if reuse_card {
+        bundle.campaign.card_id.clone()
+    } else {
+        Id::new()
+    };
     let new_campaign_id = Id::new();
-    let new_source_character_id = Id::new();
+    let new_source_character_id = if reuse_card {
+        bundle
+            .card
+            .as_ref()
+            .ok_or_else(|| TauriCommandError::validation("分支缺少角色卡"))?
+            .source_character_id
+            .clone()
+    } else {
+        Id::new()
+    };
+    let mut history_ids = HashMap::new();
+    history_ids.insert(old_campaign_id.clone(), new_campaign_id.clone());
+    if let Some(id) = bundle.campaign.conversation_id.as_ref() {
+        history_ids.insert(id.clone(), Id::new());
+    }
 
     let mut definition_id_map: HashMap<Id, Id> = HashMap::new();
     let mut card = bundle
@@ -694,14 +765,18 @@ pub(crate) fn rewrite_bundle_ids(
         card.character_definitions
     };
     card.id = new_card_id.clone();
-    card.source_character_id = new_source_character_id;
+    card.source_character_id = new_source_character_id.clone();
     if card.name.trim().is_empty() {
         card.name = bundle.campaign.name.clone();
     }
     card.character_definitions = definitions
         .into_iter()
         .map(|mut def| {
-            let new_id = Id::new();
+            let new_id = if reuse_card {
+                def.id.clone()
+            } else {
+                Id::new()
+            };
             definition_id_map.insert(def.id.clone(), new_id.clone());
             def.id = new_id;
             def.card_id = new_card_id.clone();
@@ -718,11 +793,15 @@ pub(crate) fn rewrite_bundle_ids(
     // This marker describes an in-flight publication in the source store. Its ids
     // are rewritten below and its job/ledger state is not part of Bundle v2.
     campaign.pending_compress_publication = None;
+    campaign.context_epoch = None;
+    campaign.lineage_id = Some(Id::new());
 
     let mut instance_id_map: HashMap<Id, Id> = HashMap::new();
     for instance in &bundle.instances {
         instance_id_map.insert(instance.id.clone(), Id::new());
     }
+    history_ids.extend(instance_id_map.clone());
+    history_ids.extend(definition_id_map.clone());
     let mut rewritten_instances = Vec::with_capacity(bundle.instances.len());
     for mut instance in bundle.instances {
         let Some(new_instance_id) = instance_id_map.get(&instance.id).cloned() else {
@@ -750,7 +829,11 @@ pub(crate) fn rewrite_bundle_ids(
     let mut knowledge_id_map: HashMap<Id, Id> = HashMap::new();
     for entry in &bundle.knowledge {
         knowledge_id_map.insert(entry.id.clone(), Id::new());
+        if let Some(event_id) = &entry.event_id {
+            history_ids.entry(event_id.clone()).or_insert_with(Id::new);
+        }
     }
+    history_ids.extend(knowledge_id_map.clone());
     let mut rewritten_knowledge = Vec::new();
     for mut entry in bundle.knowledge {
         let Some(new_character_id) = instance_id_map.get(&entry.character_id).cloned() else {
@@ -768,6 +851,7 @@ pub(crate) fn rewrite_bundle_ids(
         entry.id = new_entry_id;
         entry.campaign_id = new_campaign_id.clone();
         entry.character_id = new_character_id;
+        entry.event_id = entry.event_id.map(|id| history_ids[&id].clone());
         if let Some(old_source_character) = entry.source_character_id.clone() {
             let Some(new_source_character) = instance_id_map.get(&old_source_character).cloned()
             else {
@@ -793,7 +877,9 @@ pub(crate) fn rewrite_bundle_ids(
 
     let mut rewritten_tasks = Vec::with_capacity(bundle.tasks.len());
     for mut task in bundle.tasks {
-        task.id = Id::new();
+        let id = Id::new();
+        history_ids.insert(task.id.clone(), id.clone());
+        task.id = id;
         task.campaign_id = new_campaign_id.clone();
         let mut related = Vec::with_capacity(task.related_characters.len());
         for old_id in task.related_characters {
@@ -814,6 +900,7 @@ pub(crate) fn rewrite_bundle_ids(
     for summary in &bundle.summaries {
         summary_id_map.insert(summary.id.clone(), Id::new());
     }
+    history_ids.extend(summary_id_map.clone());
     let mut rewritten_summaries = Vec::with_capacity(bundle.summaries.len());
     for mut summary in bundle.summaries {
         let Some(new_summary_id) = summary_id_map.get(&summary.id).cloned() else {
@@ -824,6 +911,7 @@ pub(crate) fn rewrite_bundle_ids(
         };
         summary.id = new_summary_id;
         summary.campaign_id = new_campaign_id.clone();
+        summary.lineage_id = campaign.lineage_id.clone();
         if let Some(old_parent) = summary.covered_by.clone() {
             let Some(new_parent) = summary_id_map.get(&old_parent).cloned() else {
                 return Err(TauriCommandError::validation(format!(
@@ -848,6 +936,22 @@ pub(crate) fn rewrite_bundle_ids(
         rewritten_summaries.push(summary);
     }
 
+    let stored_character_id = bundle.runtime.as_ref().map(|r| r.character.id.clone());
+    let mut runtime = bundle
+        .runtime
+        .map(|runtime| {
+            super::bundle_runtime::rewrite_runtime(
+                runtime,
+                &mut history_ids,
+                &new_source_character_id,
+                campaign.lineage_id.as_ref(),
+            )
+        })
+        .transpose()?;
+    if reuse_card && let Some(runtime) = &mut runtime {
+        runtime.character.id = stored_character_id.expect("runtime source exists");
+        runtime.conversation.character_id = Some(runtime.character.id.clone());
+    }
     Ok(RewrittenBundle {
         old_campaign_id,
         card,
@@ -856,9 +960,12 @@ pub(crate) fn rewrite_bundle_ids(
         rewritten_knowledge,
         rewritten_tasks,
         rewritten_summaries,
+        runtime,
+        reuse_card,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn import_campaign_bundle_into_store_with_after_campaign<F>(
     store: &campaign_store::CampaignStore,
     conv_store: &ConversationStore,
@@ -868,15 +975,71 @@ pub(crate) fn import_campaign_bundle_into_store_with_after_campaign<F>(
 where
     F: FnOnce() -> Result<(), TauriCommandError>,
 {
-    if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
+    import_campaign_bundle_into_store_with_runtime(
+        store,
+        conv_store,
+        bundle,
+        None,
+        after_campaign_saved,
+    )
+}
+
+pub(crate) fn import_campaign_bundle_into_store_with_runtime<F>(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    bundle: CampaignBundle,
+    runtime_stores: Option<(
+        &crate::storage::CharacterStore,
+        &crate::turn_store::TurnStore,
+    )>,
+    after_campaign_saved: F,
+) -> Result<CampaignImportResult, TauriCommandError>
+where
+    F: FnOnce() -> Result<(), TauriCommandError>,
+{
+    if bundle.format_version == 0 || bundle.format_version > 3 {
         return Err(TauriCommandError::validation(format!(
             "不支持的 Campaign Bundle 版本: {}",
             bundle.format_version
         )));
     }
     validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
+    super::bundle_runtime::validate_runtime(&bundle)?;
 
     let rewritten = rewrite_bundle_ids(bundle)?;
+    import_rewritten_bundle_into_store(
+        store,
+        conv_store,
+        rewritten,
+        runtime_stores,
+        after_campaign_saved,
+    )
+}
+
+pub(crate) fn import_rewritten_bundle_into_store<F>(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    rewritten: RewrittenBundle,
+    runtime_stores: Option<(
+        &crate::storage::CharacterStore,
+        &crate::turn_store::TurnStore,
+    )>,
+    after_campaign_saved: F,
+) -> Result<CampaignImportResult, TauriCommandError>
+where
+    F: FnOnce() -> Result<(), TauriCommandError>,
+{
+    if rewritten.runtime.is_some() && runtime_stores.is_none() {
+        return Err(TauriCommandError::validation("正文快照缺少目标存储"));
+    }
+    let source = rewritten
+        .runtime
+        .as_ref()
+        .map(|r| r.character.clone())
+        .unwrap_or_else(|| super::bundle_runtime::legacy_source(&rewritten.card));
+    let runtime = rewritten.runtime;
+    let had_runtime = runtime.is_some();
+    let reuse_card = rewritten.reuse_card;
     let old_campaign_id = rewritten.old_campaign_id;
     let new_card_id = rewritten.card.id.clone();
     let new_campaign_id = rewritten.campaign.id.clone();
@@ -912,8 +1075,16 @@ where
             .delete_campaign(&new_campaign_id)
             .err()
             .map(|error| format!("delete_campaign: {error}"));
-        if let Err(e) = store.delete_card(&new_card_id) {
+        if !reuse_card && let Err(e) = store.delete_card(&new_card_id) {
             errors.push(format!("delete_card: {e}"));
+        }
+        if let Some((characters, turns)) = runtime_stores {
+            if !reuse_card && let Err(e) = characters.delete(&source.id) {
+                errors.push(e);
+            }
+            if let Err(e) = turns.delete_turns_for_campaign(&new_campaign_id) {
+                errors.push(e);
+            }
         }
         if let Some(conversation_id) = created_conversation_id
             && let Err(e) = conv_store.delete(conversation_id)
@@ -959,17 +1130,30 @@ where
     };
 
     let result = (|| {
-        store
-            .save_card(card)
-            .map_err(|e| TauriCommandError::storage(format!("导入角色卡失败: {e}")))?;
+        if !reuse_card {
+            store
+                .save_card(card)
+                .map_err(|e| TauriCommandError::storage(format!("导入角色卡失败: {e}")))?;
+        }
+        if !reuse_card && let Some((characters, _)) = runtime_stores {
+            characters
+                .insert(source.clone())
+                .map_err(TauriCommandError::storage)?;
+        }
 
-        let conversation = conv_store
-            .create_persisted(
-                Some(new_card_id.as_str().to_string()),
-                Some(new_campaign_id.clone()),
-            )
-            .map_err(|e| TauriCommandError::storage(format!("导入对话失败: {e}")))?;
+        let conversation = runtime
+            .as_ref()
+            .map(|r| r.conversation.clone())
+            .unwrap_or_else(|| {
+                storyforge_domain::conversation::Conversation::new(
+                    Some(source.id.clone()),
+                    Some(new_campaign_id.clone()),
+                )
+            });
         created_conversation_id = Some(conversation.id.clone());
+        conv_store
+            .insert_persisted(conversation.clone())
+            .map_err(|e| TauriCommandError::storage(format!("导入对话失败: {e}")))?;
         campaign.conversation_id = Some(conversation.id.clone());
         store
             .save_campaign(campaign)
@@ -1015,6 +1199,17 @@ where
                 }
             }
         }
+        if let Some(runtime) = runtime {
+            store
+                .set_world_info(&new_campaign_id, runtime.world_info)
+                .map_err(TauriCommandError::storage)?;
+            let (_, turns) = runtime_stores.expect("runtime stores checked");
+            for turn in runtime.turns {
+                turns
+                    .create_turn(turn)
+                    .map_err(TauriCommandError::storage)?;
+            }
+        }
 
         tracing::info!(
             "Imported Campaign Bundle {} -> {}",
@@ -1023,6 +1218,7 @@ where
         );
 
         Ok(CampaignImportResult {
+            warnings: bundle_import_warnings(had_runtime),
             campaign_id: new_campaign_id.as_str().to_string(),
             card_id: new_card_id.as_str().to_string(),
             conversation_id: conversation.id.as_str().to_string(),

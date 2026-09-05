@@ -1,5 +1,7 @@
 # StoryForge 发布检查清单
 
+> 当前候选入口：[`RELEASE-STATUS.md`](RELEASE-STATUS.md)（2026-09-05）。本文保留历史日期和原验收结果；旧「待真机」「签名阻塞」或测试数量不得直接代表当前环境。当前 UI 已有真机顶栏专项证据，但 Android 凭据保存缺陷仍需修复和完整生命周期复验。
+
 > 状态：2026-08-05 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`

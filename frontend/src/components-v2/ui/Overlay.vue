@@ -46,14 +46,14 @@ const isOpen = computed({
 const panelWrapperClass = computed(() => {
   switch (props.side) {
     case 'left':
-      return 'fixed left-0 top-0 h-full'
+      return 'fixed left-0 top-0 bottom-0'
     case 'center':
-      return 'fixed inset-0 flex items-center justify-center p-4'
+      return 'sf-dialog-viewport fixed inset-0 flex items-center justify-center'
     case 'full':
       return 'fixed inset-0'
     case 'right':
     default:
-      return 'fixed right-0 top-0 h-full'
+      return 'fixed right-0 top-0 bottom-0'
   }
 })
 
@@ -70,18 +70,21 @@ const panelClass = computed(() => {
     case 'left':
     case 'right':
       // 固定宽：min() 封顶视口；不用 max-w-only 以免内容把壳撑到不同视觉宽度
-      return `${base} h-full ${custom || defaultSideWidth}`
+      return `${base} sf-safe-screen h-full ${custom || defaultSideWidth}`
     case 'center':
-      return `${base} ${custom || defaultCenterWidth} rounded-xl`
+      return `${base} max-h-full ${custom || defaultCenterWidth} rounded-xl`
     case 'full':
-      return `${base} h-full w-full`
+      return `${base} sf-safe-screen h-full w-full`
     default:
-      return `${base} h-full ${custom || defaultSideWidth}`
+      return `${base} sf-safe-screen h-full ${custom || defaultSideWidth}`
   }
 })
 
 const panelTransition = computed(() => {
   switch (props.side) {
+    case 'full':
+      // A full-screen header must cover the previous page from its first frame.
+      return {}
     case 'left':
       return {
         enter: 'transition ease-[cubic-bezier(0.22,1,0.36,1)] duration-200',
@@ -134,21 +137,23 @@ const overlayTransition = {
           <DialogPanel :class="panelClass">
             <div
               v-if="title"
-              class="flex items-center justify-between px-4 py-3 border-b border-line shrink-0"
+              class="sf-toolbar flex items-center justify-between px-4 border-b border-line"
             >
-              <h2 class="text-base font-semibold text-ink">{{ title }}</h2>
+              <h2 class="min-w-0 truncate text-sm font-semibold text-ink">{{ title }}</h2>
               <button
                 type="button"
-                class="text-ink-soft hover:text-ink transition-colors px-1 -mr-1"
+                class="sf-toolbar-icon transition-colors"
                 @click="isOpen = false"
                 aria-label="关闭"
+                title="关闭"
               >
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
               </button>
             </div>
             <div
               v-else-if="showClose"
-              class="absolute right-2 top-2 z-10"
+              class="absolute right-2 z-10"
+              :style="{ top: side === 'center' ? '4px' : 'calc(var(--sf-safe-top) + 4px)' }"
             >
               <button
                 type="button"

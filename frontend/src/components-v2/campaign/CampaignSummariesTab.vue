@@ -63,7 +63,16 @@ defineExpose({ refresh: load })
   <EmptyState v-else-if="summaries.length === 0" title="暂无摘要" />
 
   <template v-else>
-    <DataTable :columns="columns" :rows="summaries" empty-title="暂无摘要">
+    <ul class="sm:hidden divide-y divide-line" data-testid="summary-mobile">
+      <li v-for="row in summaries" :key="row.id" class="py-3">
+        <div class="flex flex-wrap items-center gap-2 mb-2">
+          <Badge variant="accent" size="sm">第 {{ row.turn }} 轮</Badge>
+          <time class="text-[10px] text-ink-soft">{{ formatTime(row.created_at) }}</time>
+        </div>
+        <p class="text-xs text-ink-soft leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{{ row.content }}</p>
+      </li>
+    </ul>
+    <DataTable class="hidden sm:block" :columns="columns" :rows="summaries" empty-title="暂无摘要">
       <template #cell-turn="{ row }">
         <Badge variant="accent" size="sm">第 {{ row.turn }} 轮</Badge>
       </template>

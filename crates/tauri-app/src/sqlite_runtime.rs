@@ -201,6 +201,109 @@ pub fn get_turn_by_variant(variant_id: &Id) -> Result<Option<TurnRecord>, String
     })
 }
 
+fn list_turns_for_campaign_in_db(
+    db: &Database,
+    campaign_id: &Id,
+) -> Result<Vec<TurnRecord>, String> {
+    let mut query = db
+        .connection()
+        .prepare(
+            "SELECT payload_json FROM turns WHERE campaign_id = ?1 ORDER BY created_at, turn_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = query
+        .query_map([campaign_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    })
+    .collect()
+}
+
+pub(crate) fn export_campaign_snapshot(
+    campaign_id: &Id,
+) -> Result<crate::commands::import_export::CampaignBundle, String> {
+    use crate::commands::bundle_runtime::BundleRuntime;
+    use crate::commands::import_export::CampaignBundle;
+    with_db(|db| {
+        // All repository reads use this connection and therefore this one
+        // SQLite read transaction, including writes from other connections.
+        let transaction = db
+            .connection()
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let campaign = SqliteProductionRepository::get_campaign(db, campaign_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Campaign 不存在")?;
+        let turns = list_turns_for_campaign_in_db(db, campaign_id)?;
+        if turns.iter().any(|turn| turn.status.is_active())
+            || campaign.pending_compress_publication.is_some()
+        {
+            return Err("请先结束当前轮次及记忆发布，再导出故事快照".into());
+        }
+        let card = SqliteProductionRepository::get_card_payload(db, &campaign.card_id)
+            .map_err(|e| e.to_string())?
+            .map(serde_json::from_value::<crate::campaign_store::StoredCard>)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .map(|stored| stored.card);
+        let runtime = if let Some(conversation_id) = &campaign.conversation_id {
+            let conversation = SqliteProductionRepository::get_conversation(db, conversation_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("Campaign 正文缺失，拒绝生成不完整快照")?;
+            let card = card.as_ref().ok_or("Campaign 角色卡缺失")?;
+            let character =
+                character_select_by_id_or_source(db, card.source_character_id.as_str())?
+                    .ok_or("源角色卡缺失，拒绝生成不完整快照")?;
+            let world_info = SqliteProductionRepository::get_world_info_payload(db, campaign_id)
+                .map_err(|e| e.to_string())?
+                .map(serde_json::from_value::<storyforge_domain::world_info::WorldInfoBook>)
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| storyforge_domain::world_info::WorldInfoBook {
+                    entries: vec![],
+                    source: storyforge_domain::Source::Native,
+                    metadata: Default::default(),
+                });
+            Some(BundleRuntime {
+                conversation,
+                character,
+                world_info,
+                turns,
+            })
+        } else {
+            None
+        };
+        let bundle = CampaignBundle {
+            format_version: if runtime.is_some() { 3 } else { 2 },
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            definitions: card
+                .as_ref()
+                .map(|card| card.character_definitions.clone())
+                .unwrap_or_default(),
+            runtime,
+            card,
+            campaign,
+            instances: SqliteProductionRepository::list_instances(db, campaign_id)
+                .map_err(|e| e.to_string())?,
+            knowledge: SqliteProductionRepository::list_knowledge(db, campaign_id)
+                .map_err(|e| e.to_string())?,
+            tasks: SqliteProductionRepository::list_tasks(db, campaign_id)
+                .map_err(|e| e.to_string())?,
+            summaries: SqliteProductionRepository::list_summaries(db, campaign_id)
+                .map_err(|e| e.to_string())?,
+        };
+        crate::commands::bundle_runtime::validate_runtime(&bundle).map_err(|e| e.to_string())?;
+        crate::commands::import_export::validate_bundle_summary_graph(
+            &bundle.campaign,
+            &bundle.summaries,
+        )
+        .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(bundle)
+    })
+}
+
 pub fn get_turn(turn_id: &Id) -> Result<Option<TurnRecord>, String> {
     with_db(|db| SqliteProductionRepository::get_turn(db, turn_id).map_err(|e| e.to_string()))
 }
@@ -292,6 +395,18 @@ where
 pub fn save_conversation(conversation: &Conversation) -> Result<(), String> {
     with_db_mut(|db| {
         SqliteProductionRepository::save_conversation(db, conversation).map_err(|e| e.to_string())
+    })
+}
+
+pub fn truncate_uncommitted_history(conversation_id: &Id, node_id: &Id) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::truncate_uncommitted(
+            db,
+            conversation_id,
+            node_id,
+            storyforge_infra_sqlite::preaccept::PreacceptFault::None,
+        )
+        .map_err(|e| e.to_string())
     })
 }
 
@@ -1913,6 +2028,7 @@ pub enum BundleImportFault {
     AfterCard,
     AfterCampaign,
     AfterSummaries,
+    AfterRuntime,
 }
 
 /// Test-only fault injection setter for the bundle import UoW.
@@ -1942,6 +2058,34 @@ pub fn import_campaign_bundle_into_db(
     tasks: &[StoryTask],
     summaries: &[RoundSummary],
 ) -> Result<(), String> {
+    import_campaign_bundle_with_runtime_into_db(
+        conversation,
+        card,
+        campaign,
+        instances,
+        knowledge,
+        tasks,
+        summaries,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn import_campaign_bundle_with_runtime_into_db(
+    conversation: &Conversation,
+    card: &CharacterCard,
+    campaign: &Campaign,
+    instances: &[CharacterInstance],
+    knowledge: &[CharacterKnowledgeEntry],
+    tasks: &[StoryTask],
+    summaries: &[RoundSummary],
+    runtime: Option<(
+        &crate::storage::StoredCharacter,
+        Option<&crate::commands::bundle_runtime::BundleRuntime>,
+    )>,
+    reuse_card: bool,
+) -> Result<(), String> {
     with_db_mut(|db| {
         let tx = db
             .connection_mut()
@@ -1958,7 +2102,8 @@ pub fn import_campaign_bundle_into_db(
             imported_at: imported_at.clone(),
         })
         .map_err(|e| format!("序列化角色卡失败: {e}"))?;
-        tx.execute(
+        if !reuse_card {
+            tx.execute(
             r#"
             INSERT INTO character_cards (card_id, source_character_id, name, imported_at, payload_json)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1972,6 +2117,7 @@ pub fn import_campaign_bundle_into_db(
             ],
         )
         .map_err(|e| format!("导入角色卡失败: {e}"))?;
+        }
         if fault == BundleImportFault::AfterCard {
             return Err("injected failure after bundle card import".to_string());
         }
@@ -2114,6 +2260,32 @@ pub fn import_campaign_bundle_into_db(
             return Err("injected failure after bundle summaries import".to_string());
         }
 
+        if let Some((source, runtime)) = runtime {
+            if !reuse_card {
+                tx.execute(
+                    "INSERT INTO characters (character_id, source_character_id, name, info_json, imported_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![source.id, source.info.source_character_id, source.info.name,
+                        serde_json::to_string(&source.info).map_err(|e| e.to_string())?, source.imported_at],
+                ).map_err(|e| e.to_string())?;
+            }
+            if let Some(runtime) = runtime {
+                tx.execute(
+                    "INSERT INTO campaign_world_info (campaign_id, payload_json) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        campaign.id.as_str(),
+                        serde_json::to_string(&runtime.world_info).map_err(|e| e.to_string())?
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                for turn in &runtime.turns {
+                    storyforge_infra_sqlite::production::import_terminal_turn(&tx, turn)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if fault == BundleImportFault::AfterRuntime {
+            return Err("injected failure after bundle runtime import".into());
+        }
         tx.commit().map_err(|e| format!("导入事务提交失败: {e}"))?;
         Ok(())
     })

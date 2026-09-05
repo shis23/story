@@ -80,6 +80,68 @@ fn quality_report_with_error() -> QualityReport {
     }
 }
 
+#[test]
+fn truncate_draft_atomically_ends_the_turn_and_rolls_back_faults() {
+    let mut f = fixture();
+    let attempt_id = Id::new();
+    let draft = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "Draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    let before = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+    for fault in [
+        PreacceptFault::AfterConversation,
+        PreacceptFault::BeforeCommit,
+    ] {
+        assert!(
+            SqlitePreacceptRepository::truncate_uncommitted(
+                &mut f.db,
+                &f.conversation_id,
+                &draft.variant_id,
+                fault,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id),
+            before
+        );
+    }
+    SqlitePreacceptRepository::truncate_uncommitted(
+        &mut f.db,
+        &f.conversation_id,
+        &draft.variant_id,
+        PreacceptFault::None,
+    )
+    .unwrap();
+    assert!(
+        SqliteProductionRepository::get_active_turn(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_none()
+    );
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Abandoned);
+    assert_eq!(turn.attempts[0].status, AttemptStatus::Discarded);
+    assert!(
+        SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+            .unwrap()
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+}
+
 fn force_committing(db: &mut Database, turn_id: &Id, attempt_id: &Id) {
     let mut turn = SqliteProductionRepository::get_turn(db, turn_id)
         .unwrap()

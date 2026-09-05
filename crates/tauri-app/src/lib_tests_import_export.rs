@@ -48,6 +48,7 @@ fn valid_summary_graph_bundle() -> CampaignBundle {
     b.covers = vec![a1_id, a2_id];
 
     CampaignBundle {
+        runtime: None,
         format_version: BUNDLE_FORMAT_VERSION,
         exported_at: chrono::Utc::now().to_rfc3339(),
         card: None,
@@ -565,6 +566,7 @@ fn import_campaign_bundle_rewrites_ids_and_references() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -723,6 +725,7 @@ fn import_campaign_bundle_is_atomic_on_mid_write_failure() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -1016,6 +1019,7 @@ fn import_campaign_bundle_rejects_unsupported_version_without_mutation() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: 99,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -1242,6 +1246,7 @@ fn import_campaign_bundle_rewrites_summary_covers_and_preserves_bc_graph() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -1375,6 +1380,7 @@ fn import_campaign_bundle_rejects_broken_internal_references() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -1466,6 +1472,7 @@ fn import_campaign_bundle_rollback_is_verified_on_disk() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: Some(card),
@@ -1562,6 +1569,7 @@ fn import_campaign_bundle_rejects_preexisting_corrupt_store_before_any_write() {
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: None,
@@ -1607,6 +1615,7 @@ fn import_campaign_bundle_conversation_create_failure_leaves_no_card_or_campaign
         &store,
         &conv_store,
         CampaignBundle {
+            runtime: None,
             format_version: BUNDLE_FORMAT_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
             card: None,

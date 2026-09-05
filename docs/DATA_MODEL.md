@@ -98,12 +98,22 @@ CompressJob（M4 队列）
 
 ### Campaign fork
 
-`Campaign.fork_from` records `(source_campaign_id, fork_node_id)`. The Tauri
-`fork_campaign` command creates a new Campaign from that source, copies the
-source Campaign variables and `story_clock`, clones the source
-`CharacterInstance` snapshot with fresh instance ids, and creates a new
-conversation copied through the fork node. The source Campaign and source
-conversation remain unchanged.
+`Campaign.fork_from` records `(source_campaign_id, fork_node_id)`. As of
+2026-09-05, `fork_campaign` accepts only the committed conversation head and
+reuses the v3 story-snapshot path. It copies conversation variants, terminal
+turns, instances, variables, knowledge, tasks, summaries and campaign world
+information, remapping internal identity references. The source remains
+unchanged. Arbitrary historical forks and committed-history rollback are not
+supported.
+
+### Campaign Bundle v3
+
+`CampaignBundle.runtime` contains the conversation, original stored character,
+campaign world information and terminal turns. Export requires no active turn;
+import checks ownership and reference scope before publishing the new Campaign.
+Older v1/v2 bundles remain readable but cannot restore complete story history.
+Connections, credentials, plugin installations and external assets are outside
+the snapshot contract; it is not a full application backup.
 
 ## CharacterInstance
 

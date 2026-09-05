@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::card_studio_store::CardStudioStore;
 use crate::error::TauriCommandError;
 use crate::{AppState, CharacterInfo, CharacterSummary};
 use serde::{Deserialize, Serialize};
@@ -17,10 +16,6 @@ use storyforge_domain::character::{
     CharacterCard, CharacterDefinition, CharacterExtractionStatus, StCharacterCard,
 };
 use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
-
-fn get_card_studio_store() -> &'static CardStudioStore {
-    crate::get_card_studio_store()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardProjectSummaryDto {
@@ -75,8 +70,11 @@ pub struct ImportCompiledResultDto {
 }
 
 #[tauri::command]
-pub fn cardstudio_list_projects() -> Vec<CardProjectSummaryDto> {
-    get_card_studio_store()
+pub fn cardstudio_list_projects(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Vec<CardProjectSummaryDto> {
+    state
+        .card_studio_store
         .list()
         .iter()
         .map(CardProjectSummaryDto::from)
@@ -87,13 +85,15 @@ pub fn cardstudio_list_projects() -> Vec<CardProjectSummaryDto> {
 pub fn cardstudio_create_project(
     name: String,
     brief: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(TauriCommandError::validation("项目名不能为空"));
     }
     let project = CardProject::new_from_scratch(name, brief);
-    get_card_studio_store()
+    state
+        .card_studio_store
         .insert(project)
         .map_err(TauriCommandError::storage)
 }
@@ -105,6 +105,7 @@ pub fn cardstudio_create_from_novel(
     brief: String,
     novel_title: String,
     novel_text: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
     let novel_text = novel_text.trim();
     if novel_text.is_empty() {
@@ -126,7 +127,8 @@ pub fn cardstudio_create_from_novel(
         name.trim().to_string()
     };
     let project = CardProject::new_from_novel(name, brief, novel_title, novel_text);
-    get_card_studio_store()
+    state
+        .card_studio_store
         .insert(project)
         .map_err(TauriCommandError::storage)
 }
@@ -175,21 +177,30 @@ pub fn cardstudio_create_from_character(
         Some(stored.id.clone()),
         brief.unwrap_or_default(),
     );
-    get_card_studio_store()
+    state
+        .card_studio_store
         .insert(project)
         .map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
-pub fn cardstudio_get_project(id: String) -> Result<CardProject, TauriCommandError> {
-    get_card_studio_store()
+pub fn cardstudio_get_project(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CardProject, TauriCommandError> {
+    state
+        .card_studio_store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))
 }
 
 #[tauri::command]
-pub fn cardstudio_delete_project(id: String) -> Result<bool, TauriCommandError> {
-    get_card_studio_store()
+pub fn cardstudio_delete_project(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, TauriCommandError> {
+    state
+        .card_studio_store
         .delete(&id)
         .map_err(TauriCommandError::storage)
 }
@@ -198,8 +209,9 @@ pub fn cardstudio_delete_project(id: String) -> Result<bool, TauriCommandError> 
 pub fn cardstudio_update_artifacts(
     id: String,
     artifacts: CardArtifacts,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -215,13 +227,14 @@ pub fn cardstudio_update_artifacts(
 pub fn cardstudio_set_stage(
     id: String,
     stage_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
     if !phase1_stage_ids().contains(&stage_id.as_str()) {
         return Err(TauriCommandError::validation(format!(
             "未知阶段: {stage_id}"
         )));
     }
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -236,8 +249,9 @@ pub fn cardstudio_set_options(
     id: String,
     allow_ai_freewrite: Option<bool>,
     stage_pack_id: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -261,8 +275,12 @@ pub fn cardstudio_set_options(
 }
 
 #[tauri::command]
-pub fn cardstudio_run_checks(id: String) -> Result<CheckReport, TauriCommandError> {
-    let project = get_card_studio_store()
+pub fn cardstudio_run_checks(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CheckReport, TauriCommandError> {
+    let project = state
+        .card_studio_store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     Ok(run_checks(&project.artifacts))
@@ -276,7 +294,7 @@ pub async fn cardstudio_run_review(
     use_llm: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CheckReport, TauriCommandError> {
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -345,8 +363,12 @@ pub async fn cardstudio_run_review(
 }
 
 #[tauri::command]
-pub fn cardstudio_compile(id: String) -> Result<CompilePreviewDto, TauriCommandError> {
-    let project = get_card_studio_store()
+pub fn cardstudio_compile(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CompilePreviewDto, TauriCommandError> {
+    let project = state
+        .card_studio_store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     let compiled = compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
@@ -398,8 +420,12 @@ fn run_export_gate(project: &CardProject) -> Result<ExportGateReportDto, String>
 }
 
 #[tauri::command]
-pub fn cardstudio_export_gate(id: String) -> Result<ExportGateReportDto, TauriCommandError> {
-    let project = get_card_studio_store()
+pub fn cardstudio_export_gate(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ExportGateReportDto, TauriCommandError> {
+    let project = state
+        .card_studio_store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     run_export_gate(&project).map_err(TauriCommandError::validation)
@@ -408,8 +434,12 @@ pub fn cardstudio_export_gate(id: String) -> Result<ExportGateReportDto, TauriCo
 /// 导出编译产物为 ST PNG 卡（与 export_st_card_png 同一 PNG 写入层，
 /// 但源头是 Studio 编译产物而非 CharacterStore 已存卡）。
 #[tauri::command]
-pub fn cardstudio_export_png(id: String) -> Result<Vec<u8>, TauriCommandError> {
-    let project = get_card_studio_store()
+pub fn cardstudio_export_png(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<u8>, TauriCommandError> {
+    let project = state
+        .card_studio_store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     let compiled = compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
@@ -424,8 +454,9 @@ pub fn cardstudio_export_png(id: String) -> Result<Vec<u8>, TauriCommandError> {
 pub fn cardstudio_complete_manual_stage(
     id: String,
     stage_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -483,7 +514,7 @@ pub async fn cardstudio_prefill_from_novel(
     include_style: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardProject, TauriCommandError> {
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -634,7 +665,7 @@ pub async fn cardstudio_run_stage(
         }
     }
 
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
@@ -724,7 +755,7 @@ pub fn cardstudio_import_compiled(
             "import compiled Card Studio character",
         )
         .map_err(TauriCommandError::validation)?;
-    let store = get_card_studio_store();
+    let store = &state.card_studio_store;
     let mut project = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;

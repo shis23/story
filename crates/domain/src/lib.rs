@@ -9,6 +9,7 @@ pub mod character_knowledge;
 pub mod chronicle;
 pub mod conversation;
 pub mod generation;
+pub mod history;
 pub mod llm;
 pub mod message_layout;
 pub mod mvu_translation;

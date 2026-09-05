@@ -22,6 +22,7 @@ const props = defineProps({
   showPipeline: { type: Boolean, default: false },
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
+  saveVariant: { type: Function, default: null },
   allowPartialReroll: { type: Boolean, default: true },
   generationMode: { type: String, default: null },
   qualityAcceptHint: { type: String, default: null },
@@ -36,7 +37,6 @@ const emit = defineEmits([
   'reroll',
   'reroll-user',
   'switch-variant',
-  'edit-variant',
   'accept-variant',
   'retry-postprocess',
   'dismiss-receipt',
@@ -57,6 +57,9 @@ const wordCount = computed(() => {
 
 const status = computed(() => {
   if (props.isWriting) return { text: '生成中', cls: 'text-running border-running/30 bg-running/10', dot: 'bg-running animate-pulse' }
+  if (props.pipeline.state === 'idle' && props.pipeline.stateLabel === '已停止') {
+    return { text: '已停止', cls: 'text-ink-faint border-line bg-surface-2', dot: 'bg-ink-faint' }
+  }
   if (props.messages.length) return { text: '已完成', cls: 'text-ok border-ok/30 bg-ok/10', dot: 'bg-ok' }
   return null
 })
@@ -65,7 +68,6 @@ const messageEvents = {
   'reroll': (p) => emit('reroll', p),
   'reroll-user': (p) => emit('reroll-user', p),
   'switch-variant': (p) => emit('switch-variant', p),
-  'edit-variant': (p) => emit('edit-variant', p),
   'accept-variant': (p) => emit('accept-variant', p),
   'retry-postprocess': (p) => emit('retry-postprocess', p),
   'dismiss-receipt': (p) => emit('dismiss-receipt', p),
@@ -77,15 +79,21 @@ const messageEvents = {
 function rolesFor(message) {
   return props.subagentRolesByMessage[message.id] || []
 }
+
+const branchHeadId = computed(() => {
+  const head = props.messages.findLast((m) => m.variants?.[m.active_variant]?.status !== 'discarded')
+  return head?.role === 'assistant' && head.variants?.[head.active_variant]?.status === 'final'
+    ? head.id : null
+})
 </script>
 
 <template>
   <div class="px-4 sm:px-8 py-6 sm:py-8">
     <div class="mx-auto w-full max-w-[760px] rounded-xl border border-line bg-surface shadow-rise">
-      <header class="px-6 sm:px-12 pt-8 sm:pt-10 pb-2">
-        <div class="flex items-start gap-3">
+      <header class="px-5 sm:px-10 pt-6 sm:pt-8 pb-2">
+        <div class="flex flex-wrap items-start gap-3">
           <div class="flex-1 min-w-0">
-            <h1 class="font-semibold text-[22px] sm:text-[24px] leading-snug text-ink">
+            <h1 class="font-semibold text-xl sm:text-[22px] leading-snug text-ink [overflow-wrap:anywhere]">
               {{ title || '未命名文稿' }}
             </h1>
             <p class="mt-1.5 text-xs text-ink-faint">
@@ -95,6 +103,8 @@ function rolesFor(message) {
           </div>
           <span
             v-if="status"
+            data-testid="story-status"
+            role="status"
             class="shrink-0 mt-1 flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[11px]"
             :class="status.cls"
           >
@@ -103,13 +113,14 @@ function rolesFor(message) {
         </div>
       </header>
 
-      <div class="px-6 sm:px-12 pb-4">
+      <div class="px-5 sm:px-10 pb-4">
         <MessageItem
           v-for="m in messages"
           :key="m.id"
           :message="m"
           :busy="isWriting"
-          :can-branch="canBranch"
+          :can-branch="canBranch && m.id === branchHeadId"
+          :save-variant="saveVariant"
           :allow-partial-reroll="allowPartialReroll"
           :generation-mode="generationMode"
           :quality-accept-hint="qualityAcceptHint"

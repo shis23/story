@@ -21,6 +21,7 @@ export const useUiStore = defineStore('ui', () => {
   const showPluginPanel = ref(false) // App.vue:64
   const showDebugDrawer = ref(false) // App.vue:65
   const showSidebar = ref(false) // App.vue:66 — 移动端左导航抽屉
+  const sidebarCollapsed = ref(false) // Desktop preference, independent of the mobile drawer.
   const showConnConfig = ref(false) // App.vue:340
   const showAgentProfile = ref(false) // AgentProfile 管理面板（Phase 8 补挂,P3-5）
   const showHistory = ref(true) // App.vue:336
@@ -87,6 +88,7 @@ export const useUiStore = defineStore('ui', () => {
     showPluginPanel,
     showDebugDrawer,
     showSidebar,
+    sidebarCollapsed,
     showConnConfig,
     showAgentProfile,
     showHistory,

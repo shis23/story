@@ -1,20 +1,21 @@
 <script setup>
 import { computed } from 'vue'
-import { useTheme } from '../../useTheme.js'
+import { PanelLeftClose, X } from '@lucide/vue'
+import ThemePicker from './ThemePicker.vue'
 import { useUiStore, useWritingStore, useCampaignStore } from '../../stores/index.js'
 
 const ui = useUiStore()
 const writing = useWritingStore()
 const campaign = useCampaignStore()
-const { theme, toggle } = useTheme()
 
-// docked：桌面常驻模式（隐藏关闭按钮）；默认 false（移动端抽屉）
+// Desktop collapse and mobile dismissal are separate from navigation events.
 defineProps({
   docked: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
   'close',
+  'collapse',
   'new-campaign',
   'view-history',
   'open-campaign',
@@ -49,10 +50,6 @@ const iconPaths = {
     '<path d="M20.5 11.5a8 8 0 0 1-8 8 8.2 8.2 0 0 1-3.6-.85L3.5 20.5l1.85-5.4a8 8 0 1 1 15.15-3.6z"/>',
   feather:
     '<path d="M19.7 12.7a5.5 5.5 0 0 0-7.78-7.78L5.5 10.34V18.5h8.16z"/><path d="M15.5 8.5L3 21"/><path d="M17 14.5H9.5"/>',
-  sun:
-    '<circle cx="12" cy="12" r="4"/><path d="M12 2.5V5"/><path d="M12 19v2.5"/><path d="M4.8 4.8l1.8 1.8"/><path d="M17.4 17.4l1.8 1.8"/><path d="M2.5 12H5"/><path d="M19 12h2.5"/><path d="M4.8 19.2l1.8-1.8"/><path d="M17.4 6.6l1.8-1.8"/>',
-  moon:
-    '<path d="M20.5 13.2A8.5 8.5 0 1 1 10.8 3.5a7 7 0 0 0 9.7 9.7z"/>',
 }
 
 // 导航项（事件与顺序对齐原实现；分区仅为视觉分组）
@@ -113,9 +110,9 @@ function clickNew() {
 </script>
 
 <template>
-  <div class="flex flex-col h-full w-full bg-bg">
+  <div class="flex flex-col h-full min-h-0 w-full bg-bg">
     <!-- 品牌区 -->
-    <div class="shrink-0 flex items-center gap-2.5 px-5 h-16 border-b border-line">
+    <div data-sidebar-header class="sf-toolbar flex items-center gap-2.5 px-4 border-b border-line">
       <span class="text-accent" aria-hidden="true">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" v-html="iconPaths.feather"></svg>
       </span>
@@ -124,12 +121,13 @@ function clickNew() {
         <div class="text-[11px] text-ink-faint leading-tight mt-0.5">互动叙事写作台</div>
       </div>
       <button
-        v-if="!docked"
-        class="w-9 h-9 flex items-center justify-center rounded-md text-ink-soft hover:bg-surface-2 transition-colors"
-        @click="emit('close')"
-        aria-label="关闭"
+        type="button"
+        class="sf-toolbar-icon transition-colors"
+        @click="emit(docked ? 'collapse' : 'close')"
+        :aria-label="docked ? '收起侧栏' : '关闭'"
+        :title="docked ? '收起侧栏' : '关闭'"
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        <component :is="docked ? PanelLeftClose : X" :size="18" aria-hidden="true" />
       </button>
     </div>
 
@@ -145,7 +143,7 @@ function clickNew() {
     </div>
 
     <!-- 分区导航 -->
-    <nav class="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+    <nav class="flex-1 min-h-0 overflow-y-auto px-3 py-4 space-y-5">
       <div v-for="section in sections" :key="section.label">
         <div class="px-2.5 pb-1.5 text-[11px] tracking-[0.14em] text-ink-faint select-none">
           {{ section.label }}
@@ -185,16 +183,6 @@ function clickNew() {
     </div>
 
     <!-- 底部：主题切换 -->
-    <div class="shrink-0 border-t border-line p-3">
-      <button
-        class="w-full flex items-center gap-2.5 px-2.5 h-9 rounded-md text-[13px] text-ink-soft hover:text-ink hover:bg-surface-2 transition-colors"
-        @click="toggle"
-      >
-        <span class="shrink-0 opacity-80" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" v-html="theme === 'dark' ? iconPaths.sun : iconPaths.moon"></svg>
-        </span>
-        <span class="flex-1 text-left">{{ theme === 'dark' ? '切换为浅色' : '夜读模式' }}</span>
-      </button>
-    </div>
+    <ThemePicker class="shrink-0 border-t border-line px-3 pt-2 pb-3" />
   </div>
 </template>

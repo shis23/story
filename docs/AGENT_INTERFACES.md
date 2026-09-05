@@ -2,6 +2,17 @@
 
 本文定义 StoryForge 中 Agent 的职责、输入输出和当前缺口。
 
+> 2026-09-05 核对：Campaign 实例隔离和共享 ProductionPostprocessService 已实现。发布证据与剩余项见 `RELEASE-STATUS.md`。
+
+## 生成模式
+
+- `continuation`：主界面默认，单笔者直接续写。
+- `duet`：对手戏，按角色进行多次交互编排。
+- `sequential_crew`：Director 规划、角色按顺序接戏、Editor 合稿。
+- `big_scene`：旧并行剧组，仅保留后端兼容路径。
+
+各模式共用质量检查、后处理和 Turn 采纳约束。以下 Agent 分工图描述完整剧组路径，不代表续写也会调用 Director 和每个角色。
+
 ## Agent 分工
 
 ```text
@@ -48,7 +59,7 @@ User Intent
 - `search_chronicle(query, level?, include_covered?, limit?)` — 搜 **Chronicle A/B/C**（RoundSummary 兼容视图，优先较近）；返回短目录行（code + headline + level + turn_span）；不返回 full；**不含** ArchivedSummary；每轮预算 `DEFAULT_SEARCH_MAX`
 - `get_chronicle(code|id, detail=summary|full)` — A/B/C；**默认 summary**；full 可选；返回 `source_kind`/`turn_span`/`covers`；每轮 summary/full 预算分计
 
-装配进度：**M0–M4.2.2 已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job/publication、共享 Turn Accept 和 SQLite opt-in UoW）。NarrativeContract / ScenePlan 已进入写作与 Gate。**M5 仍为历史 Partial Evidence**：production pipeline 写作与 probe 调用的共享 JSON Turn 生命周期服务已覆盖到 Full 45/100；原始外部 evidence 已清理，且完整 Summarizer/PostProcessor/Attempt 后台写回仍未成为 Tauri 与 harness 共用服务。详见：
+装配进度：**M0–M4.2.2 已落地**，SQLite 已是默认后端，NarrativeContract / ScenePlan 已进入写作与 Gate。Tauri 和 harness 已共用 `ProductionPostprocessService`。M5 的 Canary3/Coverage12/TextFallback3/Stability30 已有封存证据；Full100 未完成，Gate 6 于 2026-08-31 决议关闭（非 PASS）。旧 45/100 仅作历史记录，不作为当前完成证明。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
@@ -124,17 +135,13 @@ User Intent
 - `recent_window`
 - `task`
 
-当前缺口：
-
-- `character_brief` 仍主要从扁平角色卡构造。
-- 角色身份未严格绑定 `CharacterInstance.id`。
-- 角色知识隔离还不完整，子 Agent 可能看到不该知道的全局事实。
-
-目标：
+当前 Campaign 路径：
 
 - stable system 段放 persona、behavior、常驻世界设定。
 - volatile tail 放当前场景、任务、变量、可见知识、最近窗口。
-- 每个 Subagent 只能拿到该角色视角允许的信息。
+- 每个 Subagent 绑定 `CharacterInstance.id`，其 `get_character` 工具仅允许查询自己的实例。
+- `CampaignRuntimeContext` 是纯领域快照，不携带 Store、锁或 Tauri 状态。未激活 Campaign 时保留旧单卡路径。
+- 知识读写门禁和 Editor redaction 已实现，但文本匹配不等同于完整语义安全保证。
 
 ## Editor Agent
 
@@ -146,6 +153,8 @@ User Intent
 - 不新增与 Subagent 冲突的关键事实，除非是必要的叙事衔接。
 
 当前 Editor 没有工具，直接输出正文。旧 `big_scene` 兼容档局部重 roll 时可以复用 Director Plan 或 Subagent 产出，并注入用户 hint；Sequential Crew 可以复用目标角色之前的公开场记，从目标角色起依次重演后缀并重新运行 Editor，但必须验证原产物的 `generation_mode`；续写与对手戏只允许按原模式整体重写。
+
+质量门禁的单次自动修订是独立的 `PipelineOrchestrator::revise_draft`：输入已有正文、约束和 provenance，输出修订正文及更新后的溯源。它不调用旧模式局部重跑，不创建新变体；二次质量检查通过后再同步最终稿和 Attempt。
 
 目标：
 
@@ -186,7 +195,7 @@ User Intent
 
 代码：`crates/app-agent/src/prompts/postprocess.rs`。可由 `enable_postprocess` 关闭。
 
-当前生产编排边界：Tauri 写作命令负责启动 Summarizer/PostProcessor、同步 Attempt 和持久化候选结果；harness 尚未能复用这整段后台编排，只复用了 production pipeline，且其 probe 调用共享 JSON `TurnLifecycleService`。该 probe 不执行 Tauri command 或 SQLite Accept 路径。下一步应抽出共享 `ProductionPostprocessService`，避免测试长期维护 synthetic Chronicle 替身。
+当前生产编排边界：Tauri 与 harness 共用 `ProductionPostprocessService`，负责 Summarizer/PostProcessor、Attempt/hash 同步、候选 MutationBatch、迟到结果和失败传播。SQLite Accept 使用原子工作单元，JSON 保留兼容实现。临时角色挂在当前 Attempt，采纳时先写入实例，再应用引用它们的知识/变量更新；放弃不写入 Campaign。
 
 ## ChronicleCompressor（已有基础）
 
