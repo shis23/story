@@ -43,7 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 
 ## 候选身份
 
-这些是基于 `1ca37a2` 加本轮修复构建的调试候选，不是干净发布输入或生产签名的声明。构建后的调整只涉及测试夹具和门禁/验收文档。
+这些是基于 `1ca37a2` 加本轮修复构建的调试候选；修复随后提交为 `bb39b43`。它们不是干净发布输入或生产签名的声明。构建后的调整只涉及测试夹具和门禁/验收文档。
 
 | 产物 | SHA-256 |
 | --- | --- |
@@ -58,6 +58,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 - ADB 旧管道写法曾中断合成连接配置，触发应用写入保护；恢复了本轮验收前已确认的空连接配置，改用文件推送和读回校验后，完整凭据专项通过。没有真实密钥或故事数据库修复操作。
 - 真机有一局旧 v2 导入数据缺失源角色卡。当前版本拒绝导出不完整 v3 快照；失败已保留，原数据未改写。新格式测试通过不代表这份历史缺失数据已修复。
 - 真实模型与预算、第三方插件样本、当前候选正式分发安装验收，以及推送后的远端 CI 仍需闭合。未执行推送、打 tag 或发布。
+- 修复提交后尝试了 Windows 正式发布流程，干净输入检查通过，但在 `npm ci` 阶段因 `lightningcss.win32-x64-msvc.node` 占用（EPERM）失败；没有到 Rust release 或安装器构建。依赖目录因此不完整，追加 Android 三模式写作检查因找不到 Playwright 而未启动，不能计为通过。
+- 用户随后要求停止测试和构建。本轮调试 App、模型夹具和 Android 构建残留进程已关闭，没有重装依赖或继续构建。恢复开发时须先处理本地文件占用并重新安装锁定依赖；此前完整门禁结果仍是停止前的已执行证据，不代表目前依赖目录可直接运行。
 
 ## 本地证据
 
@@ -65,6 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 
 - `gate-verified.log`：完整 11 步成功；`full-gate*.log` 保留此前失败。
 - `windows-build.log`、`android-build.log`：原生调试构建日志。
+- `windows-release-build.log`：正式发布流程在依赖安装阶段失败的记录。
 - `windows/ipc-verification.json`、`windows/fixed-story-native.png`。
 - `android/verification.json`、`android/restored-story.png`、`android/legacy-source-failure.json`。
 - `android-before.tar`、`android-database-comparison.json`：升级前备份与逐表比较。
