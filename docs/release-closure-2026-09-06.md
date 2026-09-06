@@ -125,3 +125,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 - `artifacts/realmodel-2026-09-06/windows/`（gitignored）
 - `artifacts/realmodel-2026-09-06/android/`
 - `artifacts/plugin-acceptance-2026-09-06/`（summary.md + rerun-1a/ + rerun-1b/）
+
+## v0.1.2 发布与远端 CI 闭合
+
+本节为追加记录，不改写上文。执行时间：2026-09-06，Asia/Shanghai。上文「正式分发安装包（计划，未完成）」与 4948da7 阶段的远端 CI 记录在本节闭合。
+
+### 正式分发（v0.1.2，已闭合）
+
+- tag v0.1.2 触发 GitHub Actions release.yml（run 34013739416），windows/android/release 三个 job 全部 success；GitHub Release v0.1.2 于 2026-09-06T05:42:43Z 正式发布（非 draft）。URL：https://github.com/shis23/story/actions/runs/34013739416
+- 资产（三个产物均已下载实测，SHA-256 一致）：
+
+| 产物 | 大小（B） | SHA-256 |
+| --- | --- | --- |
+| StoryForge_0.1.2_x64-setup.exe | 8,893,240 | `7759fece23a3717dbc53d13e0e8b0a3db74869ace9a1adace031cf4f84ca6585` |
+| StoryForge_0.1.2_x64_en-US.msi | 12,226,560 | `df8bf8c2b6d9da6b66beef0bc8644158ae2ef390b53d8e1cf95e94a41fcb6079` |
+| app-arm64-release.apk（release keystore 签名） | 24,944,036 | `75bfc0c5942c94f5b97a96bca18b278fc9aee9c72cbcaa5a1c904ac61ed804a4` |
+
+- 校验和已知缺陷与处置：workflow 中 windows/android 两个 job 的校验和文件同名 `SHA256SUMS.txt`，上传时 android 覆盖 windows（v0.1.1/v0.1.2 均如此）；v0.1.2 Release 已补传 `SHA256SUMS-android.txt`（APK 哈希），workflow 已改为按平台命名（`SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt`），供未来版本生效。
+- 签名边界：Windows EXE 仍无代码签名（SmartScreen 警告，README 已说明）；Android 为 release keystore 签名。
+
+### 远端 CI（已闭合）
+
+- 最终提交链 ce6117d（含插件修复与版本 0.1.2）已推送 Gitea + GitHub 双远端；tag v0.1.2 已推双远端，GitHub Actions tag 构建全绿（run 34013739416，即最终发布提交的远端构建证据）。
+- 另 main@4948da7 的 workflow_dispatch 调试构建全绿（run 33980646148）。
+- Gitea Actions 已按用户 2026-09-06 决定停用：jd 主机 act_runner 与正在执行的任务容器已停止、排队 run 34-36 不再执行、仓库 has_actions 已关闭；原因是该 runner 性能不足且存在工作区缓存 non-fast-forward 问题（run #33 全败的根因）。远端构建自本轮起只在 GitHub 进行。
+
+### 门禁（两轮全绿）
+
+- 两轮完整 11 步门禁均通过且计数完全一致：secret 扫描、Pester 四套 198 项、fmt、严格 Clippy、Rust 1980 通过 / 0 失败 / 33 忽略、前端 504 + 119 + 9 + 28 + 2 = 662 项、生产构建全部通过。
+- 第一轮（插件修复 + 版本 0.1.2 最终树，2026-09-06 13:02 退出码 0）：`artifacts/release-gate-2026-09-06/gate-run.log`；第二轮（SHA256SUMS workflow/README 修复后）：`artifacts/release-gate-2026-09-06-fixsums/gate-run.log`。
+- Gate 6 维持「关闭非 PASS」不变；不宣称任何覆盖率指标；历史 PASS 不代表后续改动已验收。

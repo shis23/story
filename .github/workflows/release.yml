@@ -87,10 +87,10 @@ jobs:
           if (-not $nsis) { throw "No NSIS exe produced under target/release/bundle/nsis" }
           Copy-Item $msi.FullName -Destination $stage
           Copy-Item $nsis.FullName -Destination $stage
-          # SHA-256 sidecar
+          # SHA-256 sidecar；文件名带平台后缀，避免与 Android 的校验和文件在 Release 上同名互相覆盖
           Get-ChildItem $stage -File | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)" | Out-File -Encoding ascii -Append "$stage/SHA256SUMS.txt"
+            "$h  $($_.Name)" | Out-File -Encoding ascii -Append "$stage/SHA256SUMS-windows.txt"
           }
           Write-Host "Windows artifacts:"
           Get-ChildItem $stage | Format-Table Name, Length
@@ -201,7 +201,8 @@ jobs:
             exit 1
           fi
           cp "$apk" "$stage/"
-          (cd "$stage" && sha256sum *.apk > SHA256SUMS.txt)
+          # 文件名带平台后缀，避免与 Windows 的校验和文件在 Release 上同名互相覆盖
+          (cd "$stage" && sha256sum *.apk > SHA256SUMS-android.txt)
           echo "Android artifacts:"
           ls -la "$stage"
 
@@ -246,7 +247,7 @@ jobs:
             - **Android**：下载 `*-arm64-*-release.apk`，手机允许「安装未知来源应用」后安装。
               仅支持 arm64（主流 Android 手机）。
 
-            构建详情见 Actions 运行记录；每个产物都有 `SHA256SUMS.txt` 校验。
+            构建详情见 Actions 运行记录；每个产物都有按平台分文件的校验和（`SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt`）。
           files: |
             release/windows/*
             release/android/*

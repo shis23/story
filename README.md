@@ -40,7 +40,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - **Windows**：`*-setup.exe`（NSIS 安装器）或 `*.msi`，双击安装。首次运行若有 SmartScreen 警告，点「更多信息 → 仍要运行」即可（EXE 未做代码签名，开源项目常见）。
 - **Android**：`*-arm64-*-release.apk`，允许「安装未知来源应用」后安装（仅支持 arm64 设备）。
 
-每个版本附 `SHA256SUMS.txt` 校验和。
+每个版本附按平台分文件的校验和：`SHA256SUMS-windows.txt`（Windows 安装器）与 `SHA256SUMS-android.txt`（APK）。
 
 ## 快速启动
 
