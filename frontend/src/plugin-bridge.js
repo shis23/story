@@ -442,6 +442,44 @@ function postResponse(event, payload) {
   }
 }
 
+/**
+ * postMessage 结构化克隆不支持 Proxy——宿主事件 feed / prompt 状态常是
+ * Vue reactive 代理，直接广播会抛 DataCloneError（真实 GUI 一轮生成刷出
+ * 1003 条，见 artifacts/plugin-acceptance-2026-09-06/rerun-1a/summary.md）。
+ * 所有 host→plugin 的 postMessage payload 必须先经过这里解克隆。
+ *
+ * 选 JSON 往返而不是 structuredClone(逐层 toRaw(...))：事件与 hook
+ * payload 均为可 JSON 化的普通数据（Tauri IPC / postMessage 反序列化
+ * 产物，审计路径本就 JSON.stringify 它们），JSON 往返对嵌套 reactive、
+ * getter、Proxy 一次性解干净；逐层 toRaw 无法保证覆盖 ref 与嵌套代理的
+ * 全部组合，且 structuredClone 本身拒绝 Proxy——正确性优先。
+ * 代价：undefined 字段与函数会被丢弃（事件/hook 负载无此类语义字段）；
+ * 循环引用等不可序列化结构兜底返回空对象，宁可空负载也不让广播抛错
+ * 中断事件 feed。
+ */
+export function toCloneablePostMessagePayload(payload) {
+  if (payload === null || typeof payload !== 'object') return payload
+  try {
+    return JSON.parse(JSON.stringify(payload))
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 宿主 → 插件 iframe 的事件广播。PluginHost 的即时广播与 iframe ready 前
+ * 的 pending 队列 flush 统一走这里，确保 data 先解成普通可克隆对象。
+ */
+export function postPluginEventToTarget(target, pluginEvent, targetOrigin = '*') {
+  if (!target || typeof target.postMessage !== 'function') return false
+  target.postMessage({
+    type: MSG_EVENT,
+    event: pluginEvent?.event,
+    data: toCloneablePostMessagePayload(pluginEvent?.data),
+  }, targetOrigin)
+  return true
+}
+
 export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin()) {
   const targetOrigin = normalizeTargetOrigin(hostOrigin)
   return `<script>
@@ -1954,7 +1992,10 @@ export function createPluginHookBridge(plugin, options = {}) {
         pluginId,
         id,
         event: eventName,
-        data: payload,
+        // hook payload 派生自宿主 prompt 状态，同样可能是 reactive 代理；
+        // 与事件广播共用同一道解克隆防线。fallback 仍用原始 payload，
+        // 宿主侧 hook 链上的对象身份不受影响。
+        data: toCloneablePostMessagePayload(payload),
       }, targetOrigin)
     })
   }

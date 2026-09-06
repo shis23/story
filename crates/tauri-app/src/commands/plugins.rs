@@ -8,6 +8,10 @@ pub struct InstalledPluginDto {
     pub(crate) name: String,
     pub(crate) version: String,
     pub(crate) permissions: Vec<String>,
+    /// 入口 HTML：PluginHost.vue 依赖它在沙箱 iframe 内启动插件桥。
+    /// 缺了它前端 `iframeDoc` 恒为空，插件的事件订阅/prompt hook 全部失效。
+    /// 安全边界在 `sandbox="allow-scripts"` iframe 与权限门控命令桥，不在此处。
+    pub(crate) entry_html: String,
     pub(crate) ui_slots: Vec<String>,
     pub(crate) event_subscriptions: Vec<String>,
     pub(crate) description: Option<String>,
@@ -23,6 +27,7 @@ pub(crate) fn plugin_to_dto(
         id: p.manifest.id.clone(),
         name: p.manifest.name.clone(),
         version: p.manifest.version.clone(),
+        entry_html: p.manifest.entry_html.clone(),
         permissions: p
             .manifest
             .permissions

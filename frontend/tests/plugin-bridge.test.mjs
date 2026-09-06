@@ -9,6 +9,8 @@ import {
   canReadMemory,
   mapPipelineEventToPluginEvents,
   mapPluginEventRecordToPluginEvents,
+  postPluginEventToTarget,
+  toCloneablePostMessagePayload,
   MSG_EVENT,
   MSG_HOOK_REQUEST,
   MSG_HOOK_RESPONSE,
@@ -2171,4 +2173,130 @@ test('host hook bridge ignores late duplicate response id after settle', async (
   )
 
   assert.deepEqual(await promise, { prompt: 'first' })
+})
+
+// ─── host→plugin postMessage 解克隆（DataCloneError 修复） ───────────────────
+
+// 复刻 Vue reactive 的关键特征：递归 Proxy，属性经 getter 读取且嵌套对象
+// 读取会再包一层代理。structuredClone 拒绝 Proxy，所以该 fixture 能精确
+// 复现线上 DataCloneError（事件 feed 里的 pipelineEvent.data 即此形态）。
+function createReactiveLike(value) {
+  if (value === null || typeof value !== 'object') return value
+  return new Proxy(value, {
+    get(target, key) {
+      if (key === '__v_isReactive') return true
+      const child = target[key]
+      if (child === null || typeof child !== 'object') return child
+      return createReactiveLike(child)
+    },
+  })
+}
+
+test('postPluginEventToTarget broadcasts reactive-like payloads without DataCloneError', () => {
+  const raw = {
+    delta: 'hello',
+    nested: { deep: { token: 'abc' } },
+    tags: ['a', 'b'],
+  }
+  const payload = createReactiveLike(raw)
+  const captured = []
+  const contentWindow = {
+    postMessage(message, targetOrigin) {
+      captured.push({ message, targetOrigin })
+    },
+  }
+
+  // fixture 必须先真的复现缺陷类别：结构化克隆拒绝 Proxy。
+  assert.throws(
+    () => structuredClone(payload),
+    (error) => error.name === 'DataCloneError',
+  )
+
+  let posted = false
+  assert.doesNotThrow(() => {
+    posted = postPluginEventToTarget(contentWindow, {
+      event: 'STREAM_TOKEN',
+      data: payload,
+    }, '*')
+  })
+  assert.equal(posted, true)
+
+  assert.equal(captured.length, 1)
+  assert.equal(captured[0].targetOrigin, '*')
+  assert.equal(captured[0].message.type, MSG_EVENT)
+  assert.equal(captured[0].message.event, 'STREAM_TOKEN')
+
+  const data = captured[0].message.data
+  assert.equal(
+    Object.getPrototypeOf(data),
+    Object.prototype,
+    '广播数据必须是普通可克隆对象（不得是 Proxy）',
+  )
+  assert.deepEqual(plain(data), { delta: 'hello', nested: { deep: { token: 'abc' } }, tags: ['a', 'b'] })
+  // 接收端视角：接收到的 data 必须能完整走一遍结构化克隆。
+  assert.deepEqual(structuredClone(data), JSON.parse(JSON.stringify(raw)))
+  // 必须是深拷贝：改动广播数据不得穿透回原始 reactive 源。
+  data.nested.deep.token = 'mutated'
+  assert.equal(raw.nested.deep.token, 'abc')
+})
+
+test('host hook bridge posts plain cloneable hook request payloads', async () => {
+  const raw = { intent: 'base', context: { prompt: 'p' } }
+  const payload = createReactiveLike(raw)
+  const target = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const hookBridge = createPluginHookBridge(
+    { id: 'plugin-a' },
+    {
+      getTarget: () => target,
+      isTrustedSource: (event) => event.source === target,
+      targetOrigin: '*',
+      timeoutMs: 1000,
+    },
+  )
+
+  let promise
+  assert.doesNotThrow(() => {
+    promise = hookBridge.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+  })
+
+  const request = target.posted.at(-1).message
+  assert.equal(request.type, MSG_HOOK_REQUEST)
+  assert.equal(
+    Object.getPrototypeOf(request.data),
+    Object.prototype,
+    'hook request data 必须是普通可克隆对象',
+  )
+  assert.deepEqual(plain(request.data), raw)
+  assert.doesNotThrow(() => structuredClone(request.data))
+  // hook 链继续使用原始 payload（fallback 身份不被克隆影响）。
+  hookBridge.handleMessage({
+    source: target,
+    data: {
+      type: MSG_HOOK_RESPONSE,
+      pluginId: 'plugin-a',
+      id: request.id,
+      result: { intent: 'hooked' },
+    },
+  })
+  assert.deepEqual(await promise, { intent: 'hooked' })
+})
+
+test('toCloneablePostMessagePayload passes primitives through and degrades unserializable payloads', () => {
+  assert.equal(toCloneablePostMessagePayload(null), null)
+  assert.equal(toCloneablePostMessagePayload(undefined), undefined)
+  assert.equal(toCloneablePostMessagePayload('raw'), 'raw')
+  assert.equal(toCloneablePostMessagePayload(7), 7)
+
+  const circular = { ok: true }
+  circular.self = circular
+  assert.deepEqual(toCloneablePostMessagePayload(circular), {})
+
+  // undefined 字段与函数按 JSON 往返语义被丢弃，普通字段保留。
+  const withHoles = createReactiveLike({ keep: 1, drop: undefined, fn: () => {} })
+  assert.deepEqual(toCloneablePostMessagePayload(withHoles), { keep: 1 })
 })

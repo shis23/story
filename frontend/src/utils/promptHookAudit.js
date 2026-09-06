@@ -53,8 +53,16 @@ function hashString(value) {
   return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
+// 已脱敏标签的形状（hashString 恒定输出 8 位小写 hex）。redaction 必须幂等：
+// 记录在每个边界（追加时的哈希材料 canonicalRecordMaterial、校验、导出、查询）
+// 都会被再 sanitize 一次，若标签再次参与哈希，校验时重算的材料永远对不上
+// 追加时存储的材料——真实症状即每次追加都报 record_hash_mismatch(invalidIndex
+// 0)，环形缓冲被 fail-closed 在 1 条记录（2026-09-06 插件验收缺陷 3）。
+const REDACTED_LABEL_PATTERN = /^<redacted:[0-9a-f]{8}>$/
+
 function redactLabel(value, fallback = '') {
   const text = String(value ?? fallback)
+  if (REDACTED_LABEL_PATTERN.test(text)) return text
   return `<redacted:${hashString(text)}>`
 }
 

@@ -76,9 +76,9 @@ import {
   generateBridgeScript,
   createHostHandler,
   createPluginHookBridge,
-  MSG_EVENT,
   MSG_MOUNT,
   mapPluginEventRecordToPluginEvents,
+  postPluginEventToTarget,
 } from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
@@ -124,7 +124,14 @@ const PLUGIN_IFRAME_TARGET_ORIGIN = '*'
 const iframeDoc = computed(() => {
   if (!props.plugin?.manifest?.entry_html && !props.plugin?.entry_html) return ''
   const rawHtml = props.plugin?.manifest?.entry_html || props.plugin?.entry_html || ''
-  const entryHtml = DOMPurify.sanitize(rawHtml)
+  // ADD_TAGS:['script'] 是刻意的：entry_html 的 <script> 就是插件本体（事件
+  // 订阅 / prompt hook 都靠它注册），默认 sanitize 会整体剥除（dompurify
+  // 3.4.12 真 Chromium 实测），插件桥形同虚设。安全边界不在这里——本文档整体
+  // 跑在 sandbox="allow-scripts" 的 opaque-origin iframe 里，对宿主的唯一通道
+  // 是经权限门控的桥消息（isTrustedPluginSource + createHostHandler 的插件
+  // 权限校验）；DOMPurify 只负责收掉 script 之外的注入面（事件处理器属性、
+  // javascript: URL 等在真 Chromium 实测中仍被剥除）。
+  const entryHtml = DOMPurify.sanitize(rawHtml, { ADD_TAGS: ['script'] })
   const bridgeScript = generateBridgeScript(props.plugin.id, HOST_ORIGIN)
   return `<!DOCTYPE html><html><head>${buildShellCspMetaTag([])}${bridgeScript}</head><body>${entryHtml}</body></html>`
 })
@@ -212,11 +219,9 @@ function postPluginEvent(pluginEvent) {
     return
   }
 
-  target.postMessage({
-    type: MSG_EVENT,
-    event: pluginEvent.event,
-    data: pluginEvent.data,
-  }, PLUGIN_IFRAME_TARGET_ORIGIN)
+  // 广播前统一解克隆：事件 feed 常携带 Vue reactive 代理，直接 postMessage
+  // 会抛 DataCloneError（rerun-1a 验收实录）。
+  postPluginEventToTarget(target, pluginEvent, PLUGIN_IFRAME_TARGET_ORIGIN)
 }
 
 function flushPendingPluginEvents() {
@@ -224,12 +229,7 @@ function flushPendingPluginEvents() {
   if (!iframeReady.value || !target) return
 
   while (pendingPluginEvents.length > 0) {
-    const pluginEvent = pendingPluginEvents.shift()
-    target.postMessage({
-      type: MSG_EVENT,
-      event: pluginEvent.event,
-      data: pluginEvent.data,
-    }, PLUGIN_IFRAME_TARGET_ORIGIN)
+    postPluginEventToTarget(target, pendingPluginEvents.shift(), PLUGIN_IFRAME_TARGET_ORIGIN)
   }
 }
 

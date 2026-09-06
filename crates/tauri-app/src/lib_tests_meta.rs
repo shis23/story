@@ -979,7 +979,7 @@ fn plugin_dto_exposes_modify_prompt_permission_and_event_subscriptions() {
             name: "Prompt Hook".into(),
             version: "1.0.0".into(),
             permissions: vec![Permission::ModifyPrompt],
-            entry_html: String::new(),
+            entry_html: "<script>window.TavernHelper=1</script>".into(),
             ui_slots: vec![UiSlot::SidebarPanel],
             event_subscriptions: vec!["CHAT_COMPLETION_PROMPT_READY".into()],
             description: None,
@@ -996,6 +996,10 @@ fn plugin_dto_exposes_modify_prompt_permission_and_event_subscriptions() {
         dto.event_subscriptions,
         vec!["CHAT_COMPLETION_PROMPT_READY"]
     );
+    // 缺陷回归钉：DTO 必须携带 entry_html（serde 默认 snake_case 序列化为
+    // `entry_html`），否则 PluginHost.vue 的 iframeDoc 恒为空、插件桥永不启动
+    // （2026-09-06 插件验收 FAIL 的根因 1）。
+    assert_eq!(dto.entry_html, "<script>window.TavernHelper=1</script>");
 }
 
 /// Batch 2.4 契约：typed patch 的前置条件校验（target 存在 + definition/schema 一致）

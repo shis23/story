@@ -12,6 +12,7 @@ import {
   verifyAuditRecordChain,
   appendAuditRecordWithIntegrity,
   retainAuditRecords,
+  sanitizePromptHookAuditRecord,
 } from '../src/utils/promptHookAudit.js'
 
 function baseRecord(overrides = {}) {
@@ -467,4 +468,51 @@ test('audit append rejects a non-empty chain after all integrity metadata is str
   assert.equal(appendResult.records.length, strippedAndTampered.length)
   assert.equal(appendResult.integrity.valid, false)
   assert.equal(appendResult.integrity.reason, 'missing_integrity_metadata')
+})
+
+// ─── redaction 幂等性（2026-09-06 验收缺陷 3 回归钉）─────────────────────────
+// 生产路径（usePluginBridge.recordPromptHookAudit → append → 下一次 append 时
+// verify）会对记录多次 sanitize。redaction 标签 `<redacted:hash>` 若再次参与
+// 哈希，第二次 append 的 verify 必然报 record_hash_mismatch（invalidIndex 0，
+// headHash null），环形缓冲被 fail-closed 在 1 条——真实运行 5 次 hook 只进 1 条。
+
+test('redaction labels are idempotent: re-sanitizing a sanitized record is a no-op', () => {
+  const once = sanitizePromptHookAuditRecord(baseRecord({
+    pluginName: 'MVU 验收·事件计数与 Prompt Hook', // 非 [L/N/ ._:/-] 字符 → 触发 redaction
+    correlationId: 'hook:1:2',
+  }))
+  const twice = sanitizePromptHookAuditRecord(once)
+
+  assert.match(once.pluginName, /^<redacted:[0-9a-f]{8}>$/)
+  assert.equal(twice.pluginName, once.pluginName)
+  assert.deepEqual(twice, once)
+  // 哈希材料在多次 sanitize 后必须稳定。
+  assert.equal(computeAuditRecordHash(once, null), computeAuditRecordHash(twice, null))
+})
+
+test('ring buffer keeps appending records whose fields were redacted (production path)', () => {
+  // 还原 recordPromptHookAudit：先 sanitize 一次再 append。
+  const redactedName = 'MVU 验收·事件计数与 Prompt Hook'
+  const first = appendAuditRecordWithIntegrity(
+    [],
+    sanitizePromptHookAuditRecord(baseRecord({ pluginName: redactedName, recordedAt: 1000 })),
+  )
+  assert.equal(first.appended, true)
+  assert.equal(verifyAuditRecordChain(first.records).valid, true)
+
+  // 修复前：第二次 append 对已存记录 verify 时重算哈希失败（record_hash_mismatch），
+  // appended=false，缓冲区永远停在 1 条。
+  const second = appendAuditRecordWithIntegrity(
+    first.records,
+    sanitizePromptHookAuditRecord(baseRecord({ pluginName: redactedName, recordedAt: 2000 })),
+  )
+  assert.equal(second.appended, true)
+  assert.equal(second.integrity.valid, true)
+  assert.equal(second.records.length, 2)
+  assert.equal(verifyAuditRecordChain(second.records).valid, true)
+
+  // 导出边界（又一次 sanitize）同样保持链有效。
+  const exported = parsePromptHookAuditExport(exportPromptHookAudit(second.records))
+  assert.equal(exported.integrity.valid, true)
+  assert.equal(exported.totalRecords, 2)
 })
