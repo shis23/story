@@ -15,7 +15,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 
 ## 当前状态
 
-- 当前源码版本为 `0.1.1`。发布范围、当前验收和未闭合项目统一见 [发布状态](docs/RELEASE-STATUS.md)；历史 PASS 不代表后续工作区改动已验收。
+- 当前源码版本为 `0.1.2`。发布范围、当前验收和未闭合项目统一见 [发布状态](docs/RELEASE-STATUS.md)；历史 PASS 不代表后续工作区改动已验收。
 - 主界面提供续写（默认）、对手戏和顺序剧组三种生成模式；旧并行 `big_scene` 保留为后端兼容模式，不是每轮都运行完整剧组。
 - 多角色 Campaign 写作、重 roll、QualityGate、1× Editor auto-fix、私密知识归属门禁与 Editor redaction 已接入。
 - v3 Campaign Bundle 保存正文、变体、终态轮次、源角色卡和本局状态；它是单局故事快照，不是完整应用备份。已采纳历史不可直接改写，当前仅支持已采纳末尾分支。
