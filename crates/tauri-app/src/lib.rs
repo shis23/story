@@ -1285,6 +1285,13 @@ pub fn run() {
     let mvu_pending: MvuPendingMap = new_mvu_pending_map();
 
     tauri::Builder::default()
+        // P0-2/M-01: appended to the invoke initialization script so it runs
+        // in every frame right after the IPC bootstrap. wry on Windows
+        // injects init scripts into subframes, and the runtime PoC
+        // (2026-09-28) confirmed a storyforge-shell iframe could invoke app
+        // commands; this guard neuters IPC in subframes only. See
+        // shell_doc_protocol::SUBFRAME_IPC_GUARD docs for the mechanism.
+        .append_invoke_initialization_script(shell_doc_protocol::SUBFRAME_IPC_GUARD)
         .register_uri_scheme_protocol(card_shell_cache::LOCAL_PROTOCOL_SCHEME, |_ctx, request| {
             card_shell_cache_protocol_response(request)
         })

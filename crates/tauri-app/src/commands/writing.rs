@@ -1526,10 +1526,26 @@ fn should_block_source_knowledge_propagation(
         return false;
     }
 
+    // R12-R3：与 production_postprocess.rs 的 SQLite 门禁对称——三处 fail-open
+    //（源缺失/源解析不出/源无同文本条目）是有意放行，但此前完全静默；这里补上
+    // 同款 warn（reason 字符串保持一致，便于跨路径聚合计数），不改变放行语义。
     let Some(source_id) = &update.source_character_id else {
+        tracing::warn!(
+            target: "knowledge_propagation",
+            reason = "source_character_id missing",
+            text = %update.knowledge_text,
+            "知识传播门禁未能判定源策略（JSON 直写路径），按放行处理（W-11 下游 fail-open）"
+        );
         return false;
     };
     let Some(source) = find_instance_by_name_or_id(store, camp_id, source_id) else {
+        tracing::warn!(
+            target: "knowledge_propagation",
+            reason = "source character unresolved",
+            source = %source_id.as_str(),
+            text = %update.knowledge_text,
+            "知识传播门禁未能判定源策略（JSON 直写路径），按放行处理（W-11 下游 fail-open）"
+        );
         return false;
     };
 
@@ -1560,6 +1576,14 @@ fn should_block_source_knowledge_propagation(
             return true;
         }
     }
+
+    tracing::warn!(
+        target: "knowledge_propagation",
+        reason = "source knowledge entry not found (policy unknown)",
+        source = %source.name,
+        text = %update.knowledge_text,
+        "知识传播门禁未能判定源策略（JSON 直写路径），按放行处理（W-11 下游 fail-open）"
+    );
 
     false
 }

@@ -29,6 +29,68 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// The custom-protocol scheme under which shell documents are served.
 pub const SHELL_DOC_SCHEME: &str = "storyforge-shell";
 
+/// M-01 mitigation (P0-2, appended to the Tauri invoke initialization script).
+///
+/// wry on Windows injects every initialization script into subframes
+/// (`for_main_frame_only` is a no-op there — wry-0.55.1 `src/lib.rs:990`), so a
+/// `storyforge-shell` subframe receives the full Tauri IPC bootstrap, whose
+/// `__TAURI_INTERNALS__.postMessage` closure carries the per-session invoke
+/// key, while `is_local_url` classifies the shell origin as local and the ACL
+/// branch in `webview/mod.rs` is skipped for app commands (no `permissions/`
+/// manifest ⇒ `has_app_acl_manifest == false`). Runtime PoC (2026-09-28,
+/// `artifacts/p02-poc/`): a plain iframe on the shell origin invoked
+/// `list_conversations` and `list_agent_profile_configs` successfully
+/// (pre-fix). Shell documents are designed to talk to the host ONLY via
+/// postMessage bridges (see the module docs), so this guard runs at the tail
+/// of the invoke initialization script and, in any subframe:
+///
+/// 1. freezes `__TAURI_INTERNALS__` — the property itself is non-configurable
+///    (`Object.defineProperty` default in tauri's first init script) and
+///    cannot be deleted, but freezing the value stops every later tauri init
+///    script (metadata, core.js `invoke`/`convertFileSrc`, event/plugin
+///    scripts) from attaching anything. Without `convertFileSrc`, the fetch
+///    branch of `sendIpcMessage` (`tauri-2.11.5/scripts/ipc-protocol.js:37`)
+///    throws before a request is sent, and the `window.ipc.postMessage`
+///    fallback (`:84`) is unreachable behind the closure-private
+///    `customProtocolIpcFailed` flag;
+/// 2. blocks the two IPC transports for page code as well — `fetch` to
+///    `ipc:`/`http(s)://ipc.localhost` (all other URLs pass through, so shell
+///    asset/module fetches are unaffected) and `window.ipc`. The invoke key
+///    never becomes page-readable text (it is deliberately declared outside
+///    the exposed functions so `toString` cannot leak it), so hand-crafted
+///    raw payloads cannot pass the key check in `on_message` either.
+///
+/// On platforms that honor `for_main_frame_only` (macOS/Linux) this script
+/// never runs in subframes; on Android the direct postMessage branch is
+/// covered by the `window.ipc` removal. The main frame is untouched
+/// (`window.self === window.top`).
+pub const SUBFRAME_IPC_GUARD: &str = r#"
+;(function () {
+  if (window.self !== window.top) {
+    var sf = window.__TAURI_INTERNALS__
+    if (sf) {
+      try { Object.freeze(sf) } catch (e) {}
+    }
+    try {
+      var nativeFetch = window.fetch && window.fetch.bind(window)
+      if (nativeFetch) {
+        window.fetch = function (input, init) {
+          var u = typeof input === 'string' ? input : (input && input.url) || ''
+          if (/^ipc:/i.test(u) || /^https?:\/\/ipc\.localhost($|[:/])/i.test(u)) {
+            return Promise.reject(new Error('storyforge: subframe IPC is disabled (P0-2)'))
+          }
+          return nativeFetch(input, init)
+        }
+      }
+    } catch (e) {}
+    try { delete window.ipc } catch (e) {}
+    try {
+      Object.defineProperty(window, 'ipc', { value: undefined, writable: false, configurable: false })
+    } catch (e) {}
+  }
+})()
+"#;
+
 // On Windows and Android Tauri/Wry exposes a registered custom protocol under
 // an http localhost origin. macOS/Linux keep the native scheme origin. Mirrors
 // card_shell_cache.rs:26-29 — keep in sync. This constant is the authoritative
@@ -398,14 +460,15 @@ mod tests {
     /// M-01 守卫 4：app ACL manifest 的存在性必须被显式记录（防静默回退）。
     /// - 当前仓库没有 `permissions/`，因此 `has_app_acl_manifest == false`
     ///   （`tauri-2.11.5/src/ipc/authority.rs:132-134` →
-    ///   `webview/mod.rs:1819-1826`），本地源的应用命令**整体跳过 ACL**：
-    ///   壳 iframe 可以直接 invoke 任意命令。这里打印醒目告警，把已知风险
-    ///   留在 CI 日志里。
+    ///   `webview/mod.rs:1819-1826`），本地源的应用命令**整体跳过 ACL**。
+    ///   ACL 本身也区分不了同 webview 的主帧与同源子帧（粒度是
+    ///   window/webview label + Local/Remote），所以补 manifest 单独并不
+    ///   解决子帧问题——真正的运行时缓解是 `SUBFRAME_IPC_GUARD`（见下）。
     /// - 一旦有人新增 `permissions/`，就必须同时把 `__app__` 编进
     ///   `gen/schemas/acl-manifests.json`；否则 manifest 没编进去，
     ///   `has_app_acl_manifest` 仍是 false，会造成"以为加了 ACL"的假安全感。
     ///   此时还必须为前端真正需要的命令逐条定义权限，否则主窗口命令会被拒
-    ///   （`Command X not allowed by ACL`）——这条由 Lead 裁决为"需运行时验证"。
+    ///   （`Command X not allowed by ACL`）。
     #[test]
     fn acl_manifest_absence_is_a_known_risk() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -416,15 +479,11 @@ mod tests {
             .unwrap_or(false);
         if !has_permissions_dir {
             eprintln!(
-                "warning: M-01 known risk — no `permissions/` app ACL manifest, so \
-                 `has_app_acl_manifest == false` and Tauri skips ACL for every app command \
-                 issued from the local shell origin (card / plugin / MVU / TH iframes). \
-                 Runtime PoC: load a plugin with `permissions: []` and log \
-                 `typeof window.__TAURI_INTERNALS__` (or call \
-                 `await window.__TAURI_INTERNALS__.invoke('list_conversations')`) inside its \
-                 iframe. Real fixes: (a) upgrade wry so main-frame-only init scripts are \
-                 actually main-frame-only, (b) host untrusted HTML in a separate webview, \
-                 (c) require a main-frame credential at the command layer. Do NOT add a \
+                "warning: M-01 — no `permissions/` app ACL manifest, so `has_app_acl_manifest == \
+                 false` and Tauri skips ACL for every app command issued from a local origin. \
+                 ACL cannot distinguish a same-origin subframe from the main frame anyway, so the \
+                 shipped runtime mitigation is `SUBFRAME_IPC_GUARD` (subframe IPC neutered at init \
+                 time; runtime PoC evidence 2026-09-28 in artifacts/p02-poc/). Do NOT add a \
                  manifest without whitelisting every command the app UI calls."
             );
             return;
@@ -440,6 +499,64 @@ mod tests {
             raw.contains("\"__app__\""),
             "`permissions/` exists but `__app__` is missing from acl-manifests.json — the \
              manifest is not compiled in, so ACL is still skipped (false confidence)"
+        );
+    }
+
+    /// M-01 守卫 5：子帧 IPC 毒化脚本必须在场且只针对子帧。
+    /// 静态断言（运行时证据见 artifacts/p02-poc/ 的前后对照 PoC）：
+    /// ① 用 `window.self !== window.top` 限定子帧（主帧零影响）；
+    /// ② 冻结 `__TAURI_INTERNALS__`（阻断后续 init 脚本装 invoke/
+    ///    convertFileSrc，fetch 分支因缺 convertFileSrc 而发不出请求）；
+    /// ③ 拦截 `ipc:` / `ipc.localhost` 目标的 fetch 且放行其它 URL
+    ///    （壳文档的资产/模块 fetch 不受影响）；
+    /// ④ 删除并封死 `window.ipc`（postMessage 传输 + Android 直连分支）。
+    #[test]
+    fn subframe_guard_only_acts_in_subframes_and_blocks_both_transports() {
+        assert!(
+            SUBFRAME_IPC_GUARD.contains("window.self !== window.top"),
+            "guard must be scoped to subframes only"
+        );
+        assert!(
+            SUBFRAME_IPC_GUARD.contains("Object.freeze(sf)"),
+            "guard must freeze __TAURI_INTERNALS__ so later init scripts attach nothing"
+        );
+        assert!(
+            SUBFRAME_IPC_GUARD.contains(r"/^ipc:/i.test(u)")
+                && SUBFRAME_IPC_GUARD.contains(r"/^https?:\/\/ipc\.localhost($|[:/])/i.test(u)"),
+            "guard must block fetch to the ipc custom protocol targets"
+        );
+        assert!(
+            SUBFRAME_IPC_GUARD.contains("return nativeFetch(input, init)"),
+            "guard must pass non-ipc fetches through untouched"
+        );
+        assert!(
+            SUBFRAME_IPC_GUARD.contains("delete window.ipc")
+                && SUBFRAME_IPC_GUARD.contains("defineProperty(window, 'ipc'"),
+            "guard must remove and seal the wry postMessage bridge"
+        );
+        assert!(
+            SUBFRAME_IPC_GUARD.is_ascii(),
+            "guard must stay pure ASCII (PS5.1 ASCII rule extends to embedded scripts)"
+        );
+        assert!(
+            !SUBFRAME_IPC_GUARD.contains("__TAURI_INVOKE_KEY__"),
+            "guard must not reference the invoke key (nothing may make it page-readable)"
+        );
+    }
+
+    /// M-01 守卫 6：毒化脚本必须真的接在 Builder 上（防止重构时被静默摘除）。
+    #[test]
+    fn subframe_guard_is_wired_into_the_builder() {
+        let lib_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs");
+        let raw = std::fs::read_to_string(&lib_rs)
+            .unwrap_or_else(|e| panic!("read {}: {e}", lib_rs.display()));
+        assert!(
+            raw.contains(
+                "append_invoke_initialization_script(shell_doc_protocol::SUBFRAME_IPC_GUARD)"
+            ),
+            "lib.rs must keep SUBFRAME_IPC_GUARD appended to the invoke initialization script"
         );
     }
 
