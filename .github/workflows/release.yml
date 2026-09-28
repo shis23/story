@@ -137,12 +137,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # ubuntu-latest ships a preinstalled Android SDK. The third-party
-      # android-actions/setup-android@v3 step broke on 2026-09-28 runners
-      # (sdkmanager: "Failed to find package 'tools'", exit 1 — dispatch run
-      # 36432958941); accept licenses on the preinstalled SDK instead.
-      - name: Accept Android SDK licenses (preinstalled SDK)
-        run: yes | sdkmanager --licenses > /dev/null || true
+      # ubuntu-latest ships a preinstalled Android SDK, but current images no
+      # longer put cmdline-tools on PATH (that was setup-android@v3's job; the
+      # action itself broke on 2026-09-28 runners — sdkmanager "Failed to find
+      # package 'tools'", exit 1, dispatch runs 36432958941/36434192312).
+      # Restore PATH on the preinstalled SDK and accept licenses inline.
+      - name: Expose preinstalled Android cmdline-tools + accept licenses
+        run: |
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/bin" >> "$GITHUB_PATH"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null || true
+          command -v sdkmanager
 
       - name: Install NDK ${{ env.NDK_VERSION }}
         run: |
