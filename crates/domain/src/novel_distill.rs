@@ -87,7 +87,9 @@ pub const DEFAULT_CHUNK_CHARS: usize = 6_000;
 /// - 返回块区间按 char 偏移（调用方用 `slice_chunk` 取文本）。
 pub fn chunk_novel(text: &str, target_chars: usize) -> Vec<DistillChunk> {
     let target = target_chars.max(200);
-    let hard_cap = target * 2;
+    // D-17：`target * 2` 在 target 接近 usize::MAX 时会溢出（debug panic / release 回绕成 0，
+    // 退化为每字符一块）；改用饱和乘法。
+    let hard_cap = target.saturating_mul(2);
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let mut chunks = Vec::new();
@@ -131,12 +133,22 @@ pub fn slice_chunk(text: &str, chunk: &DistillChunk) -> String {
 }
 
 impl NovelDistillJob {
-    /// 从原文新建作业（Chunks 阶段起步）。
+    /// 从原文新建作业。
+    ///
+    /// D-17：空/纯空白小说会被 `chunk_novel` 切成 0 块，此前 stage 停在 `Chunks`
+    /// 却永远没有待处理块——`apply_chunk_result` 无合法 index、`apply_style_formula`
+    /// 又因阶段不符被拒，作业永久卡死。现在没有块时直接落到终态 `Done`。
     pub fn new(project_id: impl Into<String>, novel_text: &str, target_chars: usize) -> Self {
+        let chunks = chunk_novel(novel_text, target_chars);
+        let stage = if chunks.is_empty() {
+            DistillStage::Done
+        } else {
+            DistillStage::Chunks
+        };
         Self {
             project_id: project_id.into(),
-            stage: DistillStage::Chunks,
-            chunks: chunk_novel(novel_text, target_chars),
+            stage,
+            chunks,
             style_formula: None,
             final_style_prompt: None,
             ledgers: DistillLedgers::default(),
@@ -319,5 +331,30 @@ mod tests {
         let mut job = NovelDistillJob::new("proj-2", "短文本", 1_000);
         assert_eq!(job.chunks.len(), 1);
         assert!(job.apply_chunk_result(9, "s".into(), "r".into()).is_err());
+    }
+
+    // ─── D-17：空输入不得让作业永久卡死；硬上限不得溢出 ────────────────────
+
+    #[test]
+    fn empty_novel_job_reaches_terminal_stage() {
+        // 空文本切成 0 块：此前 stage=Chunks 且无块可写 → 无任何合法推进路径
+        let job = NovelDistillJob::new("proj-empty", "", 1_000);
+        assert!(job.chunks.is_empty());
+        assert_eq!(
+            job.stage,
+            DistillStage::Done,
+            "空小说必须直接进入终态，不得停在 Chunks（D-17）"
+        );
+        assert!(job.next_pending_chunk().is_none());
+        assert_eq!(job.progress(), (0, 0));
+    }
+
+    #[test]
+    fn huge_target_chars_does_not_overflow_hard_cap() {
+        // D-17：`target * 2` 对接近 usize::MAX 的入参溢出
+        let text = "字".repeat(1_000);
+        let chunks = chunk_novel(&text, usize::MAX);
+        assert_eq!(chunks.len(), 1, "饱和乘法后不应退化为逐字符切块");
+        assert_eq!(chunks[0].char_end, 1_000);
     }
 }

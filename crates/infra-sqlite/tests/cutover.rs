@@ -8,8 +8,8 @@ use std::path::Path;
 
 use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::cutover::{
-    CutoverFault, CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, inspect_marker,
-    recover_or_verify, run_cutover, run_cutover_with_fault,
+    CutoverFault, CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, StaleKind,
+    inspect_marker, recover_or_verify, run_cutover, run_cutover_with_fault,
 };
 use storyforge_infra_sqlite::migrations::current_version;
 use tempfile::TempDir;
@@ -976,5 +976,433 @@ fn orphan_fresh_cutover_identity_does_not_match_foreign_db() {
     assert!(
         err.to_string().to_lowercase().contains("stale"),
         "foreign StoryForge DB must fail closed, got: {err}"
+    );
+}
+
+// ── S-02/S-03：Stale 分类（typed StaleKind）与内容绑定恢复 ──────────────
+
+fn read_marker(dir: &Path) -> serde_json::Value {
+    let raw = fs::read_to_string(dir.join("storyforge.backend.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn stale_kind(plan: &CutoverPlan) -> StaleKind {
+    match inspect_marker(plan) {
+        MarkerStatus::Stale { kind, .. } => kind,
+        other => panic!("expected Stale marker, got {other:?}"),
+    }
+}
+
+fn sqlite_marker_json(
+    schema_version: i64,
+    manifest_hash: &str,
+    authority_id: &str,
+    cutover_nonce: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "backend": "sqlite",
+        "schema_version": schema_version,
+        "manifest_hash": manifest_hash,
+        "created_at": "2026-07-13T00:00:00Z",
+        "authority_id": authority_id,
+        "cutover_nonce": cutover_nonce,
+    })
+}
+
+#[test]
+fn s02_version_ahead_marker_is_reconciled_never_reimported() {
+    // S-02：更新版二进制迁移过 DB、marker 未对账（DbVersionAhead）。旧实现把它
+    // 当成「可恢复中断残留」，会用陈旧 JSON 重发布**覆盖更新版的库**。现在必须
+    // 只回写 marker 版本（reconcile），绝不允许重导入。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    let db_path = dir.path().join("storyforge.sqlite3");
+    let db = Database::open(&db_path).unwrap();
+    let version = current_version(&db).unwrap();
+    let content_hash_before =
+        storyforge_infra_sqlite::readiness::recompute_db_content_hash_for_test(&db).unwrap();
+    drop(db);
+    assert!(version >= 1);
+
+    // marker 版本落后一档（等价于「DB 已被新版迁移，marker 还是旧的」）。
+    let mut marker = read_marker(dir.path());
+    marker["schema_version"] = serde_json::json!(version - 1);
+    write_json(&dir.path().join("storyforge.backend.json"), &marker);
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::DbVersionAhead);
+
+    // 自愈入口只回写 marker 版本；DB 内容一字不改。
+    let reconciled = storyforge_infra_sqlite::reconcile_marker_schema_version(&db_path).unwrap();
+    assert_eq!(reconciled, Some((version - 1, version)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+
+    // 幂等：重跑是 AlreadyCutover，绝不回退到 JSON 重导入。
+    let outcome = run_cutover(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::AlreadyCutover(_)));
+
+    let db = Database::open(&db_path).unwrap();
+    let content_hash_after =
+        storyforge_infra_sqlite::readiness::recompute_db_content_hash_for_test(&db).unwrap();
+    assert_eq!(
+        content_hash_before, content_hash_after,
+        "reconcile 是纯 marker 变更，数据库内容必须逐字节等价"
+    );
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
+#[test]
+fn s03_fresh_start_orphan_db_with_user_data_is_refused() {
+    // S-03：fresh-start（无 legacy 布局）的孤儿库只要**已有用户数据**，就不再是
+    // 「本次 cutover 的中断残留」。旧实现只用身份（authority_id）判定，会把用户
+    // 切到 SQLite 后写入的数据当作空库残留、重新发布一个空库覆盖掉。
+    let dir = TempDir::new().unwrap();
+    let request = make_request(dir.path());
+    let outcome = run_cutover(&request).unwrap();
+    assert!(
+        matches!(outcome, CutoverOutcome::Completed(_)),
+        "空目录必须走 fresh start"
+    );
+
+    let db_path = dir.path().join("storyforge.sqlite3");
+    // 模拟「marker 丢失 + 库里已有真实数据」。
+    fs::remove_file(dir.path().join("storyforge.backend.json")).unwrap();
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO character_cards (card_id, name, imported_at, payload_json) \
+                 VALUES ('card-live', 'Live', '2026-08-01T00:00:00Z', \
+                 '{\"id\":\"card-live\",\"name\":\"Live\"}')",
+                [],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerAbsentOrphanDb);
+    assert!(
+        !storyforge_infra_sqlite::stale_recovery_eligible(&request.plan),
+        "fresh-start 孤儿库一旦有用户数据，绝不能被当作本次 cutover 残留自动重发布"
+    );
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "必须 fail-closed，got: {err}"
+    );
+
+    // 用户数据必须原样还在（没有被空库覆盖）。
+    let db = Database::open(&db_path).unwrap();
+    let count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM character_cards WHERE card_id = 'card-live'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+}
+
+#[test]
+fn s03_post_cutover_writes_block_stale_json_republish() {
+    // S-03：正式 cutover 之后（内容 hash == 源）若 marker 丢失，可以自愈；但一旦
+    // 库里出现 cutover 之后的新写入（内容不再等于源 manifest hash），重发布陈旧
+    // JSON 就会丢掉这些写入 → 必须拒绝。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    let db_path = dir.path().join("storyforge.sqlite3");
+    fs::remove_file(dir.path().join("storyforge.backend.json")).unwrap();
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO character_cards (card_id, name, imported_at, payload_json) \
+                 VALUES ('card-2', 'Second', '2026-08-01T00:00:00Z', \
+                 '{\"id\":\"card-2\",\"name\":\"Second\"}')",
+                [],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerAbsentOrphanDb);
+    assert!(
+        !storyforge_infra_sqlite::stale_recovery_eligible(&request.plan),
+        "cutover 之后的写入必须阻止陈旧 JSON 重发布"
+    );
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "got: {err}"
+    );
+
+    let db = Database::open(&db_path).unwrap();
+    let count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM character_cards WHERE card_id = 'card-2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "post-cutover 写入不得被重导入覆盖");
+}
+
+#[test]
+fn s03_unchanged_source_with_lost_marker_is_recoverable() {
+    // S-03 正例（不得过度拦截）：publish 之后、写 marker 之前崩溃——库里内容
+    // 仍与源 manifest hash 完全一致 → 属于本次 cutover 的中断残留，可自愈续跑。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    let err = run_cutover_with_fault(&request, CutoverFault::AfterPublishBeforeMarker).unwrap_err();
+    assert!(err.to_string().contains("after publish"));
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerAbsentOrphanDb);
+    assert!(
+        storyforge_infra_sqlite::stale_recovery_eligible(&request.plan),
+        "内容与源一致的孤儿库是可自愈的中断残留"
+    );
+    let outcome = recover_or_verify(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
+#[test]
+fn s02_missing_db_with_matching_source_is_recoverable() {
+    // S-02 正例：marker 与当前源 hash 一致、只是 DB 文件丢了（发布前崩在
+    // 重命名/杀软清理）→ 重新导入并发布会得到**同一个权威**，允许自愈。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    let db_path = dir.path().join("storyforge.sqlite3");
+    fs::remove_file(&db_path).unwrap();
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::DbMissing);
+    assert!(storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+
+    let outcome = recover_or_verify(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::Completed(_)));
+    assert!(db_path.exists());
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+
+    // 重新发布出来的库必须与 marker 记录的 manifest hash 一致（同一权威）。
+    let marker = read_marker(dir.path());
+    let db = Database::open(&db_path).unwrap();
+    let hash = storyforge_infra_sqlite::readiness::recompute_db_content_hash_for_test(&db).unwrap();
+    assert_eq!(hash, marker["manifest_hash"].as_str().unwrap());
+}
+
+#[test]
+fn s02_missing_db_with_changed_source_is_refused() {
+    // S-02 反例：DB 丢了，但**源 JSON 已经变了**（用户在 JSON 模式下继续写作）。
+    // 重新导入会得到不同权威 → 拒绝自动恢复（否则会把用户切到一个由新 JSON
+    // 派生的库上，且旧库一旦回来就出现双权威）。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+    fs::remove_file(dir.path().join("storyforge.sqlite3")).unwrap();
+
+    // 源在 cutover 之后被改动。
+    write_json(
+        &dir.path().join("cards.json"),
+        &serde_json::json!([
+            { "id": "card-1", "name": "Hero", "source_character_id": null },
+            { "id": "card-2", "name": "Second", "source_character_id": null }
+        ]),
+    );
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::DbMissing);
+    assert!(
+        !storyforge_infra_sqlite::stale_recovery_eligible(&request.plan),
+        "源已改动时 DbMissing 不得自愈"
+    );
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn s02_db_probe_failure_is_refused_not_treated_as_interruption() {
+    // S-02：DB 打不开（损坏/被占用/权限）不能按「中断残留」处理——旧实现按错误
+    // 文本子串判定，会把探测失败当成可恢复，进而用陈旧 JSON 覆盖真实库。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    // 用垃圾字节替换 DB 文件（不是 SQLite 文件 → 只读探测必然失败）。
+    fs::write(
+        dir.path().join("storyforge.sqlite3"),
+        b"not a sqlite database",
+    )
+    .unwrap();
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::DbProbeFailed);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "got: {err}"
+    );
+    // 文件内容没有被改写。
+    assert_eq!(
+        fs::read(dir.path().join("storyforge.sqlite3")).unwrap(),
+        b"not a sqlite database"
+    );
+}
+
+#[test]
+fn s03_orphan_db_from_other_source_identity_is_refused() {
+    // S-03：marker 缺失 + 孤儿库身份不属于本次源（同一 data_dir 但 JSON 已被
+    // 换成另一套数据）→ 拒绝，绝不静默覆盖。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+    fs::remove_file(dir.path().join("storyforge.backend.json")).unwrap();
+
+    // 另一套源：不同 card/campaign id。
+    write_json(
+        &dir.path().join("cards.json"),
+        &serde_json::json!([{ "id": "card-x", "name": "Other", "source_character_id": null }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &serde_json::json!([{
+            "id": "camp-x",
+            "card_id": "card-x",
+            "name": "Other",
+            "created_at": "2026-07-13T00:00:00Z",
+            "revision": 0,
+            "chronicle_revision": 0,
+            "lineage_id": "lin-x"
+        }]),
+    );
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerAbsentOrphanDb);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn s03_orphan_db_with_foreign_authority_binding_is_refused() {
+    // S-03：孤儿库的 authority_binding 指向别的身份（例如别处复制来的库）→ 拒绝。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    // 篡改身份绑定，模拟「不是本次 cutover 的产物」。
+    {
+        let db = Database::open(dir.path().join("storyforge.sqlite3")).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE authority_binding SET authority_id = 'foreign-authority', \
+                 cutover_nonce = 'foreign-nonce'",
+                [],
+            )
+            .unwrap();
+    }
+    fs::remove_file(dir.path().join("storyforge.backend.json")).unwrap();
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerAbsentOrphanDb);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+    let err = run_cutover(&request).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("stale"),
+        "got: {err}"
+    );
+    // 身份绑定没有被覆盖。
+    let db = Database::open(dir.path().join("storyforge.sqlite3")).unwrap();
+    let authority: String = db
+        .connection()
+        .query_row("SELECT authority_id FROM authority_binding", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(authority, "foreign-authority");
+}
+
+#[test]
+fn s02_marker_corrupt_and_unknown_backend_kinds_are_typed() {
+    // S-02：marker 损坏 / 后端名未知必须有独立类型（旧实现只有自由文本，调用方
+    // 只能靠子串猜），且都不可恢复。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+
+    fs::write(dir.path().join("storyforge.backend.json"), b"{ corrupt").unwrap();
+    assert_eq!(stale_kind(&request.plan), StaleKind::MarkerCorrupt);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+
+    let mut marker = sqlite_marker_json(1, "hash", "authority", "nonce");
+    marker["backend"] = serde_json::json!("postgres");
+    write_json(&dir.path().join("storyforge.backend.json"), &marker);
+    assert_eq!(stale_kind(&request.plan), StaleKind::BackendUnknown);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+}
+
+#[test]
+fn s02_sqlite_marker_without_db_and_foreign_manifest_is_refused() {
+    // 既有回归（`stale_marker_with_missing_db_is_rejected`）的 typed 版本：
+    // DbMissing + manifest_hash 与当前源不一致 → 拒绝，且错误里带类型标签。
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    write_json(
+        &dir.path().join("storyforge.backend.json"),
+        &sqlite_marker_json(4, "fake", "authority", "nonce"),
+    );
+
+    assert_eq!(stale_kind(&request.plan), StaleKind::DbMissing);
+    assert!(!storyforge_infra_sqlite::stale_recovery_eligible(
+        &request.plan
+    ));
+    let err = run_cutover(&request).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("stale"), "got: {err}");
+    assert!(
+        text.contains("db-missing"),
+        "错误必须带 typed 类型标签，便于 UI/日志分类，got: {err}"
     );
 }

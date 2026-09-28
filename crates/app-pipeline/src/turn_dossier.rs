@@ -146,10 +146,12 @@ fn normalized_fact(text: &str) -> String {
         .collect()
 }
 
+/// `story_clock`：真实故事时钟（D-04，不得传空串，否则 StoryTime 触发器恒不命中）。
 pub(crate) fn compile_turn_dossier(
     intent: &str,
     runtime: &CampaignRuntimeContext,
     pending_tasks: &[StoryTask],
+    story_clock: &str,
     max_full_actors: usize,
 ) -> CompiledTurnDossier {
     let roster = runtime
@@ -281,8 +283,11 @@ pub(crate) fn compile_turn_dossier(
         })
         .collect();
 
-    let pending_tasks =
-        storyforge_domain::story_task::render_tasks_for_injection(pending_tasks, runtime.turn, "");
+    let pending_tasks = storyforge_domain::story_task::render_tasks_for_injection(
+        pending_tasks,
+        runtime.turn,
+        story_clock,
+    );
     CompiledTurnDossier {
         intent: intent.to_string(),
         roster,
@@ -407,9 +412,122 @@ mod tests {
         }
     }
 
+    /// 域1 `render_tasks_for_injection` 的两个分组标题（D-04 裁定：两组不得混用）。
+    const SATISFIED_TITLE: &str = "【已满足条件的任务/伏笔】";
+    const PENDING_TITLE: &str = "【待判断的任务/伏笔】";
+
+    /// 取某分组标题覆盖的文本片段（已满足组到待判断标题为止；待判断组到结尾）。
+    fn group_text<'a>(text: &'a str, title: &str) -> &'a str {
+        let Some(start) = text.find(title) else {
+            return "";
+        };
+        let rest = &text[start..];
+        if title == SATISFIED_TITLE
+            && let Some(end) = rest.find(PENDING_TITLE)
+        {
+            return &rest[..end];
+        }
+        rest
+    }
+
+    /// D-04：StoryTime 触发器必须用**真实** story_clock 判定。
+    ///
+    /// 根因修复：旧实现把 `""` 当故事时钟传给 `render_tasks_for_injection`，导致
+    /// 匹配的伏笔无法确定性命中（不匹配的也可能被误判）。现在：
+    /// 匹配 → `Satisfied`（注入"已满足"组）；不匹配 → `NotSatisfied`（不注入）。
+    #[test]
+    fn story_time_task_injected_only_with_matching_real_clock() {
+        let runtime = runtime();
+        let task = StoryTask::user_planned(
+            runtime.campaign.id.clone(),
+            "钟楼约定",
+            "第2天夜里在钟楼碰头",
+            vec![storyforge_domain::story_task::TaskTrigger::StoryTime {
+                target: "第2天".into(),
+            }],
+            1,
+        );
+        let tasks = vec![task];
+
+        // 真实时钟匹配 → 注入「已满足」组
+        let matched = compile_turn_dossier("林如质问陈默", &runtime, &tasks, "第2天", 3);
+        assert!(
+            matched.pending_tasks.contains("钟楼约定"),
+            "时钟匹配应注入: {}",
+            matched.pending_tasks
+        );
+        assert!(
+            group_text(&matched.pending_tasks, SATISFIED_TITLE).contains("钟楼约定"),
+            "确定性命中的任务必须在「已满足」组: {}",
+            matched.pending_tasks
+        );
+        assert!(
+            !group_text(&matched.pending_tasks, PENDING_TITLE).contains("钟楼约定"),
+            "确定性命中的任务不得混进「待判断」组: {}",
+            matched.pending_tasks
+        );
+
+        // 不匹配的时钟 → 不注入（旧实现在这里会误注入/误判）
+        let mismatched = compile_turn_dossier("林如质问陈默", &runtime, &tasks, "第3天", 3);
+        assert!(
+            !mismatched.pending_tasks.contains("钟楼约定"),
+            "不匹配时钟不得命中: {}",
+            mismatched.pending_tasks
+        );
+    }
+
+    /// D-04：时钟缺失（调用方没接故事时钟）不是"确定性判否"，也不是"无条件注入"：
+    /// 域侧 `check_trigger` 返回 `NeedsAgentJudgment`，该任务进入**待判断**分组，
+    /// 由 Agent 判断是否适用（渲染分组标题由域1 的 `render_tasks_for_injection` 负责，
+    /// 本域只保证传真实时钟 + 不改分类语义）。
+    #[test]
+    fn story_time_task_without_clock_goes_to_pending_judgment_group() {
+        use storyforge_domain::story_task::TriggerCheck;
+
+        let runtime = runtime();
+        let task = StoryTask::user_planned(
+            runtime.campaign.id.clone(),
+            "钟楼约定",
+            "第2天夜里在钟楼碰头",
+            vec![storyforge_domain::story_task::TaskTrigger::StoryTime {
+                target: "第2天".into(),
+            }],
+            1,
+        );
+
+        // 分类语义（域侧接口约定）：空时钟 = 需 Agent 判断；真实时钟匹配 = 确定性满足
+        assert_eq!(task.check_trigger(3, ""), TriggerCheck::NeedsAgentJudgment);
+        assert_ne!(task.check_trigger(3, ""), TriggerCheck::Satisfied);
+        assert_eq!(task.check_trigger(3, "第2天"), TriggerCheck::Satisfied);
+
+        // 必须仍出现在待注入集合里（否则长程伏笔静默蒸发），且只能落在「待判断」组
+        let tasks = vec![task];
+        let dossier = compile_turn_dossier("林如质问陈默", &runtime, &tasks, "", 3);
+        assert!(
+            dossier.pending_tasks.contains("钟楼约定"),
+            "空时钟应进入待判断分组并注入: {}",
+            dossier.pending_tasks
+        );
+        assert!(
+            group_text(&dossier.pending_tasks, PENDING_TITLE).contains("钟楼约定"),
+            "空时钟的任务必须在「待判断」组: {}",
+            dossier.pending_tasks
+        );
+        assert!(
+            !group_text(&dossier.pending_tasks, SATISFIED_TITLE).contains("钟楼约定"),
+            "空时钟不得被当作「已满足」提前触发: {}",
+            dossier.pending_tasks
+        );
+        assert!(
+            dossier.pending_tasks.contains("不要提前揭示"),
+            "「待判断」组必须带防剧透指令: {}",
+            dossier.pending_tasks
+        );
+    }
+
     #[test]
     fn compiler_prioritizes_named_actors_and_caps_full_dossiers_at_three() {
-        let dossier = compile_turn_dossier("陈默逼问林如，周岚在门口旁听", &runtime(), &[], 3);
+        let dossier = compile_turn_dossier("陈默逼问林如，周岚在门口旁听", &runtime(), &[], "", 3);
 
         assert_eq!(dossier.actors.len(), 3);
         assert_eq!(
@@ -425,7 +543,7 @@ mod tests {
 
     #[test]
     fn private_knowledge_is_owner_labeled_and_creates_conservative_boundary() {
-        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], 3);
+        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], "", 3);
         let owner = dossier
             .actors
             .iter()
@@ -455,7 +573,7 @@ mod tests {
 
     #[test]
     fn missing_open_fact_never_becomes_an_ignorance_boundary() {
-        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], 3);
+        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], "", 3);
 
         assert!(
             dossier
@@ -467,7 +585,7 @@ mod tests {
 
     #[test]
     fn rendered_dossier_carries_ids_agenda_variables_and_ownership_labels() {
-        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], 3);
+        let dossier = compile_turn_dossier("林如质问陈默", &runtime(), &[], "", 3);
         let rendered = dossier.render_for_writer();
 
         assert!(rendered.contains("林如（actor-a）"));

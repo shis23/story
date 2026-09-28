@@ -24,6 +24,12 @@ pub enum RegexExecutionTarget {
 }
 
 /// Regex execution error
+///
+/// §5.2-3（域1 记录，语义注解，变体不改以保持 API/文案兼容）：
+/// - 输入超过 `MAX_REGEX_INPUT_LEN` 时返回的是 `Compile`，**不是**正则语法错误；
+///   调用方文案不应提示用户"正则写错了"（该场景是超长文本触发的 ReDoS 防护）。
+/// - 已进入 `TIMED_OUT_SPECS` 的 spec 复用 `Timeout` 变体（首次超时值与
+///   `REGEX_TIMEOUT_SECS`），语义是"本进程内已禁用该 spec"，不是"这一次又超时了"。
 #[derive(Debug, thiserror::Error)]
 pub enum RegexError {
     #[error("正则编译失败: {0}")]
@@ -154,8 +160,10 @@ pub fn apply_reasoning_regex_to_think_blocks_at_depth(
 fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, RegexError> {
     const MAX_REGEX_INPUT_LEN: usize = 1024 * 1024; // 1MB
     if text.len() > MAX_REGEX_INPUT_LEN {
+        // §5.2-3：超长输入走 Compile 变体是历史形状；错误文案已写明是长度防护，
+        // 调用方不得把它当"正则语法错误"提示用户。
         return Err(RegexError::Compile(format!(
-            "regex input too long: {} bytes (max {}), possible ReDoS",
+            "regex input too long: {} bytes (max {}), possible ReDoS（输入长度防护，不是正则语法错误）",
             text.len(),
             MAX_REGEX_INPUT_LEN
         )));

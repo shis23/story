@@ -111,6 +111,9 @@ impl MessageLayout {
     }
 
     /// 完整请求指纹（system + history + tail），用于同输入可复现校验。
+    ///
+    /// D-19：每个 tail part 先写入长度前缀再写内容，否则 `["a", "b"]` 与
+    /// `["a\nb"]` 会拼成同一字节流、得到同一指纹（两者 `into_messages()` 语义不同）。
     pub fn full_request_fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"system\0");
@@ -121,6 +124,7 @@ impl MessageLayout {
         }
         hasher.update(b"tail\0");
         for part in &self.volatile_tail.parts {
+            hasher.update((part.len() as u64).to_le_bytes());
             hasher.update(part.as_bytes());
             hasher.update(b"\n");
         }
@@ -135,6 +139,8 @@ impl MessageLayout {
         }
         let mut tail_hasher = Sha256::new();
         for part in &self.volatile_tail.parts {
+            // D-19：长度前缀，消除分段歧义
+            tail_hasher.update((part.len() as u64).to_le_bytes());
             tail_hasher.update(part.as_bytes());
             tail_hasher.update(b"\n");
         }
@@ -366,12 +372,16 @@ fn short_hex(hex: &str, n: usize) -> &str {
     if hex.len() >= n { &hex[..n] } else { hex }
 }
 
-// ─── Builder（类型状态机，编译期强制顺序）──────────────────────────────────
+// ─── Builder（运行时顺序约定，非编译期强制）────────────────────────────────
 
 /// 构建器
 ///
-/// 强制顺序：system → history → tail。
-/// 调 `tail()` 后返回最终 MessageLayout，不能再改 system/history。
+/// 约定调用顺序：system → history → tail。`tail()` 返回最终 `MessageLayout`，
+/// 之后不能再改 system/history（值已 move 进 layout）。
+///
+/// D-19：这**不是**编译期强制的类型状态机——三个字段都是 `Option`，
+/// `tail()` 用 `unwrap_or_default()` 兜底，漏填不会编译报错，只是产生空段。
+/// 因此漏填 system 会发出一条空 system 消息（此处 `warn!` 提示，不改变行为）。
 pub struct MessageLayoutBuilder {
     stable_system: Option<String>,
     stable_history: Option<Vec<ChatMessage>>,
@@ -397,6 +407,11 @@ impl MessageLayoutBuilder {
     where
         F: FnOnce(VolatileTail) -> VolatileTail,
     {
+        if self.stable_system.is_none() {
+            tracing::warn!(
+                "MessageLayoutBuilder::tail 未先调用 system()：将发送空 system 消息（D-19）"
+            );
+        }
         MessageLayout {
             stable_system: self.stable_system.unwrap_or_default(),
             stable_history: self.stable_history.unwrap_or_default(),
@@ -720,5 +735,55 @@ mod tests {
         b.params.temperature = Some(0.2);
         assert_ne!(fingerprint_chat_request(&a), fingerprint_chat_request(&b));
         assert_eq!(fingerprint_chat_request(&a), fingerprint_chat_request(&a));
+    }
+
+    // ─── D-19：tail 分段歧义 ───────────────────────────────────────────────
+
+    #[test]
+    fn tail_part_boundaries_are_not_ambiguous() {
+        // ["a", "b"]（两段，into_messages 只发一条 user="a\nb"… 分段语义不同）
+        // 与 ["a\nb"]（单段）此前拼出同一字节流 → 同指纹
+        let two_parts = MessageLayout::build()
+            .system("s")
+            .history(vec![])
+            .tail(|t| t.push("a").push("b"));
+        let one_part = MessageLayout::build()
+            .system("s")
+            .history(vec![])
+            .tail(|t| t.push("a\nb"));
+
+        assert_ne!(
+            two_parts.full_request_fingerprint(),
+            one_part.full_request_fingerprint(),
+            "分段数不同的 tail 不得共享指纹（D-19）"
+        );
+        assert_ne!(
+            two_parts.segment_fingerprint().tail_hash,
+            one_part.segment_fingerprint().tail_hash
+        );
+        // 分段数进入 tail_parts，可区分
+        assert_ne!(
+            two_parts.segment_fingerprint().tail_parts,
+            one_part.segment_fingerprint().tail_parts
+        );
+        // 相同布局仍稳定
+        assert_eq!(
+            two_parts.full_request_fingerprint(),
+            MessageLayout::build()
+                .system("s")
+                .history(vec![])
+                .tail(|t| t.push("a").push("b"))
+                .full_request_fingerprint()
+        );
+    }
+
+    #[test]
+    fn builder_without_system_still_produces_system_message() {
+        // D-19：文档曾称"编译期强制顺序"，实际漏填 system 只产生空段
+        let layout = MessageLayout::build().tail(|t| t.push("尾部"));
+        let msgs = layout.into_messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].role, ChatRole::System));
+        assert!(msgs[0].content.is_empty());
     }
 }

@@ -58,7 +58,21 @@ pub struct Campaign {
 }
 
 fn default_story_clock() -> String {
-    "Day 1".into()
+    crate::variables::DEFAULT_STORY_CLOCK.into()
+}
+
+/// 从（已合并的）变量 schema 中取 `story_clock` 默认值；缺字段时回退系统常量。
+///
+/// 顶层 `story_clock` 只是旧数据的兼容镜像，权威是 `variables["story_clock"]`。
+/// 新建 Campaign 必须从最终 schema 取值，否则卡模板一覆盖 `story_clock` 默认值，
+/// 新档就会立刻处于"双表示分歧"状态（D-06）。
+fn story_clock_from_schema(schema: &[VariableField]) -> String {
+    schema
+        .iter()
+        .find(|field| field.key == "story_clock")
+        .and_then(|field| field.default.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(default_story_clock)
 }
 
 /// 故事时钟双表示修复结果（Gate 4 评审 P2-6）：调用方据此发出可审计日志。
@@ -88,6 +102,7 @@ impl Campaign {
             &crate::variables::default_campaign_variables(),
             card_schema,
         );
+        let story_clock = story_clock_from_schema(&variable_schema);
         Self {
             id: Id::new(),
             card_id,
@@ -97,7 +112,7 @@ impl Campaign {
             variables: crate::variables::init_values_from_schema(&variable_schema, 0),
             variable_schema,
             conversation_id: None,
-            story_clock: default_story_clock(),
+            story_clock,
             revision: 0,
             chronicle_revision: 0,
             lineage_id: Some(Id::new()),
@@ -425,7 +440,7 @@ mod tests {
         assert_eq!(campaign.name, "run-1");
         assert_eq!(campaign.card_id, card_id);
         assert!(campaign.fork_from.is_none());
-        assert_eq!(campaign.story_clock, "Day 1");
+        assert_eq!(campaign.story_clock, crate::variables::DEFAULT_STORY_CLOCK);
         assert!(campaign.get_variable("story_clock").is_some());
         assert!(campaign.get_variable("weather").is_some());
     }
@@ -570,8 +585,72 @@ mod tests {
         let mut campaign = Campaign::new(Id::new(), "test");
         // Manually remove the story_clock variable to simulate desync
         campaign.variables.retain(|v| v.key != "story_clock");
-        // Top-level field still has old value
-        assert_eq!(campaign.current_story_clock(), "Day 1");
+        // 顶层镜像字段与 variables schema 默认值同源（D-06）
+        assert_eq!(
+            campaign.current_story_clock(),
+            crate::variables::DEFAULT_STORY_CLOCK
+        );
+        assert!(
+            !campaign.story_clock_diverged(),
+            "权威项缺失不算分歧（回退镜像字段）"
+        );
+    }
+
+    #[test]
+    fn test_fresh_campaign_story_clock_has_single_authority() {
+        let mut campaign = Campaign::new(Id::new(), "fresh");
+        assert_eq!(campaign.story_clock, crate::variables::DEFAULT_STORY_CLOCK);
+        assert_eq!(
+            campaign.current_story_clock(),
+            crate::variables::DEFAULT_STORY_CLOCK
+        );
+        assert!(
+            !campaign.story_clock_diverged(),
+            "新建 Campaign 不应天生处于双表示分歧状态（D-06）"
+        );
+        assert_eq!(
+            campaign.repair_story_clock_authority(),
+            StoryClockRepair::NoChange,
+            "无分歧时 repair 不应产生 FieldRepaired 噪声"
+        );
+    }
+
+    #[test]
+    fn test_fork_campaign_story_clock_has_single_authority() {
+        let campaign = Campaign::fork(Id::new(), "fork", Id::new(), Id::new());
+        assert_eq!(campaign.story_clock, crate::variables::DEFAULT_STORY_CLOCK);
+        assert!(!campaign.story_clock_diverged());
+    }
+
+    #[test]
+    fn test_card_story_clock_default_is_mirrored_into_legacy_field() {
+        // 卡模板覆盖 story_clock 默认值时，镜像字段必须跟随最终 schema（D-06）
+        let card_schema = vec![VariableField::string(
+            "story_clock",
+            "故事时间",
+            "Day 7",
+            "全局",
+        )];
+        let campaign = Campaign::new_with_variable_schema(Id::new(), "card", &card_schema);
+        assert_eq!(campaign.current_story_clock(), "Day 7");
+        assert_eq!(campaign.story_clock, "Day 7");
+        assert!(!campaign.story_clock_diverged(), "卡覆盖默认值后仍不应分歧");
+    }
+
+    #[test]
+    fn test_legacy_json_missing_story_clock_uses_schema_default() {
+        // 旧 JSON 缺 story_clock/variables 字段时，serde 默认值必须与 schema 默认值同源
+        let mut value = serde_json::to_value(Campaign::new(Id::new(), "old")).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("story_clock");
+        obj.remove("variables");
+        let campaign: Campaign = serde_json::from_value(value).unwrap();
+        assert_eq!(campaign.story_clock, crate::variables::DEFAULT_STORY_CLOCK);
+        assert_eq!(
+            campaign.current_story_clock(),
+            crate::variables::DEFAULT_STORY_CLOCK
+        );
+        assert!(!campaign.story_clock_diverged());
     }
 
     #[test]

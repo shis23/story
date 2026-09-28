@@ -598,6 +598,51 @@ pub enum AgentError {
 /// 默认子 Agent 并发上限。
 pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
+/// 归一后的实例名比较：委托 `storyforge_domain::campaign_runtime::normalize_instance_identity`
+/// （`trim` + Unicode 小写）。
+///
+/// W-01 / N-R7-01：`CampaignRuntimeContext::with_temporaries_for` 的去重语义与
+/// 这里的匹配语义**必须共用同一个归一函数**，否则 Director 输出的大小写/空白变体会
+/// 先被去重逻辑认为"已存在"、再在匹配时 miss，导致子 Agent 丢失 instance 绑定
+/// （persona/知识/变量注入全部退化）。此前本文件用 `trim + eq_ignore_ascii_case`、
+/// domain 用 `to_lowercase` 且不 trim，`"Ähre"/"ähre"` 与 `" Alice "/"Alice"`
+/// 两侧结论恰好相反——不要退回两套语义。
+pub(crate) fn instance_name_matches(candidate: &str, needle: &str) -> bool {
+    storyforge_domain::campaign_runtime::normalize_instance_identity(candidate)
+        == storyforge_domain::campaign_runtime::normalize_instance_identity(needle)
+}
+
+/// 统一身份解析：id 精确 → id 归一（trim + Unicode 小写）→ 名称归一。
+///
+/// 与 `with_temporaries_for` 的归一语义一致（W-01 / N-R7-01，共享
+/// `normalize_instance_identity`）。同名多实例时返回第一个，需要歧义检测的调用方
+/// （get_character 工具）应自行收集全部候选。
+pub(crate) fn find_instance_normalized<'a>(
+    runtime: &'a CampaignRuntimeContext,
+    value: &str,
+) -> Option<&'a storyforge_domain::campaign::CharacterInstance> {
+    let needle = value.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    runtime
+        .instances
+        .iter()
+        .find(|inst| inst.id.as_str() == needle)
+        .or_else(|| {
+            runtime.instances.iter().find(|inst| {
+                storyforge_domain::campaign_runtime::normalize_instance_identity(inst.id.as_str())
+                    == storyforge_domain::campaign_runtime::normalize_instance_identity(needle)
+            })
+        })
+        .or_else(|| {
+            runtime
+                .instances
+                .iter()
+                .find(|inst| instance_name_matches(&inst.name, needle))
+        })
+}
+
 /// 委派子 Agent（tokio::spawn + watch 取消，借鉴 TT）
 ///
 /// 每个子 Agent clone 全局 `cancel`，主流水线取消时所有子 Agent 立即响应。
@@ -608,7 +653,7 @@ pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 ///   转发为 `PipelineEvent::SubagentProgress`（带 character_id + index），供前端实时显示。
 /// - **并发**：用 `Semaphore` 限流，默认上限为 `DEFAULT_MAX_CONCURRENT_SUBAGENTS`，
 ///   超出的任务**排队等待**而非丢弃，最终全部跑完。结果按原始 index 对齐返回。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 11 个参数是流水线装配面的自然投影（W-01 归一需要 runtime）
 pub async fn spawn_subagents(
     tasks: Vec<SubagentTask>,
     runtime: Arc<AgentRuntime>,
@@ -653,9 +698,11 @@ pub async fn spawn_subagents(
         let subagent_whitelist = subagent_run_config.and_then(|rc| rc.tool_whitelist.clone());
 
         // ── 阶段 4：Campaign 模式下按 character_id 匹配 instance ──
+        // W-01：归一语义与 with_temporaries_for（trim + 大小写不敏感）一致，
+        // 否则大小写/空白变体会丢掉 instance 绑定。
         let matched_instance = campaign_runtime
             .as_ref()
-            .and_then(|cr| cr.find_instance_by_id_or_name(&task.character_id));
+            .and_then(|cr| find_instance_normalized(cr, &task.character_id));
 
         // ── 构造 system prompt（稳定段）──
         let (stable_system, instance_id_for_ctx) =
@@ -953,7 +1000,9 @@ pub fn build_campaign_subagent_volatile(
 ///
 /// 包含：角色设定（persona）+ 常驻世界设定（蓝灯）。
 /// 这些跨场戏稳定，进 system 段让 cache 命中。
-fn format_context_stable(pkg: &ContextPackage) -> String {
+///
+/// W-32：本函数是唯一实现（app-pipeline 路径 C 直接复用，不再各写一份）。
+pub fn format_context_stable(pkg: &ContextPackage) -> String {
     let mut out = String::new();
 
     if !pkg.character_brief.is_empty() {
@@ -975,7 +1024,9 @@ fn format_context_stable(pkg: &ContextPackage) -> String {
 ///
 /// 包含：当前场景 + 相关世界设定（绿灯检索）+ 最近对话窗口。
 /// 这些每场戏不同，压在 tail。
-fn format_context_volatile(pkg: &ContextPackage) -> String {
+///
+/// W-32：本函数是唯一实现（app-pipeline 路径 C 直接复用）。
+pub fn format_context_volatile(pkg: &ContextPackage) -> String {
     let mut out = String::new();
 
     if !pkg.scene_brief.is_empty() {
@@ -2380,6 +2431,228 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "旧路径应成功: {:?}", results[0]);
+    }
+
+    /// W-01：归一函数必须与 with_temporaries_for 的 trim + 大小写不敏感语义一致。
+    #[test]
+    fn test_find_instance_normalized_matches_case_and_whitespace_variants() {
+        let cr = make_campaign_runtime();
+        for variant in ["lin", " LIN ", "LiN", "\tlin\n"] {
+            let inst = find_instance_normalized(&cr, variant)
+                .unwrap_or_else(|| panic!("变体 {variant:?} 应命中 inst-lin"));
+            assert_eq!(inst.id.as_str(), "inst-lin", "变体 {variant:?}");
+        }
+        // instance_id 的大小写/空白变体同样命中
+        assert_eq!(
+            find_instance_normalized(&cr, "  INST-LIN  ")
+                .unwrap()
+                .id
+                .as_str(),
+            "inst-lin"
+        );
+        // 空串/纯空白不命中（不得回退到"第一个实例"）
+        assert!(find_instance_normalized(&cr, "   ").is_none());
+        assert!(find_instance_normalized(&cr, "").is_none());
+        // 未知名仍不命中
+        assert!(find_instance_normalized(&cr, "Nobody").is_none());
+        assert!(instance_name_matches(" Lin ", "lIN"));
+    }
+
+    /// N-R7-01 跨 crate 等价性（共享语料 / 失败可控）：
+    /// domain 的去重键（`with_temporaries_for`）与 app-agent 的实例匹配
+    /// （`instance_name_matches` / `find_instance_normalized`）必须对同一份语料
+    /// 给出**同一个**答案——同一个人的大小写/空白/非 ASCII 变体视为同一人，
+    /// 不同的人绝不合并。
+    ///
+    /// 修复前本测试必然失败：`(" Alice ", "Alice")` 在 domain 侧不 trim、
+    /// `("Ähre", "ähre")` 在 app-agent 侧是 ASCII-only，两侧结论相反。
+    #[test]
+    fn test_normalization_shared_corpus_agrees_across_crates() {
+        /// (实例名, 候选字符串, 是否应视为同一身份)
+        const CORPUS: &[(&str, &str, bool)] = &[
+            ("Alice", "alice", true),     // ASCII 大小写
+            ("Alice", "ALICE", true),     // ASCII 全大写
+            (" Alice ", "Alice", true),   // 存量名带空白（domain 侧曾漏 trim）
+            ("Alice", " Alice ", true),   // 候选带空白
+            ("Alice", "\tALICE\n", true), // 制表/换行 + 大小写
+            ("Ähre", "ähre", true),       // 非 ASCII 大小写（Unicode 小写）
+            ("Élodie", "élodie", true),   // 变音符
+            ("İrem", "irem", false),      // 土耳其 İ：保守不合并（不误合并优先）
+            ("irem", "İrem", false),
+            ("Straße", "strasse", false), // ß 不做 ss 展开
+            ("Alice", "Bob", false),      // 不同人
+            ("Alice", "Älice", false),    // 形近不同字符
+        ];
+
+        for (stored, candidate, same) in CORPUS {
+            let ctx = runtime_with_instance_named(stored);
+
+            // domain 侧：命中则不产生临时实例（去重跳过）；未命中则恰好 1 个。
+            let (_new_ctx, temps) =
+                ctx.with_temporaries_for(&[(candidate.to_string(), None, None)]);
+            let dedup_says_same = temps.is_empty();
+
+            // app-agent 侧：归一匹配 / 统一身份解析必须一致。
+            let matches_says_same = instance_name_matches(stored, candidate)
+                && find_instance_normalized(&ctx, candidate).is_some();
+
+            assert_eq!(
+                dedup_says_same,
+                *same,
+                "domain 去重结论与期望不符: stored={stored:?} candidate={candidate:?} (temps={})",
+                temps.len()
+            );
+            assert_eq!(
+                matches_says_same, *same,
+                "app-agent 匹配结论与期望不符: stored={stored:?} candidate={candidate:?}"
+            );
+            assert_eq!(
+                dedup_says_same, matches_says_same,
+                "两侧归一语义必须一致（N-R7-01）: stored={stored:?} candidate={candidate:?}"
+            );
+        }
+    }
+
+    /// N-R7-01：同名多实例时——去重（domain）与解析（app-agent）都不新造实例，
+    /// 解析返回第一个（歧义检测由 get_character 工具负责）。
+    #[test]
+    fn test_normalization_same_name_multi_instance_agrees() {
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let campaign_id = campaign.id.clone();
+        let make = |id: &str| CharacterInstance {
+            id: Id::from_str(id),
+            campaign_id: campaign_id.clone(),
+            definition_id: None,
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let ctx = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![make("inst-a"), make("inst-b")],
+            definitions_by_id: Default::default(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        });
+
+        let (new_ctx, temps) = ctx.with_temporaries_for(&[(" LIN ".into(), None, None)]);
+        assert!(temps.is_empty(), "同名变体不应新造临时实例");
+        assert_eq!(new_ctx.instances.len(), 2, "不新增实例");
+        assert_eq!(
+            find_instance_normalized(&ctx, " lin ").unwrap().id.as_str(),
+            "inst-a",
+            "同名多实例返回第一个"
+        );
+    }
+
+    /// 构造只含一个指定名字实例的 runtime（供跨 crate 语料测试使用）。
+    fn runtime_with_instance_named(name: &str) -> Arc<CampaignRuntimeContext> {
+        let campaign = Campaign::new(Id::from_str("card-norm"), "norm-campaign");
+        Arc::new(CampaignRuntimeContext {
+            campaign: campaign.clone(),
+            instances: vec![CharacterInstance {
+                id: Id::from_str("inst-only"),
+                campaign_id: campaign.id.clone(),
+                definition_id: None,
+                name: name.to_string(),
+                persona_override: None,
+                behavior_override: None,
+                variables: vec![],
+                is_temporary: false,
+            }],
+            definitions_by_id: Default::default(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        })
+    }
+
+    /// W-01 端到端：character_id 为大小写/空白变体时，子 Agent 仍绑定到
+    /// 同一 instance（注入 campaign persona，不退化到 context_package）。
+    #[tokio::test]
+    async fn test_spawn_subagents_normalizes_case_and_whitespace_variant() {
+        let cr = make_campaign_runtime();
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "subagent ok with enough narrative content to satisfy completion probe".into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(cr.clone()),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm.clone(), tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let tasks = vec![SubagentTask {
+            character_id: "  lIn  ".into(), // 大小写 + 空白变体
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "旧的角色简介（不应被使用）".into(),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
+        }];
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            Some(cr),
+            2,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "子 Agent 应成功: {:?}", results[0]);
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1, "子 Agent 应只发一次请求");
+        let all: String = requests[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("calm surgeon"),
+            "变体应绑定 inst-lin 并注入 campaign persona: {all}"
+        );
+        assert!(
+            !all.contains("旧的角色简介"),
+            "变体不得退化到 context_package.character_brief: {all}"
+        );
     }
 
     // ── Phase 4 cleanup：直接断言 prompt 内容 ──

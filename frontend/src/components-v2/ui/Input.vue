@@ -26,6 +26,7 @@ function classes() {
     :value="modelValue"
     :placeholder="placeholder"
     :disabled="disabled"
+    :aria-invalid="invalid ? 'true' : undefined"
     :class="classes()"
     @input="$emit('update:modelValue', $event.target.value)"
   />

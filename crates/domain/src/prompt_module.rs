@@ -137,16 +137,6 @@ impl PromptProfile {
     }
 }
 
-// ─── Agent 绑定（对应设计 §3.6.6 Layer ③）─────────────────────────────────
-
-/// 运行时绑定：每个 Agent 角色当前用哪个 Profile + 连接
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentBinding {
-    pub role: AgentRole,
-    pub active_profile_id: Id,
-    pub active_connection_id: Id,
-}
-
 // ─── 提示词组装函数（对应设计 §3.6.7）─────────────────────────────────────
 
 /// 按 Profile 组装系统提示词（设计 §3.6.7 的核心流程）
@@ -187,12 +177,24 @@ pub fn assemble_system_prompt(
                 continue;
             }
             let ids = profile.selected_ids(role, cat);
+            // D-13：`Exclusivity::Single` 的单选语义必须在这里执行——同类别只取
+            // 第一个可用模块，否则视角/文风/语气会互相矛盾的指令同时进 system。
+            let single = ids.iter().any(|mid| {
+                modules
+                    .iter()
+                    .any(|m| &m.id == mid && matches!(m.exclusivity, Exclusivity::Single))
+            });
+            let mut injected = 0usize;
             for mid in ids {
                 if let Some(m) = modules
                     .iter()
                     .find(|m| &m.id == mid && role_applicable(&m.applicable_roles, role))
                 {
+                    if single && injected > 0 {
+                        break;
+                    }
                     parts.push(m.content.clone());
+                    injected += 1;
                 }
             }
         }
@@ -332,6 +334,26 @@ pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarConte
             .unwrap_or_else(default_template_random_seed),
         random_counter: 0,
     };
+    render_template_text(text, context, &mut state, 0)
+}
+
+/// 嵌套宏的最大展开深度（防御自引用宏导致的无界递归，D-11）。
+const MAX_MACRO_NESTING: usize = 8;
+
+/// 渲染一段文本里的 `{{...}}` 宏。
+///
+/// D-11：宏体按 `{{`/`}}` 配对查找（而非第一个 `}}`），并先递归渲染嵌套宏，
+/// 因此 `{{setvar::a::{{getvar::b}}}}` 会写入 b 的值而不是被截断的 `{{getvar::b`；
+/// 未知宏仍按原始字节原样保留（不注入已求值内容）。
+fn render_template_text(
+    text: &str,
+    context: &TemplateVarContext,
+    state: &mut TemplateRenderState,
+    depth: usize,
+) -> String {
+    if depth >= MAX_MACRO_NESTING {
+        return text.to_string();
+    }
     let mut rendered = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -339,11 +361,17 @@ pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarConte
         let (before, after_start) = rest.split_at(start);
         rendered.push_str(before);
         let macro_body_start = &after_start[2..];
-        if let Some(end) = macro_body_start.find("}}") {
+        if let Some(end) = find_macro_body_end(macro_body_start) {
             let (body, after_body) = macro_body_start.split_at(end);
-            match render_template_macro(body.trim(), context, &mut state) {
+            let expanded_body = if body.contains("{{") {
+                render_template_text(body, context, state, depth + 1)
+            } else {
+                body.to_string()
+            };
+            match render_template_macro(expanded_body.trim(), context, state) {
                 Some(value) => rendered.push_str(&value),
                 None => {
+                    // 未知宏：按原始字节保留（保持旧契约）
                     rendered.push_str("{{");
                     rendered.push_str(body);
                     rendered.push_str("}}");
@@ -357,12 +385,39 @@ pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarConte
     }
 
     rendered.push_str(rest);
+    if depth > 0 {
+        return rendered;
+    }
     let rendered = replace_angle_aliases(&rendered, context);
     if state.trim_output {
         rendered.trim().to_string()
     } else {
         rendered
     }
+}
+
+/// 返回与开头 `{{` 配对的 `}}` 下标（相对 `after_open`，即 `{{` 之后的文本）。
+///
+/// `{`/`}` 都是 ASCII：扫描命中处一定是 char 边界，因此按下标切片是安全的。
+fn find_macro_body_end(after_open: &str) -> Option<usize> {
+    let bytes = after_open.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'}' && bytes[i + 1] == b'}' {
+            if depth == 0 {
+                return Some(i);
+            }
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn render_template_macro(
@@ -1227,6 +1282,191 @@ pub mod builtins {
                 out.contains("[子Agent专属约束]"),
                 "子Agent 应命中 Subagent(\"*\") 通配符模块，实际: {out}"
             );
+        }
+
+        // ─── D-11：嵌套宏 ──────────────────────────────────────────────────
+
+        fn ctx_with_vars() -> TemplateVarContext {
+            TemplateVarContext {
+                char_name: "塞拉菲娜".into(),
+                user_name: "玩家".into(),
+                variables: Default::default(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn nested_macro_inside_setvar_argument_is_expanded_first() {
+            // 旧实现取第一个 `}}` → body = "setvar::a::{{getvar::b"，被截断
+            let mut ctx = ctx_with_vars();
+            ctx.variables.insert("b".to_string(), "内层值".to_string());
+            let out = replace_template_vars_with_context(
+                "{{setvar::a::前缀{{getvar::b}}后缀}}{{getvar::a}}",
+                &ctx,
+            );
+            assert_eq!(out, "前缀内层值后缀", "嵌套宏必须先求内层（D-11）");
+        }
+
+        #[test]
+        fn nested_macro_rendering_keeps_unknown_macros_verbatim() {
+            // 未知宏原样保留，且不得因为外层截断破坏字节
+            let ctx = ctx_with_vars();
+            let out = replace_template_vars_with_context("保留 {{char}} 与 {{未知宏}}", &ctx);
+            assert_eq!(out, "保留 塞拉菲娜 与 {{未知宏}}");
+        }
+
+        #[test]
+        fn macro_body_end_matching_is_depth_aware() {
+            // 直接验证配对查找：跳过内层 `}}`
+            assert_eq!(find_macro_body_end("a{{b}}c}}tail"), Some(7));
+            assert_eq!(find_macro_body_end("no-end"), None);
+            // "中文{{内}}尾}}"：内层 `}}`（下标 11）被跳过，返回外层 `}}`（下标 16）
+            // 中文各占 3 字节，但 `{`/`}` 是 ASCII，返回下标必落在 char 边界
+            assert_eq!(find_macro_body_end("中文{{内}}尾}}"), Some(16));
+        }
+
+        #[test]
+        fn deeply_nested_macros_stop_at_recursion_limit() {
+            // 50 层嵌套：递归深度被 MAX_MACRO_NESTING 截断，不会栈溢出/指数展开
+            let ctx = ctx_with_vars();
+            let levels = 50usize;
+            let mut text = String::new();
+            for _ in 0..levels {
+                text.push_str("{{setvar::k::");
+            }
+            text.push('值');
+            for _ in 0..levels {
+                text.push_str("}}");
+            }
+            let out = replace_template_vars_with_context(&text, &ctx);
+            assert!(
+                out.len() < text.len(),
+                "深层嵌套必须被限幅而不是原样放大: input={} output={}",
+                text.len(),
+                out.len()
+            );
+        }
+
+        // ─── D-13：Single 互斥 ─────────────────────────────────────────────
+
+        fn module(
+            id: &str,
+            category: ModuleCategory,
+            content: &str,
+            ex: Exclusivity,
+        ) -> PromptModule {
+            PromptModule {
+                id: Id::from_str(id),
+                name: id.into(),
+                category,
+                content: content.into(),
+                exclusivity: ex,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: vec![AgentRole::Editor],
+                tags: vec![],
+            }
+        }
+
+        fn profile_with(category: ModuleCategory, ids: Vec<&str>) -> PromptProfile {
+            use std::collections::HashMap;
+            let mut cats = HashMap::new();
+            cats.insert(
+                category,
+                ids.into_iter().map(Id::from_str).collect::<Vec<_>>(),
+            );
+            let mut selections = HashMap::new();
+            selections.insert(AgentRole::Editor, cats);
+            PromptProfile {
+                id: Id::from_str("p-mutex"),
+                name: "mutex".into(),
+                selections,
+                overrides: HashMap::new(),
+                source: ProfileSource::BuiltIn,
+            }
+        }
+
+        #[test]
+        fn single_exclusivity_keeps_only_first_selected_module() {
+            let modules = vec![
+                module(
+                    "m-style-a",
+                    ModuleCategory::Style,
+                    "[文风A]",
+                    Exclusivity::Single,
+                ),
+                module(
+                    "m-style-b",
+                    ModuleCategory::Style,
+                    "[文风B]",
+                    Exclusivity::Single,
+                ),
+            ];
+            let profile = profile_with(ModuleCategory::Style, vec!["m-style-a", "m-style-b"]);
+            let out = assemble_system_prompt(
+                &AgentRole::Editor,
+                "角色",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::default(),
+            );
+            assert!(out.contains("[文风A]"), "第一个选中模块必须注入");
+            assert!(
+                !out.contains("[文风B]"),
+                "Single 互斥组不得同时注入两个模块（D-13）：{out}"
+            );
+        }
+
+        #[test]
+        fn multiple_exclusivity_still_accumulates() {
+            let modules = vec![
+                module(
+                    "m-quality-a",
+                    ModuleCategory::Quality,
+                    "[质量A]",
+                    Exclusivity::Multiple,
+                ),
+                module(
+                    "m-quality-b",
+                    ModuleCategory::Quality,
+                    "[质量B]",
+                    Exclusivity::Multiple,
+                ),
+            ];
+            let profile = profile_with(ModuleCategory::Quality, vec!["m-quality-a", "m-quality-b"]);
+            let out = assemble_system_prompt(
+                &AgentRole::Editor,
+                "角色",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::default(),
+            );
+            assert!(
+                out.contains("[质量A]") && out.contains("[质量B]"),
+                "多选组必须叠加"
+            );
+        }
+
+        #[test]
+        fn single_group_skips_unavailable_first_candidate() {
+            // 第一个候选不存在/不适用时，应落到下一个可用模块（不是直接不注入）
+            let modules = vec![module(
+                "m-style-b",
+                ModuleCategory::Style,
+                "[文风B]",
+                Exclusivity::Single,
+            )];
+            let profile = profile_with(ModuleCategory::Style, vec!["m-style-missing", "m-style-b"]);
+            let out = assemble_system_prompt(
+                &AgentRole::Editor,
+                "角色",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::default(),
+            );
+            assert!(out.contains("[文风B]"), "必须回退到下一个可用候选：{out}");
         }
     }
 }

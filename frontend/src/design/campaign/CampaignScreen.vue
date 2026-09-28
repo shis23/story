@@ -18,6 +18,8 @@ const props = defineProps({
   selectedCampaignId: { type: String, default: null },
   selectedCampaign: { type: Object, default: null },
   loadingCampaigns: { type: Boolean, default: false },
+  /** 活动列表加载失败信息（F-10）：非空时显示错误行 + 重试，而不是"还没有活动档" */
+  listError: { type: String, default: '' },
   detailTab: { type: String, default: 'instances' },
   instances: { type: Array, default: () => [] },
   knowledge: { type: Array, default: () => [] },
@@ -160,7 +162,15 @@ function taskStatusClass(status) {
             @click="emit('new-campaign')"
           >新建</button>
         </div>
-        <div v-if="loadingCampaigns" class="px-3 py-6 text-xs text-ink-faint">加载中…</div>
+        <div v-if="listError" class="px-3 py-4 space-y-2">
+          <div class="text-xs text-err">加载活动列表失败: {{ listError }}</div>
+          <button
+            type="button"
+            class="min-h-7 px-2 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors"
+            @click="emit('refresh')"
+          >重试</button>
+        </div>
+        <div v-else-if="loadingCampaigns" class="px-3 py-6 text-xs text-ink-faint">加载中…</div>
         <div v-else-if="!campaigns.length" class="px-3 py-6 text-xs text-ink-faint">还没有活动档</div>
         <ul v-else class="flex-1 overflow-y-auto px-2 pb-3 space-y-1">
           <li v-for="c in campaigns" :key="c.id">

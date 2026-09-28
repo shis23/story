@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { TabGroup, TabList, Tab } from '@headlessui/vue'
+import { TabGroup, TabList, Tab, TabPanel } from '@headlessui/vue'
 
 const props = defineProps({
   tabs: { type: Array, default: () => [] }, // [{ key, label }]
@@ -11,7 +11,13 @@ const emit = defineEmits(['update:modelValue'])
 // 当前激活索引（modelValue 是 tab 的 key，需映射为索引）
 const selectedIndex = computed(() => {
   const idx = props.tabs.findIndex((t) => t.key === props.modelValue)
-  return idx >= 0 ? idx : 0
+  if (idx >= 0) return idx
+  // F-21：modelValue 非法时静默回落第 0 项会让"选中态"与调用方的
+  // `v-if="activeTab === 'x'"` 内容不一致，且无任何信号。
+  if (import.meta.env?.DEV && props.tabs.length > 0) {
+    console.warn(`[Tabs] modelValue "${props.modelValue}" 不在 tabs 中，已回退到第 0 项`)
+  }
+  return 0
 })
 
 function handleChange(index) {
@@ -47,8 +53,9 @@ const tabClass = (selected) => {
       </Tab>
     </TabList>
 
-    <div class="pt-3 focus:outline-none min-w-0">
+    <!-- F-37：内容包在 TabPanel 里，Tab 的 aria-controls 才有真实指向 -->
+    <TabPanel class="pt-3 focus:outline-none min-w-0">
       <slot />
-    </div>
+    </TabPanel>
   </TabGroup>
 </template>

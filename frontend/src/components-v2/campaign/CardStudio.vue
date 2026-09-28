@@ -13,6 +13,7 @@ import {
   cardstudioGetProject,
   cardstudioImportCompiled,
   cardstudioListProjects,
+  cardstudioListStages,
   cardstudioPrefillFromNovel,
   cardstudioRunChecks,
   cardstudioRunReview,
@@ -25,6 +26,7 @@ import {
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import Input from '../ui/Input.vue'
+import LoadingState from '../ui/LoadingState.vue'
 import { errorText } from '../../utils/errorText.js'
 
 const props = defineProps({
@@ -33,7 +35,8 @@ const props = defineProps({
 })
 const emit = defineEmits(['imported', 'close', 'go-library'])
 
-const STAGE_META = [
+// 本地回退：后端 cardstudio_list_stages 不可用（或非 Tauri 环境）时保持原行为
+const STAGE_META_FALLBACK = [
   { id: 'brief', label: '意图' },
   { id: 'basic', label: '角色基础' },
   { id: 'personality', label: '性格' },
@@ -42,10 +45,26 @@ const STAGE_META = [
   { id: 'review', label: '检查' },
   { id: 'compile_import', label: '导入' },
 ]
+// F-39：阶段轨此前硬编码 —— 后端阶段定义（phase1_stage_ids）变更时 UI 静默漂移。
+// 挂载时用 cardstudio_list_stages 的权威 id 序列驱动，未知 id 用 id 自身作标签。
+const STAGE_LABEL_BY_ID = new Map(STAGE_META_FALLBACK.map((s) => [s.id, s.label]))
+const stageMeta = ref(STAGE_META_FALLBACK)
+
+async function loadStageMeta() {
+  try {
+    const ids = await cardstudioListStages()
+    if (!Array.isArray(ids) || ids.length === 0) return
+    stageMeta.value = ids.map((id) => ({ id, label: STAGE_LABEL_BY_ID.get(id) || id }))
+  } catch (e) {
+    // 拉取失败保留本地常量（阶段轨不属于关键路径）
+    console.error('加载写卡阶段定义失败:', e)
+  }
+}
 
 const projects = ref([])
 const project = ref(null)
 const loading = ref(false)
+const projectsError = ref(null)
 const busy = ref(false)
 const statusText = ref('')
 const newName = ref('')
@@ -81,7 +100,7 @@ function emptyArtifacts() {
   }
 }
 
-const stages = computed(() => STAGE_META.map((s) => {
+const stages = computed(() => stageMeta.value.map((s) => {
   const st = project.value?.stage_status?.[s.id] || 'pending'
   return { ...s, status: st }
 }))
@@ -138,8 +157,13 @@ const tagsText = computed({
 
 async function refreshProjects() {
   loading.value = true
+  projectsError.value = null
   try {
     projects.value = await cardstudioListProjects()
+  } catch (e) {
+    // F-19：此前无 catch（调用方还额外 `.catch(() => {})`）——加载失败渲染成
+    // 「还没有写卡项目」空态，错误与空数据无法区分，也没有重试入口。
+    projectsError.value = errorText(e)
   } finally {
     loading.value = false
   }
@@ -218,7 +242,9 @@ function safeFileBase(name) {
 
 async function exportStJson() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     const compiled = await cardstudioCompile(project.value.id)
@@ -272,7 +298,9 @@ async function exportStJson() {
 
 async function runExportGate() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     gateReport.value = await cardstudioExportGate(project.value.id)
@@ -289,7 +317,9 @@ async function runExportGate() {
 
 async function exportStPng() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     const bytes = await cardstudioExportPng(project.value.id)
@@ -452,7 +482,7 @@ async function prefillFromNovel() {
 }
 
 async function saveArtifacts() {
-  if (!project.value) return
+  if (!project.value) return false
   busy.value = true
   try {
     const artifacts = {
@@ -466,8 +496,10 @@ async function saveArtifacts() {
     allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
     syncDraftFromProject()
     statusText.value = '产物已保存'
+    return true
   } catch (e) {
     await alertDialog('保存失败: ' + errorText(e))
+    return false
   } finally {
     busy.value = false
   }
@@ -475,7 +507,9 @@ async function saveArtifacts() {
 
 async function completeManual() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     project.value = await cardstudioCompleteManualStage(project.value.id, currentStage.value)
@@ -490,7 +524,9 @@ async function completeManual() {
 
 async function runStage() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   statusText.value = `正在生成：${currentStage.value}…`
   try {
@@ -513,7 +549,9 @@ async function runStage() {
 
 async function runChecks() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     checkReport.value = await cardstudioRunChecks(project.value.id)
@@ -529,7 +567,9 @@ async function runChecks() {
 
 async function runReview(useLlm = true) {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   statusText.value = useLlm ? '正在做方法论审查（规则+LLM）…' : '正在做规则审查…'
   try {
@@ -546,7 +586,9 @@ async function runReview(useLlm = true) {
 
 async function importCompiled() {
   if (!project.value) return
-  await saveArtifacts()
+  // F-12：保存失败必须阻断后续动作（此前 saveArtifacts 无返回值，调用方
+  // 保存失败后照样继续推进阶段/编译导入，用户以为改动已入库）
+  if (!(await saveArtifacts())) return
   busy.value = true
   try {
     const result = await cardstudioImportCompiled(project.value.id)
@@ -592,7 +634,8 @@ function stageBadgeClass(status) {
   return 'text-ink-soft'
 }
 
-refreshProjects().catch(() => {})
+refreshProjects()
+loadStageMeta()
 
 watch(
   () => project.value?.id,
@@ -658,7 +701,12 @@ watch(
 
     <div class="rounded-xl border border-line bg-surface p-3 shadow-card">
       <div class="text-xs font-medium text-ink mb-2">已有项目</div>
-      <EmptyState v-if="!loading && projects.length === 0" title="还没有写卡项目" description="先创建一个从零 / 小说 / 修订项目" />
+      <div v-if="projectsError" class="rounded-xl border border-err/40 bg-err/10 px-3 py-3 text-center space-y-2">
+      <div class="text-xs text-err">加载写卡项目失败: {{ projectsError }}</div>
+      <Button variant="default" size="sm" @click="refreshProjects">重试</Button>
+    </div>
+    <EmptyState v-else-if="!loading && projects.length === 0" title="还没有写卡项目" description="先创建一个从零 / 小说 / 修订项目" />
+    <LoadingState v-else-if="loading" />
       <div v-else class="space-y-1">
         <div
           v-for="p in projects"

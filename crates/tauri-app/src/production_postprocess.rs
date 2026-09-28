@@ -1122,6 +1122,59 @@ fn source_entry_for(
         .cloned()
 }
 
+/// 传播门禁的判定结果（W-11 下游可观测性，R12）。
+///
+/// `blocked` = 阻止（跳过该 target 的知识写入）；`unresolved` = 本次判定**没能拿到
+/// 源条目的传播策略**因而按放行处理（fail-open）的原因串，用于日志/审计。
+///
+/// 三处 fail-open 都是**有意保留**的（证据见
+/// `docs/review-2026-09-13/round2/R12-storage-failopen-closure.md` §1）：
+/// 1. 广播的文档形状不带 `source_character_id`（app-agent 提示词示例）；
+/// 2. 上游名字归一只对**唯一命中**生效，未命中/同名多实例有意保留原名；
+/// 3. 源实例可解析但没有同文本条目（`told_by_other` 的常见形态：源条目尚未落库
+///    或措辞不同）——按 fail-closed 会把合法知识整条丢掉。
+///
+/// 本结构只把这些情形从**完全静默**升级为**可观测**：调用点对 `unresolved` 打
+/// warn，**绝不改变**放行/阻止语义（JSON 与 SQLite mutation 路径共用本函数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PropagationGate {
+    blocked: bool,
+    unresolved: Option<&'static str>,
+}
+
+impl PropagationGate {
+    /// 放行且无需审计（未传播，或策略明确为 Open）。
+    const fn allow() -> Self {
+        Self {
+            blocked: false,
+            unresolved: None,
+        }
+    }
+
+    /// 放行，但记录「为什么没能判定策略」。
+    const fn allow_unresolved(reason: &'static str) -> Self {
+        Self {
+            blocked: false,
+            unresolved: Some(reason),
+        }
+    }
+
+    /// 阻止（策略明确受限）。
+    const fn block() -> Self {
+        Self {
+            blocked: true,
+            unresolved: None,
+        }
+    }
+}
+
+/// `source_character_id` 缺失（广播文档形状 / 模型未填）。
+const GATE_SOURCE_MISSING: &str = "source_character_id missing";
+/// `source_character_id` 存在但解析不到实例（删角色/临时角色/旁白/同名多实例）。
+const GATE_SOURCE_UNRESOLVED: &str = "source character unresolved";
+/// 源实例可解析，但没有同文本条目 ⇒ 策略未知。
+const GATE_SOURCE_ENTRY_MISSING: &str = "source knowledge entry not found (policy unknown)";
+
 /// 判断一条知识更新是否被源端传播策略阻止（Open=放行，Private=阻止，
 /// GroupRestricted=按 group/target 判定）。
 ///
@@ -1136,7 +1189,7 @@ fn source_propagation_blocks(
         &Id,
         &str,
     ) -> Option<storyforge_domain::character_knowledge::PropagationPolicy>,
-) -> bool {
+) -> PropagationGate {
     use storyforge_domain::character_knowledge::{
         BroadcastTarget, KnowledgeSource, PropagationPolicy,
     };
@@ -1144,25 +1197,38 @@ fn source_propagation_blocks(
     let propagating =
         update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
     if !propagating {
-        return false;
+        // 非传播（自持知识写入）：没有源端策略可查，不算 fail-open。
+        return PropagationGate::allow();
     }
     let Some(source_raw) = update.source_character_id.as_ref() else {
-        return false;
+        return PropagationGate::allow_unresolved(GATE_SOURCE_MISSING);
     };
     let Some(source) = resolve(source_raw) else {
-        return false;
+        return PropagationGate::allow_unresolved(GATE_SOURCE_UNRESOLVED);
     };
     let Some(policy) = source_lookup(&source.id, &update.knowledge_text) else {
-        return false;
+        return PropagationGate::allow_unresolved(GATE_SOURCE_ENTRY_MISSING);
     };
     match policy {
-        PropagationPolicy::Open => false,
-        PropagationPolicy::Private => true,
+        PropagationPolicy::Open => PropagationGate::allow(),
+        PropagationPolicy::Private => PropagationGate::block(),
         PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
-            (Some(BroadcastTarget::Group(target_group)), _) => target_group != &group,
-            (Some(BroadcastTarget::All), _) => true,
-            (None, Some(target_instance)) => !group_member(target_instance, &group),
-            (None, None) => true,
+            (Some(BroadcastTarget::Group(target_group)), _) => {
+                if target_group != &group {
+                    PropagationGate::block()
+                } else {
+                    PropagationGate::allow()
+                }
+            }
+            (Some(BroadcastTarget::All), _) => PropagationGate::block(),
+            (None, Some(target_instance)) => {
+                if !group_member(target_instance, &group) {
+                    PropagationGate::block()
+                } else {
+                    PropagationGate::allow()
+                }
+            }
+            (None, None) => PropagationGate::block(),
         },
     }
 }
@@ -1196,7 +1262,24 @@ fn build_knowledge_mutations(
         if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
             continue;
         }
-        if source_propagation_blocks(update, None, resolve, group_member, source_lookup) {
+        // W-11 下游门禁：三处「策略未知」是**有意放行**（文档形状/上游归一策略），
+        // 但此前完全静默——这里按 update 记一次 warn，使 fail-open 可观测、可计数，
+        // 不改变放行语义（见 `PropagationGate` 与 R12 报告）。
+        let gate = source_propagation_blocks(update, None, resolve, group_member, source_lookup);
+        if let Some(reason) = gate.unresolved {
+            tracing::warn!(
+                target: "knowledge_propagation",
+                reason,
+                source = update
+                    .source_character_id
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("<none>"),
+                text = %update.knowledge_text,
+                "知识传播门禁未能判定源策略，按放行处理（W-11 下游 fail-open）"
+            );
+        }
+        if gate.blocked {
             continue;
         }
         let source_instance = update.source_character_id.as_ref().and_then(resolve);
@@ -1219,13 +1302,17 @@ fn build_knowledge_mutations(
         };
 
         for target in targets {
+            // 每条 target 只关心 `blocked`：`unresolved` 与 target 无关（F1/F2/F3 都
+            // 只依赖 update 与源侧），上面已按 update 记过一次，避免逐 target 刷屏。
             if source_propagation_blocks(
                 update,
                 Some(&target),
                 resolve,
                 group_member,
                 source_lookup,
-            ) {
+            )
+            .blocked
+            {
                 continue;
             }
             let presence_exempt = matches!(
@@ -1434,8 +1521,201 @@ mod tests {
     use std::sync::Arc;
     use storyforge_app_conversation::ConversationStore;
     use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
-    use storyforge_domain::campaign::Campaign;
+    use storyforge_domain::campaign::{Campaign, CharacterInstance};
+    use storyforge_domain::character_knowledge::{
+        BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+    };
     use storyforge_domain::turn::{AttemptStatus, TurnRecord};
+
+    // ── W-11 下游传播门禁（R12）：放行语义 + fail-open 可观测性 ──────────────
+
+    fn gate_update(
+        source: KnowledgeSource,
+        source_character_id: Option<&str>,
+        broadcast: Option<BroadcastTarget>,
+    ) -> CharacterKnowledgeUpdate {
+        CharacterKnowledgeUpdate {
+            character_id: Id::from_str("inst-chen"),
+            knowledge_text: "保险柜密码是 0427".into(),
+            source,
+            source_character_id: source_character_id.map(Id::from_str),
+            pinned: false,
+            broadcast,
+            propagation: PropagationPolicy::Open,
+        }
+    }
+
+    fn lin_instance() -> CharacterInstance {
+        let mut lin = CharacterInstance::temporary(Id::from_str("camp-1"), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        lin
+    }
+
+    /// 三处「策略未知」都必须**放行**（有意 fail-open），且带可观测原因；
+    /// 若有人把它们改成 fail-closed，这三条断言会立刻变红——
+    /// 证据与代价见 `docs/review-2026-09-13/round2/R12-storage-failopen-closure.md`。
+    #[test]
+    fn propagation_gate_reports_unresolved_fail_open_reasons() {
+        let lin = lin_instance();
+        let resolve = |id: &Id| -> Option<CharacterInstance> {
+            (id.as_str() == "inst-lin" || id.as_str() == "Lin").then(|| lin.clone())
+        };
+        let group_member = |_: &CharacterInstance, _: &str| false;
+        let no_policy = |_: &Id, _: &str| None;
+
+        // ① app-agent 提示词的广播示例形状：broadcast=all 且**不带** source_character_id。
+        let broadcast_no_source =
+            gate_update(KnowledgeSource::Witnessed, None, Some(BroadcastTarget::All));
+        let gate =
+            source_propagation_blocks(&broadcast_no_source, None, resolve, group_member, no_policy);
+        assert!(
+            !gate.blocked,
+            "文档化的广播形状（无 source_character_id）必须继续放行，否则广播功能整体失效"
+        );
+        assert_eq!(gate.unresolved, Some(GATE_SOURCE_MISSING));
+
+        // ② 源名字解析不到实例（上游只对唯一命中归一，未命中/同名多实例有意保留原名）。
+        let unresolved_source = gate_update(KnowledgeSource::ToldByOther, Some("旁白"), None);
+        let gate =
+            source_propagation_blocks(&unresolved_source, None, resolve, group_member, no_policy);
+        assert!(!gate.blocked, "源不可解析时按放行处理（有意 best-effort）");
+        assert_eq!(gate.unresolved, Some(GATE_SOURCE_UNRESOLVED));
+
+        // ③ 源可解析但没有同文本条目 ⇒ 策略未知（told_by_other 常见形态）。
+        let no_entry = gate_update(KnowledgeSource::ToldByOther, Some("inst-lin"), None);
+        let gate = source_propagation_blocks(&no_entry, None, resolve, group_member, no_policy);
+        assert!(
+            !gate.blocked,
+            "源无匹配条目时按放行处理（有意 best-effort）"
+        );
+        assert_eq!(gate.unresolved, Some(GATE_SOURCE_ENTRY_MISSING));
+    }
+
+    /// 放行/阻止语义在改造后保持不变：策略明确时不再有 `unresolved`。
+    #[test]
+    fn propagation_gate_keeps_explicit_policy_verdicts() {
+        let lin = lin_instance();
+        let resolve = |id: &Id| -> Option<CharacterInstance> {
+            (id.as_str() == "inst-lin").then(|| lin.clone())
+        };
+        let group_member =
+            |inst: &CharacterInstance, group: &str| inst.name == group || group == "在场组";
+
+        // 策略 Private + 解析得动的源 ⇒ 阻止（既有隔离不变量：private 不外传）。
+        let told = gate_update(KnowledgeSource::ToldByOther, Some("inst-lin"), None);
+        let private = |_: &Id, _: &str| Some(PropagationPolicy::Private);
+        let gate = source_propagation_blocks(&told, None, resolve, group_member, private);
+        assert!(gate.blocked, "private 源知识必须阻止 told_by_other 传播");
+        assert_eq!(gate.unresolved, None, "策略明确时不再记 fail-open");
+
+        // 策略 Open ⇒ 放行且无审计噪声。
+        let open = |_: &Id, _: &str| Some(PropagationPolicy::Open);
+        let gate = source_propagation_blocks(&told, None, resolve, group_member, open);
+        assert!(!gate.blocked);
+        assert_eq!(gate.unresolved, None);
+
+        // GroupRestricted：组广播给本组 ⇒ 放行；给全体 ⇒ 阻止。
+        let restricted = |_: &Id, _: &str| Some(PropagationPolicy::GroupRestricted("守卫".into()));
+        let to_group = gate_update(
+            KnowledgeSource::Witnessed,
+            Some("inst-lin"),
+            Some(BroadcastTarget::Group("守卫".into())),
+        );
+        let gate = source_propagation_blocks(&to_group, None, resolve, group_member, restricted);
+        assert!(!gate.blocked, "组内广播不被阻止");
+        let to_all = gate_update(
+            KnowledgeSource::Witnessed,
+            Some("inst-lin"),
+            Some(BroadcastTarget::All),
+        );
+        let gate = source_propagation_blocks(&to_all, None, resolve, group_member, restricted);
+        assert!(gate.blocked, "GroupRestricted 不得广播给全体");
+
+        // 非传播（自持知识写入）⇒ 放行且不记 fail-open。
+        let self_knowledge = gate_update(KnowledgeSource::Witnessed, None, None);
+        let gate = source_propagation_blocks(&self_knowledge, None, resolve, group_member, private);
+        assert!(!gate.blocked);
+        assert_eq!(gate.unresolved, None, "非传播路径没有源端策略可查");
+    }
+
+    /// W-11 下游 fail-open 的行为面（R12）：app-agent 提示词里的**文档化广播形状**
+    /// （`broadcast: all` 且不带 `source_character_id`）仍然写入知识 mutation。
+    /// 门禁本轮只把 fail-open 升级为可观测（warn），**不改变**放行语义；
+    /// 若有人改成 fail-closed，本用例会立刻变红（广播功能整体失效的回归锁）。
+    #[test]
+    fn broadcast_without_source_character_id_still_writes_knowledge_mutations() {
+        let fx = Fx::new("failopen-broadcast");
+        let camp_id = fx.campaign_id.clone();
+        let conv_id = fx.conversation_id.clone();
+        let inst_lin = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: camp_id.clone(),
+            definition_id: None,
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let inst_chen = CharacterInstance {
+            id: Id::from_str("inst-chen"),
+            campaign_id: camp_id.clone(),
+            definition_id: None,
+            name: "Chen".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        fx.campaign_store.add_instance(inst_lin).unwrap();
+        fx.campaign_store.add_instance(inst_chen).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: camp_id.clone(),
+            conversation_id: conv_id,
+            turn: 3,
+        };
+        let outcome = PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("Lin"),
+                    knowledge_text: "城主宣告全城戒严".into(),
+                    source: KnowledgeSource::Witnessed,
+                    // ← 提示词示例的形状：广播条目不带 source_character_id
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: Some(BroadcastTarget::All),
+                    propagation: PropagationPolicy::Open,
+                }],
+                ..Default::default()
+            }),
+            summary_attempted: false,
+            post_process_attempted: true,
+        };
+        let present = vec!["Lin".to_string(), "Chen".to_string()];
+        let batch =
+            build_json_mutation_batch(&fx.campaign_store, &persist_ctx, &outcome, &present, &[]);
+        let knowledge: Vec<_> = batch
+            .mutations
+            .iter()
+            .filter_map(|m| match m {
+                Mutation::UpsertKnowledge(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            knowledge.len(),
+            2,
+            "广播给全体（除源外）应写 2 条知识；fail-open 若被改成 fail-closed 这里会变成 0"
+        );
+        assert!(
+            knowledge
+                .iter()
+                .all(|k| k.propagation == PropagationPolicy::Open),
+            "写入条目的传播策略沿用 update 声明的值"
+        );
+    }
 
     struct Fx {
         _data_dir: std::path::PathBuf,

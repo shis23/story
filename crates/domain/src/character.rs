@@ -149,19 +149,38 @@ pub struct StWorldInfoEntry {
 }
 
 impl StWorldInfoEntry {
-    /// 解析 position 为数字（兼容字符串和数字两种格式）
+    /// 解析 position 为数字（兼容字符串和数字两种格式）。
+    ///
+    /// M-26：未知字符串/越界数字不再静默折叠为 0，一律 `tracing::warn!` 后回退
+    /// `before_char`（0），保证"异常可见"且行为与旧版一致。
     pub fn position_as_i32(&self) -> i32 {
         match &self.position {
-            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) as i32,
+            Some(serde_json::Value::Number(n)) => match n.as_i64() {
+                Some(v) => i32::try_from(v).unwrap_or_else(|_| {
+                    tracing::warn!(value = v, "world-info position number out of i32 range");
+                    0
+                }),
+                None => {
+                    tracing::warn!(value = %n, "world-info position number is not an integer");
+                    0
+                }
+            },
             Some(serde_json::Value::String(s)) => match s.as_str() {
                 "before_char" => 0,
                 "after_char" => 1,
                 "in_roleplay" => 2,
                 "before_examples" => 3,
                 "after_examples" => 4,
-                _ => 0,
+                other => {
+                    tracing::warn!(position = other, "unknown world-info position string");
+                    0
+                }
             },
-            _ => 0,
+            Some(other) => {
+                tracing::warn!(value = %other, "unsupported world-info position value");
+                0
+            }
+            None => 0,
         }
     }
 
@@ -298,8 +317,9 @@ impl Character {
     }
 }
 
-/// 从 Character + 可选 CharacterDefinition 构建 StCharacterData（导出用）
-///
+/// 注意：`to_st_data_with_parse_diagnostic` 与旧的 `to_st_data` 行为一致
+/// （除返回值外不改变导出内容），失败时产物带 [`RAW_CARD_JSON_PARSE_FAILED_KEY`] 标记。
+/// 从 Character + 可选 CharacterDefinition 构建 StCharacterData（导出用）///
 /// 策略：优先 raw_card_json round-trip 保底（不丢 ST 扩展字段），
 /// 然后用 Character/Definition 的字段覆盖核心字段。
 ///
@@ -309,16 +329,59 @@ pub fn to_st_data(
     definition: Option<&CharacterDefinition>,
     character_book: Option<StWorldInfoBook>,
 ) -> StCharacterData {
+    to_st_data_with_parse_diagnostic(character, definition, character_book).0
+}
+
+/// raw_card_json 解析失败时写入 extensions 的命名空间标记键（M-32.8）。
+///
+/// 值恒为 `true`；错误摘要见 [`RAW_CARD_JSON_PARSE_ERROR_KEY`]。
+pub const RAW_CARD_JSON_PARSE_FAILED_KEY: &str = "storyforge_raw_card_json_parse_failed";
+/// raw_card_json 解析失败的错误摘要键（M-32.8）。
+pub const RAW_CARD_JSON_PARSE_ERROR_KEY: &str = "storyforge_raw_card_json_parse_error";
+
+/// 在导出数据上打"raw_card_json 解析失败"可见标记。
+///
+/// M-32.8：此前解析失败只 `warn` 后回退 `empty_st_data`，导出产物会**静默丢掉全部
+/// ST 扩展字段**，下游（含 infra-import 的 wire 对账）只能靠猜。现在把失败事实写进
+/// `extensions`（ST 规范的扩展袋），产物本身即可见、可对账。
+fn mark_raw_card_json_parse_failure(data: &mut StCharacterData, error: &str) {
+    if !data.extensions.is_object() {
+        data.extensions = serde_json::json!({});
+    }
+    if let Some(map) = data.extensions.as_object_mut() {
+        map.insert(
+            RAW_CARD_JSON_PARSE_FAILED_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        map.insert(
+            RAW_CARD_JSON_PARSE_ERROR_KEY.to_string(),
+            serde_json::Value::String(error.to_string()),
+        );
+    }
+}
+
+/// [`to_st_data`] 的带诊断版本：额外返回 raw_card_json 解析失败原因（None = 成功）。
+pub fn to_st_data_with_parse_diagnostic(
+    character: &Character,
+    definition: Option<&CharacterDefinition>,
+    character_book: Option<StWorldInfoBook>,
+) -> (StCharacterData, Option<String>) {
     // 从 raw_card_json 反序列化为 base，保留扩展字段
+    let mut parse_error: Option<String> = None;
     let mut data: StCharacterData = if !character.raw_card_json.is_null() {
-        serde_json::from_value(character.raw_card_json.clone()).unwrap_or_else(|e| {
-            // 静默回空白会丢掉全部 ST 扩展字段且无从排查——留 warn 供日志检索
-            tracing::warn!(
-                "角色 {} raw_card_json 反序列化失败（{e}），导出回退为空 ST 数据",
-                character.name
-            );
-            empty_st_data(&character.name)
-        })
+        match serde_json::from_value(character.raw_card_json.clone()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // 静默回空白会丢掉全部 ST 扩展字段且无从排查——warn + 产物可见标记
+                let detail = e.to_string();
+                tracing::warn!(
+                    "角色 {} raw_card_json 反序列化失败（{detail}），导出回退为空 ST 数据并打标记（M-32.8）",
+                    character.name
+                );
+                parse_error = Some(detail);
+                empty_st_data(&character.name)
+            }
+        }
     } else {
         empty_st_data(&character.name)
     };
@@ -367,7 +430,12 @@ pub fn to_st_data(
         data.extensions = character.extensions.clone();
     }
 
-    data
+    // M-32.8：标记必须最后打，避免被上面的 extensions 覆盖抹掉
+    if let Some(detail) = &parse_error {
+        mark_raw_card_json_parse_failure(&mut data, detail);
+    }
+
+    (data, parse_error)
 }
 
 fn is_non_empty_json(value: &serde_json::Value) -> bool {
@@ -387,9 +455,21 @@ pub fn to_st_data_from_card(
     definition: &CharacterDefinition,
     character_book: Option<StWorldInfoBook>,
 ) -> StCharacterData {
+    let mut parse_error: Option<String> = None;
+    // M-32.8：与 to_st_data 同策略——失败不再静默，warn + 产物标记
     let mut data: StCharacterData = if !card.raw_card_json.is_null() {
-        serde_json::from_value(card.raw_card_json.clone())
-            .unwrap_or_else(|_| empty_st_data(&definition.name))
+        match serde_json::from_value(card.raw_card_json.clone()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let detail = e.to_string();
+                tracing::warn!(
+                    "角色 {} raw_card_json 反序列化失败（{detail}），导出回退为空 ST 数据并打标记（M-32.8）",
+                    definition.name
+                );
+                parse_error = Some(detail);
+                empty_st_data(&definition.name)
+            }
+        }
     } else {
         empty_st_data(&definition.name)
     };
@@ -414,6 +494,11 @@ pub fn to_st_data_from_card(
 
     if let Some(book) = character_book {
         data.character_book = Some(book);
+    }
+
+    // M-32.8：解析失败在导出产物上留可见标记
+    if let Some(detail) = &parse_error {
+        mark_raw_card_json_parse_failure(&mut data, detail);
     }
 
     data
@@ -1188,5 +1273,161 @@ mod multi_character_tests {
         let entry = &exported_json["character_book"]["entries"][0];
         assert_eq!(entry["probability"], serde_json::json!(73));
         assert_eq!(entry["automation_id"], serde_json::json!("entry-hook-7"));
+    }
+
+    // ─── M-26：position 解析不得静默折叠未知值 ──────────────────────────────
+
+    #[test]
+    fn position_as_i32_accepts_spec_strings_and_legacy_numbers() {
+        let with = |v: serde_json::Value| StWorldInfoEntry {
+            id: None,
+            keys: vec![],
+            key_alias: None,
+            secondary_keys: None,
+            keysecondary_alias: None,
+            content: None,
+            constant: false,
+            selective: false,
+            selective_logic: None,
+            position: Some(v),
+            disable: None,
+            order: None,
+            depth: None,
+            extensions: serde_json::Value::Null,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        // ST V2/V3 字符串标签
+        assert_eq!(with(serde_json::json!("before_char")).position_as_i32(), 0);
+        assert_eq!(with(serde_json::json!("after_char")).position_as_i32(), 1);
+        assert_eq!(with(serde_json::json!("in_roleplay")).position_as_i32(), 2);
+        // 旧版数字形态
+        assert_eq!(with(serde_json::json!(2)).position_as_i32(), 2);
+        assert_eq!(with(serde_json::json!(0)).position_as_i32(), 0);
+        // 缺失 / null → 默认 0（不 panic）
+        assert_eq!(with(serde_json::Value::Null).position_as_i32(), 0);
+        let mut missing = with(serde_json::json!(1));
+        missing.position = None;
+        assert_eq!(missing.position_as_i32(), 0);
+
+        // 未知字符串 / 越界数字：告警后回退 0（行为不变，但从静默变为可见）
+        assert_eq!(with(serde_json::json!("bogus_slot")).position_as_i32(), 0);
+        assert_eq!(
+            with(serde_json::json!(9_999_999_999i64)).position_as_i32(),
+            0
+        );
+        assert_eq!(with(serde_json::json!(true)).position_as_i32(), 0);
+    }
+
+    // ─── M-32.8：raw_card_json 解析失败不得静默丢字段 ────────────────────────
+
+    fn character_with_raw_json(raw: serde_json::Value) -> Character {
+        Character {
+            id: Id::from_str("src-raw"),
+            name: "源卡".into(),
+            description: String::new(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::json!({}),
+            renderable_assets: None,
+            source: Source::ImportedFromST,
+            spec_version: "3.0".into(),
+            raw_card_json: raw,
+        }
+    }
+
+    #[test]
+    fn raw_card_json_parse_failure_is_visible_in_export() {
+        // name 期望 String，给对象 → 反序列化失败
+        let character = character_with_raw_json(serde_json::json!({
+            "name": { "not": "a string" },
+            "extensions": { "keep": "me" }
+        }));
+
+        let (data, diagnostic) = to_st_data_with_parse_diagnostic(&character, None, None);
+        let detail = diagnostic.expect("必须返回解析失败诊断（M-32.8）");
+        assert!(!detail.is_empty());
+
+        assert_eq!(
+            data.extensions
+                .get(RAW_CARD_JSON_PARSE_FAILED_KEY)
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "解析失败的导出必须带可见标记，下游（如 wire 对账）才能识别为 Loss"
+        );
+        assert!(
+            data.extensions
+                .get(RAW_CARD_JSON_PARSE_ERROR_KEY)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        // 旧入口行为不变（同样带标记）
+        let legacy = to_st_data(&character, None, None);
+        assert_eq!(
+            legacy
+                .extensions
+                .get(RAW_CARD_JSON_PARSE_FAILED_KEY)
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn successful_raw_card_json_parse_adds_no_marker() {
+        let character = character_with_raw_json(serde_json::json!({
+            "name": "源卡",
+            "extensions": { "keep": "me" }
+        }));
+        let (data, diagnostic) = to_st_data_with_parse_diagnostic(&character, None, None);
+        assert!(diagnostic.is_none());
+        assert!(
+            data.extensions
+                .get(RAW_CARD_JSON_PARSE_FAILED_KEY)
+                .is_none()
+        );
+        // 正常路径仍保留扩展字段
+        assert_eq!(data.extensions["keep"], serde_json::json!("me"));
+    }
+
+    #[test]
+    fn to_st_data_from_card_also_marks_parse_failure() {
+        let card = CharacterCard {
+            id: Id::from_str("card-bad"),
+            name: "坏卡".into(),
+            source_character_id: Id::from_str("src-bad"),
+            character_definitions: vec![],
+            campaign_variable_schema: vec![],
+            raw_card_json: serde_json::json!({ "name": [1, 2, 3] }),
+            extraction_status: CharacterExtractionStatus::Extracted,
+            extraction_message: None,
+        };
+        let def = CharacterDefinition {
+            id: Id::from_str("d-bad"),
+            card_id: Id::from_str("card-bad"),
+            name: "坏卡".into(),
+            persona_prompt: "人格".into(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+        let data = to_st_data_from_card(&card, &def, None);
+        assert_eq!(
+            data.extensions
+                .get(RAW_CARD_JSON_PARSE_FAILED_KEY)
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "Campaign 导出路径同样必须打标记（M-32.8）"
+        );
     }
 }

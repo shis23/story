@@ -141,7 +141,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 | StoryForge_0.1.2_x64_en-US.msi | 12,226,560 | `df8bf8c2b6d9da6b66beef0bc8644158ae2ef390b53d8e1cf95e94a41fcb6079` |
 | app-arm64-release.apk（release keystore 签名） | 24,944,036 | `75bfc0c5942c94f5b97a96bca18b278fc9aee9c72cbcaa5a1c904ac61ed804a4` |
 
-- 校验和已知缺陷与处置：workflow 中 windows/android 两个 job 的校验和文件同名 `SHA256SUMS.txt`，上传时 android 覆盖 windows（v0.1.1/v0.1.2 均如此）；v0.1.2 Release 已补传 `SHA256SUMS-android.txt`（APK 哈希），workflow 已改为按平台命名（`SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt`），供未来版本生效。
+- 校验和已知缺陷与处置：workflow 中 windows/android 两个 job 的校验和文件同名 `SHA256SUMS.txt`，上传时发生**同名资产冲突、后到的那份被跳过**。**2026-09-13 复核定案（更正原文方向）**：v0.1.2 Release 里**实际留存并随发布分发的是 Windows 校验和**（`SHA256SUMS.txt`，196 B），**缺失的是 Android 校验和**（随后人工补传 `SHA256SUMS-android.txt`，88 B）；原文"android 覆盖 windows"方向相反。workflow 已改为按平台命名（`SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt`），自 v0.1.2 **之后**的版本生效。
 - 签名边界：Windows EXE 仍无代码签名（SmartScreen 警告，README 已说明）；Android 为 release keystore 签名。
 
 ### 远端 CI（已闭合）

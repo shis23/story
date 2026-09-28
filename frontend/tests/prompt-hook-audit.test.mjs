@@ -247,6 +247,30 @@ test('hostile safe-leaf and identity fields cannot smuggle secrets into audit ex
 
 // ─── query / filter / pagination / chain / retention ────────────────────────
 
+// M-21a / M-21b：新增的链内状态必须在 export / query 边界存活（否则被
+// sanitizeStatus 折叠成 audit_error，排障时看不到真实原因）
+test('keeps the M-21a/M-21b chain statuses through sanitize, export and query', () => {
+  const records = [
+    baseRecord({ pluginId: 'p1', status: 'invalid_mutation' }),
+    baseRecord({ pluginId: 'p2', status: 'chain_budget_exceeded' }),
+  ]
+
+  assert.equal(sanitizePromptHookAuditRecord(records[0]).status, 'invalid_mutation')
+  assert.equal(sanitizePromptHookAuditRecord(records[1]).status, 'chain_budget_exceeded')
+
+  const parsed = parsePromptHookAuditExport(exportPromptHookAudit(records))
+  assert.deepEqual(parsed.records.map((record) => record.status), [
+    'invalid_mutation',
+    'chain_budget_exceeded',
+  ])
+
+  assert.equal(queryPromptHookAudit(records, { status: 'invalid_mutation' }).length, 1)
+  assert.equal(queryPromptHookAudit(records, { status: 'chain_budget_exceeded' }).length, 1)
+
+  // 未登记状态仍然折叠成 audit_error（fail-closed 边界不变）
+  assert.equal(sanitizePromptHookAuditRecord(baseRecord({ status: 'not_a_status' })).status, 'audit_error')
+})
+
 test('queryPromptHookAudit filters by pluginId, event, stage, status, correlation, generation', () => {
   const records = [
     baseRecord({ pluginId: 'p1', event: 'E1', stage: 's1', status: 'ok', correlationId: 'c1', generationId: 'g1' }),

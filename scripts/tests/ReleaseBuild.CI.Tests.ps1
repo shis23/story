@@ -461,8 +461,52 @@ exports.parse = function (text) {
     }
 }
 
-Describe 'ReleaseBuild Gitea workflow governance checks' {
-    It 'parses tracked workflows with a real parser or fails closed without one' {
+# G-06 (review-2026-09-13): Gitea Actions was decommissioned on 2026-09-06, so the
+# assertions in this block guard *retained historical* workflow files against silent
+# rot. They must not be read as certifying an active CI provider: the release path is
+# .github/workflows/release.yml, and the release entry scripts must never depend on
+# .gitea. The decommission marker is .gitea/DECOMMISSIONED.md.
+Describe 'ReleaseBuild legacy Gitea workflow governance checks (Gitea Actions decommissioned 2026-09-06)' {
+    It 'marks the decommissioned provider, keeps it out of the release path, and still parses the retained workflows' {
+        $markerPath = Join-Path $RepoRoot '.gitea\DECOMMISSIONED.md'
+        Test-Path -LiteralPath $markerPath | Should Be $true
+        # Explicit UTF-8: Windows PowerShell 5.1 Get-Content would decode the file
+        # with the ANSI code page and mangle multi-byte characters.
+        $marker = [System.IO.File]::ReadAllText($markerPath, [System.Text.Encoding]::UTF8)
+        $marker | Should Match '2026-09-06'
+        $marker | Should Match 'decommission'
+        $marker | Should Match 'GitHub Actions'
+
+        # No release entry point may read the decommissioned Gitea workflows.
+        foreach ($rel in @(
+                'scripts\verify-release.ps1',
+                'scripts\run-release-build.ps1',
+                'scripts\verify-release-evidence.ps1',
+                'scripts\tests\run-release-build-tests.ps1')) {
+            $entry = Join-Path $RepoRoot $rel
+            Test-Path -LiteralPath $entry | Should Be $true
+            (Get-Content -LiteralPath $entry -Raw) | Should Not Match '\.gitea'
+        }
+
+        # The release path is GitHub Actions, with the three expected jobs.
+        $releaseWorkflow = Join-Path $RepoRoot '.github\workflows\release.yml'
+        Test-Path -LiteralPath $releaseWorkflow | Should Be $true
+        $releaseText = Get-Content -LiteralPath $releaseWorkflow -Raw
+        $releaseText | Should Match 'cargo tauri build --ci'
+        $releaseText | Should Match '(?m)^\s{2}windows:'
+        $releaseText | Should Match '(?m)^\s{2}android:'
+        $releaseText | Should Match '(?m)^\s{2}release:'
+
+        # Checksum files must stay platform-suffixed: v0.1.2 shipped only the Windows
+        # sums (196 B, two CRLF lines) because both jobs wrote 'SHA256SUMS.txt'; the
+        # Android sums were re-uploaded by hand as remediation.
+        $sumNames = @([regex]::Matches($releaseText, 'SHA256SUMS[-A-Za-z0-9._]*') |
+                ForEach-Object { $_.Value } | Sort-Object -Unique)
+        ($sumNames -contains 'SHA256SUMS.txt') | Should Be $false
+        @($sumNames).Count | Should BeGreaterThan 1
+
+        # The retained historical files must still parse with a real YAML engine
+        # (or fail closed when no engine is available, as before).
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
         $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File -ErrorAction SilentlyContinue) +
                  @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
@@ -482,7 +526,10 @@ Describe 'ReleaseBuild Gitea workflow governance checks' {
 
     It 'workflows do not hard-code the workstation CARGO_TARGET_DIR path' {
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
-        $files = @(Get-ChildItem -LiteralPath $workflowDir -File -ErrorAction SilentlyContinue)
+        # Workflow *files* only: non-YAML notes under this directory (for example the
+        # decommission marker) are not workflow definitions and must not be asserted.
+        $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File -ErrorAction SilentlyContinue) +
+                 @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
         foreach ($f in $files) {
             $text = Get-Content -LiteralPath $f.FullName -Raw
             $text | Should Not Match 'storyforge-parallel-target'
@@ -491,7 +538,8 @@ Describe 'ReleaseBuild Gitea workflow governance checks' {
 
     It 'workflows use timeouts-minutes on artifact-producing jobs' {
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
-        $files = @(Get-ChildItem -LiteralPath $workflowDir -File -ErrorAction SilentlyContinue)
+        $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File -ErrorAction SilentlyContinue) +
+                 @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
         foreach ($f in $files) {
             $text = Get-Content -LiteralPath $f.FullName -Raw
             # Every workflow must mention a timeout somewhere.
@@ -501,7 +549,8 @@ Describe 'ReleaseBuild Gitea workflow governance checks' {
 
     It 'workflows use concurrency cancellation and least-privilege permissions' {
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
-        $files = @(Get-ChildItem -LiteralPath $workflowDir -File -ErrorAction SilentlyContinue)
+        $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File -ErrorAction SilentlyContinue) +
+                 @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
         foreach ($f in $files) {
             $text = Get-Content -LiteralPath $f.FullName -Raw
             $text | Should Match 'concurrency'
@@ -540,6 +589,31 @@ Describe 'ReleaseBuild secret scan untracked inputs' {
             Set-Content -LiteralPath (Join-Path $repo 'README.md') -Value 'ok' -Encoding utf8
             & git add README.md
             & git commit -m 'init' --quiet | Out-Null
+            # Prose/unspaced text in untracked notes must not trip the
+            # unquoted-assignment rule (task-17: a Markdown review report with
+            # "api_key: String" followed by prose failed the release gate).
+            $prose = 'api_key: String' + ('x' * 20)
+            Set-Content -LiteralPath (Join-Path $repo 'review-notes.md') -Value $prose -Encoding utf8
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Not Throw
+
+            # task-24: the evidence-root scan applies the same scope. A prose report
+            # inside an evidence root must not trip the unquoted-assignment rule,
+            # while a config/script file there still must (fail-closed kept).
+            $evidenceRoot = Join-Path $repo 'evidence-root'
+            New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
+            Set-Content -LiteralPath (Join-Path $evidenceRoot 'summary.md') -Value $prose -Encoding utf8
+            { Invoke-ReleaseSecretScan -RepoRoot $repo -EvidenceRoots $evidenceRoot } | Should Not Throw
+            Set-Content -LiteralPath (Join-Path $evidenceRoot 'captured.env') -Value ('api_key=' + ('A' * 32)) -Encoding utf8
+            { Invoke-ReleaseSecretScan -RepoRoot $repo -EvidenceRoots $evidenceRoot } | Should Throw
+            Remove-Item -LiteralPath (Join-Path $evidenceRoot 'captured.env') -Force
+
+            # The rule stays scoped to config/script formats so real assignments
+            # are still caught fail-closed.
+            Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath 'local-build.env' | Should Be $true
+            Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath 'scripts/build.ps1' | Should Be $true
+            Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath 'docs/review-notes.md' | Should Be $false
+            Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath 'src/main.rs' | Should Be $false
+
             $fake = 'sk' + '-' + ('u' * 24)
             Set-Content -LiteralPath (Join-Path $repo 'local-build.env') -Value ("API_TOKEN=$fake") -Encoding utf8
             { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
@@ -692,7 +766,9 @@ Describe 'ReleaseBuild workflow syntax structural fallback' {
     }
 }
 
-Describe 'ReleaseBuild host evidence workflow defaults' {
+# Legacy: Gitea Actions is decommissioned (2026-09-06). This block keeps the retained
+# release-host-evidence workflow from rotting; it does not certify an active runner.
+Describe 'ReleaseBuild legacy host evidence workflow defaults (Gitea Actions decommissioned 2026-09-06)' {
     It 'defaults skip_bundle to true and pins tauri-cli when bundle is requested' {
         $wf = Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'
         $text = Get-Content -LiteralPath $wf -Raw

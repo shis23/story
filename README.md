@@ -22,7 +22,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
 - M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），Gate 6 已按决议关闭（关闭非 PASS）。
 - **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
-- 本轮 11 步确定性门禁、Windows 原生 IPC、Android 凭据生命周期、世界书往返和保留数据升级已通过。真实模型移动写作、第三方插件、正式分发安装包和远端 CI 仍须分别闭合，不能由调试包或浏览器测试替代。
+- 11 步确定性门禁已三轮全绿且计数完全一致（secret 扫描、Pester 四套 198 项、fmt、严格 Clippy、Rust 1980 通过/0 失败/33 忽略、前端 504+119+9+28+2=662 项、生产构建）；另有 Windows 原生 13/13 项真实 IPC 检查、Android 凭据生命周期真机、世界书往返和保留数据升级通过。真实模型写作（Windows 原生 + Android 真机 9/9 环节）、第三方插件两条通道、正式分发安装包（v0.1.2 已发布并核对三产物哈希）与远端 CI（GitHub tag 构建全绿）均已闭合，详见[发布状态](docs/RELEASE-STATUS.md)。仍未闭合：Windows EXE 代码签名、任意历史回滚、ST 99 事件全集、JSON 生产写路径删除、记忆参数标定和 CoT 长程研究；调试包或浏览器测试不能替代真机与真实产物验证。
 
 ## 技术栈
 
@@ -38,9 +38,8 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 到 [Releases](https://github.com/shis23/story/releases) 下载最新版：
 
 - **Windows**：`*-setup.exe`（NSIS 安装器）或 `*.msi`，双击安装。首次运行若有 SmartScreen 警告，点「更多信息 → 仍要运行」即可（EXE 未做代码签名，开源项目常见）。
-- **Android**：`*-arm64-*-release.apk`，允许「安装未知来源应用」后安装（仅支持 arm64 设备）。
-
-每个版本附按平台分文件的校验和：`SHA256SUMS-windows.txt`（Windows 安装器）与 `SHA256SUMS-android.txt`（APK）。
+- **Android**：`app-arm64-release.apk`（匹配模式 `*arm64-release.apk`），允许「安装未知来源应用」后安装（仅支持 arm64 设备）。
+- 校验和文件：v0.1.2 的 Release 资产是 `SHA256SUMS.txt` 与 `SHA256SUMS-android.txt`（APK 哈希，发布后补传）；平台命名文件 `SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt` 自 v0.1.2 之后的版本起生效，下载时以 Release 页面上的实际文件名为准。
 
 ## 快速启动
 

@@ -76,16 +76,42 @@ export function useNewCampaignForm(options = {}) {
   }
 
   // 来源 App.vue:546-556
+  // F-39：openNewCampaignDialog 已经 `await loadNewCampaignCardDetail()`，
+  // 而 NewCampaignForm 里 `watch(newCampaignCardId)` 会再触发一次 → 每次打开
+  // 弹层两次 get_card。这里做进程内去重（同一张卡在飞行中复用 promise；
+  // 已加载完成且 id 相同则直接返回），空 id 时清空详情。
+  let detailLoadInFlight = null // { cardId, promise }
+  const newCampaignCardDetailLoading = ref(false)
+
   async function loadNewCampaignCardDetail() {
-    newCampaignCardDetail.value = null
+    const cardId = newCampaignCardId.value
     newCampaignGreetingIndex.value = 0
-    if (!newCampaignCardId.value) return
-    try {
-      newCampaignCardDetail.value = await getCard(newCampaignCardId.value)
-      normalizeNewCampaignGreetingSelection()
-    } catch (e) {
-      console.error('加载 Campaign 开场白失败:', e)
+    if (!cardId) {
+      newCampaignCardDetail.value = null
+      detailLoadInFlight = null
+      return
     }
+    if (!detailLoadInFlight && newCampaignCardDetail.value?.id === cardId) return
+    if (detailLoadInFlight?.cardId === cardId) return detailLoadInFlight.promise
+
+    const promise = (async () => {
+      newCampaignCardDetailLoading.value = true
+      try {
+        const detail = await getCard(cardId)
+        // 竞态保护：期间用户又换了卡，则丢弃这次结果
+        if (newCampaignCardId.value !== cardId) return
+        newCampaignCardDetail.value = detail
+        normalizeNewCampaignGreetingSelection()
+      } catch (e) {
+        console.error('加载 Campaign 开场白失败:', e)
+        if (newCampaignCardId.value === cardId) newCampaignCardDetail.value = null
+      } finally {
+        newCampaignCardDetailLoading.value = false
+        if (detailLoadInFlight?.cardId === cardId) detailLoadInFlight = null
+      }
+    })()
+    detailLoadInFlight = { cardId, promise }
+    return promise
   }
 
   // 来源 App.vue:558-570
@@ -169,6 +195,7 @@ export function useNewCampaignForm(options = {}) {
     creatingCampaign,
     newCampaignGreetingOptions,
     selectedNewCampaignGreeting,
+    newCampaignCardDetailLoading,
     // functions
     normalizeNewCampaignGreetingSelection,
     loadNewCampaignCardDetail,

@@ -39,6 +39,37 @@ test('generation mode rejects unknown wire values', () => {
   assert.equal(writing.generationMode, 'continuation')
 })
 
+test('retired big_scene in localStorage is not accepted as the current mode (W-31)', () => {
+  // big_scene 仍是后端兼容模式，但前端产品面只有目录里的三档；旧偏好值必须回退默认档位，
+  // 否则会以"看不到选中项"的昂贵模式发起 start_writing / 局部 reroll。
+  const values = new Map([['storyforge:generation-mode-by-campaign', JSON.stringify({ 'campaign-a': 'big_scene' })]])
+  globalThis.localStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  }
+  try {
+    setActivePinia(createPinia())
+    const writing = useWritingStore()
+    const campaign = useCampaignStore()
+    campaign.activeCampaign = { id: 'campaign-a' }
+
+    assert.equal(writing.generationMode, 'continuation')
+    writing.setGenerationMode('big_scene')
+    assert.equal(writing.generationMode, 'continuation')
+    assert.equal(
+      JSON.parse(values.get('storyforge:generation-mode-by-campaign'))['campaign-a'],
+      'big_scene',
+      'rejection must not rewrite the stored preference blob',
+    )
+    for (const mode of ['continuation', 'duet', 'sequential_crew']) {
+      writing.setGenerationMode(mode)
+      assert.equal(writing.generationMode, mode)
+    }
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
 test('generation mode memory survives store recreation but remains keyed by campaign', () => {
   const values = new Map()
   globalThis.localStorage = {

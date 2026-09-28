@@ -168,10 +168,22 @@ fn extract_from_regex_script(
         || replace.contains("<!DOCTYPE")
         || replace.contains("<!doctype")
         || (replace.contains("<body") && replace.contains("<script"));
-    if looks_html && replace.chars().count() > 80 {
+    // D-24：两个阈值单位必须各自明确，避免"字符 vs 字节"混用被误读。
+    // `INLINE_HTML_MIN_CHARS` 用字符数（中文卡正文按字算更直观）；
+    // `INLINE_HTML_IPC_MAX_BYTES` 用字节数（IPC 载荷上限本身是字节概念）。
+    if looks_html && replace.chars().count() > INLINE_HTML_MIN_CHARS {
         let deps = all_urls.clone();
         // Huge ST display HTML (viewer shells 80KB+) must not ride the IPC manifest.
-        let html = if replace.len() > 8_192 {
+        let byte_len = replace.len();
+        let html = if byte_len > INLINE_HTML_IPC_MAX_BYTES {
+            // D-24：此前静默丢弃正文——manifest 里留下 `html: ""`，
+            // 前端只能靠 display 文本自己认出内联文档，失败时无从排查。
+            tracing::warn!(
+                "内联 HTML 壳正文 {} 字节超过 IPC 上限 {}，manifest 仅保留触发信息（html 置空，label={}）",
+                byte_len,
+                INLINE_HTML_IPC_MAX_BYTES,
+                label
+            );
             String::new()
         } else {
             replace.clone()
@@ -186,6 +198,12 @@ fn extract_from_regex_script(
         });
     }
 }
+
+/// 内联 HTML 壳的最小正文长度（字符数，D-24）。
+const INLINE_HTML_MIN_CHARS: usize = 80;
+
+/// 内联 HTML 壳正文进入 IPC manifest 的字节上限（D-24）。
+const INLINE_HTML_IPC_MAX_BYTES: usize = 8_192;
 
 fn extract_from_tavern_helper(
     extensions: &serde_json::Value,
@@ -286,6 +304,22 @@ fn extract_visible_th_buttons(sc: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Shell surface kind.
+///
+/// `Other` 是**前向兼容 catch-all**：域内当前不构造它（`classify_shell_kind` 只返回
+/// 上面四类），保留它是为了让未来/外部写入的 manifest 在反序列化时不至于整条失败，
+/// 前端也可把它当作"未知壳"分组。D-22 复核：不删除，语义见 D-22 记录。
+///
+/// D-25（跨域记录）：前端 `frontend/src/utils/cardShellDisplay.js::classifyShellUrl`
+/// 自带一套 URL-only 关键词分类（`/status/`、`/home/`、`custom_start`、`/intro/`），
+/// 与这里的 find/label/url 三路分类**不等价**，只覆盖 URL 片段那一路：
+/// - 前端不认 `find/label` 里的中文关键词（首页/状态栏/开场/自定义/自定义），
+///   这类壳在 manifest 里 kind 正确、前端 URL 分类落到 `message_html`；
+/// - 前端也不认 Rust 侧的 `statusplaceholder` / `status_placeholder` 片段。
+///
+/// 现状不影响挂载（kind 只用于展示分组/审计），但两套判定长期会漂移。
+/// 建议（域1 无法单方面完成，需前端配合）：前端改用 manifest 的 `kind` 字段
+/// （由 Rust 单一权威输出），仅在 manifest 缺失时回退到 URL 关键词。
 fn classify_shell_kind(find: &str, label: &str, url: &str) -> CardShellKind {
     let f = find.to_lowercase();
     let l = label.to_lowercase();
@@ -438,7 +472,12 @@ fn capture_es_module_urls(text: &str) -> Vec<String> {
                     }
                 }
             }
+            // Advance by UTF-8 char boundaries — a bare `abs + 1` panics when the
+            // byte after the needle is inside a multi-byte char (e.g. `from 原作`).
             search_from = abs + 1;
+            while search_from < text.len() && !text.is_char_boundary(search_from) {
+                search_from += 1;
+            }
             if search_from >= text.len() {
                 break;
             }
@@ -700,5 +739,86 @@ $1
             "变量更新中 $('body').load('https://testingcf.jsdelivr.net/x/home/index.html')",
         );
         assert_eq!(loads.len(), 1);
+    }
+
+    #[test]
+    fn es_module_scan_handles_multibyte_after_needle() {
+        // Regression (D-01): `from 原作` / `import 模块` put a CJK char right after
+        // the ASCII needle; the old `search_from = abs + 1` sliced mid-character and
+        // panicked with "start byte index N is not a char boundary".
+        for text in [
+            "// 移植 from 原作：设定集",
+            "// 参考 import 模块实现",
+            "注释 from 原作\nimport 'https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/x.js'",
+            "注释 import 模块\nfrom 'https://example.com/a.js'",
+        ] {
+            let urls = capture_es_module_urls(text);
+            assert!(
+                urls.iter().all(|u| u.starts_with("http")),
+                "unexpected url in {text:?}: {urls:?}"
+            );
+        }
+        // Positive path still works with CJK elsewhere in the document.
+        let urls = capture_es_module_urls("说明：从原作提取\nimport 'https://example.com/ok.js'");
+        assert_eq!(urls, vec!["https://example.com/ok.js".to_string()]);
+    }
+
+    // ─── D-24：内联 HTML 壳的阈值语义必须明确可见 ──────────────────────────
+
+    fn inline_html_shells(replace: String) -> Vec<CardFrontendShell> {
+        let extensions = serde_json::json!({
+            "regex_scripts": [
+                regex("<viewer>", "<viewer>", &replace),
+            ],
+        });
+        crate::card_shell::extract_card_shell_manifest(&char_with_ext(extensions))
+            .shells
+            .into_iter()
+            .filter(|s| matches!(s.entry, CardShellEntry::InlineHtml { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn inline_html_shell_keeps_body_under_ipc_limit() {
+        let html = format!(
+            "<!DOCTYPE html><html><body><script>var a=1;</script>{}</body></html>",
+            "字".repeat(40)
+        );
+        assert!(html.len() <= INLINE_HTML_IPC_MAX_BYTES);
+        let shells = inline_html_shells(html.clone());
+        assert_eq!(shells.len(), 1);
+        match &shells[0].entry {
+            CardShellEntry::InlineHtml { html: kept } => assert_eq!(kept, &html),
+            other => panic!("expected InlineHtml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_html_shell_over_ipc_limit_is_still_listed_without_body() {
+        // > 8KB 的内联文档：仍必须出现在 manifest 里（前端靠 trigger 认领），
+        // 但正文被丢弃——此行为保留，且从静默改为 warn 可见（D-24）
+        let big = format!(
+            "<!DOCTYPE html><html><body><script>var a=1;</script>{}</body></html>",
+            "字".repeat(4_000)
+        );
+        assert!(big.len() > INLINE_HTML_IPC_MAX_BYTES);
+        let shells = inline_html_shells(big);
+        assert_eq!(shells.len(), 1, "超大内联壳不得被整条丢弃");
+        match &shells[0].entry {
+            CardShellEntry::InlineHtml { html } => {
+                assert!(html.is_empty(), "超过 IPC 上限时正文置空");
+            }
+            other => panic!("expected InlineHtml, got {other:?}"),
+        }
+        assert_eq!(shells[0].kind, CardShellKind::MessageHtml);
+        assert_eq!(shells[0].trigger, "<viewer>");
+    }
+
+    #[test]
+    fn short_html_snippet_is_not_treated_as_shell() {
+        // 阈值下限用字符数（中文 20 字 < 80）：不构成壳，避免把普通消息里的
+        // 短 HTML 片段误挂 iframe（D-24 单位说明）
+        let shells = inline_html_shells("<html><body>短</body></html>".to_string());
+        assert!(shells.is_empty());
     }
 }

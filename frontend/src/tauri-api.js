@@ -48,15 +48,6 @@ export async function getCharacter(id) {
 }
 
 /**
- * 删除角色卡
- */
-export async function deleteCharacter(id) {
-  if (isTauri()) {
-    return await invoke('delete_character', { id })
-  }
-}
-
-/**
  * 导入预设
  */
 export async function importPreset(data) {
@@ -78,14 +69,6 @@ export async function listPresets() {
 export async function getPreset(id) {
   if (isTauri()) {
     return await invoke('get_preset', { id })
-  }
-  return null
-}
-
-/** 获取当前活跃预设 */
-export async function getActivePreset() {
-  if (isTauri()) {
-    return await invoke('get_active_preset')
   }
   return null
 }
@@ -187,48 +170,6 @@ export async function setPluginEnabled(id, enabled) {
 
 // ─── 预设/模块系统 ──────────────────────────────────────────────────────────
 
-/** 列出所有模块（内置+自定义，含 enabled 状态） */
-export async function listModules() {
-  if (isTauri()) {
-    return await invoke('list_modules')
-  }
-}
-
-/** 更新模块内容或启停状态 */
-export async function updateModule(id, content, enabled) {
-  if (isTauri()) {
-    return await invoke('update_module', { id, content, enabled })
-  }
-}
-
-/** 列出所有 Profile */
-export async function listProfiles() {
-  if (isTauri()) {
-    return await invoke('list_profiles')
-  }
-}
-
-/** 获取当前活跃 Profile */
-export async function getActiveProfile() {
-  if (isTauri()) {
-    return await invoke('get_active_profile')
-  }
-}
-
-/** 保存/更新 Profile */
-export async function saveProfile(profileJson) {
-  if (isTauri()) {
-    return await invoke('save_profile', { profileJson })
-  }
-}
-
-/** 设置活跃 Profile */
-export async function setActiveProfile(id) {
-  if (isTauri()) {
-    return await invoke('set_active_profile', { id })
-  }
-}
-
 // ─── Agent Profile Config 命令 ─────────────────────────────────────────────
 
 /** 列出所有 Agent Profile 配置（摘要） */
@@ -243,14 +184,6 @@ export async function listAgentProfileConfigs() {
 export async function getAgentProfileConfig(id) {
   if (isTauri()) {
     return await invoke('get_agent_profile_config', { id })
-  }
-  return null
-}
-
-/** 获取当前活跃 Agent Profile 配置 */
-export async function getActiveAgentProfileConfig() {
-  if (isTauri()) {
-    return await invoke('get_active_agent_profile_config')
   }
   return null
 }
@@ -300,46 +233,6 @@ export async function getVersion() {
     return await invoke('get_version')
   }
   return '0.1.0-dev'
-}
-
-/**
- * 更新世界书条目路由
- * @param {string} characterId - 角色卡 ID
- * @param {number} entryIndex - 条目索引
- * @param {string} route - 'Constant' | 'Selective' | 'Both' | 'Disabled'
- */
-export async function updateWorldInfoRoute(characterId, entryIndex, route) {
-  if (isTauri()) {
-    return await invoke('update_world_info_route', { characterId, entryIndex, route })
-  }
-}
-
-/**
- * 更新世界书条目的 keys/content/constant/is_global/depth/order
- */
-export async function updateWorldInfoEntry(characterId, entryIndex, keys, content, constant, isGlobal = false, depth = 2, order = 100) {
-  if (isTauri()) {
-    return await invoke('update_world_info_entry', { characterId, entryIndex, keys, content, constant, isGlobal, depth, order })
-  }
-}
-
-/**
- * 新增世界书条目，返回新索引
- */
-export async function addWorldInfoEntry(characterId, keys, content, constant, isGlobal = false) {
-  if (isTauri()) {
-    return await invoke('add_world_info_entry', { characterId, keys, content, constant, isGlobal })
-  }
-  return 0
-}
-
-/**
- * 删除世界书条目
- */
-export async function deleteWorldInfoEntry(characterId, entryIndex) {
-  if (isTauri()) {
-    return await invoke('delete_world_info_entry', { characterId, entryIndex })
-  }
 }
 
 /**
@@ -467,7 +360,8 @@ export async function setActiveConnection(id) {
 /**
  * 测试连接连通性
  * @param {Object} req - { baseUrl, apiKey, model, protocol, toolMode }
- * @returns {Promise<{success: boolean, message: string, latencyMs?: number}>}
+ * @returns {Promise<{success: boolean, message: string, latency_ms?: number}>} 延迟字段是
+ *   snake_case `latency_ms`（F-42：Tauri 只 camelCase 命令参数，响应体保持 serde 原样）
  */
 export async function testConnection(req) {
   if (isTauri()) {
@@ -482,7 +376,7 @@ export async function testConnection(req) {
       },
     })
   }
-  return { success: true, message: '（mock）连通成功', latencyMs: 42 }
+  return { success: true, message: '（mock）连通成功', latency_ms: 42 }
 }
 
 // ─── M1 写作命令 ──────────────────────────────────────────────────────────
@@ -524,15 +418,34 @@ export async function startWriting(intent, characterId, onEvent, conversationId,
 
 /**
  * 提交 prompt hook 的执行结果（消息数组或错误）给后端挂起的请求
+ *
+ * M-08（依赖后端 M-08，已由 Rust 侧实现）：只要提交了 `messages`，就必须声明
+ * 至少一个改写者；后端校验每个声明的插件已在 PluginRegistry 启用且持
+ * `ModifyPrompt`，否则**丢弃 messages**（保留原始提示词、不报错）。
+ * 未带参数时是安全降级：插件改 prompt 暂时静默失效（不会崩）。
+ *
+ * @param {string} requestId
+ * @param {Array|null} messages - 改写后的消息数组；null = 不提交改写
+ * @param {boolean|string|null} error
+ * @param {Object} [options]
+ * @param {string[]} [options.modifierPluginIds] - 实际参与改写且声明了
+ *   ModifyPrompt 的插件 id 集合（首选形式）
+ * @param {string} [options.pluginId] - 单值兜底：只声明一个改写者
  */
-export async function pluginPromptHookResult(requestId, messages, error = null) {
+export async function pluginPromptHookResult(requestId, messages, error = null, options = {}) {
   if (isTauri()) {
+    const modifierPluginIds = Array.isArray(options.modifierPluginIds)
+      ? options.modifierPluginIds.filter((id) => typeof id === 'string' && id)
+      : []
     return await invoke('plugin_prompt_hook_result', {
       requestId,
       messages: Array.isArray(messages) ? messages : null,
       error: error || null,
+      pluginId: options.pluginId || null,
+      modifierPluginIds: modifierPluginIds.length > 0 ? modifierPluginIds : null,
     })
   }
+  return null
 }
 
 /**
@@ -677,16 +590,6 @@ export async function logClear(kind = null) {
 }
 
 /**
- * A2：获取单条 LLM 调用详情（含 token 统计、缓存命中）
- */
-export async function logGetLlmCall(id) {
-  if (isTauri()) {
-    return await invoke('log_get_llm_call', { id })
-  }
-  return null
-}
-
-/**
  * 导出日志 bundle
  */
 export async function logExportBundle(redactContent = true) {
@@ -708,21 +611,6 @@ export async function logAppendFrontend(level, message) {
 }
 
 // ─── M2 记忆系统命令 ──────────────────────────────────────────────────────
-
-/** 配置嵌入 API */
-export async function configureEmbedder(endpoint, apiKey, model, dim) {
-  if (isTauri()) {
-    return await invoke('configure_embedder', { endpoint, apiKey, model, dim })
-  }
-}
-
-/** 获取当前嵌入配置（不含 key） */
-export async function getEmbedConfig() {
-  if (isTauri()) {
-    return await invoke('get_embed_config')
-  }
-  return null
-}
 
 // ─── Meta Agent 命令 ──────────────────────────────────────────────────────
 
@@ -1183,12 +1071,6 @@ export async function cardShellListAllowedHosts() {
   return []
 }
 
-export async function cardShellAllowHost(host) {
-  if (isTauri()) {
-    return await invoke('card_shell_allow_host', { host })
-  }
-}
-
 /** 清空卡壳磁盘缓存（L6 刷新通道）；返回清掉的对象数 */
 export async function cardShellClearCache() {
   if (isTauri()) {
@@ -1473,14 +1355,6 @@ export async function metaChat(conversationId, userInput, onProgress) {
   }
 }
 
-/** 获取 Meta 对话完整历史 */
-export async function metaGetConversation(conversationId) {
-  if (isTauri()) {
-    return await invoke('meta_get_conversation', { conversationId })
-  }
-  return null
-}
-
 /** 列所有待采纳的 Meta Patch */
 export async function metaListPendingPatches() {
   if (isTauri()) {
@@ -1533,14 +1407,6 @@ export async function metaApplyMvuSchema(sourceCharacterId, definitionId) {
   if (isTauri()) {
     return await invoke('meta_apply_mvu_schema', { sourceCharacterId, definitionId })
   }
-}
-
-/** 手动触发 ST 预设 LLM 分类 */
-export async function metaClassifyStPreset(presetId) {
-  if (isTauri()) {
-    return await invoke('meta_classify_st_preset', { presetId })
-  }
-  return null
 }
 
 /** Campaign 健康检查（确定性数据校验，零 LLM） */
@@ -1602,14 +1468,6 @@ export async function metaExplainGeneration(conversationId, nodeId) {
 }
 
 // ─── W7 导出命令 ─────────────────────────────────────────────────────────────
-
-/** 导出单个角色卡为 ST PNG（含 tEXt "chara" 块） */
-export async function exportStCardPng(characterId) {
-  if (isTauri()) {
-    return await invoke('export_st_card_png', { characterId })
-  }
-  return null
-}
 
 /**
  * 导出 Campaign 全部角色为 ST PNG + 共享 lorebook

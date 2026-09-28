@@ -1,6 +1,6 @@
 # StoryForge 架构说明
 
-> 更新日期：2026-09-05。
+> 更新日期：2026-09-13（「插件与导入边界」「发布边界」「当前主要技术债」按 2026-09-06 的闭合结果回写；其余部分仍为 2026-09-05 代码快照）。
 > 本文描述当前源码的代码边界；当前候选的验收状态以 `RELEASE-STATUS.md` 为准，功能存在不等于门禁通过。
 
 ## 架构原则
@@ -153,6 +153,17 @@ Gate 7 候选周期还定义了默认切换下的兼容语义（RESULT §36）�
 孤儿行（父对象已删除的残留，JSON 应用里不可达）跳过并计数；不双写、不删除旧
 JSON、不遇错静默建空库。
 
+**存储语义补充（2026-09-13 审查修复回写，含域2 §9 六项）**：
+
+- **S-01 例外**：上面的"缺失 legacy 文件按空集合导入"有一条例外——`cards.json`/`campaigns.json` **文件缺失且存在交叉引用**（不完整源目录）时 **fail-closed**；文件存在但为空仍是空集合。被跳过的孤儿行除 `tracing::warn!` 外还通过 `storage_health` backend incident 暴露；**`import_runs` 表没有 skip 计数列**，重启/重开后无法从 DB 读回历史 skip（已知降级项，需 V009 schema 变更另行立项）。
+- **S-10 WAL 硬约束**：文件库启动时必须确认真实的 `PRAGMA journal_mode` 是 `wal`，否则以 `SqliteError::Other("journal_mode WAL was not applied (got …)")` **启动失败**（`configure_connection(conn, expect_wal)`；`Database::open` 传 `true`、`open_in_memory` 传 `false`）。`synchronous=NORMAL` 下断电可能丢失最近若干**已提交**事务（提交点不等价于每提交 fsync），因此导出/迁移必须走一致性快照，不能依赖 fsync 边界。
+- **S-17 启动阻断语义**：`DbProbeFailed` 会阻断启动（transient 文件占用也不例外）；`DbVersionAhead` 由 marker reconcile 处理，会先回写 Foreign marker 的 `schema_version`，但**"回写版本"不等于"承认权威"**——绑定不一致时仍 fail-closed。
+- **S-18/6b（已知限制，待决策）**：`gate5_bigdata_perf.rs`、`sqlite_bigdata_perf.rs` 目前只有 `println!`、没有阈值且未 `#[ignore]`；`backend_parity_suite.rs` 的重启子进程检查默认 no-op。需要"独立 perf job + 阈值"或显式 ignore 的决策，当前**不构成发布门禁**。
+- **S-22.2/22.3/22.6（已知限制，不损数据）**：cutover 会读两次源；首次打开存在一个无租约窗口；rollback 不覆盖 `active_campaign.json`。三点都是 fail-closed 或仅告警。
+- **S-22.4 保留策略**：导出前的让位备份只保留最新 **2** 份（`MAX_PRE_EXPORT_BACKUPS = 2`），更早的会被清理——用户不要以为旧备份一直都在。
+- **D-2 SecretRef fail-closed**：`resolve_secret_value` 对 SecretRef 只走凭据库，`Err` 原样上抛，**不会**把 ref 文本当值返回；`connection_store` / `embed.json` / `harness-real-llm` 四处调用点全部 fail-closed（无 ref-as-key 回退）。
+- **D-3 `write_fence` 并入健康面**：`storage_health::record_write_fence_state()` 把 `write_fence::frozen_entries()` 按**真实文件路径**登记为 `blocking = true` 事件，`error` 前缀带 kind 串 `write_fence_frozen`；已被 `json_store::record_unrecoverable` 登记的更完整条目会被跳过（按 path 去重、幂等）。前端 `storage_health_acknowledge(path)` 解除冻结，UI 为 `StorageHealthGate.vue`。
+
 ### JSON（显式回退）
 
 JSON 保留为限期兼容导入、反向导出和紧急回退能力，不再承载默认生产写入。选择
@@ -166,23 +177,23 @@ JSON 路径的 Turn journal、revision、MutationBatch 和恢复逻辑提供专�
 - 插件 runtime 支持显式权限、运行时撤销、prompt-hook timeout/cancel/budget、审计查询/分页/retention 和显式 degraded/unsupported 兼容矩阵。
 - FNV-1a audit chain 仅是本地完整性链，不是密码学签名或可信头证明。
 - ST/世界书/Campaign Bundle 导入执行 fail-closed 引用校验与补偿回滚；真实复杂卡仍需在合法 fixture 环境补证据。
-- 插件 iframe、真实第三方扩展和完整 ST 长尾语义仍需 GUI 验收。
+- 插件 iframe 与真实第三方扩展样本已由 2026-09-06 现场验收覆盖（卡内 TavernHelper 远程脚本 5/5 + manifest 插件 prompt hook 复验）；完整 ST 长尾语义（99 事件全集、冷门 Slash/TavernHelper API）仍需补。
 
 ## 发布边界
 
 - 本地 workspace、前端和 host-side release runner 已有自动化证据。
-- Linux Gitea runner 已投入运行；Windows runner 执行尚未验证。
+- Linux Gitea runner 曾投入运行；Gitea Actions 已于 2026-09-06 按用户决定停用（act_runner 与任务容器停止、排队 run 不再执行、仓库 has_actions 关闭）。远端构建改由 GitHub Actions 承担：v0.1.2 的 tag 构建（`windows-latest` / `ubuntu-latest` / release 三 job）已由 run 34013739416 证实。注意 GitHub 侧 job 只做构建与产物上传，不执行 11 步确定性门禁。
 - Windows bundle、Android APK、签名、GUI 和真机证据必须在 `docs/RELEASE-CHECKLIST.md` 单独记录。
 - 真实模型证据（Gate 6，RESULT §35）：Canary3/Coverage12/TextFallback3/Stability30
   已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），
   Gate 6 已按决议关闭（2026-08-31，关闭非 PASS，RESULT §35.9）——旧 45/100 Partial Evidence
   不复活、不视为 PASS。
-- Android 模拟器现场（§11.3，15 项验收点）与 Windows 桌面现场已 PASS；release
-  APK 签名无证书 BLOCKED；Android 真机与第三方插件现场矩阵仍缺。
+- Android 模拟器现场（§11.3，15 项验收点）与 Windows 桌面现场已 PASS（2026-08 阶段记录）。
+- 2026-09-06 补齐：Android 真机 9/9 环节（凭据生命周期、续写、采纳记账、对手戏、冷重启持久化）与第三方插件两条通道已闭合；v0.1.2 的 APK 为 release keystore 签名，但缺少可离线复现的 `apksigner verify` 证据；Windows EXE 仍无代码签名。验收与证据入口见 `RELEASE-STATUS.md`。
 
 ## 当前主要技术债
 
 1. 100-turn 真实模型长程证据与 §35.8.5 两项探测缺口（forbidden_story_facts 检测、MustNotReveal 主动探测）——Gate 6 已关闭非阻塞，如需补全另行立项（RESULT §35.9）。
 2. 完整候选周期统计与 JSON 生产写路径删除（Gate 7 §12.1.2/§12.1.5，发布后/稳定期后）。
-3. Windows runner、Android 真机、release 签名与可离线验证的真实产物证据。
-4. GUI 端到端、第三方插件现场矩阵。
+3. Windows 自托管 runner 已随 Gitea Actions 停用作废（远端构建改由 GitHub-hosted runner 承担）；APK release keystore 签名缺少可离线复现的 `apksigner verify` 证据——离线可验证的真实产物证据已由 v0.1.2 Release（三产物大小与 SHA-256）提供。
+4. GUI 端到端完整矩阵：2026-09-06 已覆盖 Windows 原生 13 项 IPC 检查、Android 真机 9 环节与第三方插件现场样本；完整矩阵与第三方脚本长尾仍待补。

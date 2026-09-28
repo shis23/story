@@ -677,10 +677,60 @@ async function prepareTavernHelperRemoteScript(entryUrl) {
   return { module: true, ...graph }
 }
 
+/**
+ * M-07：桥消息的帧归属判定。
+ *
+ * 旧实现只认 `d.__sf_th_bridge` 标记字段，监听器挂在 window 上，因此任何能
+ * 向主窗 postMessage 的 frame（含加载远程卡 HTML 的 CardShellHost）都能伪造
+ * 桥请求（register_module / prepare_remote_script / report / var_write /
+ * fetch_text）。这里对齐 mvu-runtime-bridge.js:1-4 的正确基线：event.source
+ * 必须归属本组件的 TH iframe。
+ *
+ * 采用与 CardShellHost.vue:1019-1036（L3）相同的 parent 链判定而不是
+ * `event.source === iframeRef.contentWindow` 直等：壳文档里再嵌 iframe 时，
+ * 内层帧的 parent 是壳帧，沿链上溯仍能归属本壳；链外的窗口（同级 frame、
+ * 打开的弹窗）在 10 跳内到顶即判否。
+ */
+function isTavernHelperFrame(event) {
+  const frameWindow = iframeRef.value?.contentWindow
+  if (!frameWindow || !event?.source) return false
+  try {
+    let candidate = event.source
+    for (let hop = 0; candidate && hop < 10; hop += 1) {
+      if (candidate === frameWindow) return true
+      if (candidate === candidate.parent) break
+      candidate = candidate.parent
+    }
+  } catch (_) {
+    /* 跨源访问 parent 抛错 ⇒ 不在本壳链上，判否 */
+  }
+  return false
+}
+
+/**
+ * 回信目标 origin：壳文档统一由 registerShellDoc 发布在隔离的
+ * storyforge-shell 源，能确定具体 origin 时不再用 '*'。
+ * 非 Tauri 的 blob: 兜底（不透明源，父窗读不到）保持 '*'。
+ */
+function bridgeReplyOrigin() {
+  const frameUrl = String(iframeRef.value?.src || frameSrc.value || '')
+  if (!frameUrl) return '*'
+  try {
+    const origin = new URL(frameUrl).origin
+    if (origin && origin !== 'null') return origin
+  } catch (_) {
+    /* about:blank / 相对地址等无法解析 ⇒ 退回 '*' */
+  }
+  return '*'
+}
+
 async function onBridgeMessage(ev) {
   const d = ev.data
   if (!d || !d.__sf_th_bridge) return
-  // blob: iframe is cross-origin — do not require contentWindow identity.
+  // M-07：先做帧归属校验，再处理任何桥请求。旧注释「blob: iframe is
+  // cross-origin — do not require contentWindow identity」已过期：V5 之后
+  // TH 文档由 registerShellDoc 发布在隔离的 storyforge-shell 源上。
+  if (!isTavernHelperFrame(ev)) return
 
   if (d.type === 'ready') {
     iframeReady.value = true
@@ -696,11 +746,12 @@ async function onBridgeMessage(ev) {
   }
 
   if (!d.id) return
+  const replyOrigin = bridgeReplyOrigin()
   const reply = (result, err) => {
     try {
       ev.source.postMessage(
         { __sf_th_bridge_res: d.id, result, error: err || null },
-        '*',
+        replyOrigin,
       )
     } catch (_) {
       /* ignore */
@@ -770,7 +821,8 @@ async function waitReady(timeoutMs = 30000) {
 function postToIframe(message) {
   const win = iframeRef.value?.contentWindow
   if (!win) throw new Error('TH iframe missing')
-  win.postMessage(message, '*')
+  // M-07：能定到壳源就钉死 origin，不再无条件用 '*'。
+  win.postMessage(message, bridgeReplyOrigin())
 }
 
 function waitForBridgeEvent(type, requestId, timeoutMs = 120000) {
@@ -782,6 +834,9 @@ function waitForBridgeEvent(type, requestId, timeoutMs = 120000) {
     function onMsg(ev) {
       const d = ev.data || {}
       if (!d || !d.__sf_th_bridge) return
+      // M-07：事件也要认帧，否则帧自导航后的新文档可凭捕获到的 requestId
+      // 伪造 run_done / button_done 让宿主播报成功。
+      if (!isTavernHelperFrame(ev)) return
       if (d.type !== type) return
       if (requestId != null && d.requestId !== requestId) return
       clearTimeout(timer)

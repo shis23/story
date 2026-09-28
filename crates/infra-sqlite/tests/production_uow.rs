@@ -660,6 +660,84 @@ fn accept_rejects_knowledge_owned_by_another_existing_campaign() {
 }
 
 #[test]
+fn accept_rejects_superseded_and_stale_attempts_without_side_effects() {
+    // S-18.1：旧 Attempt（Superseded/Stale）绝不能被 accept——否则「旧草稿覆盖
+    // 新草稿」。守卫在 production.rs（attempt.status != AwaitingAcceptance →
+    // Conflict），但此前没有任何测试驱动它。这里 Turn 保持 AwaitingAcceptance、
+    // 只把 Attempt 置为 Superseded/Stale，逼近真实 regenerate 时序。
+    for (label, status) in [
+        ("superseded", AttemptStatus::Superseded),
+        ("stale", AttemptStatus::Stale),
+    ] {
+        let mut f = fixture();
+        {
+            let mut turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(turn.status, TurnStatus::AwaitingAcceptance);
+            turn.find_attempt_mut(&f.attempt_id).unwrap().status = status.clone();
+            SqliteProductionRepository::save_turn(&mut f.db, &turn).unwrap();
+        }
+
+        let err = SqliteProductionRepository::accept_turn(
+            &mut f.db,
+            request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+        )
+        .unwrap_err();
+        match &err {
+            SqliteError::Conflict(message) => assert!(
+                message.contains("expected AwaitingAcceptance"),
+                "[{label}] 必须因 Attempt 状态被拒绝，got: {message}"
+            ),
+            other => panic!("[{label}] 期望 Conflict，got: {other:?}"),
+        }
+
+        // 零副作用：campaign/turn/variant/ledger 全部不变（attempt 状态保持我们写入的值）。
+        let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(campaign.revision, 0, "[{label}] campaign 不得推进");
+        assert_eq!(
+            campaign.chronicle_revision, 0,
+            "[{label}] chronicle 不得推进"
+        );
+        let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.status, TurnStatus::AwaitingAcceptance);
+        assert_eq!(
+            turn.find_attempt(&f.attempt_id).unwrap().status,
+            status,
+            "[{label}] 被拒绝的 accept 不得改写 Attempt 状态"
+        );
+        let conversation = SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conversation
+                .find_node(&f.node_id)
+                .unwrap()
+                .active()
+                .unwrap()
+                .status,
+            VariantStatus::Draft,
+            "[{label}] 变体不得被 Final"
+        );
+        assert!(
+            SqliteProductionRepository::list_summaries(&f.db, &f.campaign_id)
+                .unwrap()
+                .is_empty(),
+            "[{label}] 不得写入 RoundSummary"
+        );
+        assert_eq!(
+            SqliteProductionRepository::count_commit_ledger(&f.db).unwrap(),
+            0,
+            "[{label}] 不得写 ledger"
+        );
+    }
+}
+
+#[test]
 fn accept_rejects_chronicle_b_in_turn_batch() {
     let mut f = fixture();
     for mutation in &mut f.batch.mutations {
@@ -761,6 +839,53 @@ fn only_one_active_turn_per_campaign_is_allowed() {
 #[test]
 fn injected_failure_rolls_back_every_accept_side_effect() {
     let mut f = fixture();
+    // S-18.2：把 batch 换成「全 mutation」版本，让事务**中途已 INSERT** 的行
+    // （character_instances / character_knowledge / story_tasks）也进入回滚范围。
+    // 旧用例只有 SetVariable/Summary/FinalizeVariant，无法证明这些表在故障时回滚。
+    let instance_id = Id::from_str("instance-rollback");
+    let mut instance = CharacterInstance::temporary(f.campaign_id.clone(), "回滚测试角色");
+    instance.id = instance_id.clone();
+    let knowledge_id = Id::from_str("knowledge-rollback");
+    let task_id = Id::from_str("task-rollback");
+    let mut task = StoryTask::user_planned(
+        f.campaign_id.clone(),
+        "回滚目标",
+        "故障注入时不得残留",
+        vec![],
+        1,
+    );
+    task.id = task_id.clone();
+    f.batch.mutations.splice(
+        0..0,
+        [
+            Mutation::UpsertInstance(Box::new(instance)),
+            Mutation::SetVariable {
+                instance_id: Some(instance_id.clone()),
+                key: "mood".into(),
+                value: serde_json::json!("alert"),
+                turn: 1,
+            },
+            Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
+                entry_id: knowledge_id.clone(),
+                campaign_id: f.campaign_id.clone(),
+                character_id: instance_id.clone(),
+                knowledge_text: "回滚测试知识条目".into(),
+                source: KnowledgeSource::Witnessed,
+                source_character_id: None,
+                turn_number: 1,
+                event_id: None,
+                pinned: false,
+                propagation: PropagationPolicy::Open,
+            })),
+            Mutation::UpsertNewTask(Box::new(task)),
+            Mutation::SetTaskStatus {
+                task_id: task_id.clone(),
+                status: TaskStatus::Completed,
+            },
+        ],
+    );
+    persist_request_batch(&mut f);
+
     let err = SqliteProductionRepository::accept_turn_with_fault(
         &mut f.db,
         request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
@@ -786,6 +911,31 @@ fn injected_failure_rolls_back_every_accept_side_effect() {
     assert_eq!(
         SqliteProductionRepository::count_commit_ledger(&f.db).unwrap(),
         0
+    );
+    // 事务中途 INSERT 的行必须一并回滚。
+    assert!(
+        SqliteProductionRepository::get_instance(&f.db, &instance_id)
+            .unwrap()
+            .is_none(),
+        "故障注入后 character_instances 不得残留"
+    );
+    assert!(
+        SqliteProductionRepository::list_instances(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_empty(),
+        "故障注入后该 campaign 不得残留任何实例"
+    );
+    assert!(
+        SqliteProductionRepository::list_knowledge(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_empty(),
+        "故障注入后 character_knowledge 不得残留"
+    );
+    assert!(
+        SqliteProductionRepository::list_tasks(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_empty(),
+        "故障注入后 story_tasks 不得残留"
     );
 
     let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)

@@ -72,7 +72,7 @@ defineExpose({ refresh: load })
         <p class="text-xs text-ink-soft leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{{ row.content }}</p>
       </li>
     </ul>
-    <DataTable class="hidden sm:block" :columns="columns" :rows="summaries" empty-title="暂无摘要">
+    <DataTable class="hidden sm:block" :columns="columns" :rows="summaries" row-key="id" empty-title="暂无摘要">
       <template #cell-turn="{ row }">
         <Badge variant="accent" size="sm">第 {{ row.turn }} 轮</Badge>
       </template>

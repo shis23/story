@@ -50,6 +50,25 @@ test('empty allowlist fails closed to local-only sources', () => {
   assert.ok(csp.includes('blob:'))
 })
 
+test('keeps the tauri custom-protocol IPC sources in connect-src', () => {
+  // M-01（卫生项，不是安全修复）：壳文档 CSP 必须显式声明 Tauri 自定义协议 IPC
+  // 的来源，否则 tauri 的 ipc-protocol.js 会回退到不受 CSP 约束的
+  // window.ipc.postMessage；两条路径最终都到同一个 IPC handler，所以这不是
+  // "子帧可达 IPC" 的修复，只是不让 CSP 把 IPC 推回未声明的回退路径。
+  for (const hosts of [[], ['files.catbox.moe']]) {
+    const csp = buildShellCspContent(hosts)
+    const connect = csp
+      .split(';')
+      .map((d) => d.trim())
+      .find((d) => d.startsWith('connect-src'))
+    assert.ok(connect.includes('ipc:'), `connect-src must keep ipc:: ${connect}`)
+    assert.ok(
+      connect.includes('http://ipc.localhost'),
+      `connect-src must keep http://ipc.localhost: ${connect}`,
+    )
+  }
+})
+
 test('rejects malformed allowlist entries that could smuggle CSP sources', () => {
   const csp = buildShellCspContent([
     'evil.com; script-src *',

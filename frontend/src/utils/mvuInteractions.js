@@ -65,10 +65,14 @@ export function flattenInteractionActions(actions, depth = 0) {
 }
 
 // 含这些标记的表达式视为 JS，不原生解释（留给 WebView/后处理路线）
-const JS_EXPR_MARKERS = /[=(){}[\];`]|getvar|setvar|Math\.|\$\{|=>|await|fetch/
+// M-28b：全角括号/等号与 ASCII 同权（卡文本常经中文全角输入）。
+const JS_EXPR_MARKERS = /[=(){}[\];`＝（）｛｝［］；]|getvar|setvar|Math\.|\$\{|=>|await|fetch/
 
 // 混入算术运算的字符串不得当字面量落盘（防 "hp - 10" 类被写成字符串）
-const ARITHMETIC_MIX = /[+*/%]|\s-|-\s|\d-|-\d/
+// M-28b：全角/数学运算符与 ASCII 同权——＋(U+FF0B) －(U+FF0D) ×(U+00D7)
+// ÷(U+00F7) ＊(U+FF0A) ／(U+FF0F) ％(U+FF05) −(U+2212) ±(U+00B1)；
+// 否则 "hp ＋ 10" 会走「裸词」分支被写成数值变量里的字符串。
+const ARITHMETIC_MIX = /[+*/%＋－×÷＊／％−±]|\s-|-\s|\d-|-\d/
 
 /**
  * 解释 modify_variable 的 value_expr：

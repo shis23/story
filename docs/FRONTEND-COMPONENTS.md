@@ -69,6 +69,8 @@
 
 这些组件应该先统一，后续业务组件只组合它们。
 
+> **2026-09-13 现实核对（域5 F-18/F-19 + task-16 回写）**：上表是"能力蓝图"，**不等于**当前 `frontend/src/components-v2/ui/**` 的清单。现状为 **14 个 `.vue`**（Badge、Button、CodeBlock、DataList、DataTable、EmptyState、IconButton、Input、LoadingState、Overlay、Select、Tabs、Textarea、Toggle）；已删除 9 个零引用基元（Checkbox、DiffView、ErrorState、Menu、Progress、SegmentedControl、Slider、Toast、Tooltip），另有 `Dialog.vue` 早先于 commit `894730c`（2026-09-01）删除。**错误态不再引入 `ErrorState` 组件**：各面板改为内联"错误行 + 重试"（同一视觉/交互口径，F-19 降级方案）。表中已被删除的条目只作能力参考，不代表存在对应组件。
+
 | 组件 | 用途 | 关键状态 |
 | --- | --- | --- |
 | `Button` | 文本按钮、主操作、危险操作 | default / hover / active / loading / disabled |
@@ -267,17 +269,20 @@ Screens: (1) first-run empty (2) writing in progress (3) finished message with v
 > **视觉重设计请忽略这些文件的外观。**
 
 当前运行入口：`frontend/src/main.js` → `AppV2.vue` + Pinia。  
-组件根目录：`frontend/src/components-v2/`（shell / ui / writing / campaign / meta / st / config / debug）。
+组件根目录：`frontend/src/components-v2/`（shell / ui / campaign / meta / st / config / debug）。**生产写作面不在 `components-v2/writing/**`，而在 `frontend/src/design/writing/**`**（`WritingScreen.vue`、`MessageItem.vue` 等，ChatMessage 8 emit 契约的载体）；`components-v2/writing/**` 现存 8 个 `.vue`，属**阶段 8 遗留、零外部引用、未接线**（2026-09-13 复核：`frontend/src` 内没有任何相对导入指向该目录）。
 
 | 区域 | 代表文件 |
 | --- | --- |
 | Shell | `shell/TopBar.vue` `PrimarySidebar.vue` `InspectorDrawer.vue` `PanelHost.vue`（`AppShell.vue` 从未接线，2026-09-01 已删除） |
-| Writing | `writing/ConversationViewport.vue` `ChatMessage.vue` `StreamingMessage.vue` `ProcessReview.vue` `Composer.vue` … |
+| Writing（生产） | `design/writing/WritingScreen.vue`、`design/writing/MessageItem.vue`（ChatMessage 8 emit 契约的真实载体）等 |
+| Writing（遗留存档） | `components-v2/writing/`：`ConversationViewport.vue`、`ChatMessage.vue`、`StreamingMessage.vue`、`ProcessReview.vue`、`Composer.vue`、`GreetingSelector.vue`、`ConversationHistoryList.vue`、`CampaignOverview.vue` —— 零引用，仅存档参考，**不再承诺"可回退"**（见 `frontend/src/design/writing/CONTRACT.md` 第 6 条） |
 | Campaign | `campaign/CampaignPanel.vue` 与 6 个 `*Tab.vue`、`CardLibrary.vue`、`NewCampaignForm.vue` |
 | Meta / ST / Config / Debug | `meta/*` `st/*` `config/*` `debug/*` |
 | 契约未迁入 v2 | `components/PluginHost.vue`、`components/MvuJsRuntime.vue`（宿主/runtime，不是视觉主角） |
 
 （Phase 8 前端重构执行手册已不随仓库分发。）
 - `npm run build`：422KB 产物（2026-07-08 时点数据；2026-09-01 复核 minified ~590KB/gzip ~169KB，随功能增长属预期）。
-- 契约红线：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode` 全部保留。
+- 契约红线：ChatMessage 8 emit（载体 `frontend/src/design/writing/MessageItem.vue`）、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode` 全部保留。
+- 测试与计数（2026-09-13 回写）：node:test **67 文件 / 532 通过**（`cd frontend && npm test`，域5 单进程直跑）；vitest 侧 `frontend/tests/components-v2/**` 为 **31 个文件**，**通过数待 Lead 收口门禁确认后回填**。前端唯一 `invoke` 数（2026-09-13 实测 **152**）由 `node scripts/architecture/backend-baseline.mjs` 运行时输出，**不要在文档里硬编码**。
+- 前端 wrapper（2026-09-13 回写）：`tauri-api.js` 删除 20 个零引用 wrapper（可观测删除清单见 `docs/review-2026-09-13/fixes/05-frontend-fixes.md` §5-8，例如 `getActiveAgentProfileConfig`、`deleteCharacter`、`cardShellAllowHost`）；保留入口 `cardstudioListStages`（`campaign/CardStudio.vue`）与 `cardShellClearCache`（`shell/InspectorDrawer.vue`）均已接线。**后端 175 条命令一条未删**，其中 23 条零入口命令在 `scripts/architecture/backend-baseline.mjs` 的 `RETAINED_NO_FRONTEND_CALLER` 登记为"无前端入口的声明的保留 API"。
 

@@ -2,7 +2,7 @@
 import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from '../../components/base/BaseDialog.js'
 import { listTasks, createTask, completeTask, abandonTask } from '../../tauri-api.js'
-import { taskStatusText } from '../../utils/taskStatus.js'
+import { taskStatusText, isLikelyCompleted } from '../../utils/taskStatus.js'
 import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
@@ -17,13 +17,14 @@ const props = defineProps({
   campaignId: { type: String, required: true }
 })
 
-const emit = defineEmits(['refresh'])
-
 // ─── 状态 ───
 const tasks = ref([])
 const loading = ref(false)
 const error = ref(null)
 const statusFilter = ref('') // '' = 全部
+// 写操作防重（F-24）：这两个写命令都不幂等，连点会产生重复任务/重复导模块。
+const creatingTask = ref(false)
+const busyTaskId = ref(null)
 
 // ─── 新建任务 ───
 const showNewTask = ref(false)
@@ -58,38 +59,46 @@ function onFilterChange() {
 
 // ─── 任务操作 ───
 async function handleCreateTask() {
-  if (!newTaskTitle.value.trim()) return
+  if (!newTaskTitle.value.trim() || creatingTask.value) return
+  creatingTask.value = true
   try {
     await createTask(props.campaignId, newTaskTitle.value.trim(), newTaskDesc.value.trim(), [{ kind: 'manual' }])
     newTaskTitle.value = ''
     newTaskDesc.value = ''
     showNewTask.value = false
     await load()
-    emit('refresh')
   } catch (e) {
     await alertDialog('创建任务失败: ' + errorText(e))
+  } finally {
+    creatingTask.value = false
   }
 }
 
 async function handleCompleteTask(taskId) {
+  if (busyTaskId.value) return
+  busyTaskId.value = taskId
   try {
     await completeTask(taskId)
     await load()
-    emit('refresh')
   } catch (e) {
     await alertDialog('完成任务失败: ' + errorText(e))
+  } finally {
+    busyTaskId.value = null
   }
 }
 
 async function handleAbandonTask(taskId) {
+  if (busyTaskId.value) return
   const ok = await confirmDialog('确定放弃该任务？', { title: '放弃确认' })
   if (!ok) return
+  busyTaskId.value = taskId
   try {
     await abandonTask(taskId)
     await load()
-    emit('refresh')
   } catch (e) {
     await alertDialog('放弃任务失败: ' + errorText(e))
+  } finally {
+    busyTaskId.value = null
   }
 }
 
@@ -142,8 +151,9 @@ defineExpose({ refresh: load })
         size="md"
         class="flex-1"
         :disabled="!newTaskTitle.trim()"
+        :loading="creatingTask"
         @click="handleCreateTask"
-      >创建</Button>
+      >{{ creatingTask ? '创建中…' : '创建' }}</Button>
     </div>
   </div>
 
@@ -156,7 +166,7 @@ defineExpose({ refresh: load })
   </EmptyState>
 
   <template v-else>
-    <DataTable :columns="columns" :rows="tasks" empty-title="暂无任务">
+    <DataTable :columns="columns" :rows="tasks" row-key="id" empty-title="暂无任务">
       <template #cell-title="{ row }">
         <div class="text-sm font-medium text-ink">{{ row.title }}</div>
         <div v-if="row.description" class="text-xs text-ink-soft mt-0.5 line-clamp-2">{{ row.description }}</div>
@@ -172,18 +182,24 @@ defineExpose({ refresh: load })
       </template>
       <template #row-action="{ row }">
         <div class="flex flex-col gap-1">
+          <!--
+            F-07：`likely_completed`（agent 自报可能完成）必须由用户确认或驳回，
+            后端不会自动终态。此前该分支把「完成」按钮藏起来，导致这类任务永远无法终态。
+          -->
           <Button
-            v-if="row.status !== 'completed' && row.status?.likely_completed == null"
+            v-if="row.status !== 'completed' && row.status !== 'abandoned'"
             variant="default"
             size="sm"
+            :loading="busyTaskId === row.id"
             @click.stop="handleCompleteTask(row.id)"
-          >完成</Button>
+          >{{ isLikelyCompleted(row.status) ? '确认完成' : '完成' }}</Button>
           <Button
             v-if="row.status !== 'completed' && row.status !== 'abandoned'"
             variant="ghost"
             size="sm"
+            :disabled="busyTaskId === row.id"
             @click.stop="handleAbandonTask(row.id)"
-          >放弃</Button>
+          >{{ isLikelyCompleted(row.status) ? '误判，放弃' : '放弃' }}</Button>
         </div>
       </template>
     </DataTable>

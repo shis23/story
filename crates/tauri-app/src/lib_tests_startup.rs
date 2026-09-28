@@ -160,6 +160,224 @@ fn migrate_from_exe_dir_is_noop_when_old_dir_absent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// S-06/R14：迁移失败必须**可判定**为"未完成"，不能像旧实现那样照常报成功。
+///
+/// 故障注入：把嵌套目录 `conversations/` 在目标侧的落地位置预先做成一个**文件**，
+/// 于是 `create_dir_all(new_dir/conversations)` 与其中的文件拷贝必失败——
+/// 这是真实用户会遇到的形态（权限、文件占用、磁盘错误都落在这一层）。
+#[test]
+fn migrate_failure_is_reported_incomplete_and_arms_retry() {
+    let root = std::env::temp_dir().join(format!("sf-migrate-fail-{}", uuid::Uuid::new_v4()));
+    let exe_parent = root.join("install");
+    let old_dir = exe_parent.join("data");
+    let new_dir = root.join("newdata");
+    std::fs::create_dir_all(old_dir.join("conversations")).expect("create old conversations");
+    std::fs::write(
+        old_dir.join("conversations/conv-1.json"),
+        b"{\"id\":\"c1\"}",
+    )
+    .expect("seed nested data");
+    std::fs::create_dir_all(&new_dir).expect("create new dir");
+    // 注入：目标位置是文件而非目录 → 嵌套拷贝必失败
+    std::fs::write(new_dir.join("conversations"), b"blocker").expect("inject blocker");
+
+    let outcome = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+
+    match &outcome {
+        MigrationOutcome::Incomplete { failures, .. } => {
+            assert!(
+                failures.iter().any(|f| f.contains("conversations")),
+                "失败清单必须指明是哪个条目失败，实际: {failures:?}"
+            );
+            let root_str = root.to_string_lossy().to_string();
+            assert!(
+                failures.iter().all(|f| !f.contains(&root_str)),
+                "失败清单不得带用户绝对路径（会进前端健康报告），实际: {failures:?}"
+            );
+        }
+        other => panic!("拷贝失败必须返回 Incomplete，实际: {other:?}"),
+    }
+    let marker = new_dir.join(MIGRATION_INCOMPLETE_MARKER);
+    assert!(marker.exists(), "失败后必须留下重试标记");
+    let marker_text = std::fs::read_to_string(&marker).expect("marker readable");
+    assert!(
+        marker_text.contains("incomplete") && marker_text.contains("conversations"),
+        "标记内容应说明未完成并带上失败条目，实际: {marker_text}"
+    );
+    assert!(
+        !new_dir.join("conversations/conv-1.json").exists(),
+        "注入的失败必须真的没搬过去"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// S-06/R14：失败留下的标记必须让下次启动**越过**"新目录已有数据"的跳过判据。
+///
+/// 没有标记时，一次部分成功（例如 `characters.json` 已经拷过去）会让
+/// `new_has_data` 为真 → 之后每次启动都跳过迁移，旧目录里的数据永远搬不过来。
+/// 本测试同时给出**反证**：把标记删掉后，同样的目录状态确实返回 `SkippedPopulated`。
+#[test]
+fn migrate_incomplete_marker_forces_retry_past_populated_latch() {
+    let root = std::env::temp_dir().join(format!("sf-migrate-retry-{}", uuid::Uuid::new_v4()));
+    let exe_parent = root.join("install");
+    let old_dir = exe_parent.join("data");
+    let new_dir = root.join("newdata");
+    std::fs::create_dir_all(old_dir.join("conversations")).expect("create old conversations");
+    std::fs::write(
+        old_dir.join("conversations/conv-1.json"),
+        b"{\"id\":\"c1\"}",
+    )
+    .expect("seed");
+    std::fs::create_dir_all(&new_dir).expect("create new dir");
+    std::fs::write(new_dir.join("conversations"), b"blocker").expect("inject blocker");
+
+    // 第 1 次：失败 → 留下标记
+    let first = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+    assert!(
+        matches!(first, MigrationOutcome::Incomplete { .. }),
+        "实际: {first:?}"
+    );
+    let marker = new_dir.join(MIGRATION_INCOMPLETE_MARKER);
+    assert!(marker.exists(), "失败后必须有标记");
+
+    // 模拟"部分拷贝"留下的 latch 状态：新目录已经有 characters.json
+    std::fs::write(new_dir.join("characters.json"), b"{}").expect("simulate partial copy");
+
+    // 反证：删掉标记时，这个目录状态会让迁移被**永久跳过**（S-06 的锁死路径）
+    std::fs::remove_file(&marker).expect("remove marker");
+    let without_marker = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+    assert_eq!(
+        without_marker,
+        MigrationOutcome::SkippedPopulated,
+        "没有标记时 new_has_data 会跳过迁移（这正是被永久锁死的路径）"
+    );
+    assert!(!marker.exists(), "被跳过时不应产生标记");
+
+    // 标记回来了 = "上次没搬完"仍然成立 → 必须重试而不是跳过
+    std::fs::write(&marker, b"migration incomplete\n").expect("restore marker");
+    let retry = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+    match &retry {
+        MigrationOutcome::Incomplete { retried, .. } => {
+            assert!(*retried, "本次应标记为 retried=true，实际: {retry:?}")
+        }
+        other => panic!("有标记时必须重试而不是跳过，实际: {other:?}"),
+    }
+
+    // 清掉注入的阻塞物 → 本次应真正搬完并撤销标记
+    std::fs::remove_file(new_dir.join("conversations")).expect("remove blocker");
+    let done = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+    assert!(
+        matches!(done, MigrationOutcome::Completed { retried: true, .. }),
+        "清除阻塞后重试应成功且 retried=true，实际: {done:?}"
+    );
+    assert!(!marker.exists(), "成功后必须撤销标记");
+    assert_eq!(
+        std::fs::read_to_string(new_dir.join("conversations/conv-1.json")).unwrap(),
+        "{\"id\":\"c1\"}",
+        "嵌套文件必须真的搬过来了"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// S-06/R14：迁移失败必须落到**健康面**（前端可见），不能只写日志。
+#[test]
+fn migrate_incomplete_outcome_is_surfaced_as_backend_incident() {
+    let outcome = MigrationOutcome::Incomplete {
+        copied_files: 2,
+        failures: vec!["conversations/conv-1.json: 拒绝访问。 (os error 5)".to_string()],
+        retried: true,
+    };
+    report_migration_outcome(&outcome);
+    let incidents = crate::storage_health::incidents();
+    let found = incidents
+        .iter()
+        .find(|i| i.path == "backend:legacy_dir_migration_incomplete")
+        .expect("迁移未完成必须登记 health incident（否则前端看不到）");
+    assert!(
+        found.error.contains("1 项失败"),
+        "incident 文案应带失败项数，实际: {}",
+        found.error
+    );
+    assert!(
+        found.error.contains("旧目录数据未改动"),
+        "incident 应说明源数据未动，避免用户误判为已丢失，实际: {}",
+        found.error
+    );
+    assert!(!found.blocking, "迁移失败不阻断启动，应为非阻断事件");
+}
+
+/// S-06/R14：成功路径不得留下重试标记，且嵌套目录内容逐字节一致。
+#[test]
+fn migrate_success_copies_nested_dirs_and_leaves_no_marker() {
+    let root = std::env::temp_dir().join(format!("sf-migrate-ok-{}", uuid::Uuid::new_v4()));
+    let exe_parent = root.join("install");
+    let old_dir = exe_parent.join("data");
+    let new_dir = root.join("newdata");
+    std::fs::create_dir_all(old_dir.join("campaigns/camp-1")).expect("create nested");
+    std::fs::write(old_dir.join("campaigns/camp-1/state.json"), b"{\"n\":1}").expect("seed nested");
+    std::fs::write(old_dir.join("characters.json"), b"{\"c\":2}").expect("seed top-level");
+    std::fs::create_dir_all(&new_dir).expect("create new dir");
+
+    let outcome = migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent));
+    assert_eq!(
+        outcome,
+        MigrationOutcome::Completed {
+            copied_files: 2,
+            retried: false
+        },
+        "顶层 + 嵌套共 2 个文件"
+    );
+    assert!(
+        !new_dir.join(MIGRATION_INCOMPLETE_MARKER).exists(),
+        "成功后不留下标记"
+    );
+    assert_eq!(
+        std::fs::read_to_string(new_dir.join("campaigns/camp-1/state.json")).unwrap(),
+        "{\"n\":1}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// S-06/R14：非适用/无需迁移的场景显式返回枚举值，而不是"静默 return"。
+#[test]
+fn migrate_outcome_is_explicit_when_not_applicable() {
+    let root = std::env::temp_dir().join(format!("sf-migrate-na-{}", uuid::Uuid::new_v4()));
+    let exe_parent = root.join("install");
+    let new_dir = root.join("newdata");
+    std::fs::create_dir_all(&new_dir).expect("create new dir");
+
+    // 旧目录不存在 → NotApplicable
+    assert_eq!(
+        migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent)),
+        MigrationOutcome::NotApplicable
+    );
+    // 未提供 exe_parent → NotApplicable
+    assert_eq!(
+        migrate_from_exe_dir_if_needed(&new_dir, None),
+        MigrationOutcome::NotApplicable
+    );
+
+    // 旧目录有数据但新目录已有数据 → SkippedPopulated（不覆盖用户数据）
+    let old_dir = exe_parent.join("data");
+    std::fs::create_dir_all(&old_dir).expect("create old dir");
+    std::fs::write(old_dir.join("characters.json"), b"\"stale\"").expect("seed old");
+    std::fs::write(new_dir.join("characters.json"), b"\"live\"").expect("seed new");
+    assert_eq!(
+        migrate_from_exe_dir_if_needed(&new_dir, Some(&exe_parent)),
+        MigrationOutcome::SkippedPopulated
+    );
+    assert_eq!(
+        std::fs::read_to_string(new_dir.join("characters.json")).unwrap(),
+        "\"live\"",
+        "跳过迁移时不得覆盖新目录数据"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 use serde::ser::Error as _;
 use std::sync::{Arc, Mutex};
 

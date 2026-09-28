@@ -70,6 +70,8 @@ use sha2::{Digest, Sha256};
 use crate::backend::StorageBackend;
 use crate::connection::{Database, STORYFORGE_APPLICATION_ID};
 use crate::error::{Result, SqliteError};
+// S-20：与 rollback 共用同一份 fsync 语义（历史上两边各有一份，rollback 静默吞错）。
+use crate::fs_atomic::{fsync_file, fsync_parent_dir};
 use crate::importer::JsonImporter;
 use crate::lease::AuthorityLeaseGuard;
 use crate::readiness::{self, SourceManifestReport};
@@ -170,6 +172,10 @@ pub struct CutoverReport {
     /// JSON 应用里本就不可达）。审计/恢复路径为 0。
     #[serde(default)]
     pub skipped_orphan_rows: usize,
+    /// S-01：按集合的跳过明细（kind, count）——非零跳过必须可审计（日志 +
+    /// 调用方健康事件），不能只活在导入过程的 tracing 里。
+    #[serde(default)]
+    pub skipped_detail: Vec<(String, usize)>,
     pub backup_label: String,
 }
 
@@ -179,6 +185,7 @@ impl CutoverReport {
         schema_version: i64,
         import_skipped_duplicate: bool,
         skipped_orphan_rows: usize,
+        skipped_detail: Vec<(String, usize)>,
         backup_label: &str,
     ) -> Self {
         CutoverReport {
@@ -195,6 +202,7 @@ impl CutoverReport {
             schema_version,
             import_skipped_duplicate,
             skipped_orphan_rows,
+            skipped_detail,
             backup_label: backup_label.to_string(),
         }
     }
@@ -266,6 +274,56 @@ impl BackendMarker {
     }
 }
 
+/// Why a marker is stale (S-02/S-03).
+///
+/// 取代原先「按错误文本子串分类」的 `is_recoverable_stale(reason)`：文本匹配
+/// 会把「DB 被占用/权限/网络盘瞬时打不开」「DB schema 版本高于 marker」等完全不同
+/// 的情形误判成「本进程中断残留」，从而允许用陈旧 JSON 重发布覆盖新版 DB。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleKind {
+    /// marker 不存在但存在带权威绑定的 StoryForge DB（发布后/写 marker 前中断）。
+    MarkerAbsentOrphanDb,
+    /// marker 文件读不出来（权限/占用）。
+    MarkerUnreadable,
+    /// marker 内容不是合法 JSON。
+    MarkerCorrupt,
+    /// marker 版本比本二进制支持的更新。
+    MarkerVersionNewer,
+    /// marker 版本为 0（非法）。
+    MarkerVersionZero,
+    /// marker 声称 SQLite 但 DB 文件不存在（发布前中断）。
+    DbMissing,
+    /// 只读探测打不开 DB（占用/权限/损坏/网络盘）。
+    DbProbeFailed,
+    /// DB schema 版本高于 marker（更新二进制迁移过，marker 未对账）。
+    DbVersionAhead,
+    /// DB schema 版本低于 marker（旧库 + 新 marker）。
+    DbVersionBehind,
+    /// 版本一致但 DB 与 marker 绑定不一致（schema/import_runs/authority 不匹配）。
+    DbBindingMismatch,
+    /// marker 的 backend 字段无法解析。
+    BackendUnknown,
+}
+
+impl StaleKind {
+    /// 运行期是否需要操作者介入（用于诊断文案）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StaleKind::MarkerAbsentOrphanDb => "marker-absent-orphan-db",
+            StaleKind::MarkerUnreadable => "marker-unreadable",
+            StaleKind::MarkerCorrupt => "marker-corrupt",
+            StaleKind::MarkerVersionNewer => "marker-version-newer",
+            StaleKind::MarkerVersionZero => "marker-version-zero",
+            StaleKind::DbMissing => "db-missing",
+            StaleKind::DbProbeFailed => "db-probe-failed",
+            StaleKind::DbVersionAhead => "db-version-ahead",
+            StaleKind::DbVersionBehind => "db-version-behind",
+            StaleKind::DbBindingMismatch => "db-binding-mismatch",
+            StaleKind::BackendUnknown => "backend-unknown",
+        }
+    }
+}
+
 /// Result of inspecting the marker on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerStatus {
@@ -281,7 +339,7 @@ pub enum MarkerStatus {
     /// Marker claims JSON authority.
     JsonAuthoritative,
     /// Marker exists but is stale (DB missing, corrupt, or version mismatch).
-    Stale { reason: String },
+    Stale { kind: StaleKind, reason: String },
 }
 
 /// Test-only fault injection points. Each causes the cutover to fail at that
@@ -316,25 +374,41 @@ pub enum CutoverFault {
 /// Inspect the marker file and database state to determine authority.
 pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     let marker_path = plan.marker_path();
-    if !marker_path.exists() {
-        // 三审3：marker 缺失不能一律当作「空白新用户」。若 db_path 存在且是一个
-        // 带 authority_binding 的 StoryForge DB（中断的 cutover 残留），必须判
-        // Stale（ambiguous）让操作者显式处理，而非被当作 blank 并可能在后续
-        // cutover 中覆盖。真正的空白新用户 = 无 marker 且无 StoryForge DB。
-        if orphan_storyforge_db_exists(&plan.db_path) {
+    // N-R1-04：`Path::exists()` 把 stat 的权限/IO 错误也当「不存在」——而
+    // `StaleKind::MarkerUnreadable`（"marker 文件读不出来（权限/占用）"）本就
+    // 是为这个状态准备的。缺了这一步，ACL 拒绝会让带权威绑定的 marker 被当成
+    // `Absent`（后续 cutover 可能覆盖它），必须显式判 Stale 交操作者处理。
+    match crate::readiness::path_presence(&marker_path) {
+        Ok(crate::readiness::PathPresence::Missing) => {
+            // 三审3：marker 缺失不能一律当作「空白新用户」。若 db_path 存在且是一个
+            // 带 authority_binding 的 StoryForge DB（中断的 cutover 残留），必须判
+            // Stale（ambiguous）让操作者显式处理，而非被当作 blank 并可能在后续
+            // cutover 中覆盖。真正的空白新用户 = 无 marker 且无 StoryForge DB。
+            if orphan_storyforge_db_exists(&plan.db_path) {
+                return MarkerStatus::Stale {
+                    kind: StaleKind::MarkerAbsentOrphanDb,
+                    reason:
+                        "marker absent but a StoryForge database with authority binding exists \
+                             (interrupted cutover)"
+                            .into(),
+                };
+            }
+            return MarkerStatus::Absent;
+        }
+        Ok(crate::readiness::PathPresence::Present) => {}
+        Err(e) => {
             return MarkerStatus::Stale {
-                reason: "marker absent but a StoryForge database with authority binding exists \
-                         (interrupted cutover); resolve manually or re-run cutover"
-                    .into(),
+                kind: StaleKind::MarkerUnreadable,
+                reason: format!("marker path not stat-able: {e}"),
             };
         }
-        return MarkerStatus::Absent;
     }
     let raw = match fs::read_to_string(&marker_path) {
         Ok(raw) => raw,
-        Err(_) => {
+        Err(e) => {
             return MarkerStatus::Stale {
-                reason: "marker file unreadable".into(),
+                kind: StaleKind::MarkerUnreadable,
+                reason: format!("marker file unreadable: {e}"),
             };
         }
     };
@@ -342,6 +416,7 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
         Ok(m) => m,
         Err(e) => {
             return MarkerStatus::Stale {
+                kind: StaleKind::MarkerCorrupt,
                 reason: format!("marker corrupt: {e}"),
             };
         }
@@ -349,6 +424,7 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     // Unknown / too-new marker version is always stale — refuse regardless of env.
     if marker.version > MARKER_VERSION {
         return MarkerStatus::Stale {
+            kind: StaleKind::MarkerVersionNewer,
             reason: format!(
                 "marker version {} is newer than supported {}",
                 marker.version, MARKER_VERSION
@@ -357,6 +433,7 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
     }
     if marker.version == 0 {
         return MarkerStatus::Stale {
+            kind: StaleKind::MarkerVersionZero,
             reason: "marker version 0 is invalid".into(),
         };
     }
@@ -364,8 +441,49 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
         Ok(StorageBackend::Sqlite) => {
             if !plan.db_path.exists() {
                 return MarkerStatus::Stale {
+                    kind: StaleKind::DbMissing,
                     reason: "marker claims sqlite but database file is missing".into(),
                 };
+            }
+            // S-02/S-03：先做只读版本探测，把「探测失败」「版本领先/落后」
+            // 与「绑定不一致」区分开——旧实现把三者一律包成
+            // "database verification failed"，再按子串判成「可恢复中断残留」，
+            // 会让陈旧 JSON 重发布覆盖更新版 DB。
+            match Database::open_readonly(&plan.db_path) {
+                Err(e) => {
+                    return MarkerStatus::Stale {
+                        kind: StaleKind::DbProbeFailed,
+                        reason: format!("database probe failed: {e}"),
+                    };
+                }
+                Ok(db) => match crate::migrations::current_version(&db) {
+                    Err(e) => {
+                        return MarkerStatus::Stale {
+                            kind: StaleKind::DbProbeFailed,
+                            reason: format!("database schema version unreadable: {e}"),
+                        };
+                    }
+                    Ok(version) if version > marker.schema_version => {
+                        return MarkerStatus::Stale {
+                            kind: StaleKind::DbVersionAhead,
+                            reason: format!(
+                                "database schema version {version} is newer than marker version {} \
+                                 (binary upgraded the DB but the marker was not reconciled)",
+                                marker.schema_version
+                            ),
+                        };
+                    }
+                    Ok(version) if version < marker.schema_version => {
+                        return MarkerStatus::Stale {
+                            kind: StaleKind::DbVersionBehind,
+                            reason: format!(
+                                "database schema version {version} is older than marker version {}",
+                                marker.schema_version
+                            ),
+                        };
+                    }
+                    Ok(_) => {}
+                },
             }
             // Verify schema + authority binding (marker ↔ DB).
             match verify_database_with_marker(&plan.db_path, &marker) {
@@ -375,12 +493,14 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
                     authority_id: marker.authority_id.clone(),
                 },
                 Err(e) => MarkerStatus::Stale {
+                    kind: StaleKind::DbBindingMismatch,
                     reason: format!("database verification failed: {e}"),
                 },
             }
         }
         Ok(StorageBackend::Json) => MarkerStatus::JsonAuthoritative,
         Err(e) => MarkerStatus::Stale {
+            kind: StaleKind::BackendUnknown,
             reason: e.to_string(),
         },
     }
@@ -392,6 +512,13 @@ pub fn inspect_marker(plan: &CutoverPlan) -> MarkerStatus {
 /// 目录、可选集合文件（mvu_translations / compress_jobs / characters）与旧
 /// 版 active 指针。任意一个存在 → 必须走正常 cutover（fail-closed 源校验）；
 /// 全部不存在 → 真正的空白新用户，允许直接初始化空 SQLite 权威。
+///
+/// N-R1-04：`Path::exists()` 会把 stat 的权限/IO 错误一并吞成 false，方向恰好
+/// 是最危险的——「有数据但读不了」被判成「全新用户」，于是跳过源校验、直接发布
+/// 空 SQLite 权威（用户数据静默消失）。这里改用
+/// [`crate::readiness::path_presence`]：**缺失**才算不存在，stat 报错按
+/// **存在**处理（fail-closed：宁可走正常 cutover，让
+/// `validate_source_manifest` 用真实错误把启动挡住，也不建空库）。
 fn legacy_json_layout_present(data_dir: &Path) -> bool {
     const CORE_FILES: [&str; 7] = [
         "cards.json",
@@ -408,12 +535,18 @@ fn legacy_json_layout_present(data_dir: &Path) -> bool {
         "characters.json",
         "active_campaign.json",
     ];
-    CORE_FILES.iter().any(|name| data_dir.join(name).exists())
-        || data_dir.join("conversations").exists()
-        || data_dir.join("campaign_world_info").exists()
+    let present = |path: &Path| -> bool {
+        !matches!(
+            crate::readiness::path_presence(path),
+            Ok(crate::readiness::PathPresence::Missing)
+        )
+    };
+    CORE_FILES.iter().any(|name| present(&data_dir.join(name)))
+        || present(&data_dir.join("conversations"))
+        || present(&data_dir.join("campaign_world_info"))
         || OPTIONAL_FILES
             .iter()
-            .any(|name| data_dir.join(name).exists())
+            .any(|name| present(&data_dir.join(name)))
 }
 
 /// 计算「已迁移空库」的确定性内容 hash（Gate 7 fresh start / 孤儿身份判定）。
@@ -503,6 +636,8 @@ fn run_fresh_start_cutover(
         turns: 0,
         characters: 0,
         issues: Vec::new(),
+        skipped_orphan_rows: 0,
+        skipped_detail: Vec::new(),
     };
     verify_imported_database(&verify_db, &empty_manifest, schema_version)?;
     drop(verify_db);
@@ -545,6 +680,7 @@ fn run_fresh_start_cutover(
         schema_version,
         false,
         0,
+        Vec::new(),
         &backup.label,
     );
     Ok(CutoverOutcome::Completed(report))
@@ -573,6 +709,14 @@ fn new_fresh_run_id() -> String {
 ///
 /// Gate 7（默认切换）：全新用户目录（无任何 legacy 布局文件）改用「已迁移空库
 /// 的确定性 hash」派生身份，使中断的 fresh cutover 同样可恢复续跑。
+///
+/// S-03 加固：身份必须与**内容**关联，否则「marker 丢失 + 陈旧 JSON」会授权
+/// 用空库/旧数据顶替真实库：
+/// - fresh-start 分支：身份与 DB 内容无关（空库 hash 是常量），因此额外要求
+///   孤儿库确实是空库（迁移后无用户数据），非空一律拒绝恢复。
+/// - legacy 分支：身份来自冻结的源 JSON，源 hash 在 cutover 后不再变化，因此
+///   额外要求孤儿库的内容 hash 仍等于源 manifest hash；库里有 cutover 之后的
+///   新写入（hash 不同）时拒绝恢复，交由人工处理而不是静默回滚到旧 JSON。
 fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
     if !legacy_json_layout_present(&plan.data_dir) {
         // 源 manifest 无法对空目录计算（核心文件必需），改用空库 hash。
@@ -580,7 +724,8 @@ fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
             return false;
         };
         let (authority_id, _nonce) = new_authority_identity(&plan.data_dir, &empty_hash);
-        return orphan_db_matches_authority(&plan.db_path, &authority_id);
+        return orphan_db_matches_authority(&plan.db_path, &authority_id)
+            && orphan_db_has_no_user_data(&plan.db_path);
     }
     // 源 manifest 必须可计算（否则连 cutover 都进不去，交由后续步骤报错）。
     let Ok(manifest) = readiness::validate_source_manifest(&plan.data_dir) else {
@@ -588,22 +733,118 @@ fn orphan_belongs_to_this_cutover(plan: &CutoverPlan) -> bool {
     };
     let (authority_id, _nonce) = new_authority_identity(&plan.data_dir, &manifest.manifest_hash);
     orphan_db_matches_authority(&plan.db_path, &authority_id)
+        && orphan_db_content_hash_matches(&plan.db_path, &manifest.manifest_hash)
 }
 
-/// Stale marker 是否属于「本次二进制可理解的中断 cutover 残留」。
+/// S-03：fresh-start 孤儿库必须是「没有任何用户数据的空库」。
 ///
-/// Gate 8 复评：仅三种原因允许走身份恢复——① `database file is missing`
-/// （BeforePublish 中断）、② `database verification failed`（AfterPublish 中断、
-/// marker↔DB 不匹配）、③ `marker absent but a StoryForge database…`
-/// （marker 写入前中断，DB 残留权威绑定）。版本过新 / 损坏 / 版本 0 / 后端未知
-/// 等一律无条件拒绝——它们可能是**更新的二进制**写入的权威，旧二进制绝不可凭
-/// 身份匹配重发布陈旧 JSON 覆盖新版 DB（跨版本降级）。
-/// `orphan_belongs_to_this_cutover` 只验 DB 的 authority_id，无法区分「同一次
-/// cutover 的中断」与「更新二进制在旧数据上的权威」，故此处先按原因收紧。
-fn is_recoverable_stale(reason: &str) -> bool {
-    reason.contains("database file is missing")
-        || reason.contains("database verification failed")
-        || reason.contains("marker absent but a StoryForge database")
+/// 只读探测；任一关键表非空即返回 false（fail-closed）。表不存在时按「非空」
+/// 处理（说明它不是本二进制迁移出的库，身份校验前就该被拒）。
+fn orphan_db_has_no_user_data(path: &Path) -> bool {
+    let Ok(db) = Database::open_readonly(path) else {
+        return false;
+    };
+    const TABLES: [&str; 9] = [
+        "character_cards",
+        "campaigns",
+        "character_instances",
+        "character_knowledge",
+        "story_tasks",
+        "round_summaries",
+        "conversations",
+        "turns",
+        "characters",
+    ];
+    for table in TABLES {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        match db
+            .connection()
+            .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        {
+            Ok(0) => {}
+            Ok(_) | Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// S-03：legacy 分支的孤儿库内容必须仍等于源 manifest（未被 cutover 之后的
+/// 写入推进）。用 `immutable=1` 只读投影读取，避免 sidecar 被外部占用时把
+/// 「读不到」误判成「内容不一致」而拒绝本可自愈的中断残留。
+fn orphan_db_content_hash_matches(path: &Path, expected_manifest_hash: &str) -> bool {
+    match db_content_hash_immutable_readonly(path) {
+        Ok(hash) => hash == expected_manifest_hash,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "cannot read orphan database content hash; treating as not-recoverable (fail closed)"
+            );
+            false
+        }
+    }
+}
+
+/// Stale marker 是否属于「本次二进制可理解、且可安全自愈的中断残留」。
+///
+/// S-02/S-03：判据由「错误文本子串」改为 typed `StaleKind`。只有两类中断残留
+/// 允许继续（且都要通过**内容绑定**校验，见 `stale_recovery_eligible_for`）：
+/// ① 发布后/写 marker 前中断（`MarkerAbsentOrphanDb`）、② 已发布但 DB 文件丢失
+/// （`DbMissing`）。其余（探测失败 / 绑定不一致 / 版本领先或落后 / marker 损坏 /
+/// 版本过新 / 后端未知）一律拒绝：
+/// - `DbProbeFailed` 可能只是瞬时占用/权限，重发布会让陈旧 JSON 覆盖真实库；
+/// - `DbVersionAhead` 由 `reconcile_marker_schema_version` 回写 marker 处理，
+///   绝不允许回退到 JSON 重导入（跨版本降级）；
+/// - `DbBindingMismatch` 意味着库不属于本源的派生，同样 fail-closed。
+pub fn is_recoverable_stale(kind: StaleKind) -> bool {
+    matches!(kind, StaleKind::MarkerAbsentOrphanDb | StaleKind::DbMissing)
+}
+
+/// S-02：给定的可恢复 Stale 类型是否确实属于**本次** cutover（内容绑定）。
+///
+/// - `MarkerAbsentOrphanDb`：孤儿库身份匹配 + 内容 hash 仍等于源 manifest
+///   （fresh-start 则要求空库）。库里已有 cutover 之后的新写入时拒绝恢复。
+/// - `DbMissing`：marker 记录的 manifest hash 必须等于当前源（或 fresh-start
+///   空库）派生的 hash——确保「重新导入并发布」出来的正是丢失的那个权威，
+///   源 JSON 已被改动时拒绝。
+pub fn stale_recovery_eligible_for(plan: &CutoverPlan, kind: StaleKind) -> bool {
+    match kind {
+        StaleKind::MarkerAbsentOrphanDb => orphan_belongs_to_this_cutover(plan),
+        StaleKind::DbMissing => db_missing_source_matches_marker(plan),
+        _ => false,
+    }
+}
+
+/// App 层入口（S-02）：当前 Stale marker 是否可由 `recover_or_verify` 自愈。
+pub fn stale_recovery_eligible(plan: &CutoverPlan) -> bool {
+    match inspect_marker(plan) {
+        MarkerStatus::Stale { kind, .. } => stale_recovery_eligible_for(plan, kind),
+        _ => false,
+    }
+}
+
+/// `DbMissing` 恢复判据：marker 的 manifest_hash 与当前源派生 hash 一致。
+///
+/// 只读解析 marker（`inspect_marker` 已确认它可解析且版本合法）。
+fn db_missing_source_matches_marker(plan: &CutoverPlan) -> bool {
+    let Ok(raw) = fs::read_to_string(plan.marker_path()) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<BackendMarker>(&raw) else {
+        return false;
+    };
+    if marker.backend().ok() != Some(StorageBackend::Sqlite) {
+        return false;
+    }
+    if legacy_json_layout_present(&plan.data_dir) {
+        return readiness::validate_source_manifest(&plan.data_dir)
+            .map(|manifest| manifest.manifest_hash == marker.manifest_hash)
+            .unwrap_or(false);
+    }
+    // 无 legacy 布局：空库 hash 必须与 marker 记录一致（fresh-start 权威）。
+    empty_db_content_hash()
+        .map(|hash| hash == marker.manifest_hash)
+        .unwrap_or(false)
 }
 
 /// 只读探测：孤儿 DB 的 authority_binding.authority_id 是否等于给定身份。
@@ -652,7 +893,10 @@ pub fn reconcile_marker_schema_version(db_path: &Path) -> Result<Option<(i64, i6
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(MARKER_FILENAME);
-    if !marker_path.exists() {
+    // N-R1-04：stat 失败（权限/IO）不是「没有 marker」——把它当 None 会静默跳过
+    // 版本对账；两个调用点（sqlite_runtime::activate / storage_backend 启动闸门）
+    // 都把 Err 当 fail-closed 处理，因此这里直接传播 `ImportSourceUnreadable`。
+    if crate::readiness::path_presence(&marker_path)?.is_missing() {
         return Ok(None);
     }
     let mut marker: BackendMarker = serde_json::from_str(&fs::read_to_string(&marker_path)?)
@@ -877,16 +1121,21 @@ pub fn run_cutover_with_fault(
         MarkerStatus::Absent => {
             // Proceed with cutover.
         }
-        MarkerStatus::Stale { reason } => {
-            // 三审3：孤儿 DB（中断的 cutover 残留）若属于本次 cutover（同身份），
-            // 允许恢复继续；否则 fail closed（绝不静默覆盖无关/未知 DB）。
-            // Gate 8 复评：先按原因收紧——版本过新/损坏等不可恢复 Stale 一律
-            // 拒绝（旧二进制不得在更新二进制的权威上重发布陈旧 JSON）。
-            if is_recoverable_stale(&reason) && orphan_belongs_to_this_cutover(plan) {
-                // 本次 cutover 的中断残留 → 继续（发布时让位旧 DB）。
+        MarkerStatus::Stale { kind, reason } => {
+            // 三审3：孤儿 DB（中断的 cutover 残留）若属于本次 cutover（同身份 +
+            // 同内容），允许恢复继续；否则 fail closed（绝不静默覆盖无关/未知 DB）。
+            // S-02/S-03：判据改为 typed StaleKind + 内容绑定；版本领先（更新的
+            // 二进制迁移过）绝不再走「重发布陈旧 JSON」这条降级路径。
+            if stale_recovery_eligible_for(plan, kind) {
+                tracing::warn!(
+                    stale_kind = kind.as_str(),
+                    reason = %reason,
+                    "recovering interrupted cutover (stale marker with own identity + content match)"
+                );
             } else {
                 return Err(SqliteError::Other(format!(
-                    "stale backend marker; refusing cutover until resolved: {reason}"
+                    "stale backend marker ({kind}): refusing cutover until resolved: {reason}",
+                    kind = kind.as_str()
                 )));
             }
         }
@@ -924,14 +1173,15 @@ pub fn run_cutover_with_fault(
             }
         }
         MarkerStatus::Absent => {}
-        MarkerStatus::Stale { reason } => {
+        MarkerStatus::Stale { kind, reason } => {
             // 三审3：加锁后再查——孤儿 DB 属于本次 cutover 才允许继续。
-            // Gate 8 复评：与 pre-lock 同口径，先按原因收紧。
-            if is_recoverable_stale(&reason) && orphan_belongs_to_this_cutover(plan) {
+            // S-02/S-03：与 pre-lock 同口径（typed kind + 内容绑定）。
+            if stale_recovery_eligible_for(plan, kind) {
                 // 继续。
             } else {
                 return Err(SqliteError::Other(format!(
-                    "stale backend marker after lock; refusing cutover until resolved: {reason}"
+                    "stale backend marker after lock ({kind}): refusing cutover until resolved: {reason}",
+                    kind = kind.as_str()
                 )));
             }
         }
@@ -977,6 +1227,8 @@ pub fn run_cutover_with_fault(
 
     // ── Step 3: Import JSON → temp DB ────────────────────────────────
     // If a temp DB from a previous failed attempt exists, discard it first.
+    // S-08：丢弃失败不再静默——残留 temp（含 -wal/-shm）会让后续重试把
+    // 「上次未完成的产物」当本次导入结果，discard_temp_db 现在会记录失败原因。
     discard_temp_db(plan);
 
     let mut import_db = Database::open(plan.temp_db_path())?;
@@ -994,9 +1246,21 @@ pub fn run_cutover_with_fault(
         return Err(SqliteError::Other("injected fault: after import".into()));
     }
 
-    // ── Step 4: Backup checkpoint of the populated temp DB ───────────
-    // This proves the data was correctly imported and gives an audit trail.
-    let backup = readiness::create_backup_checkpoint(&import_db, &plan.backup_dir, &request.label)?;
+    // ── Step 4: Verify the temp DB（S-09：先验证，再备份）─────────────
+    // 旧顺序是「先写备份 checkpoint，再验证」——导入损坏时 backup 目录里会留下
+    // 一个**从未被验证过**的库，任何按 checkpoint 恢复的人都会把坏数据当真。
+    // 现在只对已通过计数 + import_runs hash + 内容 hash 校验的库做 checkpoint。
+    verify_imported_database(&import_db, &manifest, schema_version)?;
+
+    // ── Step 5: Backup checkpoint of the verified temp DB ────────────
+    // 除文件字节 SHA-256 外，把源 manifest hash 一并写进 checkpoint manifest，
+    // 便于事后核对「这个备份对应哪份源」。
+    let backup = readiness::create_backup_checkpoint_with_source(
+        &import_db,
+        &plan.backup_dir,
+        &request.label,
+        &manifest.manifest_hash,
+    )?;
 
     // Close the temp DB before publishing (Windows requires this for rename).
     drop(import_db);
@@ -1007,11 +1271,6 @@ pub fn run_cutover_with_fault(
             "injected fault: after backup checkpoint".into(),
         ));
     }
-
-    // ── Step 5: Verify the temp DB ───────────────────────────────────
-    let verify_db = Database::open(plan.temp_db_path())?;
-    verify_imported_database(&verify_db, &manifest, schema_version)?;
-    drop(verify_db);
 
     if fault == CutoverFault::AfterVerify {
         discard_temp_db(plan);
@@ -1028,9 +1287,11 @@ pub fn run_cutover_with_fault(
 
     if fault == CutoverFault::AfterPublishBeforeMarker {
         // The DB is published but the marker is not. This is the ambiguous
-        // window. On the next run, inspect_marker will see Absent (no marker)
-        // and re-run the cutover, which will re-import and re-publish.
-        // JSON remains authoritative.
+        // window. S-19 修正过时描述：下一次 `inspect_marker` 看到的是
+        // `Stale(MarkerAbsentOrphanDb)`（**不是** Absent —— 无 marker 但存在
+        // StoryForge 孤儿库），只有该孤儿库通过「身份 + 内容 hash」校验
+        // （`stale_recovery_eligible_for`）才允许自动重发布；任何不匹配都会
+        // fail-closed 并要求人工处理。JSON 在此期间仍为权威。
         return Err(SqliteError::Other(
             "injected fault: after publish, before marker".into(),
         ));
@@ -1068,12 +1329,16 @@ pub fn run_cutover_with_fault(
         schema_version,
         import_report.skipped_as_duplicate,
         import_report.skipped_orphan_rows,
+        import_report.skipped_detail.clone(),
         &backup.label,
     );
     if import_report.skipped_orphan_rows > 0 {
-        tracing::info!(
+        // S-01/S-17：跳过是非零即告警（warn，不只是 info），并带上分集合明细，
+        // 便于事后审计「到底哪些集合被丢了多少行」。
+        tracing::warn!(
             skipped_orphan_rows = import_report.skipped_orphan_rows,
-            "cutover skipped unreachable orphan rows (deleted parents)"
+            skipped_detail = ?import_report.skipped_detail,
+            "cutover skipped unreachable orphan rows (missing parents in the source tree)"
         );
     }
 
@@ -1188,7 +1453,11 @@ fn audit_sqlite_authoritative(
         characters: table_count(&db, "characters")?,
         schema_version,
         import_skipped_duplicate: false,
+        // S-17：审计/恢复路径无法回溯导入期的跳过计数（import_runs 未持久化该
+        // 列，见 S-01 修复记录）。真实非零计数在 cutover 完成时已通过 warn 日志
+        // 与应用层健康事件暴露，此处保持 0 并显式说明，避免误读为「没有跳过」。
         skipped_orphan_rows: 0,
+        skipped_detail: Vec::new(),
         backup_label: String::new(),
     })
 }
@@ -1205,12 +1474,39 @@ fn table_count(db: &Database, table: &str) -> Result<usize> {
 /// Rebuild the source-manifest hash from stored payload_json rows so verification
 /// is independent of the importer's self-reported import_runs value.
 pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
+    recompute_db_content_hash_conn(db.connection())
+}
+
+/// S-03：用 `immutable=1` 只读连接读取内容投影（与
+/// `owned_by_storyforge_readonly` 同一探测姿势）。
+///
+/// 为什么不用 [`Database::open_readonly`]：普通只读打开 WAL 库会去接触
+/// `-wal`/`-shm` sidecar——sidecar 被外部进程占用、或路径被非文件顶替时整体
+/// 失败，现场表现是「身份匹配但内容读不出来」，会把本可自愈的中断残留误判成
+/// 不可恢复。`immutable=1` 明确声明「库文件不再变化、无其它写者」，因此不接触
+/// sidecar，也不会创建 sidecar。
+fn db_content_hash_immutable_readonly(path: &Path) -> Result<String> {
+    use rusqlite::OpenFlags;
+    let raw = path
+        .to_str()
+        .ok_or_else(|| SqliteError::Other(format!("non-utf8 db path: {}", path.display())))?;
+    let uri = format!("file:{raw}?mode=ro&immutable=1");
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    recompute_db_content_hash_conn(&conn)
+}
+
+fn recompute_db_content_hash_conn(conn: &rusqlite::Connection) -> Result<String> {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
-    fn load_payloads(db: &Database, table: &str) -> Result<Vec<Value>> {
+    fn load_payloads(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Value>> {
         let sql = format!("SELECT payload_json FROM {table}");
-        let mut stmt = db.connection().prepare(&sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -1238,10 +1534,8 @@ pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
 
     /// 读 (campaign_id, payload_json) 对，投影与源侧 manifest 完全一致：
     /// 每行参与 hash 前绑定 campaign_id，保证 hash 区分不同 campaign。
-    fn load_world_info_pairs(db: &Database) -> Result<Vec<(String, Value)>> {
-        let mut stmt = db
-            .connection()
-            .prepare("SELECT campaign_id, payload_json FROM campaign_world_info")?;
+    fn load_world_info_pairs(conn: &rusqlite::Connection) -> Result<Vec<(String, Value)>> {
+        let mut stmt = conn.prepare("SELECT campaign_id, payload_json FROM campaign_world_info")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1258,21 +1552,21 @@ pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
         Ok(out)
     }
 
-    let cards = load_payloads(db, "character_cards")?;
-    let campaigns = load_payloads(db, "campaigns")?;
-    let instances = load_payloads(db, "character_instances")?;
-    let knowledge = load_payloads(db, "character_knowledge")?;
-    let tasks = load_payloads(db, "story_tasks")?;
-    let summaries = load_payloads(db, "round_summaries")?;
-    let turns = load_payloads(db, "turns")?;
-    let conversations = load_payloads(db, "conversations")?;
+    let cards = load_payloads(conn, "character_cards")?;
+    let campaigns = load_payloads(conn, "campaigns")?;
+    let instances = load_payloads(conn, "character_instances")?;
+    let knowledge = load_payloads(conn, "character_knowledge")?;
+    let tasks = load_payloads(conn, "story_tasks")?;
+    let summaries = load_payloads(conn, "round_summaries")?;
+    let turns = load_payloads(conn, "turns")?;
+    let conversations = load_payloads(conn, "conversations")?;
     // Gate 4/5 可选集合：与 importer 相同的重建投影（非空才参与 hash）。
-    let mvu_translations = load_payloads(db, "mvu_translations")?;
+    let mvu_translations = load_payloads(conn, "mvu_translations")?;
     // 世界书必须绑定 campaign_id：两局内容相同但归属不同 campaign 的条目
     // hash 必须不同（与 readiness/importer 的投影完全一致）。
-    let world_info = load_world_info_pairs(db)?;
+    let world_info = load_world_info_pairs(conn)?;
     let compress_jobs = {
-        let mut stmt = db.connection().prepare(
+        let mut stmt = conn.prepare(
             "SELECT job_id, campaign_id, conversation_id, lineage_id, kind, status, attempts, \
                  max_attempts, last_error, uncovered_a_at_enqueue, uncovered_b_at_enqueue, \
                  created_at, updated_at FROM chronicle_compress_jobs",
@@ -1339,9 +1633,8 @@ pub(crate) fn recompute_db_content_hash(db: &Database) -> Result<String> {
     };
     // 角色库按 StoredCharacter 契约形态重建（与 importer 归一化一致）。
     let characters = {
-        let mut stmt = db
-            .connection()
-            .prepare("SELECT character_id, info_json, imported_at FROM characters")?;
+        let mut stmt =
+            conn.prepare("SELECT character_id, info_json, imported_at FROM characters")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1428,6 +1721,16 @@ fn atomic_publish_db(
         ));
     }
 
+    // S-08：发布前把 temp 库的 WAL 完整 checkpoint 回主文件并确认 -wal 已消失。
+    // WAL 模式下 `rename(temp → final)` 只搬主文件，若还有未合并的 -wal，发布后
+    // 的库会缺这批已提交事务（旧实现只在导入连接 drop 时隐式 checkpoint，
+    // 失败与否无人检查）。
+    checkpoint_and_close_temp(plan)?;
+    for sidecar in ["-wal", "-shm"] {
+        let path = format!("{}{sidecar}", temp.display());
+        remove_sidecar_ignoring_missing(&path)?;
+    }
+
     // If a final DB already exists (re-publish after partial failure),
     // move it aside. JSON is still authoritative at this point.
     if final_path.exists() {
@@ -1484,6 +1787,125 @@ fn atomic_publish_db(
     // 审查一.5：rename 后 fsync 已发布 DB 文件（持久化发布结果）。
     fsync_file(final_path)?;
 
+    // S-08：发布后再做一次内容校验——rename/fsync 之后仍能打开、schema 版本正确、
+    // 且内容 hash 仍等于源 manifest。任何 WAL 丢失 / 截断 / 介质问题都在这里
+    // 拦截，绝不把「看起来发布成功的坏库」写进 marker。
+    verify_published_database(final_path, expected_manifest_hash, expected_authority_id)?;
+
+    Ok(())
+}
+
+/// S-08：把 temp 库的 WAL 合并回主文件并校验 `-wal` 已消失。
+///
+/// 打开一个独立的读写连接执行 `PRAGMA wal_checkpoint(TRUNCATE)`：返回三元组
+/// (busy, log, checkpointed)；`busy != 0` 表示有其它连接在读，checkpoint 未完成
+/// → fail-closed（此时发布会在最终库上丢事务）。连接 drop 后 `-wal` 应为空或
+/// 不存在；仍有内容则同样拒绝。
+fn checkpoint_and_close_temp(plan: &CutoverPlan) -> Result<()> {
+    let temp = plan.temp_db_path();
+    let db = Database::open(&temp)?;
+    let (busy, _log, _checkpointed): (i64, i64, i64) = db
+        .connection()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| SqliteError::Other(format!("wal_checkpoint(TRUNCATE) failed: {e}")))?;
+    if busy != 0 {
+        return Err(SqliteError::Other(
+            "WAL checkpoint busy (another connection is reading the temp database); \
+             refusing to publish a database with unmerged WAL frames"
+                .into(),
+        ));
+    }
+    drop(db);
+    let wal = format!("{}-wal", temp.display());
+    match fs::metadata(&wal) {
+        Ok(meta) if meta.len() > 0 => Err(SqliteError::Other(format!(
+            "temp database still has {} bytes of unmerged WAL after checkpoint; refusing to publish",
+            meta.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// S-08：发布后的独立复检（只读打开 + 身份/内容 hash）。
+///
+/// 只读打开 WAL 库会让 SQLite 在库旁创建空的 `-wal`/`-shm` sidecar；而发布是
+/// 提交点，必须留下「干净的单文件库 + marker」——残留 sidecar 会让后续所有权
+/// 探测、下一次发布的 sidecar 清理面对不确定状态（`gate5_fault_matrix` 也以
+/// 「`-wal` 路径可被外部进程占用」作为故障注入前提）。因此复检后清理**本次复检
+/// 新建且为空**的 sidecar；一旦发现带内容的 sidecar 只告警、不强删（内容意味着
+/// 有未合并事务，删除即丢数据）。
+fn verify_published_database(
+    final_path: &Path,
+    expected_manifest_hash: &str,
+    expected_authority_id: &str,
+) -> Result<()> {
+    let sidecar_before: Vec<(String, bool)> = ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let path = format!("{}{suffix}", final_path.display());
+            let existed = fs::metadata(&path).is_ok();
+            (path, existed)
+        })
+        .collect();
+
+    let db = Database::open_readonly(final_path).map_err(|e| {
+        SqliteError::Other(format!(
+            "published database at {} is not openable: {e}",
+            final_path.display()
+        ))
+    })?;
+    let version = crate::migrations::current_version(&db).map_err(|e| {
+        SqliteError::Other(format!("published database schema version unreadable: {e}"))
+    })?;
+    let expected_version = crate::migrations::builtin_migrations()
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0);
+    if version != expected_version {
+        return Err(SqliteError::Other(format!(
+            "published database schema version {version} != expected {expected_version}"
+        )));
+    }
+    let content_hash = recompute_db_content_hash(&db)?;
+    if content_hash != expected_manifest_hash {
+        return Err(SqliteError::Other(format!(
+            "published database content hash mismatch: db={content_hash}, source={expected_manifest_hash}"
+        )));
+    }
+    drop(db);
+    // 身份绑定仍指向本次 cutover（发布的是自身产物，不是被替换的其它库）。
+    if !orphan_db_matches_authority(final_path, expected_authority_id) {
+        return Err(SqliteError::Other(
+            "published database authority binding does not match this cutover".into(),
+        ));
+    }
+
+    // 复检结束：清理本次复检新建的空 sidecar（见函数文档）。
+    for (path, existed_before) in sidecar_before {
+        if existed_before {
+            continue;
+        }
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == 0 => {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "failed to clean empty sidecar created by post-publish verification"
+                    );
+                }
+            }
+            Ok(meta) => tracing::warn!(
+                path = %path,
+                bytes = meta.len(),
+                "post-publish verification left a non-empty sidecar; keeping it (never delete unmerged WAL frames)"
+            ),
+            Err(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -1498,29 +1920,6 @@ fn remove_sidecar_ignoring_missing(path: &str) -> Result<()> {
             "failed to remove database sidecar {path}: {e}"
         ))),
     }
-}
-
-/// fsync a file。注意：Windows 上 `FlushFileBuffers` 要求句柄有**写**访问
-/// （只读句柄会返回 ERROR_ACCESS_DENIED），所以这里用 write 方式打开。
-fn fsync_file(path: &Path) -> Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// fsync the parent directory so the rename itself is durable. Windows cannot
-/// open directories for fsync, so this is unix-only.
-#[cfg(unix)]
-fn fsync_parent_dir(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir = fs::File::open(parent)?;
-    dir.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 /// 三审3：只读孤儿 DB 探测——判断 `path` 是否是一个**任何** StoryForge DB
@@ -1722,12 +2121,33 @@ fn audit_published_database(db_path: &Path) -> Result<()> {
 }
 
 /// Discard the temp database and its WAL/SHM sidecars.
+///
+/// S-08：清理是 best-effort（调用点多为故障分支，不能让清理失败掩盖注入的错误），
+/// 但**不允许静默**：任何非 NotFound 的失败都记 warn，并复核 temp 是否真的消失。
+/// 若残缺 temp 仍在，下一次 cutover 会先调用本函数重新清理，`checkpoint_and_close_temp`
+/// + `verify_imported_database` 也会拒绝把旧产物当本次结果发布。
 fn discard_temp_db(plan: &CutoverPlan) {
     let temp = plan.temp_db_path();
-    let _ = fs::remove_file(&temp);
-    for sidecar in ["-wal", "-shm"] {
-        let path = format!("{}{sidecar}", temp.display());
-        let _ = fs::remove_file(&path);
+    for path in std::iter::once(temp.display().to_string()).chain(
+        ["-wal", "-shm"]
+            .iter()
+            .map(|suffix| format!("{}{suffix}", temp.display())),
+    ) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path,
+                error = %e,
+                "discard_temp_db: failed to remove cutover temp artifact"
+            ),
+        }
+    }
+    if temp.exists() {
+        tracing::error!(
+            path = %temp.display(),
+            "cutover temp database still exists after discard; next run will discard it again"
+        );
     }
 }
 

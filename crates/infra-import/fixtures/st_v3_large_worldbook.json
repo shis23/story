@@ -2550,6 +2550,31 @@
           "selective": true,
           "position": 0,
           "order": 0
+        },
+        {
+          "id": 900,
+          "keys": [
+            "v3-meta-probe"
+          ],
+          "content": "sanitized v3 entry metadata probe",
+          "constant": false,
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "order": 42,
+          "insertion_order": 42,
+          "case_sensitive": true,
+          "match_whole_words": false,
+          "group": "sanitized-group",
+          "automation_id": "sanitized-automation",
+          "vectorized": true,
+          "probability": 100,
+          "depth": 3,
+          "extensions": {
+            "entry_extra": {
+              "rank": 900
+            }
+          }
         }
       ]
     }

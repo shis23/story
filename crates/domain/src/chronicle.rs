@@ -368,11 +368,16 @@ pub fn index_of_turn(committed: &[CommittedTurnRef], turn_id: &Id) -> Option<usi
 }
 
 /// 以 `head` 为末元素，向前取 `min(h_anchor, 已有)` 个 Turn（闭区间，时间升序）。
+///
+/// `h_anchor == 0` 表示"不要锚点"，返回空集（D-07：此前会切片越界 panic）。
 pub fn select_anchor_turns(
     committed: &[CommittedTurnRef],
     epoch_start_head: Option<&Id>,
     h_anchor: u32,
 ) -> Vec<Id> {
+    if h_anchor == 0 {
+        return Vec::new();
+    }
     let Some(head) = epoch_start_head else {
         return Vec::new();
     };
@@ -1621,5 +1626,40 @@ mod tests {
         assert_eq!(a.snapshot.band_codes, b.snapshot.band_codes);
         assert_eq!(a.snapshot.source_hash, b.snapshot.source_hash);
         assert_eq!(a.snapshot.epoch_id, b.snapshot.epoch_id);
+    }
+
+    #[test]
+    fn select_anchor_turns_handles_zero_anchor_without_panic() {
+        // D-07：h_anchor == 0 曾触发 `committed[start..=head]`（start > head）切片 panic。
+        let c3 = committed_turns_from_count(3);
+        let head = committed_turn_id(3);
+        assert!(select_anchor_turns(&c3, Some(&head), 0).is_empty());
+        // 0 之外的行为保持不变
+        assert_eq!(
+            select_anchor_turns(&c3, Some(&head), 2),
+            vec![committed_turn_id(2), committed_turn_id(3)]
+        );
+        // h_anchor 大于已有轮次数 → 全量（不越界）
+        assert_eq!(select_anchor_turns(&c3, Some(&head), 99).len(), 3);
+        // 无 head → 空集
+        assert!(select_anchor_turns(&c3, None, 3).is_empty());
+    }
+
+    #[test]
+    fn refresh_context_epoch_accepts_zero_anchor() {
+        // 端到端：h_anchor=0 的 ContextWindowParams 不应 panic，且无锚点。
+        let params = ContextWindowParams {
+            h_anchor: 0,
+            e: 2,
+            s: 2,
+            overview_max_entries: 10,
+        };
+        let c3 = committed_turns_from_count(3);
+        let cands: Vec<OverviewCandidate> = Vec::new();
+        let band_lookup = |id: &Id| {
+            sequence_from_committed_turn_id(id).map(|t| ChronicleCode::new(ChronicleLevel::A, t))
+        };
+        let r = refresh_context_epoch(None, &c3, &cands, &band_lookup, params, 0);
+        assert!(r.membership.anchor_turn_ids.is_empty());
     }
 }

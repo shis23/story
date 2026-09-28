@@ -1,7 +1,12 @@
 //! Typed, transactional SQLite repository for production Turn acceptance.
 //!
-//! This module is deliberately not wired into the default application backend. Callers must
-//! explicitly pass a SQLite [`Database`], which prevents accidental JSON/SQLite dual writes.
+//! 生产后端：本模块由 `sqlite_runtime` / `StorageFacade` 显式接线（Gate 7 起
+//! SQLite 是默认权威后端；JSON 仅在 `STORYFORGE_STORAGE_BACKEND=json` 时作为
+//! 显式回退）。调用方必须显式传入 SQLite [`Database`]，因此不存在意外的
+//! JSON/SQLite 双写路径。
+//!
+//! （原文写于 SQLite 尚未接线时：「deliberately not wired into the default
+//! application backend」已过时——S-19 文档漂移修正。）
 
 use rusqlite::{OptionalExtension, Transaction};
 use serde::Serialize;
@@ -22,6 +27,16 @@ use crate::connection::Database;
 use crate::error::{Result, SqliteError};
 use crate::migrations;
 use crate::unit_of_work::UnitOfWork;
+
+/// S-20：SQL `status IN (...)` 用的**活动 Turn 状态**清单（唯一来源）。
+///
+/// 判定真源是领域层 `TurnStatus::is_active()`；SQL 无法调用 Rust，因此字符串
+/// 清单收敛到这里，由单元测试
+/// `active_turn_status_sql_list_matches_domain_is_active` 钉住两边一致——
+/// 领域层新增活动状态时该测试立即失败，而不是让 barrier/recovery 静默漏判
+/// （漏判会放过并发 active turn，属于 P0 级数据竞争）。
+pub const ACTIVE_TURN_STATUS_SQL: &str =
+    "'generating', 'draft_ready', 'deriving_state', 'awaiting_acceptance', 'committing'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AcceptOutcome {
@@ -120,14 +135,15 @@ impl SqliteProductionRepository {
         if turn.status.is_active() {
             let competing: Option<String> = tx
                 .query_row(
-                    r#"
+                    &format!(
+                        r#"
                     SELECT turn_id FROM turns
                     WHERE campaign_id = ?1
                       AND turn_id <> ?2
-                      AND status IN ('generating', 'draft_ready', 'deriving_state',
-                                     'awaiting_acceptance', 'committing')
+                      AND status IN ({ACTIVE_TURN_STATUS_SQL})
                     LIMIT 1
-                    "#,
+                    "#
+                    ),
                     rusqlite::params![turn.campaign_id.as_str(), turn.turn_id.as_str()],
                     |row| row.get(0),
                 )
@@ -274,13 +290,14 @@ impl SqliteProductionRepository {
         let turn_id: Option<String> = db
             .connection()
             .query_row(
-                r#"
+                &format!(
+                    r#"
                 SELECT turn_id FROM turns
                 WHERE campaign_id = ?1
-                  AND status IN ('generating', 'draft_ready', 'deriving_state',
-                                 'awaiting_acceptance', 'committing')
+                  AND status IN ({ACTIVE_TURN_STATUS_SQL})
                 LIMIT 1
-                "#,
+                "#
+                ),
                 [campaign_id.as_str()],
                 |row| row.get(0),
             )
@@ -298,14 +315,13 @@ impl SqliteProductionRepository {
         // WAL 版本上触发 `database table is locked`。与 get_turn_by_variant
         // （251-270）的正确写法对齐。
         let ids: Vec<String> = {
-            let mut stmt = db.connection().prepare(
+            let mut stmt = db.connection().prepare(&format!(
                 r#"
                 SELECT turn_id FROM turns
-                WHERE status IN ('generating', 'draft_ready', 'deriving_state',
-                                 'awaiting_acceptance', 'committing')
+                WHERE status IN ({ACTIVE_TURN_STATUS_SQL})
                 ORDER BY updated_at, turn_id
-                "#,
-            )?;
+                "#
+            ))?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -817,12 +833,22 @@ impl SqliteProductionRepository {
         let uow = UnitOfWork::begin(db.connection_mut())?;
         let tx = uow.transaction()?;
         let mut count = 0usize;
-        for mut turn in active {
+        for turn in active {
+            // S-15：`list_active_turns` 在事务**外**读取，期间可能有并发 accept
+            // 提交同一 Turn（另一连接/进程）。无条件写回预读快照会把已提交的
+            // Turn 覆盖成 Failed（丢提交）。这里在事务内重新读取当前记录：
+            // 已终态 → 跳过；否则用**最新**记录改写，绝不写旧快照。
+            let Some(mut current) = load_validated_turn(tx, &turn.turn_id)? else {
+                continue;
+            };
+            if current.status.is_terminal() {
+                continue;
+            }
             // Committing should be rare under atomic accept; still fail-closed.
-            turn.status = TurnStatus::Failed;
-            turn.failure_reason =
+            current.status = TurnStatus::Failed;
+            current.failure_reason =
                 Some("sqlite recovery: incomplete turn failed after process restart".into());
-            for attempt in &mut turn.attempts {
+            for attempt in &mut current.attempts {
                 if matches!(
                     attempt.status,
                     AttemptStatus::Generating
@@ -834,8 +860,8 @@ impl SqliteProductionRepository {
                     attempt.status = AttemptStatus::Failed;
                 }
             }
-            turn.touch();
-            write_turn(tx, &turn)?;
+            current.touch();
+            write_turn(tx, &current)?;
             count += 1;
         }
         uow.commit()?;
@@ -1913,4 +1939,61 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
         out.push(HEX[(byte & 0xf) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod active_status_tests {
+    use super::{ACTIVE_TURN_STATUS_SQL, enum_text};
+    use storyforge_domain::turn::TurnStatus;
+
+    #[test]
+    fn active_turn_status_sql_list_matches_domain_is_active() {
+        // S-20 防漂移：SQL 里的 active 状态清单必须与领域 `TurnStatus::is_active()`
+        // 逐项一致。领域层新增/删除活动状态而忘记同步 SQL 时，本测试立即失败。
+        let every_status = [
+            TurnStatus::Generating,
+            TurnStatus::DraftReady,
+            TurnStatus::DerivingState,
+            TurnStatus::AwaitingAcceptance,
+            TurnStatus::Committing,
+            TurnStatus::Committed,
+            TurnStatus::Degraded,
+            TurnStatus::Failed,
+            TurnStatus::Abandoned,
+        ];
+
+        let mut expected: Vec<String> = every_status
+            .iter()
+            .filter(|status| status.is_active())
+            .map(|status| enum_text(status).expect("status serializes as string"))
+            .collect();
+        expected.sort();
+
+        let mut actual: Vec<String> = ACTIVE_TURN_STATUS_SQL
+            .split(',')
+            .map(|raw| raw.trim().trim_matches('\'').to_string())
+            .collect();
+        actual.sort();
+
+        assert_eq!(
+            actual, expected,
+            "ACTIVE_TURN_STATUS_SQL 与 TurnStatus::is_active() 漂移：\
+             领域活动状态集 {expected:?}，SQL 清单 {actual:?}"
+        );
+
+        // 反向断言：终态绝不能出现在 SQL 清单里（否则 barrier 会把已提交的
+        // Turn 当成活动 → 永久拒绝新回合）。
+        for terminal in [
+            TurnStatus::Committed,
+            TurnStatus::Degraded,
+            TurnStatus::Failed,
+            TurnStatus::Abandoned,
+        ] {
+            let text = enum_text(&terminal).unwrap();
+            assert!(
+                !actual.contains(&text),
+                "终态 {text} 不得出现在 active 状态 SQL 清单里"
+            );
+        }
+    }
 }

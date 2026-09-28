@@ -2,6 +2,10 @@
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   disabled: { type: Boolean, default: false },
+  // role="switch" 的按钮必须有自己的可访问名（F-23）：调用点用兄弟 <label> 是
+  // 关联不到 button 的，读屏只会念"开关，未选中"。
+  label: { type: String, default: '' },
+  ariaLabel: { type: String, default: '' },
 })
 const emit = defineEmits(['update:modelValue'])
 
@@ -16,6 +20,7 @@ function toggle() {
     type="button"
     role="switch"
     :aria-checked="modelValue"
+    :aria-label="ariaLabel || label || undefined"
     :disabled="disabled"
     :class="[
       'relative inline-flex w-10 h-5 rounded-full border transition-colors duration-150 ease-soft',

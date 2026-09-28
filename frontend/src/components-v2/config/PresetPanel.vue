@@ -43,6 +43,10 @@ const editingPrompt = ref(null) // 正在编辑的 prompt index
 const editContent = ref('')
 const saving = ref(false)
 const importingGlobalRegex = ref(false)
+const importingModules = ref(false)
+// F-45：加载失败此前无 catch → 浮动 rejection + 空态假象（"还没有预设"）
+const loadError = ref(null)
+const detailLoading = ref(false)
 
 const detailSubTabs = [
   { key: 'prompts', label: '提示词' },
@@ -54,6 +58,7 @@ onMounted(() => { refresh() })
 async function refresh() {
   loading.value = true
   loadingGlobalRegex.value = true
+  loadError.value = null
   try {
     const [presetList, globalRegexList] = await Promise.all([
       listPresets(),
@@ -61,6 +66,10 @@ async function refresh() {
     ])
     presets.value = presetList
     globalRegexScripts.value = globalRegexList
+  } catch (e) {
+    // F-45：只有 finally 没有 catch → 失败时界面显示"还没有预设"，
+    // 用户把读取错误当成空数据，且没有任何提示。
+    loadError.value = errorText(e)
   } finally {
     loading.value = false
     loadingGlobalRegex.value = false
@@ -71,6 +80,8 @@ async function refreshGlobalRegexScripts() {
   loadingGlobalRegex.value = true
   try {
     globalRegexScripts.value = await listGlobalRegexScripts()
+  } catch (e) {
+    await alertDialog('加载全局正则失败: ' + errorText(e))
   } finally {
     loadingGlobalRegex.value = false
   }
@@ -81,11 +92,25 @@ async function togglePreset(preset) {
     expandedId.value = null
     detail.value = null
     editingPrompt.value = null
-  } else {
-    expandedId.value = preset.id
+    return
+  }
+  // F-45：此前先置 expandedId 再 await getPreset —— 失败时箭头已翻成展开态，
+  // 而详情渲染条件是 `expandedId === id && detail`，于是永久展开不出内容。
+  const previousId = expandedId.value
+  const previousDetail = detail.value
+  expandedId.value = preset.id
+  detail.value = null
+  detailLoading.value = true
+  try {
     detail.value = await getPreset(preset.id)
     detailTab.value = 'prompts'
     editingPrompt.value = null
+  } catch (e) {
+    expandedId.value = previousId
+    detail.value = previousDetail
+    await alertDialog('读取预设详情失败: ' + errorText(e))
+  } finally {
+    detailLoading.value = false
   }
 }
 
@@ -215,11 +240,16 @@ async function toggleGlobalRegexDisabled(index) {
 }
 
 async function handleImportAsModules(preset) {
+  // F-24：写操作无防重，连点会在导演配置里生成重复模块
+  if (importingModules.value) return
+  importingModules.value = true
   try {
     const count = await importPresetAsModules(preset.id)
     await alertDialog(`已导入 ${count} 条提示词为模块，可在导演 Agent 配置中选择使用`)
   } catch (e) {
     await alertDialog('导入失败: ' + errorText(e))
+  } finally {
+    importingModules.value = false
   }
 }
 
@@ -271,6 +301,11 @@ function placementBadgeVariant(regex) {
         <div v-if="activeTopTab === 'presets'" class="space-y-3 pb-4">
           <LoadingState v-if="loading" />
 
+          <div v-else-if="loadError" class="rounded-xl border border-err/40 bg-err/10 px-3 py-3 text-center space-y-2">
+            <div class="text-xs text-err">加载预设失败: {{ loadError }}</div>
+            <Button variant="default" size="sm" @click="refresh">重试</Button>
+          </div>
+
           <EmptyState
             v-else-if="presets.length === 0"
             title="还没有预设"
@@ -310,7 +345,8 @@ function placementBadgeVariant(regex) {
               </button>
               <button
                 @click.stop="handleImportAsModules(p)"
-                class="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-accent/70 hover:bg-accent-soft transition-colors"
+                :disabled="importingModules"
+                class="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-accent/70 hover:bg-accent-soft transition-colors disabled:opacity-40"
                 title="导入为模块（可在导演配置中选择）"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 16v-7.5a2 2 0 0 0-1-1.73l-6.5-3.7a2 2 0 0 0-2 0L4.5 6.77a2 2 0 0 0-1 1.73V16a2 2 0 0 0 1 1.73l6.5 3.7a2 2 0 0 0 2 0l6.5-3.7a2 2 0 0 0 1-1.73z"/><path d="M4 7.2l8 4.55 8-4.55"/></svg>
@@ -326,7 +362,10 @@ function placementBadgeVariant(regex) {
             </div>
 
             <!-- 展开详情 -->
-            <div v-if="expandedId === p.id && detail" class="border-t border-line">
+            <div v-if="expandedId === p.id && detailLoading" class="border-t border-line px-3 py-3 text-xs text-ink-soft" role="status">
+              详情加载中…
+            </div>
+            <div v-else-if="expandedId === p.id && detail" class="border-t border-line">
               <!-- 子 tab -->
               <div class="px-3 pt-2">
                 <Tabs v-model="detailTab" :tabs="detailSubTabs">

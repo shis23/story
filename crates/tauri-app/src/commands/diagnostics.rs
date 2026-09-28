@@ -142,15 +142,34 @@ pub(crate) fn log_get_llm_call(
         })
 }
 
+/// 清空日志。
+///
+/// `kind`：`None` / `"all"` = 清空全部；`"backend"` / `"llm"` / `"frontend"` = 只清对应缓冲。
+///
+/// 2026-09-13 域4 修复 T-07：旧实现把未知 kind 经 `and_then(.. , _ => None)` 静默
+/// 降级为 `None`，而 `LogStore::clear(None)` 的语义是**清空全部**
+/// （`crates/app-logging/src/lib.rs`）——"参数非法"反而扩大了破坏面，且命令返回
+/// `()`、前端拿不到任何提示。现在非法值显式报错，不再静默清库。
+/// 前端唯一调用点 `LogPanel.vue` 的取值域是 `all|backend|llm|frontend`，
+/// 且已用 try/catch 处理错误，故此为向后兼容的行为收紧。
 #[tauri::command]
-pub(crate) fn log_clear(kind: Option<String>, state: tauri::State<'_, Arc<AppState>>) {
-    let log_kind = kind.as_deref().and_then(|k| match k {
-        "backend" => Some(LogKind::Backend),
-        "llm" => Some(LogKind::LlmCall),
-        "frontend" => Some(LogKind::FrontendPlugin),
-        _ => None,
-    });
+pub(crate) fn log_clear(
+    kind: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let log_kind = match kind.as_deref() {
+        None | Some("all") => None,
+        Some("backend") => Some(LogKind::Backend),
+        Some("llm") => Some(LogKind::LlmCall),
+        Some("frontend") => Some(LogKind::FrontendPlugin),
+        Some(other) => {
+            return Err(TauriCommandError::validation(format!(
+                "未知的日志类型 {other:?}（可选 all/backend/llm/frontend）"
+            )));
+        }
+    };
     state.log_store.clear(log_kind);
+    Ok(())
 }
 
 #[tauri::command]

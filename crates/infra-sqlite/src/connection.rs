@@ -38,7 +38,7 @@ impl Database {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )?;
-        configure_connection(&conn)?;
+        configure_connection(&conn, true)?;
 
         Ok(Self { path, conn })
     }
@@ -46,7 +46,8 @@ impl Database {
     /// 内存库（测试用）。
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        configure_connection(&conn)?;
+        // 内存库 journal_mode 恒为 memory，不做 WAL 校验（S-10）。
+        configure_connection(&conn, false)?;
         Ok(Self {
             path: PathBuf::from(":memory:"),
             conn,
@@ -58,12 +59,16 @@ impl Database {
     /// 用于启动期对 marker 所指 DB 的只读探测（Gate 8 审查 P2-A1）：检查外部
     /// 或他进程占用的文件时不得产生任何写副作用，也不能把外部库烙上
     /// StoryForge 标记或改写其 journal 模式。
+    ///
+    /// S-10：仍设置 busy_timeout——探测不应因瞬时锁竞争被误判成「库损坏/非本库」
+    /// （旧实现无 busy handler，并发 writer 持锁时探测立即失败 → Stale）。
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self { path, conn })
     }
 
@@ -89,7 +94,7 @@ impl Database {
     }
 }
 
-fn configure_connection(conn: &Connection) -> Result<()> {
+fn configure_connection(conn: &Connection, expect_wal: bool) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // Concurrent first opens can deadlock while upgrading the journal lock.
     // SQLite may return BUSY without calling its busy handler in that case.
@@ -108,7 +113,28 @@ fn configure_connection(conn: &Connection) -> Result<()> {
             }
         }
     }
+    // S-10：`journal_mode=WAL` 的返回值此前被丢弃——不支持 WAL 的文件系统
+    // （网络盘/部分虚拟盘）会静默停留在 delete 模式，WAL 带来的崩溃安全与
+    // 单写者假设随即失效。文件库必须确认真的切到了 WAL，否则 fail-closed。
+    // （内存库的 journal_mode 恒为 memory，跳过此校验。）
+    if expect_wal {
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            return Err(SqliteError::Other(format!(
+                "journal_mode WAL was not applied (got {journal:?}); \
+                 refusing to run on a non-WAL database file"
+            )));
+        }
+    }
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // S-22.1：WAL + synchronous=NORMAL 的取舍（显式记录，避免被当成遗漏）。
+    // NORMAL 下每个事务仍写入 WAL 并保证**一致性**（ACID 的原子性/隔离性不变），
+    // 但 checkpoint 前不强制 fsync WAL → 断电可能丢掉最近已提交的若干事务。
+    // 本项目的提交点是 cutover marker / Accept UoW，且：
+    //  - 迁移提交点（DB + marker）与 rollback marker 都有显式 fsync（fs_atomic）；
+    //  - 崩溃恢复（recover_turns_on_startup + 幂等重放）不依赖最后若干事务的
+    //    「已 fsync」假设，重复 accept 由 revision CAS + ledger 幂等兜住。
+    // 若未来要求「提交即断电持久」，需改为 FULL 并在写路径加显式 fsync。
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     ensure_application_id(conn)?;

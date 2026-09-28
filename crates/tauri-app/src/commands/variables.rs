@@ -36,6 +36,8 @@ pub fn set_character_variable(
     // （JSON：turns 锁守卫内 candidate→persist→swap；SQLite：单 UoW 事务）。
     // 旧实现先 `reject_if_active_turn` 再单独写盘，检查与写入之间存在
     // Turn 插入窗口（TOCTOU）。
+    // T-06：后端侧键名守卫（__ 内部段 / 字符集 / 长度），前端守卫不是安全边界。
+    validate_variable_write_key(&key)?;
     let campaign_id = Id::from_str(&campaign_id);
     let instance_id = Id::from_str(&instance_id);
     let applied = state
@@ -164,6 +166,32 @@ pub(crate) fn validate_campaign_variable_input(
     Ok(())
 }
 
+/// 写入路径（`set_*_variable`）的键名守卫。
+///
+/// 2026-09-13 域4 修复 T-06：`set_campaign_variable` / `set_character_variable`
+/// 此前对 `key` **不做任何校验**，而 `__storyforge*` 内部命名空间（例如
+/// `__storyforge_card_shell_variables`）的拒绝只写在前端
+/// `frontend/src/utils/shellVariableOutbox.js`。前端守卫不是安全边界——这与本项目
+/// 对插件通道已确立的标准（`plugin-bridge` 前端权限数组之外，后端
+/// `PluginRegistry` 二次校验）不一致，属防御纵深缺口：经命令层可写入内部键，
+/// 而 `utils/mvuStatTree.js` 正是靠该前缀把内部键排除出 stat_data 树的。
+/// 这里复用 `validate_campaign_variable_input` 的键名规则做后端侧守卫。
+pub(crate) fn validate_variable_write_key(key: &str) -> Result<(), TauriCommandError> {
+    let valid = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !key.split('.').any(|segment| segment.starts_with("__"));
+    if valid {
+        Ok(())
+    } else {
+        Err(TauriCommandError::validation(
+            "变量键名只能包含文字、数字、点、下划线或连字符，不能超过 128 字节或使用 __ 内部段",
+        ))
+    }
+}
+
 /// 新增一个 Campaign 全局变量定义与初始值。
 #[tauri::command]
 pub fn add_campaign_variable(
@@ -290,6 +318,8 @@ pub fn set_campaign_variable(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成。
+    // T-06：后端侧键名守卫（__ 内部段 / 字符集 / 长度），前端守卫不是安全边界。
+    validate_variable_write_key(&key)?;
     let campaign_id = Id::from_str(&campaign_id);
     let applied = state
         .storage()

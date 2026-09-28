@@ -11,14 +11,18 @@ import {
   mapPluginEventRecordToPluginEvents,
   postPluginEventToTarget,
   toCloneablePostMessagePayload,
+  checkPluginStorageQuota,
   MSG_EVENT,
   MSG_HOOK_REQUEST,
   MSG_HOOK_RESPONSE,
   MSG_REQUEST,
   MSG_RESPONSE,
+  MAX_PLUGIN_STORAGE_TOTAL_CHARS,
+  MAX_PLUGIN_STORAGE_VALUE_CHARS,
   PROMPT_HOOK_PERMISSION,
   READ_MEMORY_PERMISSION,
   ST_EVENT_TYPES,
+  WRITE_CHAT_PERMISSION,
 } from '../src/plugin-bridge.js'
 import { createSaveChatAdapter } from '../src/utils/pluginPersistence.js'
 
@@ -30,6 +34,14 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
       listeners[name] = callback
     },
     localStorage: {
+      get length() {
+        if (options.localStorageThrows) throw new Error('SecurityError')
+        return storage.size
+      },
+      key: (index) => {
+        if (options.localStorageThrows) throw new Error('SecurityError')
+        return Array.from(storage.keys())[index] ?? null
+      },
       getItem: (key) => {
         if (options.localStorageThrows) throw new Error('SecurityError')
         return storage.get(key) ?? null
@@ -93,6 +105,26 @@ test('bridge posts plugin messages to the configured host origin', () => {
   window.storyforge.character.list()
   assert.equal(postedMessages.at(-1).message.type, MSG_REQUEST)
   assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
+})
+
+test('bridge script carries the per-document handshake nonce verbatim (M-24)', () => {
+  const nonce = 'sfh_mabc_xyz123'
+
+  // 未传 nonce（卡壳虚拟插件等旧调用点）落成空串，宿主据此 fail closed。
+  const { postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+  assert.equal(postedMessages.at(-1).message.handshake, '')
+
+  const withNonce = generateBridgeScript('plugin-a', 'https://host.example', nonce)
+  assert.match(withNonce, /handshake: "sfh_mabc_xyz123"/)
+  assert.match(withNonce, /_postToHost\(\{ type: 'sf:ready'/)
+
+  const withoutNonce = generateBridgeScript('plugin-a', 'https://host.example')
+  assert.match(withoutNonce, /handshake: ""/)
+
+  // 令牌经 JSON 序列化嵌入，引号注入无法逃出字符串字面量（`};alert(1);//` 仍在
+  // 引号内，只是被 \" 转义，因此断言「转义后的整体形状」而不是「不含该子串」）。
+  const hostile = generateBridgeScript('plugin-a', 'https://host.example', 'a"};alert(1);//')
+  assert.match(hostile, /handshake: "a\\"\};alert\(1\);\//)
 })
 
 test('bridge keeps local-only shims usable when host postMessage is unavailable', async () => {
@@ -240,6 +272,81 @@ test('host handler supports plugin storage set/get without backend invoke', asyn
   assert.equal(source.posted[0].message.result, true)
   assert.deepEqual(source.posted[1].message.result, { statusbar: true })
   assert.equal(source.posted[1].targetOrigin, 'https://plugin.example')
+})
+
+test('host handler enforces per-key and per-plugin storage quotas (M-31b)', async () => {
+  const plugin = { id: 'plugin-storage-quota', permissions: [] }
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const handler = createHostHandler(plugin, async () => null)
+  const setValue = async (id, key, value) => {
+    await handler({
+      data: {
+        type: MSG_REQUEST,
+        pluginId: plugin.id,
+        id,
+        method: 'storage.set',
+        params: { key, value },
+      },
+      source,
+      origin: 'https://plugin.example',
+    })
+    return source.posted.at(-1).message
+  }
+
+  // 单键超限：明确报错，不静默丢弃。
+  const oversized = await setValue('set-big', 'huge', 'x'.repeat(MAX_PLUGIN_STORAGE_VALUE_CHARS + 1))
+  assert.match(oversized.error, /单键超限/)
+  assert.equal(oversized.result, undefined)
+
+  // 刚好在上限内可写（含 JSON 引号开销，故取上限减 8）。
+  const nearLimit = await setValue('set-near', 'near', 'y'.repeat(MAX_PLUGIN_STORAGE_VALUE_CHARS - 8))
+  assert.equal(nearLimit.result, true)
+
+  // 单插件总量超限（总量上限 1 MiB，单值上限 ~256 KiB ⇒ 需要 5 个近上限值才越界；
+  // 只写 2 个时总量约 512 KiB 仍在预算内，这是本用例原先失败的真正原因）。
+  const chunk = 'z'.repeat(MAX_PLUGIN_STORAGE_VALUE_CHARS - 8)
+  let totalOversized = null
+  for (let i = 0; i < 5; i += 1) {
+    totalOversized = await setValue(`set-total-${i}`, `total-${i}`, chunk)
+  }
+  assert.match(totalOversized.error, /总量超限/)
+
+  // 覆盖写同一键不按新增计费（替换修正），仍可写。
+  const overwrite = await setValue('set-overwrite', 'near', 'w'.repeat(MAX_PLUGIN_STORAGE_VALUE_CHARS - 8))
+  assert.equal(overwrite.result, true)
+
+  // 其它插件不受影响（配额按插件独立计）。
+  const otherSource = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const otherHandler = createHostHandler({ id: 'plugin-other-quota', permissions: [] }, async () => null)
+  await otherHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-other-quota',
+      id: 'set-other',
+      method: 'storage.set',
+      params: { key: 'near', value: 'v'.repeat(MAX_PLUGIN_STORAGE_VALUE_CHARS - 8) },
+    },
+    source: otherSource,
+    origin: 'https://plugin.example',
+  })
+  assert.equal(otherSource.posted.at(-1).message.result, true)
+
+  // 纯函数入口：上限常量与判定一致（防「常量改了实现没改」）。
+  assert.equal(checkPluginStorageQuota(plugin.id, 'k', 'small'), null)
+  assert.match(
+    checkPluginStorageQuota(plugin.id, 'k', 'q'.repeat(MAX_PLUGIN_STORAGE_TOTAL_CHARS + 1)),
+    /单键超限/,
+  )
 })
 
 test('host handler keeps plugin storage across handler recreation', async () => {
@@ -652,8 +759,77 @@ test('derives common SillyTavern render and chat events from host message events
     permissions: [],
   }), [{
     event: 'CHAT_CHANGED',
-    data: { messageId: 'm1', role: 'assistant', reason: 'writing_complete' },
+    data: { messageId: 'm1', role: 'assistant' },
   }])
+})
+
+test('keeps generated prose out of events for subscribers without ReadMemory (M-22)', () => {
+  const noPermission = {
+    id: 'plugin-a',
+    event_subscriptions: ['*'],
+    permissions: [],
+  }
+
+  // PipelineEvent::SubagentDone 的 payload 字段名是 full_text
+  // （commands/writing.rs:394-405 的 serde_json::json! 用字面量键，不是
+  // rename_all），归一化后是 fulltext——旧敏感表只有 text/content，无
+  // ReadMemory 的 `*` 订阅者可直接读到整段生成正文。
+  const subagentDone = {
+    id: 48,
+    event_type: 'subagent_done',
+    data: {
+      character_id: 'c1',
+      index: 0,
+      full_text: 'SECRET_PROSE_BODY',
+      fullText: 'SECRET_CAMEL_PROSE',
+      safe: 'metadata',
+    },
+  }
+
+  const redacted = mapPipelineEventToPluginEvents(subagentDone, noPermission)
+  assert.ok(redacted.length > 0)
+  for (const event of redacted) {
+    assert.equal(JSON.stringify(event.data).includes('SECRET'), false)
+    assert.equal(event.data.full_text, undefined)
+    assert.equal(event.data.fullText, undefined)
+    assert.equal(event.data.safe, 'metadata')
+    assert.equal(event.data.character_id, 'c1')
+  }
+
+  // 已知边界（记录在案，不当作被测性质）：敏感表是「归一化后精确匹配」，
+  // 同族异名（full_text_draft → fulltextdraft）不会被覆盖；后端当前只发
+  // full_text / text / content，故不影响实际门控。
+  const aliased = mapPipelineEventToPluginEvents({
+    id: 48,
+    event_type: 'subagent_done',
+    data: { full_text_draft: 'SECRET_ALIAS' },
+  }, noPermission)
+  assert.equal(aliased[0].data.full_text_draft, 'SECRET_ALIAS')
+
+  // 有 ReadMemory 的插件仍收到完整 payload（门控不是静默删字段）。
+  const withPermission = mapPipelineEventToPluginEvents(subagentDone, {
+    id: 'plugin-a',
+    event_subscriptions: ['*'],
+    permissions: [READ_MEMORY_PERMISSION],
+  })
+  assert.equal(withPermission[0].data.full_text, 'SECRET_PROSE_BODY')
+
+  // quality_checked 的 warnings 是 QualityWarning.message（含草稿样本片段）。
+  const quality = mapPipelineEventToPluginEvents({
+    id: 49,
+    event_type: 'quality_checked',
+    data: { passed: false, warning_count: 1, warnings: ['草稿含元描述泄漏：「作为AI」'] },
+  }, noPermission)
+  assert.equal(quality[0].data.warnings, undefined)
+  assert.equal(quality[0].data.warning_count, 1)
+
+  // postprocess_failed 的 reason 是后端自由文本，按同族敏感字段处理。
+  const failed = mapPipelineEventToPluginEvents({
+    id: 50,
+    event_type: 'postprocess_failed',
+    data: { reason: 'SECRET_BACKEND_REASON' },
+  }, noPermission)
+  assert.equal(failed[0].data.reason, undefined)
 })
 
 test('maps nested generic host plugin event records', () => {
@@ -1852,7 +2028,7 @@ test('host saveChat route calls the injected persistence adapter', async () => {
     },
   }
   const handler = createHostHandler(
-    { id: 'plugin-a', permissions: [] },
+    { id: 'plugin-a', permissions: [WRITE_CHAT_PERMISSION] },
     async () => null,
     { saveChatAdapter: adapter },
   )
@@ -1887,7 +2063,7 @@ test('host saveChat route deduplicates a timed-out retry of the same chat snapsh
     },
   })
   const handler = createHostHandler(
-    { id: 'plugin-a', permissions: [] },
+    { id: 'plugin-a', permissions: [WRITE_CHAT_PERMISSION] },
     async () => null,
     { saveChatAdapter: adapter },
   )
@@ -1927,7 +2103,7 @@ test('host saveChat idempotency survives handler recreation with the same adapte
     },
   })
   const makeHandler = () => createHostHandler(
-    { id: 'plugin-a', permissions: [] },
+    { id: 'plugin-a', permissions: [WRITE_CHAT_PERMISSION] },
     async () => null,
     { saveChatAdapter: adapter },
   )
@@ -1964,7 +2140,10 @@ test('host saveChat route falls back to degraded when no adapter is injected', a
       this.posted.push({ message, targetOrigin })
     },
   }
-  const handler = createHostHandler({ id: 'plugin-a', permissions: [] }, async () => null)
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [WRITE_CHAT_PERMISSION] },
+    async () => null,
+  )
 
   await handler({
     data: {
@@ -1981,6 +2160,65 @@ test('host saveChat route falls back to degraded when no adapter is injected', a
   assert.equal(source.posted.at(-1).message.result.ok, true)
   assert.equal(source.posted.at(-1).message.result.degraded, true)
   assert.equal(source.posted.at(-1).message.result.reason, 'local_mirror_only_no_host_persist')
+})
+
+test('host saveChat is gated on WriteChat so a no-permission plugin writes nothing (M-31c)', async () => {
+  const saved = []
+  const adapter = createSaveChatAdapter({
+    async persist(snapshot) {
+      saved.push(snapshot)
+      return { ok: true, persistedAt: 'ts-should-not-happen' }
+    },
+  })
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-denied',
+      method: 'chat.save',
+      params: { chat: [{ role: 'user', content: 'must not persist' }] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  // 未授权：不进 adapter，回显权限错误（不是假成功）。
+  assert.deepEqual(saved, [])
+  assert.match(source.posted.at(-1).message.error, /权限不足/)
+  assert.match(source.posted.at(-1).message.error, new RegExp(WRITE_CHAT_PERMISSION))
+  assert.equal(source.posted.at(-1).message.result, undefined)
+
+  // 其它权限不顶替 WriteChat（读权限不构成写通道）。
+  const readOnlyHandler = createHostHandler(
+    { id: 'plugin-a', permissions: [READ_MEMORY_PERMISSION] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  await readOnlyHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-read-only',
+      method: 'chat.save',
+      params: { chat: [] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  assert.deepEqual(saved, [])
+  assert.match(source.posted.at(-1).message.error, /权限不足/)
 })
 
 test('iframe saveChat tries host persistence and preserves degraded promise when host unavailable', async () => {

@@ -174,14 +174,30 @@ async function handleAdd() {
   }
 }
 
+// F-26：Select 无 busy 态、失败不回滚 → 草稿与服务端长期不一致，
+// 用户下次「保存修改」会把错误路由一起写回。失败时用服务端真值覆盖草稿。
+const savingRoute = ref(false)
+
 async function handleRouteChange(route) {
   if (expandedIndex.value == null) return
+  if (savingRoute.value) return
+  const previousRoute = draft.route
   draft.route = route
+  savingRoute.value = true
   try {
     await setCampaignWorldInfoRoute(props.campaignId, expandedIndex.value, route)
     await load()
   } catch (e) {
+    // 先本地回滚（保证即使 reload 也失败，草稿也不会停在新值上）
+    draft.route = previousRoute
+    try {
+      await load()
+    } catch (reloadError) {
+      console.error('改路由失败后重载世界书失败:', reloadError)
+    }
     await alertDialog('改路由失败: ' + errorText(e))
+  } finally {
+    savingRoute.value = false
   }
 }
 
@@ -352,6 +368,7 @@ defineExpose({ refresh: load })
             <Select
               v-model="draft.route"
               :options="routeSetOptions"
+              :disabled="savingRoute"
               @update:model-value="handleRouteChange"
             />
           </div>

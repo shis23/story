@@ -213,19 +213,24 @@ impl AgentProfileConfig {
     /// - `max_tool_rounds` 有值时须在 `[1, 100]`。
     /// - `max_concurrent_subagents` 须 `>= 1`。
     /// - 不校验 `tool_whitelist` 工具名（运行时已 warning+忽略）。
+    ///
+    /// 多个角色同时非法时，报错指向的角色必须稳定（HashMap 迭代序随机，
+    /// 因此在报错前先按角色名排序取第一个，保证同输入同输出）。
     pub fn validate(&self) -> Result<(), ProfileConfigError> {
         if self.name.trim().is_empty() {
             return Err(ProfileConfigError::EmptyName);
         }
-        for (role, run_cfg) in &self.agent_configs {
-            if let Some(rounds) = run_cfg.max_tool_rounds
-                && (rounds == 0 || rounds > 100)
-            {
-                return Err(ProfileConfigError::MaxToolRoundsOutOfRange {
-                    role: role.to_string(),
-                    value: rounds,
-                });
-            }
+        let mut offending: Vec<(String, u32)> = self
+            .agent_configs
+            .iter()
+            .filter_map(|(role, run_cfg)| match run_cfg.max_tool_rounds {
+                Some(rounds) if rounds == 0 || rounds > 100 => Some((role.to_string(), rounds)),
+                _ => None,
+            })
+            .collect();
+        offending.sort();
+        if let Some((role, value)) = offending.into_iter().next() {
+            return Err(ProfileConfigError::MaxToolRoundsOutOfRange { role, value });
         }
         if self.max_concurrent_subagents < 1 {
             return Err(ProfileConfigError::InvalidMaxConcurrent {
@@ -238,10 +243,12 @@ impl AgentProfileConfig {
     /// 版本迁移入口。将配置迁移到 `target` 版本。
     ///
     /// 当前只有 v1，v1→v1 是 no-op。返回是否发生过迁移。
-    /// 未知版本不报错，保留数据不变（向前兼容）。
+    /// 未知/更高版本不报错，保留数据不变（向前兼容，D-14）：
+    /// 只有 `target > self.config_version` 才推进版本号，绝不把更新版本降级。
     pub fn migrate_to(&mut self, target: u32) -> bool {
-        if self.config_version == target {
-            return false; // 已是目标版本，no-op
+        if target <= self.config_version {
+            // 已是目标版本，或数据来自更新的版本：no-op，不改版本标记
+            return false;
         }
         // 当前只有 v1；预留未来版本迁移分支。
         // 未知版本不做任何修改，保留数据。
@@ -633,5 +640,55 @@ mod tests {
         // migrate_to(1) 应该是 no-op
         assert!(!cfg.migrate_to(1));
         assert_eq!(cfg.config_version, 1);
+    }
+
+    // ─── D-14：绝不把数据降级到更低版本 ───────────────────────────────────
+
+    #[test]
+    fn migrate_to_never_downgrades_version_marker() {
+        let mut cfg = default_agent_profile_config();
+        cfg.config_version = 5; // 来自更新版本的数据
+        assert!(!cfg.migrate_to(1), "低版本 target 必须 no-op");
+        assert_eq!(
+            cfg.config_version, 5,
+            "版本标记不得被降级（D-14）——降级会让后续 migrate 分支误判数据结构"
+        );
+        // 相同版本同样 no-op
+        assert!(!cfg.migrate_to(5));
+        assert_eq!(cfg.config_version, 5);
+        // 只有更高的 target 才推进
+        assert!(cfg.migrate_to(6));
+        assert_eq!(cfg.config_version, 6);
+    }
+
+    #[test]
+    fn validate_reports_deterministic_role() {
+        // 多个角色同时非法时，报错角色必须稳定（HashMap 迭代序随机）
+        use std::collections::HashMap;
+        let mut cfg = default_agent_profile_config();
+        let mut configs = HashMap::new();
+        for role in [AgentRole::Director, AgentRole::Writer, AgentRole::Editor] {
+            configs.insert(
+                role,
+                AgentRunConfig {
+                    model_override: None,
+                    max_tool_rounds: Some(0),
+                    tool_whitelist: None,
+                },
+            );
+        }
+        cfg.agent_configs = configs;
+        let first = match cfg.validate() {
+            Err(ProfileConfigError::MaxToolRoundsOutOfRange { role, .. }) => role,
+            other => panic!("期望 MaxToolRoundsOutOfRange，实际 {other:?}"),
+        };
+        for _ in 0..16 {
+            match cfg.validate() {
+                Err(ProfileConfigError::MaxToolRoundsOutOfRange { role, .. }) => {
+                    assert_eq!(role, first, "同一输入的报错角色必须稳定")
+                }
+                other => panic!("期望 MaxToolRoundsOutOfRange，实际 {other:?}"),
+            }
+        }
     }
 }

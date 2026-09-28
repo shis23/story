@@ -1,5 +1,28 @@
 use super::*;
 
+/// W-20：低于原文这一比例视为异常缩水（仅对足够长的原稿判定）
+const MIN_REVISION_RATIO_DEN: usize = 4;
+/// W-20：短稿不做比例判定，只拒绝空稿
+const MIN_REVISION_COMPARE_CHARS: usize = 200;
+
+/// W-20：Editor 修订稿最低可接受性。
+///
+/// 空稿（含纯空白）一律拒绝；原稿 ≥200 字时，修订稿不足原文 1/4 视为异常缩水
+/// （模型截断/只输出摘要），拒绝后由调用方回退原稿，避免用残稿覆盖已定稿正文。
+pub(crate) fn revision_text_is_acceptable(original: &str, revised: &str) -> bool {
+    let revised_len = revised.trim().chars().count();
+    if revised_len == 0 {
+        return false;
+    }
+    let original_len = original.trim().chars().count();
+    if original_len >= MIN_REVISION_COMPARE_CHARS
+        && revised_len.saturating_mul(MIN_REVISION_RATIO_DEN) < original_len
+    {
+        return false;
+    }
+    true
+}
+
 pub struct DraftRevisionRequest<'a> {
     pub text: &'a str,
     pub hint: &'a str,
@@ -76,6 +99,18 @@ impl PipelineOrchestrator {
             return Err(PipelineError::Cancelled);
         }
         let text = apply_editor_output_regex(&response.content, &ctx.regex_scripts)?;
+        // W-20：空稿/极端缩水的"修订"不得回传（调用方会用它替换已定稿正文）
+        if !revision_text_is_acceptable(request.text, &text) {
+            warn!(
+                target: "app-pipeline",
+                "Editor 修订稿被拒绝：原文 {} 字 → 修订 {} 字（空稿或极端缩水）",
+                request.text.trim().chars().count(),
+                text.trim().chars().count()
+            );
+            return Err(PipelineError::InvalidState(
+                "Editor 修订稿为空或相对原文严重缩水".into(),
+            ));
+        }
         let mut provenance = request.provenance.cloned();
         if let Some(p) = provenance.as_mut() {
             p.editor_reasoning = response.reasoning_content;
@@ -83,5 +118,47 @@ impl PipelineOrchestrator {
             validate_provenance_reasoning_budget(p)?;
         }
         Ok((text, provenance))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W-20：空稿/纯空白一律拒绝
+    #[test]
+    fn empty_revision_is_rejected() {
+        assert!(!revision_text_is_acceptable("原本很长的正文……", ""));
+        assert!(!revision_text_is_acceptable("原本很长的正文……", "   \n  "));
+    }
+
+    /// W-20：长稿被截断成摘要（<25%）必须拒绝
+    #[test]
+    fn truncated_revision_is_rejected() {
+        let original = "正文".repeat(500); // 1000 字
+        let truncated = "正文".repeat(50); // 100 字 = 10%
+        assert!(!revision_text_is_acceptable(&original, &truncated));
+
+        // 边界：恰好 25% 可接受（不小于阈值）
+        let quarter = "正文".repeat(125); // 250 字 = 25%
+        assert!(revision_text_is_acceptable(&original, &quarter));
+    }
+
+    /// W-20：短稿只拒绝空稿，不按比例误杀（修订可能确实更精炼）
+    #[test]
+    fn short_draft_ratio_is_not_enforced() {
+        assert!(revision_text_is_acceptable("短句。", "更短。"));
+        assert!(revision_text_is_acceptable("短句。", "改。"));
+    }
+
+    /// W-20：正常等长/更长的修订必须通过
+    #[test]
+    fn normal_revision_is_accepted() {
+        let original = "正文".repeat(200);
+        assert!(revision_text_is_acceptable(&original, &original));
+        assert!(revision_text_is_acceptable(
+            &original,
+            &format!("{original}（补充一句）")
+        ));
     }
 }

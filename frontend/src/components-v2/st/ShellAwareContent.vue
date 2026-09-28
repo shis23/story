@@ -11,7 +11,9 @@
  *
  * H3/H4 信任分级（逻辑不变，只换渲染位置）：
  *   - .load 仅卡 manifest 注册 URL 自动挂载，其余原地确认卡；
- *   - 内联文档需消息源文命中卡 InlineHtml 壳的 find_regex，否则原地确认。
+ *   - 内联文档**逐个**与卡 InlineHtml 壳的 find_regex 比对（M-19：
+ *     trustedInlineShellDocStarts 按出现顺序给每个文档配一次独立命中），
+ *     未获背书的文档一律确认卡——不再因为消息里任意一处命中就放行整条。
  * 确认门同时是天然的懒加载闸门（重内联壳未放行不占资源）——将来若做
  * 「记住信任」，默认仍必须逐次确认，不得改成全自动挂载。
  *
@@ -24,8 +26,8 @@ import { computed, inject, ref } from 'vue'
 import RichContent from './RichContent.vue'
 import CardShellHost from '../../components/CardShellHost.vue'
 import {
-  matchesAnyInlineShellTrigger,
   segmentShellContent,
+  trustedInlineShellDocStarts,
 } from '../../utils/cardShellDisplay.js'
 import { useCampaignStore } from '../../stores/campaign.js'
 
@@ -60,7 +62,11 @@ const inlineShellTriggers = computed(() =>
 const approvedShellUrls = ref([])
 const approvedInlineStarts = ref([])
 
-const inlineDocsTrusted = computed(() => matchesAnyInlineShellTrigger(
+// M-19：信任按「文档」而非「消息」计算。旧写法对整条 sourceContent 求一次
+// matchesAnyInlineShellTrigger，任意一处命中就放行该消息内全部内联 script；
+// 现在只有确实被某次独立 trigger 命中背书的文档进入 trustedInlineDocStarts。
+const trustedInlineDocStarts = computed(() => trustedInlineShellDocStarts(
+  props.content,
   props.sourceContent || props.content,
   inlineShellTriggers.value,
 ))
@@ -81,7 +87,7 @@ const renderSegments = computed(() => {
         : { kind: 'confirm-url', key: `confirm:${seg.url}`, url: seg.url })
       return
     }
-    const ok = inlineDocsTrusted.value
+    const ok = trustedInlineDocStarts.value.has(seg.start)
       || approvedInlineStarts.value.includes(seg.start)
     out.push(ok
       ? { kind: 'host-html', key: `inline:${seg.start}`, html: seg.html, shellKind: seg.kind }

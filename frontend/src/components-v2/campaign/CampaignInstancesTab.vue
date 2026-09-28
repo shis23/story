@@ -239,7 +239,12 @@ async function toggleInstance(inst) {
 }
 
 // ─── 变量编辑 ───
+// F-25：控件是单向 :value 绑定，写入失败后 DOM 仍显示用户输入的新值
+// （看起来"已保存"）。失败时递增 nonce 让控件重挂载回真实值。
+const variableRevertNonce = ref(0)
+
 async function handleVariableChange(instanceId, key, value, varType) {
+  let writeOk = false
   try {
     let parsed = value
     if (varType === 'bool') {
@@ -262,6 +267,7 @@ async function handleVariableChange(instanceId, key, value, varType) {
     }
 
     await setCharacterVariable(props.campaignId, instanceId, key, parsed)
+    writeOk = true
     if (expandedInstanceId.value !== instanceId) return
 
     const inst = instances.value.find((item) => item.id === instanceId)
@@ -273,7 +279,14 @@ async function handleVariableChange(instanceId, key, value, varType) {
       instanceMvuStatusBar.value = null
     }
   } catch (e) {
-    await alertDialog('设置变量失败: ' + errorText(e))
+    // F-25：写成功但回读失败此前也会报"设置变量失败"（误导用户重试写入）。
+    // 拆成两条提示；写失败时回滚控件显示。
+    if (!writeOk) {
+      variableRevertNonce.value += 1
+      await alertDialog('设置变量失败（已回滚显示）: ' + errorText(e))
+    } else {
+      await alertDialog('变量已写入，但回读失败（请刷新查看）: ' + errorText(e))
+    }
   }
 }
 
@@ -332,7 +345,7 @@ defineExpose({ refresh: load })
   />
 
   <template v-else>
-    <DataTable :columns="columns" :rows="instances" empty-title="暂无角色实例">
+    <DataTable :columns="columns" :rows="instances" row-key="id" empty-title="暂无角色实例">
       <template #cell-name="{ row }">
         <button
           class="text-sm font-medium text-ink hover:text-accent transition-colors text-left"
@@ -381,6 +394,7 @@ defineExpose({ refresh: load })
           <label class="flex items-center gap-1 cursor-pointer">
             <input
               type="checkbox"
+              :key="`ib-${v.key}-${variableRevertNonce}`"
               :checked="v.value === true"
               @change="handleVariableChange(expandedInstanceId, v.key, $event.target.checked, 'bool')"
               class="h-4 w-4 rounded border-line bg-surface-2 text-accent focus:ring-accent"
@@ -393,6 +407,7 @@ defineExpose({ refresh: load })
         <template v-else-if="inferVarType(v.value) === 'int' || inferVarType(v.value) === 'float'">
           <input
             type="number"
+            :key="`in-${v.key}-${variableRevertNonce}`"
             :value="v.value"
             :step="inferVarType(v.value) === 'float' ? '0.01' : '1'"
             @change="handleVariableChange(expandedInstanceId, v.key, $event.target.value, inferVarType(v.value))"
@@ -403,6 +418,7 @@ defineExpose({ refresh: load })
         <!-- json → textarea (只读折叠) -->
         <template v-else-if="inferVarType(v.value) === 'json'">
           <textarea
+            :key="`ij-${v.key}-${variableRevertNonce}`"
             :value="formatJson(v.value)"
             @change="handleVariableChange(expandedInstanceId, v.key, $event.target.value, 'json')"
             rows="3"
@@ -414,6 +430,7 @@ defineExpose({ refresh: load })
         <template v-else>
           <input
             type="text"
+            :key="`is-${v.key}-${variableRevertNonce}`"
             :value="String(v.value)"
             @change="handleVariableChange(expandedInstanceId, v.key, $event.target.value, 'string')"
             class="flex-1 bg-surface-2 border border-line rounded-lg px-2 py-1.5 text-xs text-ink focus:border-accent"

@@ -127,7 +127,11 @@ impl CardShellCache {
     }
 
     pub fn is_url_allowed(&self, url: &str) -> Result<(), String> {
-        let host = host_of(url).ok_or_else(|| format!("无法解析 URL host: {url}"))?;
+        let parsed = parse_http_url(url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| format!("无法解析 URL host: {url}"))?
+            .to_ascii_lowercase();
         let guard = self.allowed_hosts.lock().unwrap_or_else(|p| p.into_inner());
         if guard.contains(&host) {
             Ok(())
@@ -142,8 +146,16 @@ impl CardShellCache {
     /// Card shells only need named, allowlisted CDN hosts; literal IP URLs are
     /// never valid and would turn this fetcher into an SSRF primitive.
     fn validate_fetch_url(&self, url: &str) -> Result<(), String> {
-        let host = host_of(url).ok_or_else(|| format!("cannot parse URL host: {url}"))?;
-        if host.parse::<std::net::IpAddr>().is_ok() {
+        let parsed = parse_http_url(url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| format!("cannot parse URL host: {url}"))?
+            .to_ascii_lowercase();
+        // `host_str()` keeps the brackets of an IPv6 literal (`[::1]`), so strip
+        // them before the literal check; the URL standard has already folded the
+        // decimal/hex/octal IPv4 spellings into the canonical dotted form.
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.contains('[') || bare_host.parse::<std::net::IpAddr>().is_ok() {
             return Err(format!("IP-literal shell URL is not allowed: {url}"));
         }
         self.is_url_allowed(url)
@@ -426,17 +438,42 @@ fn b64(bytes: &[u8]) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-pub fn host_of(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host = rest.split('/').next()?.split('@').next_back()?;
-    let host = host.split(':').next()?.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
+/// Parse an `http(s)` URL with the exact parser the client uses for the real
+/// request (`reqwest::Url` re-exports `url::Url`), so the allowlist decision and
+/// the actual connection can never disagree.
+///
+/// Hand-rolled string surgery used to disagree with the URL standard:
+/// `https://evil.example\@cdn.jsdelivr.net/x` — the old parser returned
+/// `cdn.jsdelivr.net` (allowlisted) while the standard ends the authority at the
+/// backslash, so the request really went to `evil.example`. The same trick
+/// defeated the IP-literal guard.
+///
+/// Explicit ports and URL credentials are rejected outright: no allowlisted CDN
+/// resource needs either, and both are classic allowlist-smuggling vectors.
+fn parse_http_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|error| format!("cannot parse URL {raw}: {error}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("unsupported scheme `{scheme}` in URL {raw}")),
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("URL credentials are not allowed: {raw}"));
+    }
+    // `url` normalizes `:443`/`:80` away, so a `Some(port)` here is always an
+    // explicit non-default port.
+    if let Some(port) = url.port() {
+        return Err(format!("non-default port {port} is not allowed: {raw}"));
+    }
+    Ok(url)
+}
+
+pub fn host_of(url: &str) -> Option<String> {
+    parse_http_url(url)
+        .ok()?
+        .host_str()
+        .map(|host| host.to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
 }
 
 fn cache_protocol_url_for_path(path: &Path) -> Option<String> {
@@ -733,5 +770,70 @@ mod tests {
             Some("cdn.jsdelivr.net")
         );
         assert_eq!(host_of("not-a-url"), None);
+        // Scheme/host normalization follows the URL standard, not string prefixes.
+        assert_eq!(
+            host_of("HTTPS://CDN.JSDELIVR.NET/npm/x").as_deref(),
+            Some("cdn.jsdelivr.net")
+        );
+        assert_eq!(
+            host_of("https://cdn.jsdelivr.net/npm/x?from=1#frag").as_deref(),
+            Some("cdn.jsdelivr.net")
+        );
+        assert_eq!(host_of("ftp://cdn.jsdelivr.net/x"), None);
+        assert_eq!(host_of("https://cdn.jsdelivr.net:8443/x"), None);
+    }
+
+    /// M-02 回归：手写字符串解析与 `url`/WHATWG 语义不一致时，同一条 URL 可以
+    /// 同时骗过 allowlist 与 IP 字面量守卫。
+    /// 修复后 `host_of` 与实际请求使用同一个解析器，二者不可能再分歧。
+    #[test]
+    fn authority_smuggling_cannot_bypass_allowlist_or_ip_guard() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        // 反斜杠在 URL 标准里终止 authority：真实目标主机是 evil.example，
+        // 旧实现却把 `\` 之后的 `@` 当 userinfo 分隔符，返回 cdn.jsdelivr.net。
+        assert_eq!(
+            host_of("https://evil.example\\@cdn.jsdelivr.net/x").as_deref(),
+            Some("evil.example")
+        );
+        for url in [
+            "https://evil.example\\@cdn.jsdelivr.net/x",
+            "https://127.0.0.1\\@cdn.jsdelivr.net/x",
+            "https://127.0.0.1/internal",
+            "https://[::1]/internal",
+            "https://2130706433/internal",
+            "https://0x7f.0.0.1/internal",
+        ] {
+            assert!(
+                cache.is_url_allowed(url).is_err(),
+                "allowlist must reject {url}"
+            );
+            assert!(
+                cache.validate_fetch_url(url).is_err(),
+                "fetch guard must reject {url}"
+            );
+        }
+        // 凭据与非默认端口不得出现在 CDN 资源 URL 里（allowlist 走私面）。
+        assert!(
+            cache
+                .is_url_allowed("https://user:pw@testingcf.jsdelivr.net/x")
+                .is_err()
+        );
+        assert!(
+            cache
+                .validate_fetch_url("https://testingcf.jsdelivr.net:8443/x")
+                .is_err()
+        );
+        // 正常白名单 URL 不受影响。
+        assert!(
+            cache
+                .is_url_allowed("https://testingcf.jsdelivr.net/gh/x/index.html")
+                .is_ok()
+        );
+        assert!(
+            cache
+                .validate_fetch_url("https://testingcf.jsdelivr.net/gh/x/index.html")
+                .is_ok()
+        );
     }
 }

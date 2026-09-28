@@ -17,6 +17,32 @@ use storyforge_domain::character::{
 };
 use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
 
+/// 命令侧唯一允许的落盘写法：把 `CardStudioStore::update` 的失败映射成
+/// `TauriCommandError`，保证"命令返回 Ok"等价于"状态已写入磁盘"。
+///
+/// 2026-09-13 域4 修复 T-02：此前本文件有 8 处 `let _ = store.update(...)`
+/// 丢弃 `Result`，其中 3 处位于**成功返回路径**（`cardstudio_run_review` 的
+/// 纯规则分支与 LLM 分支结尾、`cardstudio_import_compiled` 结尾）。磁盘写失败
+/// 时用户看到"成功"，但重启后阶段输出 / `last_error` / `imported_character_id`
+/// 回到旧值——命令成功并不代表已落盘。
+fn persist_project(
+    store: &crate::card_studio_store::CardStudioStore,
+    project: CardProject,
+) -> Result<CardProject, TauriCommandError> {
+    store.update(project).map_err(TauriCommandError::storage)
+}
+
+/// 已经在返回 `Err` 的路径上：失败状态"尽力保存"，但落盘失败必须留痕，
+/// 且不得覆盖真正要返回给前端的原始错误（旧实现用 `let _ =` 静默吞掉）。
+fn persist_failure_state(store: &crate::card_studio_store::CardStudioStore, project: CardProject) {
+    if let Err(e) = store.update(project) {
+        tracing::error!(
+            error = %e,
+            "写卡项目失败状态落盘失败（原始错误仍返回给前端）"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardProjectSummaryDto {
     pub id: String,
@@ -305,7 +331,7 @@ pub async fn cardstudio_run_review(
         project.last_stage_output =
             Some(serde_json::to_string_pretty(&rule_report).unwrap_or_else(|_| "{}".into()));
         project.touch();
-        let _ = store.update(project);
+        persist_project(store, project)?;
         return Ok(rule_report);
     }
 
@@ -358,7 +384,7 @@ pub async fn cardstudio_run_review(
         };
     }
     project.touch();
-    let _ = store.update(project);
+    persist_project(store, project)?;
     Ok(merged)
 }
 
@@ -483,7 +509,7 @@ pub fn cardstudio_complete_manual_stage(
                         .collect::<Vec<_>>()
                         .join("; "),
                 );
-                let _ = store.update(project.clone());
+                persist_failure_state(store, project.clone());
                 return Err(TauriCommandError::validation(
                     project
                         .last_error
@@ -571,12 +597,12 @@ pub async fn cardstudio_prefill_from_novel(
     project.last_stage_output = Some(raw.clone());
     let json = extract_json_object(&raw).map_err(|e| {
         project.last_error = Some(e.clone());
-        let _ = store.update(project.clone());
+        persist_failure_state(store, project.clone());
         TauriCommandError::validation(format!("预填 JSON 解析失败: {e}"))
     })?;
     if let Err(e) = apply_novel_prefill_json(&mut project.artifacts, &json) {
         project.last_error = Some(e.clone());
-        let _ = store.update(project.clone());
+        persist_failure_state(store, project.clone());
         return Err(TauriCommandError::validation(e));
     }
 
@@ -707,7 +733,7 @@ pub async fn cardstudio_run_stage(
         Err(e) => {
             project.set_stage_status(&stage_id, StageStatus::Failed);
             project.last_error = Some(e.clone());
-            let _ = store.update(project);
+            persist_failure_state(store, project);
             return Err(TauriCommandError::validation(e));
         }
     };
@@ -715,7 +741,7 @@ pub async fn cardstudio_run_stage(
     if let Err(e) = apply_stage_json(&stage_id, &mut project.artifacts, &json) {
         project.set_stage_status(&stage_id, StageStatus::Failed);
         project.last_error = Some(e.clone());
-        let _ = store.update(project);
+        persist_failure_state(store, project);
         return Err(TauriCommandError::validation(e));
     }
 
@@ -811,7 +837,7 @@ pub fn cardstudio_import_compiled(
     project.current_stage = STAGE_COMPILE_IMPORT.to_string();
     project.last_error = None;
     project.touch();
-    let _ = store.update(project);
+    persist_project(store, project)?;
 
     Ok(ImportCompiledResultDto {
         character: CharacterSummary::from(stored),
@@ -832,6 +858,7 @@ pub fn cardstudio_list_stages() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card_studio_store::CardStudioStore;
     use storyforge_domain::card_studio::{CardProjectMode, WorldviewDraftEntry};
 
     fn gate_test_project() -> CardProject {
@@ -908,5 +935,67 @@ mod tests {
                 .map(|b| b.entries.len()),
             Some(2)
         );
+    }
+
+    /// 造一个"内存态正常、落盘必然失败"的 store：先把目标文件换成同名目录，
+    /// `atomic_write` 的 `rename(tmp, target)` 就会失败。
+    fn store_with_failing_persist(
+        project: &CardProject,
+    ) -> (tempfile::TempDir, CardStudioStore, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CardStudioStore::new(dir.path());
+        store.insert(project.clone()).expect("首次插入应成功");
+        let target = dir.path().join("card_projects.json");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        (dir, store, target)
+    }
+
+    /// T-02 回归（基础不变量）：落盘失败时 `CardStudioStore::update` 返回 Err。
+    #[test]
+    fn update_reports_error_when_persist_fails() {
+        let project = CardProject::new_from_scratch("persist-fail", "落盘失败测试");
+        let id = project.id.clone();
+        let (_dir, store, target) = store_with_failing_persist(&project);
+
+        let err = store
+            .update(project.clone())
+            .expect_err("落盘失败时 update 必须返回 Err，而不是 Ok");
+        assert!(err.contains("落盘失败"), "错误信息应说明落盘失败: {err}");
+        // 目标路径仍是那个目录：没有发生"看起来写成功了"的假象。
+        assert!(target.is_dir());
+        assert_eq!(store.get(&id).unwrap().id, id);
+    }
+
+    /// T-02 回归（命令侧）：8 处命令改用的 `persist_project` 把落盘失败变成
+    /// `TauriCommandError::Storage`，命令因此不会再"返回 Ok 但没落盘"。
+    #[test]
+    fn persist_project_propagates_disk_failure_as_command_error() {
+        let project = CardProject::new_from_scratch("persist-fail-cmd", "命令错误映射测试");
+        let (_dir, store, _target) = store_with_failing_persist(&project);
+
+        let err = persist_project(&store, project).expect_err("落盘失败必须变成 Err");
+        match err {
+            TauriCommandError::Storage { message } => {
+                assert!(message.contains("落盘失败"), "message={message}");
+            }
+            other => panic!("应为 Storage 错误，实际: {other:?}"),
+        }
+    }
+
+    /// T-02 回归（反向）：落盘正常时 `persist_project` 仍返回 Ok——防止把
+    /// "传播错误"写成"无条件报错"。
+    #[test]
+    fn persist_project_returns_ok_when_disk_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CardStudioStore::new(dir.path());
+        let project = CardProject::new_from_scratch("persist-ok", "落盘成功测试");
+        store.insert(project.clone()).expect("插入应成功");
+
+        let mut updated = project.clone();
+        updated.name = "改名后".into();
+        let saved = persist_project(&store, updated).expect("落盘成功应返回 Ok");
+        assert_eq!(saved.name, "改名后");
+        assert_eq!(store.get(&project.id).unwrap().name, "改名后");
     }
 }

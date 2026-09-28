@@ -63,6 +63,44 @@ test('evaluates the canonical analyzer "<key> ± N" form as a delta, never a str
   assert.deepEqual(evaluateMvuValueExpr('重伤-濒死', null, 'state'), { ok: true, value: '重伤-濒死' })
 })
 
+// M-28b：全角/数学运算符表达式不得走「裸词」分支落成字符串
+test('rejects full-width and math operator expressions instead of writing strings', () => {
+  const operators = ['＋', '－', '×', '÷', '＊', '／', '％', '−', '±']
+  for (const op of operators) {
+    const spaced = evaluateMvuValueExpr(`hp ${op} 10`, 100, 'hp')
+    assert.equal(spaced.ok, false, `"hp ${op} 10" must not be a string literal`)
+    assert.match(spaced.reason, /无法原生解释/)
+
+    const tight = evaluateMvuValueExpr(`hp${op}10`, 100, 'hp')
+    assert.equal(tight.ok, false, `"hp${op}10" must not be a string literal`)
+  }
+
+  // 任务点名的四个表达式 + 攻击力／2（U+FF0F）
+  for (const expr of ['hp ＋ 10', 'hp－10', 'hp×2', '攻击力／2']) {
+    const result = evaluateMvuValueExpr(expr, 100, 'hp')
+    assert.equal(result.ok, false, `${expr} must be rejected`)
+    assert.equal(typeof result.value, 'undefined')
+  }
+
+  // 进 plan 后落进 skipped，不产生 writes（数值变量不得被写成字符串）
+  const plan = planMvuInteraction(
+    {
+      element_label: '全角攻击',
+      actions: [
+        { kind: 'modify_variable', key: 'hp', value_expr: 'hp ＋ 10' },
+        { kind: 'modify_variable', key: 'mp', value_expr: 'mp×2' },
+        { kind: 'modify_variable', key: 'state', value_expr: '战斗中' },
+      ],
+    },
+    { variables: [{ key: 'hp', value: 100 }, { key: 'mp', value: 30 }] },
+  )
+  assert.deepEqual(plan.writes, [{ key: 'state', value: '战斗中' }])
+  assert.deepEqual(plan.skipped.map((s) => s.key), ['hp', 'mp'])
+
+  // 纯全角标点的裸词（无数字混排）不受影响
+  assert.deepEqual(evaluateMvuValueExpr('战斗中', null, 'state'), { ok: true, value: '战斗中' })
+})
+
 test('plans a mapping into writes, hints, and skipped entries', () => {
   const plan = planMvuInteraction(
     {

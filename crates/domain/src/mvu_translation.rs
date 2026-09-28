@@ -239,10 +239,18 @@ const THRESHOLD_SCRIPT_BYTES_HEAVY: usize = 5_000;
 /// 对卡的 JS 复杂度做纯启发式打分（设计 §19.5）。
 ///
 /// 判定规则（可解释，无 LLM）：
-///   - `document.` / `getElementById` / `innerHTML` 任意超过 heavy 阈值 → `Heavy`
-///   - script 总字节超过 5KB → `Heavy`
-///   - 有 script 但都简单（仅 MVU API 调用） → `RuleDriven`
-///   - 无 script 或纯占位 → `PureData`
+///   - `document.` ≥ [`THRESHOLD_DOCUMENT_HEAVY`] 或 `innerHTML` ≥
+///     [`THRESHOLD_INNERHTML_HEAVY`] → `Heavy`
+///   - 脚本源码字节 ≥ 5KB → `Heavy`
+///   - 有脚本但都简单（仅 MVU API 调用） → `RuleDriven`
+///   - 无脚本或纯占位 → `PureData`
+///
+/// `getElementById` / `$(...)` / `script_blocks` 仍计入 `counts` 明细供 Meta Agent
+/// 二次判定，但不直接参与 `Heavy` 门槛（D-20 文档漂移修正：此前注释声称
+/// `getElementById` 参与判定，代码里只有 `document.`/`innerHTML`）。
+///
+/// `depth_prompt.prompt` 等自然语言正文不计入**字节**阈值（D-10），否则纯文字卡
+/// 会被误判为 `Heavy`；正文仍参与模式计数（保留 depth_prompt 内嵌 JS 片段的历史支持）。
 ///
 /// 输出 [`CardComplexityReport`]，含 counts 明细，给 Meta Agent 当判据
 /// （它在启发式基础上做元素级二次判定，§19.4）。
@@ -250,21 +258,26 @@ pub fn score_card_complexity(
     assets: Option<&RenderableAssets>,
     extensions: &serde_json::Value,
 ) -> CardComplexityReport {
-    // 拼接所有 JS 源（renderable_assets.js + extensions 里可能的 depth_prompt / script 块）
-    let js_blob = collect_js_blob(assets, extensions);
+    // 拼接所有脚本源（renderable_assets.js + extensions 里可能的 script 块），
+    // 自然语言正文单独存放（D-10）
+    let sources = collect_script_sources(assets, extensions);
     let html_blob = assets.and_then(|a| a.html.clone()).unwrap_or_default();
+    // 模式计数沿用"脚本 + 内嵌脚本的正文"（depth_prompt 里确实可能内嵌 JS 片段，
+    // 见 test_complexity_collects_js_from_extensions_depth_prompt）；
+    // 但字节阈值只看真正的脚本源，避免长中文正文把纯文字卡顶成 Heavy（D-10）。
+    let pattern_blob = format!("{}{}", sources.code, sources.prose);
+    let script_bytes = sources.code.len();
 
-    let document_calls = count_occurrences(&js_blob, "document.");
-    let get_by_id_calls = count_occurrences(&js_blob, "getElementById");
-    let innerhtml_calls = count_occurrences(&js_blob, "innerHTML");
-    let script_blocks = count_script_blocks(&html_blob, &js_blob);
-    let script_bytes = js_blob.len();
-    let placeholder_calls = count_occurrences(&js_blob, "{{");
+    let document_calls = count_occurrences(&pattern_blob, "document.");
+    let get_by_id_calls = count_occurrences(&pattern_blob, "getElementById");
+    let innerhtml_calls = count_occurrences(&pattern_blob, "innerHTML");
+    let script_blocks = count_script_blocks(&html_blob, &pattern_blob);
+    let placeholder_calls = count_occurrences(&pattern_blob, "{{");
     let mvu_set_calls =
-        count_occurrences(&js_blob, "_.set") + count_occurrences(&js_blob, "setLocalVar");
+        count_occurrences(&pattern_blob, "_.set") + count_occurrences(&pattern_blob, "setLocalVar");
     let mvu_get_calls =
-        count_occurrences(&js_blob, "_.get") + count_occurrences(&js_blob, "getLocalVar");
-    let jq_calls = count_occurrences(&js_blob, "$(");
+        count_occurrences(&pattern_blob, "_.get") + count_occurrences(&pattern_blob, "getLocalVar");
+    let jq_calls = count_occurrences(&pattern_blob, "$(");
 
     let mut counts = HashMap::new();
     counts.insert("document_calls".into(), document_calls);
@@ -327,30 +340,42 @@ pub fn score_card_complexity(
     }
 }
 
-/// 把 assets.js + extensions 里可能的 JS 源拼到一起（粗略，给打分用）
-fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::Value) -> String {
-    let mut blob = String::new();
+/// 打分用的脚本源集合（D-10：JS 代码与自然语言正文必须分开）。
+struct CardScriptSources {
+    /// 真正的脚本源码：`assets.js`、`extensions.mvu.script`、`tavern_helper.scripts[].content`。
+    code: String,
+    /// 自然语言正文（`extensions.depth_prompt.prompt`）：不参与字节/DOM 阈值。
+    prose: String,
+}
+
+/// 把 assets.js + extensions 里可能的脚本源与自然语言正文分开收集（粗略，给打分用）
+fn collect_script_sources(
+    assets: Option<&RenderableAssets>,
+    extensions: &serde_json::Value,
+) -> CardScriptSources {
+    let mut code = String::new();
+    let mut prose = String::new();
     if let Some(a) = assets
         && let Some(js) = &a.js
     {
-        blob.push_str(js);
-        blob.push('\n');
+        code.push_str(js);
+        code.push('\n');
     }
-    // depth_prompt 可能内嵌 script
+    // depth_prompt 是自然语言指令，不是脚本：只进 prose（D-10）
     if let Some(dp) = extensions
         .get("depth_prompt")
         .and_then(|v| v.get("prompt"))
         .and_then(|v| v.as_str())
     {
-        blob.push_str(dp);
-        blob.push('\n');
+        prose.push_str(dp);
+        prose.push('\n');
     }
     // mvu 插件可能内嵌 script 字段
     if let Some(mvu) = extensions.get("mvu")
         && let Some(script) = mvu.get("script").and_then(|v| v.as_str())
     {
-        blob.push_str(script);
-        blob.push('\n');
+        code.push_str(script);
+        code.push('\n');
     }
     // 新一代卡（命定之诗/卿卿形态）：卡逻辑在 extensions.tavern_helper.scripts，
     // 只统计启用脚本；不统计会把 TH-only 卡误判为 PureData 并短路跳过 LLM 分析
@@ -365,12 +390,12 @@ fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::V
                 continue;
             }
             if let Some(content) = s.get("content").and_then(|v| v.as_str()) {
-                blob.push_str(content);
-                blob.push('\n');
+                code.push_str(content);
+                code.push('\n');
             }
         }
     }
-    blob
+    CardScriptSources { code, prose }
 }
 
 /// 计数 needle 在 haystack 里出现的次数（非重叠，字节级，够用）
@@ -640,5 +665,30 @@ mod tests {
         let report = score_card_complexity(None, &ext);
         assert_eq!(report.classification, CardComplexity::RuleDriven);
         assert_eq!(report.counts.get("mvu_set_calls"), Some(&1));
+    }
+
+    #[test]
+    fn test_complexity_long_prose_depth_prompt_is_not_script_heavy() {
+        // D-10：~2000 个中文字符的纯指令正文（>5000 字节）此前会把纯文字卡判成 Heavy
+        let prose = "请以冷静克制的笔调描述场景，并保持角色语气一致。".repeat(120);
+        assert!(
+            prose.len() > THRESHOLD_SCRIPT_BYTES_HEAVY,
+            "正文必须超过字节阈值"
+        );
+        let ext = serde_json::json!({ "depth_prompt": { "prompt": prose } });
+        let report = score_card_complexity(None, &ext);
+        assert_eq!(
+            report.classification,
+            CardComplexity::PureData,
+            "无 JS 的纯文字卡不得因正文长度被判 Heavy（D-10）：{:?}",
+            report.reasoning
+        );
+        assert_eq!(report.counts.get("script_bytes"), Some(&0));
+
+        // 同等字节量的真实脚本仍然是 Heavy（阈值本身不变）
+        let js = "var a = 1;".repeat(600);
+        let heavy = score_card_complexity(Some(&assets_with_js(&js)), &serde_json::json!({}));
+        assert_eq!(heavy.classification, CardComplexity::Heavy);
+        assert!(heavy.counts.get("script_bytes").unwrap() >= &THRESHOLD_SCRIPT_BYTES_HEAVY);
     }
 }

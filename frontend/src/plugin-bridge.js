@@ -16,6 +16,10 @@ export const MSG_MOUNT = 'sf:ui:mount'
 export const DEFAULT_PLUGIN_HOOK_TIMEOUT_MS = 5000
 export const PROMPT_HOOK_PERMISSION = 'ModifyPrompt'
 export const READ_MEMORY_PERMISSION = 'ReadMemory'
+// M-31c：chat.save 是写通道（当前 adapter 为 degraded no-op，注入真实 adapter
+// 后即落盘）。ST 的 saveChat 语义是「把当前聊天写回宿主」，因此与变量写同级的
+// 独立授权位。需要 Rust `Permission` 枚举同步增加该变体（见报告中的跨域依赖）。
+export const WRITE_CHAT_PERMISSION = 'WriteChat'
 
 // Host-side persistence adapters. Default import is a no-op until a host wires
 // a real adapter; this keeps `chat.save` deterministic and out of tauri-app.
@@ -97,15 +101,11 @@ function deriveSillyTavernHostEventNames(eventName, data = {}) {
 const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
 const HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER = new WeakMap()
 const MAX_DEDUPED_SAVE_CHAT_REQUESTS = 128
-
-function saveChatRequestsForAdapter(adapter) {
-  let requests = HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.get(adapter)
-  if (!requests) {
-    requests = new Map()
-    HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.set(adapter, requests)
-  }
-  return requests
-}
+// M-31b：storage 无权限无限额时可撑爆宿主 localStorage 配额（同一个 origin 下
+// 主应用的持久化与其它插件一起遭殃）。按「JSON 序列化后的字符数」设双限：
+// 单键上限 + 单插件总量上限，超限返回明确错误而非静默丢弃。
+export const MAX_PLUGIN_STORAGE_VALUE_CHARS = 256 * 1024
+export const MAX_PLUGIN_STORAGE_TOTAL_CHARS = 1024 * 1024
 
 function hostPluginStorageKey(pluginId, key) {
   return [
@@ -117,6 +117,81 @@ function hostPluginStorageKey(pluginId, key) {
 
 function legacyHostPluginStorageKey(pluginId, key) {
   return `sf_host_plugin_storage_${pluginId}_${key}`
+}
+
+function saveChatRequestsForAdapter(adapter) {
+  let requests = HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.get(adapter)
+  if (!requests) {
+    requests = new Map()
+    HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.set(adapter, requests)
+  }
+  return requests
+}
+
+function measurePluginStorageValue(value) {
+  try {
+    const serialized = JSON.stringify(value)
+    return serialized === undefined ? 0 : serialized.length
+  } catch {
+    // 不可序列化的值（循环引用/函数）本就写不进 localStorage，按 0 放行由
+    // writeHostPluginStorage 的兜底处理，不在这里报「超限」误导调用方。
+    return 0
+  }
+}
+
+/**
+ * 单插件已占用配额（按宿主 key 前缀扫描）。宿主 key 形态为
+ * `sf_host_plugin_storage:<encodedId>:<encodedKey>`；旧键形态
+ * `sf_host_plugin_storage_<id>_<key>` 前缀有歧义（id 含下划线时无法切分），
+ * 故只统计新键——旧键在读取时会被迁移，迁移当次不入账属可接受误差。
+ */
+function pluginStorageUsageChars(pluginId) {
+  const keyPrefix = `${hostPluginStorageKey(pluginId, '')}`
+  let total = 0
+  const addValue = (raw) => {
+    if (typeof raw === 'string') total += raw.length
+  }
+  // localStorage 与进程内兜底表在写入时同步，但同时统计会双算——只取其一。
+  let usedLocalStorage = false
+  try {
+    const storage = typeof globalThis !== 'undefined' ? globalThis.localStorage : null
+    if (storage && typeof storage.length === 'number' && typeof storage.key === 'function') {
+      usedLocalStorage = true
+      for (let index = 0; index < storage.length; index += 1) {
+        const storageKey = storage.key(index)
+        if (typeof storageKey === 'string' && storageKey.startsWith(keyPrefix)) {
+          addValue(storage.getItem(storageKey))
+        }
+      }
+    }
+  } catch {
+    // localStorage 不可用（隐私模式/配额异常）时退回进程内表统计。
+    usedLocalStorage = false
+  }
+  if (!usedLocalStorage) {
+    for (const [storageKey, value] of HOST_PLUGIN_STORAGE_FALLBACK) {
+      if (storageKey.startsWith(keyPrefix)) addValue(JSON.stringify(value) ?? '')
+    }
+  }
+  return total
+}
+
+/**
+ * 校验一次 storage.set 是否可写；返回 null 表示放行，否则返回错误文案。
+ * 总量按「同一插件前缀下所有键的 JSON 字符数」计算，并用被覆盖的旧值做替换
+ * 修正（否则覆盖写会被误判为新增超限）。
+ */
+export function checkPluginStorageQuota(pluginId, key, value, previousValue = null) {
+  const currentChars = measurePluginStorageValue(value)
+  if (currentChars > MAX_PLUGIN_STORAGE_VALUE_CHARS) {
+    return `插件存储单键超限: ${key} 需要 ${currentChars} 字符，上限 ${MAX_PLUGIN_STORAGE_VALUE_CHARS}`
+  }
+  const replacedChars = measurePluginStorageValue(previousValue)
+  const totalChars = pluginStorageUsageChars(pluginId) - replacedChars + currentChars
+  if (totalChars > MAX_PLUGIN_STORAGE_TOTAL_CHARS) {
+    return `插件存储总量超限: 需要 ${totalChars} 字符，上限 ${MAX_PLUGIN_STORAGE_TOTAL_CHARS}`
+  }
+  return null
 }
 
 function readHostPluginStorageByKey(storageKey) {
@@ -189,10 +264,12 @@ export const API_METHODS = {
   'variables.get':    { permission: 'ReadVariables',     command: 'plugin_get_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId }) },
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
-  'storage.set':      { permission: null,              command: null },
+  'storage.set':      { permission: null,              command: null },  // 本地 localStorage，不走后端（配额门见 createHostHandler）
   // Host-side adapter routes (no backend command). Defaults are degraded shims;
   // production can inject real adapters without editing tauri-app storage code.
-  'chat.save':        { permission: null,              command: null },
+  // M-31c：chat.save 无权限门控时是「无 ReadMemory 也能用的写通道」——adapter
+  // 换成真实持久化后即成为插件直接改写宿主聊天的通道，故补独立授权位。
+  'chat.save':        { permission: WRITE_CHAT_PERMISSION, command: null },
   'ui.popup':         { permission: null,              command: null },
   'ui.requestHeaders':{ permission: null,              command: null },
   // Gate 8 复评：后端 start_writing 的 on_event 是必填 Channel，插件沙箱
@@ -262,6 +339,17 @@ const SENSITIVE_EVENT_FIELDS = new Set([
   'secret',
   'credential',
   'privatememory',
+  // M-22：PipelineEvent::SubagentDone 的 payload 用 `full_text` 承载整段生成
+  // 正文（commands/writing.rs:394-405），归一化后是 `fulltext`——不在此表内
+  // 即等于给无 ReadMemory 的 `*` 订阅者开了一条正文旁路。
+  'fulltext',
+  // quality_checked 的 warnings 是 QualityWarning.message（含 n-gram 重复样本
+  // 与元描述片段，见 app-pipeline/quality_gate.rs:79,114），同样是草稿正文。
+  'warnings',
+  // reason 在前端多数事件里是枚举值（edit/reroll/…），但 postprocess_failed /
+  // postprocess_skipped 的 reason 是后端自由文本；与已列的 error/message 同族，
+  // 一并收口（代价：无 ReadMemory 插件不再收到 CHAT_CHANGED.reason）。
+  'reason',
 ])
 
 function isSensitiveEventField(key) {
@@ -480,7 +568,12 @@ export function postPluginEventToTarget(target, pluginEvent, targetOrigin = '*')
   return true
 }
 
-export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin()) {
+/**
+ * M-24：宿主为每份插件文档生成的一次性握手令牌。它只经由本函数嵌入该文档的
+ * 桥脚本，因此只有「确实拿到了这份文档」的浏览上下文才能回传它——帧自我导航
+ * 后替换进来的新文档没有该令牌，宿主据此把该帧重新降级为不可信。
+ */
+export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin(), nonce = '') {
   const targetOrigin = normalizeTargetOrigin(hostOrigin)
   return `<script>
 (function() {
@@ -1731,7 +1824,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   });
 
   _loadExtensionSettingsFromHost();
-  _postToHost({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} });
+  _postToHost({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)}, handshake: ${JSON.stringify(String(nonce || ''))} });
 })();
 <\/script>`
 }
@@ -1810,6 +1903,21 @@ export function createHostHandler(plugin, invoke, options = {}) {
     }
     if (data.method === 'storage.set') {
       const { key, value } = data.params || {}
+      // M-31b：配额门在写之前，超限报明确错误（不静默丢数据）。
+      const quotaError = checkPluginStorageQuota(
+        plugin.id,
+        key,
+        value,
+        readHostPluginStorage(plugin.id, key),
+      )
+      if (quotaError) {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          error: quotaError,
+        })
+        return
+      }
       writeHostPluginStorage(plugin.id, key, value)
       postResponse(event, {
         type: MSG_RESPONSE,
@@ -1818,25 +1926,9 @@ export function createHostHandler(plugin, invoke, options = {}) {
       })
       return
     }
-    if (data.method === 'chat.save') {
-      // Every same-snapshot retry joins this host-local promise. This protects
-      // the actual durable adapter, not just the iframe's late UI response.
-      try {
-        const result = await persistChatIdempotently(data.params || {})
-        postResponse(event, {
-          type: MSG_RESPONSE,
-          id: data.id,
-          result,
-        })
-      } catch {
-        postResponse(event, {
-          type: MSG_RESPONSE,
-          id: data.id,
-          result: { ok: false, degraded: true, reason: 'persist_failed', persistedAt: null },
-        })
-      }
-      return
-    }
+    // M-31c：chat.save 曾在此与 ui.popup 并列「免权限直通」，等于给无 ReadMemory
+    // 的插件开了一条写通道（adapter 换成真实持久化后即落盘）。现在它落到下面的
+    // requiredPermissions(WriteChat) 门，adapter 默认仍是 degraded no-op。
     if (data.method === 'ui.popup') {
       const popupAdapter = options.popupAdapter || defaultAdapters.popup
       try {
@@ -1882,6 +1974,27 @@ export function createHostHandler(plugin, invoke, options = {}) {
         id: data.id,
         error: `权限不足: 需要 ${permissions.join(' 或 ')}`,
       })
+      return
+    }
+
+    // M-31c：chat.save 走宿主持久化 adapter（无后端 command，默认 degraded）。
+    // Every same-snapshot retry joins this host-local promise. This protects
+    // the actual durable adapter, not just the iframe's late UI response.
+    if (data.method === 'chat.save') {
+      try {
+        const result = await persistChatIdempotently(data.params || {})
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result,
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { ok: false, degraded: true, reason: 'persist_failed', persistedAt: null },
+        })
+      }
       return
     }
 

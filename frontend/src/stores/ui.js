@@ -50,7 +50,11 @@ export const useUiStore = defineStore('ui', () => {
   })
 
   // actions:视图切换(App.vue:92-94)
-  // viewWrite(94)是死代码(声明后未被调用),不迁移。
+  // F-39：原注释称 "viewWrite(94)是死代码(声明后未被调用),不迁移" —— 与事实相反，
+  // AppV2 在写作/概览切换时调用 ui.viewWrite()。真正零外部调用的是
+  // powerMode / togglePower / viewOverview（仅 stores/ui.js 自身与
+  // stores/ui.test.mjs 引用），保留是因为它们是既有 UI 契约的一部分，
+  // 删除需连同测试一起动，超出本域修复范围（见修复记录 F-39）。
   function viewHistory() {
     showHistory.value = true
     activeCampaignOverview.value = false

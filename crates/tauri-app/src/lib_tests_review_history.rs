@@ -376,9 +376,11 @@ fn review_bundle_to_st_export_preserves_campaign_worldbook() {
             .storage()
             .import_campaign_bundle(serde_json::from_str(&bundle).unwrap(), &target.conv_store)
             .unwrap();
-        let result = crate::commands::import_export::export_campaign_st_cards(
-            imported.campaign_id,
-            tauri_state_for_test(&target),
+        // T-12：命令改为 async + spawn_blocking 后，同步测试改调用同步实现体
+        // （async 包装只做 storage 克隆与线程卸载，逻辑全在 impl 内）。
+        let result = crate::commands::import_export::export_campaign_st_cards_impl(
+            target.storage(),
+            &imported.campaign_id,
         )
         .unwrap();
         let shared: StWorldInfoBook = serde_json::from_str(&result.lorebook_json).unwrap();

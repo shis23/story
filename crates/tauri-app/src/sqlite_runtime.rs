@@ -516,15 +516,18 @@ fn with_active_turn_mutation<R>(
             .map_err(|e| e.to_string())?;
         let tx = uow.transaction().map_err(|e| e.to_string())?;
         // 前置：活动 Turn 检查在事务内执行（与写入同事务）。
+        // S-20：active 状态清单一律取自 infra 唯一来源常量。
         let active_turn_id: Option<String> = tx
             .query_row(
-                r#"
+                &format!(
+                    r#"
                 SELECT turn_id FROM turns
                 WHERE campaign_id = ?1
-                  AND status IN ('generating', 'draft_ready', 'deriving_state',
-                                 'awaiting_acceptance', 'committing')
+                  AND status IN ({})
                 LIMIT 1
                 "#,
+                    storyforge_infra_sqlite::production::ACTIVE_TURN_STATUS_SQL
+                ),
                 [campaign_id.as_str()],
                 |row| row.get(0),
             )
@@ -1128,11 +1131,22 @@ pub fn accept_by_variant(
     // mismatch even when that id does not exist in SQLite.
     ensure_accept_scope(campaign_id, conversation_id, &turn)?;
 
+    // S-22.8：优先取「活动（AwaitingAcceptance）Attempt」，只有在没有活动 Attempt
+    // 时才回退到任意状态（终态 Attempt 供 V7 幂等重放 / typed 错误分类使用）。
+    // 旧实现直接 `.rev().find(variant)`——若同一变体下新旧 Attempt 并存且顺序异常，
+    // 会把未提交/被替换的 Attempt 当成 accept 目标，与 JSON 侧
+    // `find_attempt_by_variant`（仅活动）语义分叉。
     let attempt = turn
         .attempts
         .iter()
         .rev()
-        .find(|a| a.variant_id == *variant_id)
+        .find(|a| a.variant_id == *variant_id && a.status == AttemptStatus::AwaitingAcceptance)
+        .or_else(|| {
+            turn.attempts
+                .iter()
+                .rev()
+                .find(|a| a.variant_id == *variant_id)
+        })
         .cloned()
         .ok_or(AcceptError::NoAttempt)?;
 
@@ -1145,13 +1159,21 @@ pub fn accept_by_variant(
     let conversation = get_conversation(conversation_id)
         .map_err(AcceptError::Storage)?
         .ok_or_else(|| AcceptError::Storage(format!("conversation {conversation_id} missing")))?;
-    let current_text = conversation
+    // S-16 同语义（SQLite 侧）：正文读不出来必须与「draft_hash 不匹配」区分。
+    // 旧实现 `.unwrap_or_default()` 把「节点缺失 / 无 active 版本」折叠成空串，
+    // 最终报 DraftHashMismatch（"草稿被编辑"），把结构性问题误报成用户编辑。
+    let node = conversation
         .nodes
         .iter()
         .find(|n| n.id == *variant_id)
-        .and_then(|n| n.active())
-        .map(|v| v.content.clone())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            AcceptError::VariantContentUnavailable(format!(
+                "会话 {conversation_id} 中缺少节点 {variant_id}"
+            ))
+        })?;
+    let current_text = node.active().map(|v| v.content.clone()).ok_or_else(|| {
+        AcceptError::VariantContentUnavailable(format!("节点 {variant_id} 没有 active 版本"))
+    })?;
 
     let camp = get_campaign(&turn.campaign_id)
         .map_err(AcceptError::Storage)?
@@ -1254,8 +1276,17 @@ pub fn accept_by_variant(
             // 会让调用方跳过 conversation invalidate 与后续动作。
             let campaign_revision_after = batch.target_revision;
 
-            let _ = outcome; // Applied | AlreadyCommitted — both OK for the caller.
-            let _ = matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted);
+            // S-20：这里曾有两句纯死代码 `let _ = outcome;` /
+            // `let _ = matches!(outcome, AlreadyCommitted);`——它们暗示
+            // Applied/AlreadyCommitted 被有意区分后又忽略。两者对调用方语义相同
+            // （都是「提交已生效」），但排障需要留下可观测信号：记录下来。
+            if matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted) {
+                tracing::info!(
+                    turn_id = %turn_id,
+                    attempt_id = %attempt_id,
+                    "accept_turn replayed an already-committed attempt (idempotent replay)"
+                );
+            }
 
             Ok(AcceptOutcome {
                 turn_id,

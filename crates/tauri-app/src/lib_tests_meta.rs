@@ -486,6 +486,7 @@ fn test_meta_accept_typed_patch_prune_task_refs() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_id: Some(campaign.id.as_str().to_string()),
         campaign_revision: None,
     };
 
@@ -601,6 +602,7 @@ fn test_meta_accept_typed_patch_stale() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_id: Some(campaign.id.as_str().to_string()),
         campaign_revision: None,
     };
 
@@ -710,6 +712,7 @@ fn test_meta_accept_typed_patch_preflights_all_actions_before_writing() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_id: Some(campaign.id.as_str().to_string()),
         campaign_revision: None,
     };
     {
@@ -843,6 +846,7 @@ fn test_meta_accept_typed_patch_rejects_stale_definition_binding() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_id: Some(campaign.id.as_str().to_string()),
         campaign_revision: None,
     };
     {
@@ -910,6 +914,7 @@ fn test_typed_patch_pending_dedupe_canonicalizes_unordered_actions() {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: storyforge_app_meta::TypedPatchStatus::Pending,
+            campaign_id: Some("campaign-dedupe".into()),
             campaign_revision: None,
         }
     };
@@ -936,6 +941,7 @@ fn test_meta_dismiss_typed_patch() {
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: storyforge_app_meta::TypedPatchStatus::Pending,
+        campaign_id: Some("campaign-dismiss".into()),
         campaign_revision: None,
     };
 
@@ -1069,6 +1075,7 @@ fn typed_patch_preconditions_share_one_pure_function_between_preview_and_accept(
         diff: vec![],
         created_at: chrono::Utc::now(),
         status: TypedPatchStatus::Pending,
+        campaign_id: Some(campaign.id.as_str().to_string()),
         campaign_revision: None,
     };
     validate_patch_preconditions(&ok_patch, &input).expect("匹配的前置条件应通过");
@@ -1103,4 +1110,215 @@ fn typed_patch_preconditions_share_one_pure_function_between_preview_and_accept(
         ..ok_patch.clone()
     };
     validate_patch_preconditions(&missing_patch, &input).expect_err("target 缺失应被纯函数拒绝");
+}
+
+/// M-11 回归：卡缺失时 Meta 快照必须 fail closed，**不能**降级为空 definitions。
+/// 空定义集会把每个带 definition_id 的实例判成 orphan_instance，并生成"解绑
+/// definition 转临时角色"的破坏性提案（接受后 is_temporary = true，persona/
+/// schema 全部脱离）。SQLite 路径本来就 fail closed，这里钉住 JSON 路径对齐。
+#[test]
+fn test_meta_snapshot_fails_closed_when_card_is_missing() {
+    let dir = std::env::temp_dir().join(format!("sf_test_missing_card_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = campaign_store::CampaignStore::new(&dir);
+
+    let campaign = storyforge_domain::campaign::Campaign::new(Id::from_str("card-missing"), "run");
+    store.save_campaign(campaign.clone()).unwrap();
+
+    let err = match crate::commands::meta_typed::load_meta_snapshot_from_store(&store, &campaign.id)
+    {
+        Ok(_) => panic!("卡缺失必须 fail closed，不能按空 definitions 体检"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("卡不存在"),
+        "unexpected error: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-03 回归：A 战役提议的 patch 不能应用到 B 战役。
+///
+/// 旧实现 accept 只信入参 campaign_id；`UpdateCampaignVariable` 没有 target id，
+/// 所以"A 战役的提案写进 B 战役"真的会落盘。既有的跨战役用例都用带 target id
+/// 的 action，会被 target 查找先拒绝，覆盖不到这条路径——本用例专门用无 target
+/// 的 action 钉住绑定校验（preview stale + accept 拒绝 + B 未被写脏 + A 仍可用）。
+#[test]
+fn test_meta_typed_patch_is_bound_to_its_campaign() {
+    use storyforge_app_meta::{TypedPatch, TypedPatchAction, TypedPatchStatus};
+
+    let dir = std::env::temp_dir().join(format!("sf_test_patch_campaign_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = campaign_store::CampaignStore::new(&dir);
+
+    // 卡必须真实存在：M-11 之后快照在卡缺失时直接报错。
+    let card = storyforge_domain::character::CharacterCard {
+        id: Id::from_str("card-1"),
+        name: "测试卡".into(),
+        source_character_id: Id::from_str("src-1"),
+        character_definitions: vec![],
+        campaign_variable_schema: vec![],
+        raw_card_json: serde_json::Value::Null,
+        extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+        extraction_message: None,
+    };
+    store.save_card(card).unwrap();
+
+    let campaign_a = storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "run-a");
+    let campaign_b = storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "run-b");
+    store.save_campaign(campaign_a.clone()).unwrap();
+    store.save_campaign(campaign_b.clone()).unwrap();
+
+    let state = AppState::new_for_test();
+    let patch = TypedPatch {
+        id: "test-cross-campaign".into(),
+        description: "改 weather".into(),
+        source_issue_category: "agent_proposed".into(),
+        affected_id: Some("weather".into()),
+        actions: vec![TypedPatchAction::UpdateCampaignVariable {
+            key: "weather".into(),
+            value: serde_json::json!("storm"),
+        }],
+        diff: vec![],
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+        campaign_id: Some(campaign_a.id.as_str().to_string()),
+        campaign_revision: None,
+    };
+    state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(patch);
+
+    // 1. 在 B 战役上 accept 必须被拒绝，且 B 未被写脏。
+    //    注意顺序：先 accept 再 preview——preview 会把绑定不符的 patch 标 Stale，
+    //    之后的 accept 会先撞上"状态不是 Pending"从而掩盖绑定校验。
+    //    另外 `Campaign::new` 会播种默认 campaign 变量（weather 默认 "晴"），
+    //    所以"未被写脏"的判据是"值不变"，而不是"键不存在"。
+    let weather_before = store
+        .get_campaign(&campaign_b.id)
+        .unwrap()
+        .get_variable("weather")
+        .cloned();
+    let err = meta_accept_typed_patch_in_store(
+        &store,
+        "test-cross-campaign",
+        campaign_b.id.as_str(),
+        &state,
+    )
+    .expect_err("跨战役 accept 必须被拒绝");
+    assert!(
+        err.to_string().contains("未绑定当前 Campaign"),
+        "unexpected error: {err:?}"
+    );
+    let weather_after_b = store
+        .get_campaign(&campaign_b.id)
+        .unwrap()
+        .get_variable("weather")
+        .cloned();
+    assert_eq!(
+        weather_after_b, weather_before,
+        "B 战役的 weather 必须保持原值（不得被 A 战役的 patch 写脏）"
+    );
+    assert_ne!(
+        weather_after_b,
+        Some(serde_json::json!("storm")),
+        "A 战役 patch 的值不得出现在 B 战役"
+    );
+
+    // 2. 在 B 战役上 preview 必须 stale，而不是"看起来可以接受"。
+    let preview = meta_preview_typed_patch_in_store(
+        &store,
+        "test-cross-campaign",
+        campaign_b.id.as_str(),
+        &state,
+    )
+    .unwrap();
+    assert_eq!(preview["stale"], serde_json::json!(true));
+    assert_eq!(preview["reason"], serde_json::json!("campaign_mismatch"));
+
+    // 3. 回到 A 战役（重新置 Pending）仍可正常接受，变量写在 A。
+    {
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let patch = typed
+            .iter_mut()
+            .find(|p| p.id == "test-cross-campaign")
+            .unwrap();
+        patch.status = TypedPatchStatus::Pending;
+    }
+    meta_accept_typed_patch_in_store(
+        &store,
+        "test-cross-campaign",
+        campaign_a.id.as_str(),
+        &state,
+    )
+    .expect("A 战役自己的 patch 必须可以接受");
+    assert_eq!(
+        store
+            .get_campaign(&campaign_a.id)
+            .unwrap()
+            .get_variable("weather"),
+        Some(&serde_json::json!("storm")),
+        "A 战役应写入 weather"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-08 回归：prompt hook 的 messages 级改写必须在后端复核"谁改的 + 有没有
+/// `ModifyPrompt`"。旧实现只认 request_id，唯一门禁是前端 `canModifyPrompt`
+/// （前端不是安全边界，M-01 下壳 iframe 还能直接 invoke）。判定核心已抽成
+/// `prompt_mutation_denial` 以便直接单测。
+#[test]
+fn prompt_hook_mutation_requires_a_permissioned_modifier_plugin() {
+    use storyforge_infra_plugin_host::{Permission, PluginManifest, PluginRegistry};
+
+    fn manifest(id: &str, permissions: Vec<Permission>) -> PluginManifest {
+        PluginManifest {
+            id: id.into(),
+            name: id.into(),
+            version: "1.0.0".into(),
+            permissions,
+            entry_html: String::new(),
+            ui_slots: vec![],
+            event_subscriptions: vec!["CHAT_COMPLETION_PROMPT_READY".into()],
+            description: None,
+            author: None,
+        }
+    }
+
+    let registry = PluginRegistry::new();
+    registry
+        .install(manifest("hook-ok", vec![Permission::ModifyPrompt]))
+        .unwrap();
+    registry
+        .install(manifest("hook-noperm", vec![Permission::ReadMemory]))
+        .unwrap();
+    registry
+        .install(manifest("hook-disabled", vec![Permission::ModifyPrompt]))
+        .unwrap();
+    registry.set_enabled("hook-disabled", false).unwrap();
+
+    let denial = |plugin_id: Option<&str>, ids: Option<&[String]>| {
+        crate::commands::plugins::prompt_mutation_denial(&registry, plugin_id, ids)
+    };
+
+    // 1. 没有声明任何改写者（旧前端）→ 拒绝，安全降级为"不改写"。
+    assert!(denial(None, None).is_some());
+    assert!(denial(Some("   "), None).is_some());
+    // 2. 未注册 / 无 ModifyPrompt / 已禁用 → 拒绝。
+    assert!(denial(Some("ghost"), None).is_some());
+    assert!(denial(Some("hook-noperm"), None).is_some());
+    assert!(denial(Some("hook-disabled"), None).is_some());
+    // 3. 声明了多个改写者、其中一个不合格 → 整体拒绝（不做部分授权）。
+    assert!(denial(Some("hook-ok"), Some(&["hook-noperm".to_string()])).is_some());
+    // 4. 只有持 ModifyPrompt 的启用插件 → 放行；单值形式与列表形式等价。
+    assert!(denial(Some("hook-ok"), None).is_none());
+    assert!(denial(None, Some(&["hook-ok".to_string()])).is_none());
+    assert!(denial(Some("hook-ok"), Some(&["hook-ok".to_string()])).is_none());
 }

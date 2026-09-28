@@ -366,6 +366,49 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_secret_ref_fails_closed_without_ref_as_key_fallback() {
+        // 跨域复核项（域1 报告）：SecretRef 解析失败时**绝不能**退回把 ref 文本
+        // 当成密钥（否则后续读取必然失败，且把引用结构写进了"密钥"位置）。
+        // 场景：换机器 / 用户清了系统凭据库 → ref 在盘上、条目不存在。
+        let (store, secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("llm-1")).unwrap();
+        let saved_ref = store.get("llm-1").unwrap().connection.api_key.clone();
+        assert!(
+            saved_ref.starts_with(storyforge_infra_util::secret_store::SECRET_REF_PREFIX),
+            "save 必须把明文迁移成 SecretRef，got: {saved_ref}"
+        );
+
+        // 凭据库条目消失（ref 仍在盘上）。
+        secret_store.secrets.lock().unwrap().clear();
+
+        let err = store
+            .resolved("llm-1")
+            .expect_err("SecretRef 解析失败必须返回 Err（fail-closed）");
+        assert!(
+            err.contains("missing secret"),
+            "错误必须来自凭据库查询，got: {err}"
+        );
+        assert!(
+            store.set_active("llm-1").is_err(),
+            "无法解析密钥时不得把连接设为活跃（不得降级成 ref-as-key）"
+        );
+        assert!(
+            store.active_connection().is_none(),
+            "解析失败时必须返回 None，而不是带 ref 文本的连接"
+        );
+
+        // 盘上与凭据库都不得出现「把 ref 当密钥」的痕迹。
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(raw.contains(&saved_ref), "盘上仍应是同一个 SecretRef");
+        let secrets = secret_store.secrets.lock().unwrap();
+        assert!(
+            !secrets.contains_key(&saved_ref),
+            "解析失败不得把 ref 文本回写进凭据库（自指条目）"
+        );
+        assert!(secrets.is_empty(), "失败路径不得写入任何条目");
+    }
+
+    #[test]
     fn test_save_list_delete() {
         let store = temp_store();
         store.save(make_conn("deepseek-1")).unwrap();

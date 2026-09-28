@@ -2,7 +2,9 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <!-- F-38：去掉 maximum-scale=1.0 / user-scalable=no —— 禁止双指缩放会让
+         移动端低视力用户无法放大（WCAG 1.4.4）。viewport-fit=cover 保留。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#f4f6f8" />
     <title>StoryForge</title>
     <script>

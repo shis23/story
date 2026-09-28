@@ -6,7 +6,6 @@ pub mod llm_parse;
 /// - 委派（spawn_subagents：tokio::spawn + watch 取消 + 并发上限 4）
 /// - 工具注册（search_world_info / get_character / emit_plan / compose）
 pub mod runtime;
-pub mod tool_center;
 pub mod tools;
 
 pub mod character_extractor;
@@ -32,9 +31,9 @@ pub use prompts::character_extractor::{
 };
 pub use runtime::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
-    SUBAGENT_HINT_MARKER, inject_hint_into_editor, inject_hint_into_subagent, spawn_subagents,
+    SUBAGENT_HINT_MARKER, format_context_stable, format_context_volatile, inject_hint_into_editor,
+    inject_hint_into_subagent, spawn_subagents,
 };
-pub use tool_center::{ToolCenter, ToolScope, ToolSummary, role_matches};
 pub use tools::{
     ChronicleToolBudget, ToolContext, ToolError, ToolRegistry, filter_registry_by_whitelist,
 };

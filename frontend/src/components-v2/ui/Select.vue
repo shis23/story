@@ -13,6 +13,16 @@ const props = defineProps({
   placeholder: { type: String, default: '' },
   disabled: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
+  /**
+   * F-22：下拉默认是按钮旁的 `absolute` 面板，祖先若为 `overflow-hidden`
+   * （DataTable / DataList / Overlay 内容井）会被裁剪。放进这类容器时传
+   * `portal` 把面板挂到 body；代价是定位不再跟随按钮，需要自行确保视口内可见。
+   *
+   * 注意必须用 Vue 内置 `<Teleport :disabled>`：headlessui v1.7 的 `Portal`
+   * 只有 `as` 一个 prop（**没有** disabled/enabled），它永远 teleport，用它做开关
+   * 会让 `portal=false` 也挂到 body（并把面板从按钮定位上下文里摘出去）。
+   */
+  portal: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
 
@@ -55,14 +65,16 @@ const selectedLabel = computed(() => {
       </ListboxButton>
 
       <!-- Vue 原生 Transition：ListboxOptions 关闭时自行卸载，leave 动画由 Transition 接管 -->
-      <Transition
-        enter-active-class="transition ease-soft duration-150"
-        enter-from-class="opacity-0 -translate-y-1"
-        enter-to-class="opacity-100 translate-y-0"
-        leave-active-class="transition ease-soft duration-100"
-        leave-from-class="opacity-100 translate-y-0"
-        leave-to-class="opacity-0 -translate-y-1"
-      >
+      <!-- portal=true 时挂到 body（Vue 内置 Teleport 支持 :disabled；headlessui Portal 不支持） -->
+      <Teleport to="body" :disabled="!portal">
+        <Transition
+          enter-active-class="transition ease-soft duration-150"
+          enter-from-class="opacity-0 -translate-y-1"
+          enter-to-class="opacity-100 translate-y-0"
+          leave-active-class="transition ease-soft duration-100"
+          leave-from-class="opacity-100 translate-y-0"
+          leave-to-class="opacity-0 -translate-y-1"
+        >
         <ListboxOptions
           class="absolute left-0 z-[var(--z-overlay)] mt-1 w-full max-h-60 overflow-auto bg-surface border border-line rounded-lg shadow-rise py-1 focus:outline-none"
         >
@@ -94,7 +106,8 @@ const selectedLabel = computed(() => {
             </li>
           </ListboxOption>
         </ListboxOptions>
-      </Transition>
+        </Transition>
+      </Teleport>
     </div>
   </Listbox>
 </template>

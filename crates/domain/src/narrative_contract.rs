@@ -224,8 +224,15 @@ impl NarrativeContract {
     }
 
     /// 某条 secret 是否属于指定 owner
+    ///
+    /// §5.2-1：空串必须直接返回 None——`contains("")` 恒真，缺这个守卫会
+    /// 把"没有 secret"误判成"属于第一个 binding"。今天调用方有长度前置守卫，
+    /// 这里补上以免未来新调用方踩坑。
     pub fn owner_of_secret(&self, secret: &str) -> Option<&str> {
         let secret = secret.trim();
+        if secret.is_empty() {
+            return None;
+        }
         self.private_bindings
             .iter()
             .find(|b| b.secret == secret || secret.contains(&b.secret) || b.secret.contains(secret))
@@ -233,8 +240,13 @@ impl NarrativeContract {
     }
 
     /// 查找绑定：优先 exact secret，再 probes / contains
+    ///
+    /// §5.2-1：空 probe 同样必须返回 None（`contains("")` 恒真）。
     pub fn binding_for_probe(&self, probe: &str) -> Option<&PrivateBinding> {
         let probe = probe.trim();
+        if probe.is_empty() {
+            return None;
+        }
         self.private_bindings.iter().find(|b| {
             if b.secret == probe {
                 return true;
@@ -460,5 +472,33 @@ mod tests {
         assert!(plan.scene_plan.is_none());
         assert!(plan.subagent_tasks[0].current_desire.is_none());
         assert!(plan.subagent_tasks[0].emotion_stage.is_none());
+    }
+
+    #[test]
+    fn empty_secret_or_probe_never_matches_a_binding() {
+        // §5.2-1：`contains("")` 恒真，空输入必须 fail closed 返回 None
+        let contract = NarrativeContract {
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-lin".into(),
+                owner_name: None,
+                secret: "SF_SECRET_LIN_VAULT_0427".into(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(contract.owner_of_secret(""), None);
+        assert_eq!(contract.owner_of_secret("   "), None);
+        assert!(contract.binding_for_probe("").is_none());
+        assert!(contract.binding_for_probe("  ").is_none());
+        // 正常路径不受影响
+        assert_eq!(
+            contract.owner_of_secret("SF_SECRET_LIN_VAULT_0427"),
+            Some("inst-lin")
+        );
+        assert!(
+            contract
+                .binding_for_probe("SF_SECRET_LIN_VAULT_0427")
+                .is_some()
+        );
     }
 }

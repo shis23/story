@@ -67,8 +67,13 @@ test('writing adapter exposes and updates the campaign generation mode', () => {
   assert.equal(screenProps.value.generationMode, 'sequential_crew')
   assert.equal(screenProps.value.allowPartialReroll, false)
 
+  // W-31 / N-R2-09：`big_scene` 已从前端档位集合移除（后端仍保留兼容模式），因此
+  // 选中它必须是**空操作**——既不能切到看不见的档位，也不能把 allowPartialReroll
+  // 打开成 legacy 局部重 roll。
   screenEvents['update-generation-mode']('big_scene')
-  assert.equal(screenProps.value.allowPartialReroll, true)
+  assert.equal(writing.generationMode, 'sequential_crew')
+  assert.equal(screenProps.value.generationMode, 'sequential_crew')
+  assert.equal(screenProps.value.allowPartialReroll, false)
 })
 
 test('writing adapter exposes turn receipt and forwards postprocess retry', async () => {

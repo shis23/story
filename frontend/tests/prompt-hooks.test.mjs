@@ -9,6 +9,7 @@ import {
   resolveHookedIntent,
   resolveHookedMessages,
   summarizePromptHookPayload,
+  validateHookedMessages,
 } from '../src/utils/promptHooks.js'
 
 test('runs prompt hook plugins sequentially and skips plugins without ModifyPrompt', async () => {
@@ -203,6 +204,277 @@ test('resolves backend prompt hook messages with original fallback', () => {
 
   assert.equal(resolveHookedMessages({ messages: hookedMessages }, originalMessages), hookedMessages)
   assert.equal(resolveHookedMessages({ messages: null }, originalMessages), originalMessages)
+})
+
+// ─── M-21a: messages 结构校验（角色白名单 / 非空 / 保留原 system）────────────
+
+test('validateHookedMessages rejects empty, malformed, and system-replacing results', () => {
+  const original = [
+    { role: 'system', content: 'backend system prompt' },
+    { role: 'user', content: 'hello' },
+  ]
+
+  assert.deepEqual(validateHookedMessages(original, { originalMessages: original }), { ok: true })
+  // 追加一条插件自己的 system 消息：原始那条仍在 → 允许
+  assert.deepEqual(
+    validateHookedMessages(
+      [...original, { role: 'system', content: 'plugin extra instruction' }],
+      { originalMessages: original },
+    ),
+    { ok: true },
+  )
+
+  assert.equal(validateHookedMessages([], { originalMessages: original }).reason, 'messages_empty')
+  assert.equal(validateHookedMessages(null, { originalMessages: original }).reason, 'messages_not_an_array')
+  assert.equal(validateHookedMessages('nope', { originalMessages: original }).reason, 'messages_not_an_array')
+  assert.equal(validateHookedMessages([null], {}).reason, 'message_0_not_an_object')
+  assert.equal(
+    validateHookedMessages([{ role: 'developer', content: 'x' }], {}).reason,
+    'message_0_invalid_role',
+  )
+  assert.equal(
+    validateHookedMessages([{ role: 'user', content: 42 }], {}).reason,
+    'message_0_invalid_content',
+  )
+  // 替换系统指令：原始 system 内容必须原样保留
+  assert.equal(
+    validateHookedMessages(
+      [{ role: 'system', content: 'evil system' }, { role: 'user', content: 'hello' }],
+      { originalMessages: original },
+    ).reason,
+    'system_message_not_preserved',
+  )
+})
+
+test('resolveHookedMessages ignores invalid mutations and reports them', () => {
+  const original = [
+    { role: 'system', content: 'backend system prompt' },
+    { role: 'user', content: 'hello' },
+  ]
+  const rejected = []
+  const report = (message) => rejected.push(message)
+
+  // 空数组 = 清空提示词
+  assert.equal(
+    resolveHookedMessages({ messages: [] }, original, { onInvalid: report }),
+    original,
+  )
+  // 替换 system 指令
+  assert.equal(
+    resolveHookedMessages(
+      { messages: [{ role: 'system', content: 'evil system' }] },
+      original,
+      { onInvalid: report },
+    ),
+    original,
+  )
+  // 角色不在白名单（后端 ChatRole 反序列化会失败）
+  assert.equal(
+    resolveHookedMessages(
+      { messages: [...original, { role: 'developer', content: 'x' }] },
+      original,
+      { onInvalid: report },
+    ),
+    original,
+  )
+  assert.deepEqual(rejected, [
+    'hooked messages rejected (messages_empty); original messages used instead',
+    'hooked messages rejected (system_message_not_preserved); original messages used instead',
+    'hooked messages rejected (message_2_invalid_role); original messages used instead',
+  ])
+
+  // 合法变更照旧采用（同一数组引用，保持既有契约）
+  const hooked = [...original, { role: 'assistant', content: 'plugin draft' }]
+  assert.equal(resolveHookedMessages({ messages: hooked }, original), hooked)
+})
+
+test('resolveHookedMessages default report goes to console.warn without throwing', () => {
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => warnings.push(args)
+  try {
+    const fallback = [{ role: 'user', content: 'before' }]
+    assert.equal(resolveHookedMessages({ messages: [] }, fallback), fallback)
+    // 报告回调抛错不得让 turn 失败
+    assert.equal(
+      resolveHookedMessages({ messages: [] }, fallback, {
+        onInvalid: () => { throw new Error('logger failed') },
+      }),
+      fallback,
+    )
+  } finally {
+    console.warn = originalWarn
+  }
+
+  assert.equal(warnings.length, 1)
+  assert.match(String(warnings[0][0]), /hooked messages rejected \(messages_empty\)/)
+})
+
+test('hook chain ignores invalid messages mutations and audits them', async () => {
+  const audits = []
+  const baseline = {
+    prompt: 'base',
+    messages: [
+      { role: 'system', content: 'backend system prompt' },
+      { role: 'user', content: 'hello' },
+    ],
+  }
+  const plugins = [
+    { id: 'eraser', permissions: ['ModifyPrompt'] },
+    { id: 'replacer', permissions: ['ModifyPrompt'] },
+    { id: 'adder', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['eraser', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, messages: [] }
+      },
+    }],
+    ['replacer', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, messages: [{ role: 'system', content: 'evil system' }] }
+      },
+    }],
+    ['adder', {
+      async emitPluginEventAndWait(event, payload) {
+        return {
+          ...payload,
+          messages: [...payload.messages, { role: 'assistant', content: 'plugin draft' }],
+        }
+      },
+    }],
+  ])
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    baseline,
+    { onAudit: (record) => audits.push(record) },
+  )
+
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['eraser', 'invalid_mutation'],
+    ['replacer', 'invalid_mutation'],
+    ['adder', 'ok'],
+  ])
+  // 前两个插件的非法变更被忽略：链上始终是后端原始 system 消息 + 后续合法追加
+  assert.deepEqual(result.messages, [
+    { role: 'system', content: 'backend system prompt' },
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'plugin draft' },
+  ])
+})
+
+// ─── M-21b: 整链墙钟预算 ───────────────────────────────────────────────────
+
+test('chain budget stops calling hosts once the wall-clock budget is exhausted', async () => {
+  const calls = []
+  const audits = []
+  const plugins = [
+    { id: 'hung-1', permissions: ['ModifyPrompt'] },
+    { id: 'hung-2', permissions: ['ModifyPrompt'] },
+    { id: 'hung-3', permissions: ['ModifyPrompt'] },
+  ]
+  // 挂死的 host：promise 永不 settle（不占 timer handle）
+  const hang = (id) => ({
+    async emitPluginEventAndWait() {
+      calls.push(id)
+      return await new Promise(() => {})
+    },
+  })
+  const hostRefs = new Map([
+    ['hung-1', hang('hung-1')],
+    ['hung-2', hang('hung-2')],
+    ['hung-3', hang('hung-3')],
+  ])
+
+  const startedAt = Date.now()
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      timeoutMs: 5000,
+      totalBudgetMs: 40,
+      onAudit: (record) => audits.push(record),
+    },
+  )
+  const elapsed = Date.now() - startedAt
+
+  // 单插件超时被收紧到剩余额度（40ms），后面的插件不再被调用
+  assert.equal(calls.length, 1)
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['hung-1', 'timeout'],
+    ['hung-2', 'chain_budget_exceeded'],
+    ['hung-3', 'chain_budget_exceeded'],
+  ])
+  assert.deepEqual(result, { prompt: 'base' })
+  assert.ok(elapsed < 2000, `chain must not serially block writing (took ${elapsed}ms)`)
+})
+
+test('chain budget also bounds hosts when the per-plugin timeout is disabled', async () => {
+  const audits = []
+  const startedAt = Date.now()
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    [{ id: 'hung', permissions: ['ModifyPrompt'] }],
+    new Map([['hung', {
+      async emitPluginEventAndWait() {
+        return await new Promise(() => {})
+      },
+    }]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { timeoutMs: null, totalBudgetMs: 40, onAudit: (record) => audits.push(record) },
+  )
+  const elapsed = Date.now() - startedAt
+
+  assert.deepEqual(result, { prompt: 'base' })
+  assert.deepEqual(audits.map((record) => record.status), ['timeout'])
+  assert.ok(elapsed < 2000, `chain budget must bound a hung host (took ${elapsed}ms)`)
+})
+
+test('totalBudgetMs null disables the chain budget', async () => {
+  const slowHost = {
+    async emitPluginEventAndWait(event, payload) {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      return { ...payload, prompt: `${payload.prompt} + slow` }
+    },
+  }
+  const plugins = [{ id: 'slow', permissions: ['ModifyPrompt'] }]
+
+  // 预算 30ms < 单插件 60ms：被预算收紧成 timeout（fail-open，保留原 payload）
+  const boundedAudits = []
+  const bounded = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    new Map([['slow', slowHost]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { timeoutMs: 1000, totalBudgetMs: 30, onAudit: (record) => boundedAudits.push(record) },
+  )
+  assert.deepEqual(bounded, { prompt: 'base' })
+  assert.deepEqual(boundedAudits.map((record) => record.status), ['timeout'])
+
+  // null = 关闭预算：同一个 host 正常完成
+  const unbounded = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    new Map([['slow', slowHost]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { timeoutMs: 1000, totalBudgetMs: null },
+  )
+  assert.deepEqual(unbounded, { prompt: 'base + slow' })
+
+  // 默认预算足够宽，正常链不被误伤
+  const defaultBudget = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    new Map([['slow', slowHost]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { timeoutMs: 1000 },
+  )
+  assert.deepEqual(defaultBudget, { prompt: 'base + slow' })
 })
 
 test('summarizes prompt hook payloads and ring buffer records safely', () => {
@@ -409,14 +681,32 @@ test('classifyPromptHookFailurePolicy is machine-readable and fail-open for erro
   assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'error').failOpen, true)
   assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'timeout').failOpen, true)
   assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'budget_exceeded').failOpen, true)
+  // M-21a/b 新增的两个状态同样 fail-open（非法变更被忽略、超预算不再调用 host）
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'invalid_mutation').failOpen, true)
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'chain_budget_exceeded').failOpen, true)
   // Cancellation is fail-closed: the whole turn must abort.
   assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'cancelled').failOpen, false)
   // Each classification carries an explicit reason string.
-  for (const status of ['error', 'timeout', 'cancelled', 'budget_exceeded', 'ok']) {
+  for (const status of ['error', 'timeout', 'cancelled', 'budget_exceeded', 'ok', 'invalid_mutation', 'chain_budget_exceeded']) {
     const policy = classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', status)
     assert.equal(typeof policy.reason, 'string')
     assert.equal(typeof policy.failOpen, 'boolean')
+    // M-29：stage/operationType 参与结果（不再是被忽略的参数）
+    assert.equal(policy.surface, 'frontend_intent:prompt_hook')
   }
+  // 未知状态保守 fail-open，并给出显式理由
+  const unknown = classifyPromptHookFailurePolicy('llm_messages', 'prompt_hook', 'weird_status')
+  assert.deepEqual(unknown, {
+    failOpen: true,
+    reason: 'unknown_status_defaulted_fail_open',
+    surface: 'llm_messages:prompt_hook',
+  })
+  // 运行时 catch 分支用的就是这个分类：取消必须中止整链（既有用例已覆盖抛出），
+  // 这里固化「非取消一律 fail-open」的可执行证据。
+  assert.equal(
+    ['error', 'timeout'].every((status) => classifyPromptHookFailurePolicy('llm_messages', 'prompt_hook', status).failOpen),
+    true,
+  )
 })
 
 test('cancellation aborts the whole hook chain so later plugins never run', async () => {

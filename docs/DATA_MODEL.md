@@ -94,7 +94,7 @@ CompressJob（M4 队列）
 - `variables`
 - `story_clock`
 
-`story_clock` 当前同时存在于顶层字段和 variables 中。代码注释已经说明：兼容旧数据时保留顶层字段，但语义上应以 variables 为准，未来可通过数据迁移统一。
+`story_clock` 当前同时存在于顶层字段和 variables 中。代码注释已经说明：兼容旧数据时保留顶层字段，但语义上应以 variables 为准。**2026-09-13 回写（D-06）：默认值已收敛到单一权威**——`crates/domain/src/variables.rs:107` 的 `pub const DEFAULT_STORY_CLOCK: &str = "第1天"` 既是 `story_clock` 变量 schema 的默认值（`variables.rs:112`），也是 `Campaign::default_story_clock()`（`campaign.rs:61`）唯一委托的来源；新建 Campaign 的顶层字段取自该 schema 默认值，不再与 variables 分歧；infra-sqlite 导入兜底同样引用该常量（`importer.rs:565`，替换了旧的 `"Day 1"` 字面量）。"未来可通过数据迁移统一"只针对**历史数据**中两处已存在的取值差异，不再是新数据的口径问题。
 
 ### Campaign fork
 

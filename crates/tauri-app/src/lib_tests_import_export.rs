@@ -2,6 +2,48 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// 真实卡夹具的默认路径（与 `infra-import` 的 `default_real_card_fixture_path`
+/// 同一约定）：仓库根 `data/local/test-card.png`——**不入 git、CI 缺失**，所以
+/// 依赖它的测试一律保持 `#[ignore]`。需要真实卡时用 `SF_COMPLEX_CARD_FIXTURE`
+/// 覆盖，或跑 `scripts/run-real-card-smoke.ps1`。
+///
+/// 修复前的默认路径是仓库根 `test-card.png`（不存在），导致这两条 ignored 用例
+/// 即使在有真实卡的机器上也直接 panic（"failed to read .../test-card.png"）。
+fn default_real_card_fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("data")
+        .join("local")
+        .join("test-card.png")
+}
+
+#[test]
+fn default_real_card_fixture_path_targets_data_local_test_card() {
+    let path = default_real_card_fixture_path();
+    assert!(
+        path.ends_with("data/local/test-card.png"),
+        "default real-card fixture path must point at data/local/test-card.png, got {}",
+        path.display()
+    );
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate lives two levels below the repo root");
+    // 路径里带 `..`，必须规范化后再比（父目录真实存在，可直接 canonicalize）。
+    assert_eq!(
+        path.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .expect("fixture parent dir must exist"),
+        repo_root
+            .join("data")
+            .join("local")
+            .canonicalize()
+            .expect("repo data/local dir must exist"),
+        "default real-card fixture must be resolved from the repo root"
+    );
+}
+
 fn valid_summary_graph_bundle() -> CampaignBundle {
     use storyforge_domain::agent::RoundSummary;
     use storyforge_domain::campaign::Campaign;
@@ -106,7 +148,7 @@ pub(super) fn make_test_llm_connection(id: &str, api_key: &str) -> LlmConnection
 }
 
 #[test]
-#[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+#[ignore = "local-only real ST card: needs data/local/test-card.png (absent in CI); set SF_COMPLEX_CARD_FIXTURE or run scripts/run-real-card-smoke.ps1, then re-run with -- --ignored --nocapture"]
 fn test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle() {
     use storyforge_domain::character::{
         CharacterCard, CharacterDefinition, CharacterExtractionStatus,
@@ -114,12 +156,7 @@ fn test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle() {
 
     let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("test-card.png")
-        });
+        .unwrap_or_else(default_real_card_fixture_path);
     let bytes = std::fs::read(&fixture_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
     let character =
@@ -1637,7 +1674,7 @@ fn import_campaign_bundle_conversation_create_failure_leaves_no_card_or_campaign
 }
 
 #[tokio::test]
-#[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+#[ignore = "local-only real ST card: needs data/local/test-card.png (absent in CI); set SF_COMPLEX_CARD_FIXTURE or run scripts/run-real-card-smoke.ps1, then re-run with -- --ignored --nocapture"]
 async fn test_real_complex_card_offline_mvu_plumbing_smoke() {
     // This is an offline plumbing smoke. It uses the real complex PNG fixture
     // for import/campaign wiring, but feeds a deterministic MVU tool response
@@ -1652,12 +1689,7 @@ async fn test_real_complex_card_offline_mvu_plumbing_smoke() {
 
     let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("test-card.png")
-        });
+        .unwrap_or_else(default_real_card_fixture_path);
     let bytes = std::fs::read(&fixture_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
     let character =

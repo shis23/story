@@ -76,8 +76,17 @@ pub fn with_campaign_lock<R>(f: impl FnOnce() -> Result<R, CommitError>) -> Resu
 pub struct CampaignMutationCoordinator;
 
 impl CampaignMutationCoordinator {
-    fn payloads_match<T: serde::Serialize>(a: &T, b: &T) -> bool {
-        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    /// S-16：payload 比较必须 fail-closed。
+    ///
+    /// 旧实现 `serde_json::to_value(a).ok() == serde_json::to_value(b).ok()` 把
+    /// 「两次序列化都失败」变成 `None == None` → 判为「一致」而放行冲突写入。
+    /// 现在序列化失败直接返回 MutationConflict。
+    fn payloads_match<T: serde::Serialize>(a: &T, b: &T) -> Result<bool, CommitError> {
+        let left = serde_json::to_value(a)
+            .map_err(|e| CommitError::MutationConflict(format!("payload 序列化失败: {e}")))?;
+        let right = serde_json::to_value(b)
+            .map_err(|e| CommitError::MutationConflict(format!("payload 序列化失败: {e}")))?;
+        Ok(left == right)
     }
 
     fn instance_payloads_match(
@@ -106,6 +115,17 @@ impl CampaignMutationCoordinator {
         let campaign = store
             .get_campaign(campaign_id)
             .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
+
+        // S-16：batch 的 revision 契约必须自洽——target 恰好 = expected + 1
+        // （与 SQLite UoW `target == expected + 1` 同契约）。缺少这条校验时，
+        // 一个 target 被篡改成 expected 的坏 batch 会被下面的容差当成合法输入。
+        if batch.target_revision != batch.expected_revision.saturating_add(1) {
+            return Err(CommitError::MutationConflict(format!(
+                "MutationBatch revision 契约不成立: target_revision={} expected_revision={}",
+                batch.target_revision, batch.expected_revision
+            )));
+        }
+
         let is_replay = campaign.revision == batch.target_revision;
         let is_first_apply = campaign.revision == batch.expected_revision;
         if !is_replay && !is_first_apply {
@@ -164,7 +184,7 @@ impl CampaignMutationCoordinator {
                         )));
                     }
                     if let Some(existing) = knowledge.iter().find(|item| item.id == entry.id) {
-                        if !Self::payloads_match(existing, &entry) {
+                        if !Self::payloads_match(existing, &entry)? {
                             return Err(CommitError::MutationConflict(format!(
                                 "knowledge entry id={} 已存在但 payload 不一致",
                                 entry.id
@@ -204,7 +224,7 @@ impl CampaignMutationCoordinator {
                         )));
                     }
                     if let Some(existing) = tasks.iter().find(|item| item.id == task.id) {
-                        if !Self::payloads_match(existing, task.as_ref()) {
+                        if !Self::payloads_match(existing, task.as_ref())? {
                             return Err(CommitError::MutationConflict(format!(
                                 "task id={} 已存在但 payload 不一致",
                                 task.id
@@ -232,7 +252,7 @@ impl CampaignMutationCoordinator {
                     if let Some(existing) = summaries.iter().find(|item| {
                         item.campaign_id == summary.campaign_id && item.turn == summary.turn
                     }) {
-                        if !Self::payloads_match(existing, summary.as_ref()) {
+                        if !Self::payloads_match(existing, summary.as_ref())? {
                             return Err(CommitError::MutationConflict(format!(
                                 "summary campaign={} turn={} 已存在但 payload 不一致",
                                 summary.campaign_id, summary.turn
@@ -316,6 +336,20 @@ impl CampaignMutationCoordinator {
             store
                 .update_campaign(updated)
                 .map_err(CommitError::Storage)?;
+        }
+
+        // S-16：应用后必须精确落在 target_revision（首次提交 bump 到位；幂等重放
+        // 本就已经等于 target）。任何偏差都是外部写入或 bump 丢失，必须报冲突，
+        // 不能把「revision 没推进」当成功返回给调用方。
+        let final_revision = store
+            .get_campaign(campaign_id)
+            .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?
+            .revision;
+        if final_revision != batch.target_revision {
+            return Err(CommitError::RevisionConflict {
+                expected: batch.target_revision,
+                actual: final_revision,
+            });
         }
 
         Ok(batch.commit_id.clone())
@@ -546,6 +580,47 @@ mod tests {
         let result =
             CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch);
         assert!(matches!(result, Err(CommitError::RevisionConflict { .. })));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preflight_rejects_batch_whose_target_is_not_expected_plus_one() {
+        // S-16：revision 契约 target == expected + 1（与 SQLite 同语义）。
+        // 旧实现只做 `revision == target`（replay）或 `revision == expected`
+        // （首应用）容差判断，target 被改成 expected 的坏 batch 会被当成合法。
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        for (expected, target) in [(0u64, 0u64), (0, 2), (1, 0)] {
+            let batch = MutationBatch {
+                commit_id: Id::new(),
+                expected_revision: expected,
+                target_revision: target,
+                status: MutationBatchStatus::Prepared,
+                mutations: vec![],
+            };
+            let err =
+                CampaignMutationCoordinator::preflight_mutation_batch(&store, &campaign_id, &batch)
+                    .expect_err("非法的 target/expected 组合必须被拒绝");
+            match err {
+                CommitError::MutationConflict(message) => assert!(
+                    message.contains("revision 契约"),
+                    "expected/reject message, got: {message}"
+                ),
+                other => panic!("期望 MutationConflict，got {other:?}"),
+            }
+        }
+
+        // 合法组合（target == expected + 1 且当前 revision == expected）通过。
+        let ok = MutationBatch {
+            commit_id: Id::new(),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![],
+        };
+        CampaignMutationCoordinator::preflight_mutation_batch(&store, &campaign_id, &ok).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

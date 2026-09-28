@@ -108,6 +108,25 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         .active_campaign_update
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // S-15：删除屏障——存在未终态的 Turn 时拒绝删除。JSON 跨文件删除与 SQLite
+    // 级联都会无条件删掉 turns 行；若某变体仍在生成/推导/待采纳，删除会让在途
+    // accept 落到不存在的 Turn（报错也指不到真实原因），用户正在写的内容无声消失。
+    match state.storage().get_active_turn(campaign_id) {
+        Ok(Some(turn)) => {
+            return Err(TauriCommandError::validation(format!(
+                "该活动还有未结束的回合（{}，状态 {:?}），请先提交或放弃后再删除",
+                turn.turn_id, turn.status
+            )));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(TauriCommandError::storage(format!(
+                "删除活动前检查在途回合失败: {error}"
+            )));
+        }
+    }
+
     let active_pointer_needs_clear = {
         let active_campaign = state
             .active_campaign
@@ -312,6 +331,70 @@ mod tests {
         assert_eq!(load_active_campaign(&state.data_dir), None);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn delete_playthrough_is_blocked_while_a_turn_is_active() {
+        // S-15：活动 Turn 屏障——JSON 跨文件删除与 SQLite 级联都会无条件删掉
+        // turns 行；在途 accept 会落到不存在的 Turn，用户正在写的内容无声消失。
+        use storyforge_domain::turn::{TurnRecord, TurnStatus};
+
+        let state = AppState::new_for_test();
+        let storage = state.storage();
+        let data_dir = storage.data_dir().to_path_buf();
+        let conv_store = ConversationStore::new(data_dir.join("conversations"));
+
+        let mut campaign = Campaign::new(Id::from_str("campaign-active-turn-guard"), "guard");
+        let conversation = conv_store
+            .create_persisted(None, Some(campaign.id.clone()))
+            .unwrap();
+        campaign.conversation_id = Some(conversation.id.clone());
+        // 走 facade 自己的 JSON store（与屏障读取同一个缓存实例）。
+        storage.save_campaign(&campaign).unwrap();
+
+        let mut turn = TurnRecord::new(
+            campaign.id.clone(),
+            conversation.id.clone(),
+            Id::from_str("input-guard"),
+            0,
+        );
+        turn.status = TurnStatus::Generating;
+        let turn_id = turn.turn_id.clone();
+        storage.save_turn(&turn).unwrap();
+
+        let store = CampaignStore::new(&data_dir);
+        let err = delete_campaign_playthrough_in_store(&store, &conv_store, &state, &campaign.id)
+            .expect_err("存在未终态 Turn 时必须拒绝删除");
+        assert!(
+            err.to_string().contains("未结束的回合"),
+            "错误必须解释是活动回合挡住了删除，got: {err}"
+        );
+        assert!(
+            CampaignStore::new(&data_dir)
+                .get_campaign(&campaign.id)
+                .is_some(),
+            "被拒绝的删除不得动 Campaign"
+        );
+        assert!(
+            conv_store.find_by_campaign(&campaign.id).is_some(),
+            "被拒绝的删除不得动会话"
+        );
+
+        // Turn 进入终态后允许删除（屏障只挡「未结束」的回合）。
+        storage
+            .update_turn_record(&turn_id, |record| {
+                record.status = TurnStatus::Failed;
+            })
+            .unwrap();
+        delete_campaign_playthrough_in_store(&store, &conv_store, &state, &campaign.id)
+            .expect("Turn 终态化后必须允许删除");
+        assert!(
+            CampaignStore::new(&data_dir)
+                .get_campaign(&campaign.id)
+                .is_none(),
+            "允许的删除必须真正落盘"
+        );
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 
     #[test]

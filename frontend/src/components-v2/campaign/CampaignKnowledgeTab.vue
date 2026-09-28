@@ -115,7 +115,7 @@ defineExpose({ refresh: load })
   />
 
   <template v-else>
-    <DataTable :columns="columns" :rows="filteredKnowledge" empty-title="暂无知识">
+    <DataTable :columns="columns" :rows="filteredKnowledge" row-key="id" empty-title="暂无知识">
       <template #cell-knowledge_text="{ row }">
         <div class="text-xs text-ink leading-relaxed">{{ row.knowledge_text }}</div>
         <div v-if="row.pinned" class="text-[10px] text-accent mt-1">📌 已固定</div>

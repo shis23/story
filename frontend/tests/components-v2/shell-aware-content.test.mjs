@@ -122,6 +122,42 @@ describe('ShellAwareContent mount trust gate (H3)', () => {
     expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(false)
   })
 
+  it('trusts only the inline doc backed by its own trigger hit (M-19)', async () => {
+    // 一条消息里两个可执行文档，源文只命中一次 trigger：旧的「整条消息级」
+    // 判据会两个都自动挂载；现在只有第一个获背书，第二个走确认卡。
+    const legit = '<body class="a"><script>legit()</script></body>'
+    const attacker = '<body class="b"><script>attacker()</script></body>'
+    const wrapper = mountWithLayout(
+      `叙事。\n${legit}\n中段。\n${attacker}`,
+      { inlineTriggers: [{ label: '修炼界面', trigger: '【修炼界面】' }] },
+      { sourceContent: '【修炼界面】开场' },
+    )
+
+    const hosts = wrapper.findAllComponents(CardShellHostStub)
+    expect(hosts).toHaveLength(1)
+    expect(hosts[0].props('html')).toContain('legit()')
+    expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(true)
+
+    // 未获背书的那个可单独放行，放行后仍只有一个新增挂载点。
+    await wrapper.find('[data-testid="shell-inline-approve"]').trigger('click')
+    const after = wrapper.findAllComponents(CardShellHostStub)
+    expect(after).toHaveLength(2)
+    expect(after.map((h) => h.props('html')).join('|')).toContain('attacker()')
+  })
+
+  it('trusts every inline doc when each is backed by its own trigger hit (M-19)', () => {
+    const first = '<body class="a"><script>one()</script></body>'
+    const second = '<body class="b"><script>two()</script></body>'
+    const wrapper = mountWithLayout(
+      `${first}\n${second}`,
+      { inlineTriggers: [{ label: '修炼界面', trigger: '【修炼界面】' }] },
+      { sourceContent: '【修炼界面】第一次\n【修炼界面】第二次' },
+    )
+
+    expect(wrapper.findAllComponents(CardShellHostStub)).toHaveLength(2)
+    expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(false)
+  })
+
   it('fails closed when no layout/trust context is provided', () => {
     const wrapper = mount(ShellAwareContent, {
       props: { content: `$('body').load('${HOME}')` },

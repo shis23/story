@@ -1,15 +1,20 @@
 /// B3 DraftQualityGate（架构文档 §9）
 ///
 /// 纯确定性规则门禁，不跑 LLM。在 Editor 产出 `final_text` 后、`run_postprocess` 前执行。
-/// Gate 失败不硬阻断——只标记警告，用户仍可手动 accept（符合 Phase A 草稿有身份但不自动变事实的哲学）。
+/// Gate 本身不硬阻断，但 **Error 级会默认拦截 accept**（`QualityReport::blocks_accept`，
+/// 用户可 force → Degraded），并触发 Tauri 侧一次有界 Editor auto-fix；
+/// Warning 级仅标记，不拦截。
 ///
 /// 检查项：
 /// 1. n-gram 重复检测：UTF-8 字符级 8-gram 连续出现 ≥ 3 次
-/// 2. 元描述检测：草稿含 LLM 自述/指令残留
-/// 3. 字数下限：< 50 字
+/// 2. 元描述检测：草稿含 LLM 自述/指令残留（严格模式 Error；歧义短语需上下文判定）
+/// 3. 字数下限：< 50 字（Warning）
 /// 4. 视角/破壁：对读者说话或指令式旁白
 /// 5. 格式泄漏：代码块 / think 标签 / HTML
 /// 6. 连续性：相邻句子完全重复
+/// 7. 破折号风格（依据 NarrativeContract）
+/// 8. 否后肯结构（依据 NarrativeContract）
+/// 9. 契约 private knowledge 泄漏扫描（传入 contract 时）
 use storyforge_domain::narrative_contract::NarrativeContract;
 use storyforge_domain::turn::{QualityReport, QualitySeverity, QualityWarning, QualityWarningCode};
 
@@ -86,37 +91,106 @@ fn check_ngram_repetition(text: &str) -> Option<QualityWarning> {
 
 /// 元描述检测：草稿含 LLM 自述/指令残留。
 ///
-/// 匹配常见泄漏模式。用的是包含匹配，不是正则——保持零依赖。
+/// W-04：拆成"严格模式"与"歧义模式"两类。严格模式出现即 Error；歧义模式
+/// （「让我来」「好的，我」等正常对白开场）只有在**不处于引号对白内**且
+/// 命中点后 16 字内出现助手口吻线索（为你/以下/创作/正文…）时才升级为 Error。
+///
+/// 仅"位于行首"不再构成 Error：「让我来帮你」「好的，我这就去」「没问题，我马上到」
+/// 这类无引号的正常对白会被误判为元描述，白跑 Editor auto-fix 甚至拦截 accept；
+/// 明确的自述残留由 STRICT_PATTERNS（"作为AI"/"以下是故事"…）兜住。
+///
+/// R5-01：「我将为你」「我来为你」本身是**角色对白里合法**的第一人称承诺
+/// （「我将为你赴汤蹈火」「我来为你撑伞」），不能仅凭 `contains` 判 Error——
+/// 那会把正常对白误杀并 `blocks_accept`。它们改为与歧义模式同级的条件判定：
+/// **既不在引号对白内、命中点后 16 字内又出现"写作任务线索"**（写/创作/正文…）
+/// 时才是助手口吻泄漏。仅引号内或被引用/转述的语境不再触发（精度优先，与 W-04 同口径）。
+///
+/// N-R2-14：歧义模式（「让我来」「好的，我」…）的线索词同步收窄为**写作任务线索**，
+/// 「让我来为你倒茶。」这类含"人"的宾语（为你/帮你/替他）不再判 Error；
+/// 真正的助手前言仍带写作动词（「让我来为你安排这一章的节奏」→"安排"）。
 fn check_meta_description(text: &str) -> Option<QualityWarning> {
-    const PATTERNS: &[&str] = &[
+    /// 不会出现在正常对白里的助手自述/指令残留（无需上下文即可判 Error）。
+    const STRICT_PATTERNS: &[&str] = &[
         "作为AI",
         "作为 AI",
         "作为人工智能",
-        "我来写",
         "以下是为您创作",
         "以下是故事",
-        "让我来",
         "现在开始创作",
-        "好的，我",
-        "没问题，我",
         "根据你的要求",
         "按照你的要求",
-        "我将为你",
-        "我来为你",
+    ];
+    /// R5-01：对白里也可能出现的"第一人称承诺"，需同时满足"非引号语境 +
+    /// 写作任务线索"才升级 Error。
+    const DIALOGUE_PLAUSIBLE_STRICT: &[&str] = &["我将为你", "我来为你"];
+    /// 正常对白里也会出现的短语，需要上下文判定。
+    const AMBIGUOUS_PATTERNS: &[&str] = &["让我来", "好的，我", "没问题，我", "我来写"];
+    /// 助手口吻线索（命中点后 16 字内）：**指向写作任务**而非"指向某个人"。
+    ///
+    /// R5-01/N-R2-14：早先的线索表含「为你」「以下」「要求」等，会把
+    /// 「我将为你赴汤蹈火」「让我来为你倒茶」「满足你的要求」这类正常对白误杀成
+    /// Error 并阻断 accept。写作任务动词才能区分"助手在交代写作"与"角色在说话"。
+    const WRITING_TASK_CUES: &[&str] = &[
+        "写", "创作", "续写", "生成", "润色", "改稿", "正文", "章节", "故事", "内容", "安排",
     ];
 
-    for pat in PATTERNS {
+    for pat in STRICT_PATTERNS {
         if text.contains(pat) {
-            return Some(QualityWarning {
-                code: QualityWarningCode::MetaDescription {
-                    snippet: pat.to_string(),
-                },
-                message: format!("草稿含元描述泄漏：「{pat}」"),
-                severity: QualitySeverity::Error,
-            });
+            return Some(meta_warning(pat, QualitySeverity::Error));
+        }
+    }
+
+    // R5-01：引号内/引用转述语境不判泄漏；无写作任务线索的第一人称承诺不判泄漏。
+    for pat in DIALOGUE_PLAUSIBLE_STRICT {
+        for (idx, _) in text.match_indices(pat) {
+            if inside_dialogue(text, idx) {
+                continue; // 对白内：角色在说话，不是助手在写稿
+            }
+            let matched = idx + pat.len();
+            let tail: String = text[matched..].chars().take(16).collect();
+            if WRITING_TASK_CUES.iter().any(|cue| tail.contains(cue)) {
+                return Some(meta_warning(pat, QualitySeverity::Error));
+            }
+        }
+    }
+
+    for pat in AMBIGUOUS_PATTERNS {
+        for (idx, _) in text.match_indices(pat) {
+            if inside_dialogue(text, idx) {
+                continue; // 对白内的正常用语
+            }
+            let matched = idx + pat.len();
+            let tail: String = text[matched..].chars().take(16).collect();
+            // W-04/R5-01：必须命中**写作任务线索**才升级 Error（不再仅凭"行首"，也不靠"为你"）
+            if WRITING_TASK_CUES.iter().any(|cue| tail.contains(cue)) {
+                return Some(meta_warning(pat, QualitySeverity::Error));
+            }
         }
     }
     None
+}
+
+fn meta_warning(pat: &str, severity: QualitySeverity) -> QualityWarning {
+    QualityWarning {
+        code: QualityWarningCode::MetaDescription {
+            snippet: pat.to_string(),
+        },
+        message: format!("草稿含元描述泄漏：「{pat}」"),
+        severity,
+    }
+}
+
+/// 字节位置是否位于引号对白内部（「」『』“”‘’ 计数）。
+fn inside_dialogue(text: &str, byte_idx: usize) -> bool {
+    let mut depth: i32 = 0;
+    for ch in text[..byte_idx].chars() {
+        match ch {
+            '「' | '『' | '“' | '‘' => depth += 1,
+            '」' | '』' | '”' | '’' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+    }
+    depth > 0
 }
 
 /// 字数过短检测
@@ -247,7 +321,13 @@ fn check_negation_then_affirmation(
         return None;
     }
     // find 返回字节索引；从 &text[i..] 取字符窗口，避免把字节偏移当 char 计数。
-    if let Some(i) = text.find("不是") {
+    // W-27：扫描全部「不是」出现点，不再只看第一个（首个不构成否后肯时旧实现会漏报）。
+    let mut search_from = 0usize;
+    while search_from < text.len() {
+        let Some(rel) = text[search_from..].find("不是") else {
+            break;
+        };
+        let i = search_from + rel;
         let tail: String = text[i..].chars().take(24).collect();
         if tail.contains("而是") || tail.contains("就是") {
             let sample = truncate_sample(&tail, 32);
@@ -259,6 +339,7 @@ fn check_negation_then_affirmation(
                 severity: QualitySeverity::Warning,
             });
         }
+        search_from = i + "不是".len();
     }
     None
 }
@@ -387,10 +468,13 @@ fn is_attributed_private_leak(
         let has_other = other_labels
             .iter()
             .any(|l| !l.is_empty() && window.contains(l));
-        if has_other {
-            return true;
-        }
+        // W-21：拥有者标签与"其他角色"标签同窗时，不得直接判越权——拥有者在场
+        // 说明这是合法回忆（他人名字恰好同段出现很常见）。只有拥有者缺席、
+        // 而其他角色在场时才是越权归属。
         if !has_owner {
+            if has_other {
+                return true;
+            }
             // M-8：窄窗口无归属时，先用 2× 宽窗口复核一次，避免把「拥有者标签在
             // 窗口外但 probe 合法出现」的长间隔合法回忆误报为越权 Error。宽窗口
             // 内仍找不到拥有者，才认定是叙述层/作者视角越权。
@@ -536,6 +620,280 @@ mod tests {
                 .count()
                 >= 1,
             "元描述应为 Error 级别"
+        );
+    }
+
+    /// W-04：正常对白里的「让我来 / 好的，我 / 没问题，我」不得判为元描述 Error。
+    #[test]
+    fn test_dialogue_meta_phrases_are_not_errors() {
+        let text = "「让我来！」林如伸手接过茶杯，热水溅在她手背上。\n\
+                    陈默点头：「好的，我这就去。」\n\
+                    周岚靠在门框上：「没问题，我可以等。」\n\
+                    窗外雨声渐密，三个人都没有再说话，屋里的灯忽明忽暗。";
+        let report = run_quality_gate(text);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "对白内短语不应触发 MetaDescription: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.has_errors(),
+            "正常对白不应产生 Error: {:?}",
+            report.warnings
+        );
+    }
+
+    /// W-04：真正的助手口吻（命中点附近有助手线索）仍判 Error；
+    /// 仅"行首"不再是 Error 依据（见下一条测试）。
+    #[test]
+    fn test_assistant_preamble_still_errors() {
+        let line_start = "让我来为你安排这一章的节奏。夜风吹过窗棂，林秋坐在桌前，看着杯中残茶泛起的涟漪，他想起那年冬天也是如此安静。";
+        let report = run_quality_gate(line_start);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "行首助手前言（含「为你」线索）应被检出: {:?}",
+            report.warnings
+        );
+
+        // 行中但带助手线索（为你/以下/创作…）→ 仍 Error
+        let mid_line = "林如退开一步，让我来为你安排接下来的剧情，夜风从窗缝里钻进来。";
+        let report = run_quality_gate(mid_line);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "行中助手线索应被检出: {:?}",
+            report.warnings
+        );
+    }
+
+    /// R5-01：引号内（或引用/转述语境）的「我将为你」「我来为你」是**角色对白**，
+    /// 不得判 Error、不得 `blocks_accept`；无引号但无写作任务线索的旁白承诺同理。
+    #[test]
+    fn test_quoted_first_person_promises_are_not_meta_errors() {
+        let quoted = "「将军，我将为你赴汤蹈火，在所不辞。」沈砚抱拳行礼。夜风卷着雪粒打在帐帘上，\
+                      灯火摇了一摇，远处传来更鼓声，帐外的战马打了个响鼻。";
+        assert!(quoted.chars().count() >= 50, "测试文本需越过 TooShort 下限");
+        let report = run_quality_gate(quoted);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "引号内的第一人称承诺不应触发 MetaDescription: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.has_errors(),
+            "引号内对白不应产生 Error: {:?}",
+            report.warnings
+        );
+        assert!(!report.blocks_accept(false), "不得拦截 accept");
+
+        // 无引号、但为剧情内承诺（无写作任务线索）→ 同样不是元描述。
+        let narration = "他握紧剑柄，一字一句地说：我将为你守住这座城，直到援军抵达。\
+                         窗外的火把在风里噼啪作响，雪水顺着屋檐滴下来，夜色浓得化不开。";
+        let report = run_quality_gate(narration);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "无写作线索的「我将为你」不应触发 MetaDescription: {:?}",
+            report.warnings
+        );
+        assert!(!report.blocks_accept(false));
+    }
+
+    /// R5-01 反例（失败可控）：真正的助手口吻——非引号 + 写作任务线索——
+    /// 仍必须 Error 且拦截 accept（不能把规则放宽成恒不触发）。
+    #[test]
+    fn test_assistant_task_promises_still_error_and_block_accept() {
+        for text in [
+            "好的，我将为你创作一个精彩的场景。夜风吹过窗棂，林秋坐在桌前，\
+             看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。窗外有猫叫，声音远处传来。",
+            "我来为你写接下来这一章。夜风吹过窗棂，林秋坐在桌前，\
+             看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。窗外有猫叫，声音远处传来。",
+        ] {
+            let report = run_quality_gate(text);
+            let has_meta_error = report.warnings.iter().any(|w| {
+                matches!(&w.code, QualityWarningCode::MetaDescription { .. })
+                    && matches!(w.severity, QualitySeverity::Error)
+            });
+            assert!(
+                has_meta_error,
+                "助手口吻（含写作任务线索）必须判 Error: {text} → {:?}",
+                report.warnings
+            );
+            assert!(
+                report.blocks_accept(false),
+                "元描述 Error 必须拦截 accept: {text}"
+            );
+        }
+    }
+
+    /// R5-01 边界：**引号内 + 写作任务线索**按"引用/转述语境"处理，不判 Error
+    /// （助手口吻的兜底仍由 `STRICT_PATTERNS` 的无条件模式负责，例如
+    /// 「以下是为您创作」无论在不在引号内都会命中）。
+    #[test]
+    fn test_quoted_writing_task_promise_is_treated_as_quotation() {
+        let text = "「我来为你写这封信，」她顿了顿，「但你必须先回答我一个问题。」\
+                    屋里的挂钟走了一格，窗外的雨还在下，没有人先开口。";
+        let report = run_quality_gate(text);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+            "引号内转述不应判元描述 Error: {:?}",
+            report.warnings
+        );
+        // 无条件严格模式不受引号影响：仍然 Error。
+        let strict = "「以下是为您创作的内容。」夜风吹过窗棂，林秋坐在桌前，\
+                      看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。窗外有猫叫。";
+        let report = run_quality_gate(strict);
+        assert!(report.has_errors(), "无条件严格模式应仍为 Error");
+    }
+
+    /// N-R2-14：无引号、宾语是"人"的正常对白（「让我来为你倒茶。」）不得判元描述 Error；
+    /// 同时锁住「真助手前言（写作任务线索）仍 Error」这一半（不能放宽成恒不触发）。
+    #[test]
+    fn test_person_object_cue_phrases_are_not_meta_errors() {
+        for text in [
+            "让我来为你倒茶。",
+            "让我来帮你。",
+            "他放下杯子，让我来为你挡这一刀。窗外的雨声渐密，屋里只剩炉火噼啪的响动。",
+        ] {
+            let report = run_quality_gate(text);
+            assert!(
+                !report
+                    .warnings
+                    .iter()
+                    .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+                "「{text}」不应触发 MetaDescription: {:?}",
+                report.warnings
+            );
+            assert!(
+                !report.has_errors(),
+                "「{text}」不应产生 Error: {:?}",
+                report.warnings
+            );
+        }
+        for text in [
+            "让我来为你安排这一章的节奏。",
+            "好的，我来为你写一个精彩的场景。",
+        ] {
+            let report = run_quality_gate(text);
+            let has_meta_error = report.warnings.iter().any(|w| {
+                matches!(&w.code, QualityWarningCode::MetaDescription { .. })
+                    && matches!(w.severity, QualitySeverity::Error)
+            });
+            assert!(
+                has_meta_error,
+                "助手前言（写作任务线索）必须仍判 Error: 「{text}」→ {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    /// W-04 收紧（R2 复检口径）：无引号的正常对白不得报 MetaDescription Error；
+    /// 明确的助手自述仍必须是 Error。
+    #[test]
+    fn test_bare_dialogue_phrases_are_not_errors_but_strict_meta_still_is() {
+        for text in ["让我来帮你", "好的，我这就去", "没问题，我马上到"] {
+            let report = run_quality_gate(text);
+            assert!(
+                !report
+                    .warnings
+                    .iter()
+                    .any(|w| matches!(&w.code, QualityWarningCode::MetaDescription { .. })),
+                "正常对白「{text}」不应触发 MetaDescription: {:?}",
+                report.warnings
+            );
+            assert!(
+                !report.has_errors(),
+                "正常对白「{text}」不应产生 Error: {:?}",
+                report.warnings
+            );
+        }
+
+        for text in ["作为AI，我来帮你润色这一段。", "以下是故事正文。"] {
+            let report = run_quality_gate(text);
+            assert!(
+                report.has_errors(),
+                "明确元描述「{text}」必须是 Error: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    /// W-21：拥有者标签与其他角色标签同窗出现时，不得判为越权泄漏。
+    #[test]
+    fn test_owner_and_other_label_same_window_is_not_leak() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        let contract = NarrativeContract {
+            focalizers: vec!["inst-chen".into(), "inst-lin".into()],
+            private_bindings: vec![
+                PrivateBinding {
+                    owner_id: "inst-chen".into(),
+                    owner_name: Some("陈警官".into()),
+                    secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+                },
+                PrivateBinding {
+                    owner_id: "inst-lin".into(),
+                    owner_name: Some("林医生".into()),
+                    secret: "SF_SECRET_LIN_NOTE_Y42".into(),
+                },
+            ],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+
+        // 拥有者（陈警官）在场 + 他人（林医生）同窗 → 合法回忆，不报
+        let legal = "陈警官捏着 SF_SECRET_CHEN_BADGE_X91，林医生在门口等着，雨声打在铁皮棚顶上。";
+        let report = run_quality_gate_with_contract(legal, Some(&contract));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
+            "拥有者在场时不得判越权: {:?}",
+            report.warnings
+        );
+
+        // 拥有者缺席、他人（林医生）在场 → 越权，仍须 Error
+        let leak = "林医生在门口等着，嘴里念着 SF_SECRET_CHEN_BADGE_X91，走廊尽头一片安静。";
+        let report = run_quality_gate_with_contract(leak, Some(&contract));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
+            "他人转述拥有者秘密应判越权: {:?}",
+            report.warnings
+        );
+    }
+
+    /// W-27：否后肯扫描全部「不是」出现点，不只第一个。
+    #[test]
+    fn test_negation_then_affirmation_scans_all_occurrences() {
+        // 第一个「不是」不构成否后肯；第二个才是
+        let text = "这道题不是很难，但也不算简单。他抬起头，那不是放弃，而是一种更深的坚持。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::NegationThenAffirmation { .. })),
+            "应扫描到第二处否后肯: {:?}",
+            report.warnings
         );
     }
 

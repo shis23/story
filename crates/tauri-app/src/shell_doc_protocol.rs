@@ -65,6 +65,16 @@ const SHELL_DOC_CSP: &str = concat!(
     "http://storyforge-cache.localhost ",
     "storyforge-cache://localhost; ",
     "connect-src data: blob: ",
+    // M-01（卫生项，不构成安全修复）：把自定义协议 IPC 需要的来源补进
+    // connect-src，使 `invoke` 能走 tauri-2.11.5/scripts/ipc-protocol.js 的
+    // 自定义协议 fetch 路径，而不是落到它文档里那条「CSP 拦截后回退到
+    // window.ipc.postMessage」的路径（`ipc-protocol.js` 注释：either the
+    // webview blocked a custom protocol or it was a CSP error）。两条路径最终
+    // 都会到达同一个 IPC handler，所以这里消除的是对回退路径的依赖，不是
+    // 子帧可达 IPC 这件事本身——真正的控制点是 ACL manifest / 帧级门禁，
+    // 见 tests 中的 acl_manifest_absence_is_a_known_risk 守卫。
+    // 与主窗 CSP（tauri.conf.json connect-src ipc: http://ipc.localhost）同源。
+    "ipc: http://ipc.localhost ",
     "http://storyforge-cache.localhost ",
     "storyforge-cache://localhost ",
     "http://storyforge-shell.localhost ",
@@ -327,6 +337,112 @@ mod tests {
             .expect("test request")
     }
 
+    /// M-01 守卫 1：壳文档 CSP 必须保留自定义协议 IPC 所需来源。
+    /// 依据 `tauri-2.11.5/scripts/ipc-protocol.js`：自定义协议 fetch 失败时
+    /// （该文件注释：要么 webview 拦了自定义协议，要么是 CSP 错误）会回退到
+    /// `window.ipc.postMessage`，而回退路径不受 CSP 约束。保留这两个来源能让
+    /// IPC 走显式声明的通道，而不是依赖未声明的回退。
+    #[test]
+    fn shell_csp_keeps_tauri_ipc_sources_for_custom_protocol_fetch() {
+        let connect_src = SHELL_DOC_CSP
+            .split(';')
+            .find(|directive| directive.trim_start().starts_with("connect-src"))
+            .expect("connect-src directive");
+        assert!(
+            connect_src.contains("ipc:"),
+            "shell connect-src must keep `ipc:` (tauri custom-protocol IPC): {connect_src}"
+        );
+        assert!(
+            connect_src.contains("http://ipc.localhost"),
+            "shell connect-src must keep `http://ipc.localhost`: {connect_src}"
+        );
+    }
+
+    /// M-01 守卫 2：壳文档仍然是零信任来源——不得出现远端主机或通配指令。
+    #[test]
+    fn shell_csp_stays_locked_down() {
+        assert!(SHELL_DOC_CSP.contains("default-src 'none'"));
+        assert!(SHELL_DOC_CSP.contains("object-src 'none'"));
+        assert!(SHELL_DOC_CSP.contains("form-action 'none'"));
+        assert!(
+            !SHELL_DOC_CSP.contains("https://"),
+            "shell CSP must not allow remote https hosts: {SHELL_DOC_CSP}"
+        );
+        assert!(
+            !SHELL_DOC_CSP.contains('*'),
+            "shell CSP must not contain wildcards: {SHELL_DOC_CSP}"
+        );
+    }
+
+    /// M-01 守卫 3：capability 只能绑定主窗口 `main`。
+    /// 依据 `tauri-2.11.5/src/webview/mod.rs:1787-1852`：ACL 判定用
+    /// `Origin::Local` + 窗口标签，子帧与主帧在 ACL 眼里完全一样；一旦
+    /// capability 放宽到 `webviews`/`remote`，任何壳 iframe 直接继承权限。
+    #[test]
+    fn capability_grants_only_the_main_window() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/default.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("\"windows\":[\"main\"]"),
+            "capability must stay scoped to the `main` window only:\n{raw}"
+        );
+        assert!(
+            !compact.contains("\"webviews\"") && !compact.contains("\"remote\""),
+            "capability must not widen scope to webviews/remote:\n{raw}"
+        );
+    }
+
+    /// M-01 守卫 4：app ACL manifest 的存在性必须被显式记录（防静默回退）。
+    /// - 当前仓库没有 `permissions/`，因此 `has_app_acl_manifest == false`
+    ///   （`tauri-2.11.5/src/ipc/authority.rs:132-134` →
+    ///   `webview/mod.rs:1819-1826`），本地源的应用命令**整体跳过 ACL**：
+    ///   壳 iframe 可以直接 invoke 任意命令。这里打印醒目告警，把已知风险
+    ///   留在 CI 日志里。
+    /// - 一旦有人新增 `permissions/`，就必须同时把 `__app__` 编进
+    ///   `gen/schemas/acl-manifests.json`；否则 manifest 没编进去，
+    ///   `has_app_acl_manifest` 仍是 false，会造成"以为加了 ACL"的假安全感。
+    ///   此时还必须为前端真正需要的命令逐条定义权限，否则主窗口命令会被拒
+    ///   （`Command X not allowed by ACL`）——这条由 Lead 裁决为"需运行时验证"。
+    #[test]
+    fn acl_manifest_absence_is_a_known_risk() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let permissions_dir = manifest_dir.join("permissions");
+        let has_permissions_dir = permissions_dir
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if !has_permissions_dir {
+            eprintln!(
+                "warning: M-01 known risk — no `permissions/` app ACL manifest, so \
+                 `has_app_acl_manifest == false` and Tauri skips ACL for every app command \
+                 issued from the local shell origin (card / plugin / MVU / TH iframes). \
+                 Runtime PoC: load a plugin with `permissions: []` and log \
+                 `typeof window.__TAURI_INTERNALS__` (or call \
+                 `await window.__TAURI_INTERNALS__.invoke('list_conversations')`) inside its \
+                 iframe. Real fixes: (a) upgrade wry so main-frame-only init scripts are \
+                 actually main-frame-only, (b) host untrusted HTML in a separate webview, \
+                 (c) require a main-frame credential at the command layer. Do NOT add a \
+                 manifest without whitelisting every command the app UI calls."
+            );
+            return;
+        }
+        let acl = manifest_dir.join("gen/schemas/acl-manifests.json");
+        let raw = std::fs::read_to_string(&acl).unwrap_or_else(|e| {
+            panic!(
+                "`permissions/` exists but {} is unreadable: {e}",
+                acl.display()
+            )
+        });
+        assert!(
+            raw.contains("\"__app__\""),
+            "`permissions/` exists but `__app__` is missing from acl-manifests.json — the \
+             manifest is not compiled in, so ACL is still skipped (false confidence)"
+        );
+    }
+
     #[test]
     fn register_then_get_returns_document_once_with_csp_header() {
         let token = register_shell_doc("<!doctype html><body>hello".into())
@@ -444,8 +560,12 @@ mod tests {
             "script-src 'unsafe-inline' 'unsafe-eval' blob: data: \
              http://storyforge-shell.localhost storyforge-shell://localhost"
         ));
+        // M-01（卫生项）：connect-src 额外保留 Tauri 自定义协议 IPC 来源
+        // （`ipc:` / `http://ipc.localhost`），使 invoke 走 ipc-protocol.js 的
+        // 自定义协议 fetch 而不是不受 CSP 约束的 window.ipc.postMessage 回退。
         assert!(SHELL_DOC_CSP.contains(
-            "connect-src data: blob: http://storyforge-cache.localhost \
+            "connect-src data: blob: ipc: http://ipc.localhost \
+             http://storyforge-cache.localhost \
              storyforge-cache://localhost http://storyforge-shell.localhost \
              storyforge-shell://localhost"
         ));

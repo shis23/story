@@ -80,35 +80,34 @@ impl From<i32> for SelectiveLogic {
 impl WorldInfoEntry {
     /// 根据蓝绿灯自动计算默认路由
     pub fn default_route(&self) -> LoreRoute {
-        match (self.constant, self.selective) {
-            (true, true) => LoreRoute::Both,
-            (true, false) => LoreRoute::Constant,
-            // ST 语义：selective=false 只表示无副键过滤；非常驻条目一律按绿灯主键触发
-            (false, _) => LoreRoute::Selective,
-        }
+        route_for_flags(self.constant, self.selective)
     }
 
     /// Enable or disable an entry while preserving a meaningful injection
     /// route. An entry that was explicitly routed as Disabled can only be
     /// restored if its ST blue/green flags describe a usable default route.
+    ///
+    /// 同步写回 v3 wire 的 `enabled` 真相源（D-02）；`Result` 形状仅为兼容既有
+    /// 调用方保留，当前实现不会失败（`route_for_flags` 永远不返回 Disabled）。
     pub fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
         if enabled && matches!(self.route, LoreRoute::Disabled) {
-            let restored = self.default_route();
-            if matches!(restored, LoreRoute::Disabled) {
-                return Err("world-info entry has no injectable route to restore".into());
-            }
-            self.route = restored;
+            self.route = self.default_route();
         }
         self.disabled = !enabled;
+        // D-02：`from_st` 用 `disable || !extra["enabled"]` 计算 disabled，
+        // 即 `extra["enabled"]` 是同一语义的第二个真相源。不同步的话，
+        // 导出（disable=false + enabled=false）再导入会重新禁用该条目。
+        if self.extra.contains_key("enabled") {
+            self.extra
+                .insert("enabled".into(), serde_json::Value::Bool(enabled));
+        }
         Ok(())
-    }
-
-    pub fn matches_query(&self, query: &str) -> bool {
-        self.matches_query_lowered(&query.to_lowercase())
     }
 
     /// 与 `matches_query` 同语义，但接受调用方预先 lower 的 query——
     /// 扫描整本世界书时避免每条 entry 重复分配整段小写副本。
+    ///
+    /// （`matches_query` 无生产调用者，已按 D-22 删除；调用方一律走本函数。）
     pub fn matches_query_lowered(&self, query_lower: &str) -> bool {
         if self.disabled {
             return false;
@@ -143,6 +142,32 @@ fn any_key_matches(query_lower: &str, keys: &[String]) -> bool {
         .map(|k| k.trim())
         .filter(|k| !k.is_empty())
         .any(|k| query_lower.contains(&k.to_lowercase()))
+}
+
+/// i64 → i32 窄化：越界只告警并忽略，绝不静默回绕（D-23）。
+fn narrow_i64_to_i32(value: i64) -> Option<i32> {
+    match i32::try_from(value) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                value,
+                "world-info numeric field out of i32 range; value ignored"
+            );
+            None
+        }
+    }
+}
+
+/// 蓝绿灯 → 路由的唯一映射（`default_route` 与 `from_st` 共用，避免手工同步，D-23）。
+///
+/// ST 语义：`selective=false` 只表示"无副键过滤"，绿灯条目仍按主键触发；
+/// 因此永不会返回 [`LoreRoute::Disabled`]（`Disabled` 只能由用户显式设置）。
+fn route_for_flags(constant: bool, selective: bool) -> LoreRoute {
+    match (constant, selective) {
+        (true, true) => LoreRoute::Both,
+        (true, false) => LoreRoute::Constant,
+        (false, _) => LoreRoute::Selective,
+    }
 }
 
 impl WorldInfoBook {
@@ -220,28 +245,21 @@ impl WorldInfoEntry {
             .unwrap_or(true);
         let disabled = st.disable.unwrap_or(false) || !v3_enabled;
 
-        let route = if constant && selective {
-            LoreRoute::Both
-        } else if constant {
-            LoreRoute::Constant
-        } else {
-            // ST 语义：selective=false 只表示"无副键过滤"，绿灯条目仍按主键触发。
-            // 旧映射把 (false,false) 判成 Disabled，会让大量普通关键词条目静默死档。
-            LoreRoute::Selective
-        };
+        let route = route_for_flags(constant, selective);
 
-        // v3 导出把 order 写成 insertion_order、depth 放进 extensions
+        // v3 导出把 order 写成 insertion_order、depth 放进 extensions。
+        // 超出 i32 的值不再静默回绕（D-23），只告警后忽略。
         let order = st.order.or_else(|| {
             st.extra
                 .get("insertion_order")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v as i32)
+                .and_then(narrow_i64_to_i32)
         });
         let depth = st.depth.or_else(|| {
             st.extensions
                 .get("depth")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v as i32)
+                .and_then(narrow_i64_to_i32)
         });
 
         Self {
@@ -262,9 +280,34 @@ impl WorldInfoEntry {
         }
     }
 
+    /// 导出 position 到 ST 卡片。
+    ///
+    /// M-05：ST V2/V3 规格里 `position` 是字符串（`'before_char' | 'after_char'`），
+    /// 数字形态只作为导入兼容分支保留。0/1 之外的取值（ST 内部数字语义，如
+    /// ANTop=2）不在 V3 规格内，导出时保留数字，避免伪造一个错误的位置标签。
+    fn position_for_export(&self) -> serde_json::Value {
+        match self.position {
+            0 => serde_json::Value::String("before_char".into()),
+            1 => serde_json::Value::String("after_char".into()),
+            n => serde_json::Value::Number(n.into()),
+        }
+    }
+
     /// 导出为 ST 条目（reverse of `from_st`）
+    ///
+    /// M-32.9：`extra` 会原样克隆，其中可能仍带着源卡的 `insertion_order`
+    /// （V3 写法，见 `from_st` 的 order 回退）。若它与 `self.order` 不同，
+    /// wire 上就出现两个互相矛盾的"顺序"来源。这里以 `self.order` 为唯一权威
+    /// ——**只在键已存在时**同步其值（不凭空发明该键），既消除歧义又保持
+    /// V2/V3 双写法对第三方阅读器的兼容。
     pub fn to_st_entry(&self) -> StWorldInfoEntry {
-        use serde_json::Value;
+        let mut extra = self.extra.clone();
+        if extra.contains_key("insertion_order") {
+            extra.insert(
+                "insertion_order".to_string(),
+                serde_json::Value::Number(self.order.into()),
+            );
+        }
         StWorldInfoEntry {
             id: self.st_id,
             keys: self.keys.clone(),
@@ -283,12 +326,12 @@ impl WorldInfoEntry {
                 SelectiveLogic::Or => 1,
                 SelectiveLogic::Not => 2,
             }),
-            position: Some(Value::Number(self.position.into())),
+            position: Some(self.position_for_export()),
             disable: Some(self.disabled),
             order: Some(self.order),
             depth: Some(self.depth),
             extensions: self.extensions.clone(),
-            extra: self.extra.clone(),
+            extra,
         }
     }
 }
@@ -620,5 +663,246 @@ mod tests {
         assert_eq!(e.order, 7, "v3 insertion_order 应作为 order 读入");
         assert_eq!(e.depth, 3, "v3 extensions.depth 应作为 depth 读入");
         assert_eq!(e.position, 0);
+    }
+
+    // ─── D-02：v3 `enabled` 与领域 `disabled` 必须同步 ──────────────────────
+
+    #[test]
+    fn set_enabled_syncs_v3_enabled_flag_and_survives_round_trip() {
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "id": 11,
+                "keys": ["[InitVar]"],
+                "content": "初始变量数据条目",
+                "constant": false,
+                "selective": true,
+                "disable": false,
+                "enabled": false
+            }))],
+            extra: Default::default(),
+        });
+        let mut e = lore.entries[0].clone();
+        assert!(e.disabled, "v3 enabled:false → disabled");
+
+        e.set_enabled(true).expect("enable must succeed");
+        assert!(!e.disabled);
+        assert_eq!(
+            e.extra.get("enabled"),
+            Some(&serde_json::json!(true)),
+            "启用必须同步写回 v3 `enabled` 真相源（D-02）"
+        );
+
+        // 导出 → 重新导入：这是用户"启用后导出再导入"的真实路径
+        let exported = book(vec![e.clone()]).to_st_book();
+        let reimported =
+            WorldInfoEntry::from_st(exported.entries.into_iter().next().expect("exported entry"));
+        assert!(
+            !reimported.disabled,
+            "导出→重导入后条目必须保持启用，不得被静默重新禁用（D-02）"
+        );
+
+        // 反向：禁用同样同步
+        e.set_enabled(false).expect("disable must succeed");
+        assert_eq!(e.extra.get("enabled"), Some(&serde_json::json!(false)));
+        assert!(e.disabled);
+    }
+
+    #[test]
+    fn set_enabled_does_not_invent_enabled_key_for_v2_entries() {
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "id": 12,
+                "keys": ["旧版条目"],
+                "content": "v2 wire：只有 disable",
+                "disable": true
+            }))],
+            extra: Default::default(),
+        });
+        let mut e = lore.entries[0].clone();
+        assert!(e.disabled);
+        assert!(!e.extra.contains_key("enabled"));
+
+        e.set_enabled(true).expect("enable must succeed");
+        assert!(!e.disabled);
+        assert!(
+            !e.extra.contains_key("enabled"),
+            "v2 条目不应被凭空写出 v3 `enabled` 键"
+        );
+        assert_eq!(e.to_st_entry().disable, Some(false));
+    }
+
+    #[test]
+    fn set_enabled_restores_route_from_blue_green_flags() {
+        let mut e = entry(
+            "被显式路由为禁用",
+            LoreRoute::Selective,
+            &["k"],
+            &[],
+            SelectiveLogic::And,
+            true,
+        );
+        e.route = LoreRoute::Disabled;
+        e.set_enabled(true).expect("enable must succeed");
+        // default_route() 对 (false, true) 返回 Selective，且永不为 Disabled（D-23）
+        assert_eq!(e.route, LoreRoute::Selective);
+        assert!(!e.disabled);
+    }
+
+    // ─── D-23：路由映射唯一化 / 越界数字不静默回绕 ─────────────────────────
+
+    #[test]
+    fn from_st_route_matches_default_route_mapping() {
+        for (constant, selective) in [(true, true), (true, false), (false, true), (false, false)] {
+            let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+                entries: vec![st_entry_from_json(serde_json::json!({
+                    "keys": ["k"],
+                    "content": "c",
+                    "constant": constant,
+                    "selective": selective
+                }))],
+                extra: Default::default(),
+            });
+            let e = &lore.entries[0];
+            assert_eq!(
+                e.route,
+                e.default_route(),
+                "from_st 与 default_route 必须同源（constant={constant}, selective={selective}）"
+            );
+            assert_ne!(e.route, LoreRoute::Disabled);
+        }
+    }
+
+    #[test]
+    fn out_of_range_insertion_order_is_ignored_instead_of_wrapped() {
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "keys": ["k"],
+                "content": "c",
+                "insertion_order": 5_000_000_000i64
+            }))],
+            extra: Default::default(),
+        });
+        assert_eq!(
+            lore.entries[0].order, 100,
+            "越界 insertion_order 必须回退默认值，不得静默回绕（D-23）"
+        );
+
+        let ok = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "keys": ["k"],
+                "content": "c",
+                "insertion_order": 7
+            }))],
+            extra: Default::default(),
+        });
+        assert_eq!(ok.entries[0].order, 7);
+    }
+
+    // ─── M-05：position 导出必须是 ST V2/V3 字符串契约 ──────────────────────
+
+    #[test]
+    fn to_st_entry_writes_spec_string_positions() {
+        let mut e = entry(
+            "c",
+            LoreRoute::Selective,
+            &["k"],
+            &[],
+            SelectiveLogic::And,
+            false,
+        );
+        e.position = 0;
+        assert_eq!(
+            e.to_st_entry().position,
+            Some(serde_json::json!("before_char")),
+            "position 0 必须导出为 ST 规格字符串（M-05）"
+        );
+        e.position = 1;
+        assert_eq!(
+            e.to_st_entry().position,
+            Some(serde_json::json!("after_char"))
+        );
+        // V3 规格外取值保留数字形态（不伪造错误的位置标签）
+        e.position = 2;
+        assert_eq!(e.to_st_entry().position, Some(serde_json::json!(2)));
+
+        // 往返稳定
+        let mut back = entry(
+            "c",
+            LoreRoute::Selective,
+            &["k"],
+            &[],
+            SelectiveLogic::And,
+            false,
+        );
+        back.position = 1;
+        let st = back.to_st_entry();
+        assert_eq!(st.position_as_i32(), 1);
+    }
+
+    // ─── M-32.9：wire 上不得出现两个互相矛盾的顺序来源 ─────────────────────
+
+    #[test]
+    fn to_st_entry_syncs_preserved_insertion_order_with_authoritative_order() {
+        // V3 源卡：只有 insertion_order（落在 extra 里）；导入后 order==42
+        let mut e = WorldInfoEntry::from_st(st_entry_from_json(serde_json::json!({
+            "keys": ["k"],
+            "content": "c",
+            "insertion_order": 42
+        })));
+        assert_eq!(e.order, 42);
+        assert!(e.extra.contains_key("insertion_order"));
+
+        // 运行时把顺序改成 70（UI 排序/迁移）
+        e.order = 70;
+        let st = e.to_st_entry();
+        assert_eq!(st.order, Some(70));
+        assert_eq!(
+            st.extra.get("insertion_order"),
+            Some(&serde_json::json!(70)),
+            "已存在的 insertion_order 必须与权威 order 同步（M-32.9）"
+        );
+        // 重新导入：两个来源一致，读到的都是 70
+        let back = WorldInfoEntry::from_st(st);
+        assert_eq!(back.order, 70);
+    }
+
+    #[test]
+    fn to_st_entry_does_not_invent_insertion_order_for_v2_entries() {
+        // 没有该键的 V2 条目：导出不得凭空造出 V3 字段
+        let mut e = entry(
+            "c",
+            LoreRoute::Constant,
+            &["k"],
+            &[],
+            SelectiveLogic::And,
+            false,
+        );
+        e.order = 33;
+        let st = e.to_st_entry();
+        assert_eq!(st.order, Some(33));
+        assert!(
+            !st.extra.contains_key("insertion_order"),
+            "V2 条目不得被写入 insertion_order：{:?}",
+            st.extra
+        );
+    }
+
+    #[test]
+    fn to_st_entry_ignores_out_of_range_insertion_order_key() {
+        // 越界 insertion_order 在导入时已被忽略（D-23），extra 仍保留原值；
+        // 导出必须把它同步成合法 order，不能把越界值再传出去
+        let e = WorldInfoEntry::from_st(st_entry_from_json(serde_json::json!({
+            "keys": ["k"],
+            "content": "c",
+            "insertion_order": 5_000_000_000i64
+        })));
+        assert_eq!(e.order, 100, "越界值忽略后回退默认 100");
+        let st = e.to_st_entry();
+        assert_eq!(
+            st.extra.get("insertion_order"),
+            Some(&serde_json::json!(100))
+        );
+        assert_eq!(st.order, Some(100));
+        assert_eq!(WorldInfoEntry::from_st(st).order, 100);
     }
 }

@@ -283,6 +283,8 @@ function applyTemplate(t) {
   form.templateId = t.id
   if (t.base_url) form.baseUrl = t.base_url
   if (t.default_model) form.model = t.default_model
+  // F-47：此前漏了 protocol —— 新增非 OpenAi 协议模板时会以默认协议落库
+  if (t.protocol) form.protocol = t.protocol
   form.toolMode = t.tool_mode === 'Native' ? 'native' : 'text_fallback'
   form.reasoning = String(t.default_reasoning || 'disabled').toLowerCase()
   fetchedModels.value = [] // 切模板清空在线拉取的模型
@@ -429,8 +431,11 @@ async function handleSave() {
       model: form.model,
       apiKey: form.apiKey,
       toolMode: form.toolMode,
-      temperature: parseFloat(form.temperature),
-      topP: parseFloat(form.topP),
+      // F-47：清空输入框时 v-model.number 会给出 ''，parseFloat('')=NaN，
+      // invoke 的 JSON 序列化把 NaN 变 null → 后端静默回退厂商默认采样参数。
+      // 显式映射为 null 并让 UI 语义可预期。
+      temperature: Number.isFinite(parseFloat(form.temperature)) ? parseFloat(form.temperature) : null,
+      topP: Number.isFinite(parseFloat(form.topP)) ? parseFloat(form.topP) : null,
       maxTokens,
       maxTokensExplicit: maxTokens !== null,
       reasoning,
@@ -783,7 +788,7 @@ async function handleSetActive(id) {
           >
             <span>{{ testResult.success ? '✓' : '✗' }}</span>
             <span class="flex-1">{{ testResult.message }}</span>
-            <span v-if="testResult.latencyMs" class="text-ink-soft">· {{ testResult.latencyMs }}ms</span>
+            <span v-if="testResult.latency_ms" class="text-ink-soft">· {{ testResult.latency_ms }}ms</span>
           </div>
 
           <!-- 操作按钮 -->

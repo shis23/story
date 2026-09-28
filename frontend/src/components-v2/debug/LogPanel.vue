@@ -13,11 +13,13 @@ import Tabs from '../ui/Tabs.vue'
 import Select from '../ui/Select.vue'
 import IconButton from '../ui/IconButton.vue'
 import Badge from '../ui/Badge.vue'
+import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 
 const logs = ref([])
 const loading = ref(false)
+const loadError = ref(null)
 const activeTab = ref('all') // all | backend | llm | frontend
 const levelFilter = ref('') // '' = 全部；传小写给后端
 const listEl = ref(null)
@@ -84,7 +86,15 @@ function isOpen(id) {
 function toggle(id) {
   const next = new Set(expanded.value)
   if (next.has(id)) next.delete(id)
-  else next.add(id)
+  else {
+    next.add(id)
+    // F-47：expanded 此前只增不删（长会话无界累积）。只保留最近 50 条展开态，
+    // 超出的按插入顺序淘汰（Set 保持插入顺序）。
+    while (next.size > 50) {
+      const oldest = next.values().next().value
+      next.delete(oldest)
+    }
+  }
   expanded.value = next
 }
 
@@ -123,9 +133,20 @@ async function loadLogs({ quiet = false } = {}) {
   // 后端历史只认小写；兼容 UI 若写成 Error 也统一
   if (levelFilter.value) filter.level = String(levelFilter.value).toLowerCase()
   try {
-    logs.value = await logQuery(filter)
+    // F-47：轮询此前每次整表替换（120 条全量重渲染）。内容一致时保持原数组引用，
+    // 避免无谓的 v-for 重渲染与滚动抖动。
+    const next = await logQuery(filter)
+    const sameAsCurrent =
+      Array.isArray(next) &&
+      Array.isArray(logs.value) &&
+      next.length === logs.value.length &&
+      next.every((row, i) => row?.id === logs.value[i]?.id && row?.message === logs.value[i]?.message)
+    if (!sameAsCurrent) logs.value = next
+    loadError.value = null
   } catch (e) {
+    // F-19：失败此前只写 console，界面显示"暂无日志"（错误伪装成空态）
     console.error('加载日志失败:', e)
+    loadError.value = errorText(e)
   } finally {
     if (!quiet) loading.value = false
     firstLoad = false
@@ -232,6 +253,12 @@ defineExpose({ loadLogs })
       </div>
 
       <LoadingState v-if="loading && logs.length === 0" />
+
+      <!-- F-19：加载失败此前静默，界面长得像"暂无日志" -->
+      <div v-else-if="loadError" class="rounded-xl border border-err/40 bg-err/10 px-3 py-3 text-center space-y-2">
+        <div class="text-xs text-err">加载日志失败: {{ loadError }}</div>
+        <Button variant="default" size="sm" @click="loadLogs()">重试</Button>
+      </div>
 
       <EmptyState
         v-else-if="!loading && logs.length === 0"

@@ -17,6 +17,7 @@ pub mod contract;
 pub mod cutover;
 pub mod error;
 pub mod exporter;
+pub mod fs_atomic;
 pub mod importer;
 pub mod lease;
 pub mod migrations;
@@ -35,8 +36,9 @@ pub use backend::{
 pub use connection::{Database, STORYFORGE_APPLICATION_ID};
 pub use cutover::{
     BackendMarker, CutoverDiagnostics, CutoverFault, CutoverOutcome, CutoverPlan, CutoverReport,
-    CutoverRequest, MarkerStatus, inspect_marker, reconcile_marker_schema_version,
-    recover_or_verify, run_cutover, run_cutover_with_fault,
+    CutoverRequest, MarkerStatus, StaleKind, inspect_marker, is_recoverable_stale,
+    reconcile_marker_schema_version, recover_or_verify, run_cutover, run_cutover_with_fault,
+    stale_recovery_eligible, stale_recovery_eligible_for,
 };
 pub use error::{Result, SqliteError};
 pub use exporter::{
@@ -59,7 +61,7 @@ pub use preaccept::{
 pub use publication::{PublishFault, PublishOutcome, PublishRequest, SqliteChronicleRepository};
 pub use readiness::{
     BackupCheckpoint, ExportSnapshot, SourceManifestReport, create_backup_checkpoint,
-    export_readonly_snapshot, validate_source_manifest,
+    create_backup_checkpoint_with_source, export_readonly_snapshot, validate_source_manifest,
 };
 pub use rollback::{
     RollbackFault, RollbackReport, RollbackRequest, run_rollback, run_rollback_with_fault,

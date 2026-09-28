@@ -71,6 +71,14 @@ pub const PERMISSION_COMPAT_MATRIX: &[CompatEntry] = &[
         requires_permissions: &[Permission::WriteVariables],
     },
     CompatEntry {
+        id: "perm:write_chat",
+        surface: "permission",
+        name: "WriteChat",
+        status: CompatStatus::Implemented,
+        reason: Some("required by the chat.save bridge before it can persist (M-31c)"),
+        requires_permissions: &[Permission::WriteChat],
+    },
+    CompatEntry {
         id: "perm:propose_variable_update",
         surface: "permission",
         name: "ProposeVariableUpdate",
@@ -338,6 +346,7 @@ mod tests {
             Permission::ReadMemory,
             Permission::ReadVariables,
             Permission::WriteVariables,
+            Permission::WriteChat,
             Permission::ProposeVariableUpdate,
             Permission::ModifyPrompt,
             Permission::CallLlm,

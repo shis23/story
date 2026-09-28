@@ -107,18 +107,31 @@ pub(crate) fn card_shell_list_allowed_hosts() -> Vec<String> {
     get_card_shell_cache().list_allowed_hosts()
 }
 
+/// Map a shell-doc registry failure to the structured command-error DTO
+/// (T-05): size/entry limits are caller-facing validation errors, anything else
+/// is an internal failure. Returning a bare `String` here used to be the only
+/// exception among the `Result` commands and surfaced as `[object Object]`-class
+/// rendering problems in the frontend.
+fn shell_doc_error(message: String) -> TauriCommandError {
+    if message.contains("exceeds") || message.contains("registry reached") {
+        TauriCommandError::validation(message)
+    } else {
+        TauriCommandError::internal(message)
+    }
+}
+
 /// Register a shell document for the isolated `storyforge-shell` origin and
 /// return its opaque token. The frontend builds the iframe URL as
 /// `<shell_doc_protocol::SHELL_DOC_ORIGIN>/<token>`. V5 CSP isolation — see
 /// shell_doc_protocol.rs.
 #[tauri::command]
-pub(crate) fn card_shell_register_doc(html: String) -> Result<String, String> {
-    shell_doc_protocol::register_shell_doc(html)
+pub(crate) fn card_shell_register_doc(html: String) -> Result<String, TauriCommandError> {
+    shell_doc_protocol::register_shell_doc(html).map_err(shell_doc_error)
 }
 
 #[tauri::command]
-pub(crate) fn card_shell_register_module(source: String) -> Result<String, String> {
-    shell_doc_protocol::register_shell_module(source)
+pub(crate) fn card_shell_register_module(source: String) -> Result<String, TauriCommandError> {
+    shell_doc_protocol::register_shell_module(source).map_err(shell_doc_error)
 }
 
 #[tauri::command]
@@ -126,6 +139,15 @@ pub(crate) fn card_shell_unregister_doc(token: String) -> bool {
     shell_doc_protocol::unregister_shell_doc(&token)
 }
 
+/// 提权命令：把 host 加进卡壳网络 allowlist。
+///
+/// T-09：前端 wrapper 已被删除（域5），当前**没有任何生产调用点**；按"保留 +
+/// 标注"口径与 T-15 保持一致（删除需要同步改 lib.rs 注册表与域4的命令基线
+/// 快照，属跨域改动）。
+///
+/// 已知残余风险（记入 06 fixes 记录）：在 M-01（子帧持有 Tauri IPC）未修复
+/// 前，这条命令会放大爆炸半径——壳 iframe 可以自己 allowlist 一个任意远端
+/// host，再经 host 代持代理拉取。M-01 落地修复时应与本命令的删除一起评估。
 #[tauri::command]
 pub(crate) fn card_shell_allow_host(host: String) -> Result<(), TauriCommandError> {
     if host.trim().is_empty() {
@@ -145,21 +167,29 @@ pub(crate) fn card_shell_clear_cache() -> Result<usize, TauriCommandError> {
 }
 
 /// 宿主代持拉取远程壳资源（allowlist + 磁盘缓存）。失败显式返回错误，不降级为空成功。
+///
+/// T-03：这条命令是 reqwest blocking 客户端 + 磁盘缓存的同步 IO，过去直接跑在
+/// Tauri 的命令线程上，会让前端热路径（壳加载）在等待网络时阻塞 IPC。改为
+/// `async` + `spawn_blocking`，把阻塞 IO 挪出命令线程；错误映射与返回结构不变。
 #[tauri::command]
-pub(crate) fn card_shell_fetch_url(
+pub(crate) async fn card_shell_fetch_url(
     url: String,
 ) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
-    let cache = get_card_shell_cache();
-    let client = cache.build_client().map_err(TauriCommandError::internal)?;
-    cache
-        .fetch_blocking_with_client(&url, &client)
-        .map_err(|e| {
-            if e.contains("allowlist") {
-                TauriCommandError::validation(e)
-            } else {
-                TauriCommandError::internal(e)
-            }
-        })
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache = get_card_shell_cache();
+        let client = cache.build_client().map_err(TauriCommandError::internal)?;
+        cache
+            .fetch_blocking_with_client(&url, &client)
+            .map_err(|e| {
+                if e.contains("allowlist") {
+                    TauriCommandError::validation(e)
+                } else {
+                    TauriCommandError::internal(e)
+                }
+            })
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("card shell fetch task failed: {e}")))?
 }
 
 /// Serve large, already-validated card assets from the host cache without

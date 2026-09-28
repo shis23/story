@@ -1,7 +1,12 @@
-//! Store contract 测试骨架。
+//! Store contract 测试骨架（**仅测试用适配基线**，非生产路径）。
 //!
-//! 本阶段不切换默认 JSON Store，只验证 SQLite 侧能承载
-//! Campaign / Conversation / Turn 的最小读写契约，作为后续适配基线。
+//! 历史背景：本模块写于 SQLite 尚未接线时（当时默认仍是 JSON Store），用来验证
+//! SQLite 侧能承载 Campaign / Conversation / Turn 的最小读写契约。
+//!
+//! 现状（S-19 修正过时描述）：Gate 7 起 SQLite 已是**默认权威后端**，生产读写走
+//! `production.rs`（typed repository）与 tauri-app 的 `sqlite_runtime`；本模块的
+//! `SqliteCampaignContract` 只在自身单测中使用，作为「最小契约」回归基线保留。
+//! 新增生产代码请勿依赖它。
 
 use serde_json::Value;
 
@@ -170,7 +175,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        // 必需布局文件（Gate 5 审查一.6：核心文件缺失必须报错，测试夹具补齐）。
+        // S-19：过时注释修正。Gate 7 起「核心文件缺失 = 空集合」，这些文件
+        // **不再**是硬性必需；测试夹具写成显式空文件是为了镜像「正常写入过的
+        // 数据目录」（真实目录在无数据时也会写出 `[]`），同时避免触发 S-01 的
+        // fail-closed 前置条件（cards/campaigns 缺失且存在交叉引用）。
         for name in [
             "instances.json",
             "knowledge.json",

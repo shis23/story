@@ -1057,3 +1057,481 @@ fn campaign_with_missing_card_id_fails_closed() {
         "缺失 card_id 必须 fail-closed，got: {err}"
     );
 }
+
+// ─── S-01（默认后端 P0）：父集合缺失/为空 + 子集合非空 → fail-closed ──────────
+
+/// 只写 campaigns.json（引用 card-1）与空子集合，不写 cards.json。
+fn source_with_missing_cards(dir: &std::path::Path) {
+    write_json(
+        &dir.join("campaigns.json"),
+        &json!([{
+            "id": "camp-1", "card_id": "card-1", "name": "Main",
+            "created_at": "2026-08-01T00:00:00Z", "conversation_id": "conv-1", "lineage_id": "lin-1"
+        }]),
+    );
+    write_json(
+        &dir.join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-1", "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T00:00:00Z", "nodes": []
+        }),
+    );
+    for name in [
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+    ] {
+        write_json(&dir.join(name), &json!([]));
+    }
+}
+
+#[test]
+fn missing_cards_json_with_campaigns_fails_closed_not_empty_authority() {
+    // S-01 核心场景（Lead 指定）：cards.json **缺失**但 campaigns.json 存在。
+    // 旧行为：缺失=空集合 → 全部 Campaign 判悬空卡孤儿丢弃 → 子行全跳过 →
+    // 空库 + completed + 权威 marker 固化，用户数据静默消失。
+    // 新行为：区分 Missing/Empty → fail-closed，且不产生任何 DB/marker。
+    let dir = TempDir::new().unwrap();
+    source_with_missing_cards(dir.path());
+
+    // dry-run 也必须拒绝（readiness 与 importer 同口径）。
+    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect_err("cards.json 缺失 + 非空 campaigns 必须 fail-closed");
+    assert!(
+        err.to_string().contains("import source incomplete"),
+        "错误必须可识别为源不完整，got: {err}"
+    );
+    assert!(
+        err.to_string().contains("cards.json"),
+        "错误必须指名 cards.json，got: {err}"
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("importer 不得把该场景当空集合导入");
+    assert!(err.to_string().contains("import source incomplete"));
+
+    // 不得写入任何行（错误发生在事务前/回滚，不会留下空权威）。
+    let campaigns: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(campaigns, 0);
+    let runs: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM import_runs WHERE status = 'completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        runs, 0,
+        "不得留下 completed 导入记录（否则会被当作权威快照）"
+    );
+
+    // cutover 层：必须拒绝且不发布 DB / 不写 marker。
+    let request = storyforge_infra_sqlite::CutoverRequest {
+        plan: storyforge_infra_sqlite::CutoverPlan::new(
+            dir.path(),
+            dir.path().join("storyforge.sqlite3"),
+        ),
+        label: "s01-missing-cards".into(),
+        allow_json_authoritative_flip: true,
+    };
+    let err = storyforge_infra_sqlite::run_cutover(&request).expect_err("cutover 必须 fail-closed");
+    assert!(
+        err.to_string().contains("import source incomplete"),
+        "got: {err}"
+    );
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert_eq!(
+        storyforge_infra_sqlite::inspect_marker(&request.plan),
+        storyforge_infra_sqlite::MarkerStatus::Absent
+    );
+}
+
+#[test]
+fn empty_cards_json_with_all_campaigns_dangling_is_rejected() {
+    // N-R1-02（原 `..._is_skipped_with_audit`）：cards.json **存在但为空数组** +
+    // campaigns 非空 ⇒ 每个 campaign 都必然悬空 ⇒ 整棵 campaign 树（campaign →
+    // instances/knowledge/tasks/summaries/turns）会被判孤儿丢弃、发布 0 campaigns
+    // 的空权威 + completed 导入记录 + marker。判为源目录不完整并 fail-closed。
+    //
+    // 为什么推翻首轮「跳过 + 计数」边界（Lead 复检要求按证据裁定）：
+    // `CampaignStore::delete_card`（campaign_store.rs:298）在同一次快照/补偿写里
+    // 级联删 cards→campaigns→instances→knowledge→tasks→summaries，且写盘顺序是
+    // **cards.json 先、campaigns.json 后**（:377-383）；删除**正常完成**后二者
+    // 一致，不存在「0 张卡 + 非空 campaigns」的合法态。该形态只可能来自：
+    // 硬崩溃落在两次写盘之间、部分拷贝/恢复中断、磁盘故障、手工编辑——正是
+    // S-01 要拦的「源目录不完整」。误伤面只剩「删最后一张卡时被强杀」这一极
+    // 罕见路径，且错误文案给出可操作处置（恢复 cards.json，或确认后清理
+    // campaigns.json 再重试）；反过来放行则整棵 campaign 树静默消失。
+    let dir = TempDir::new().unwrap();
+    source_with_missing_cards(dir.path());
+    write_json(&dir.path().join("cards.json"), &json!([]));
+
+    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect_err("0 张卡 + 非空 campaigns 必须 fail-closed");
+    let message = err.to_string();
+    assert!(
+        matches!(err, SqliteError::ImportSourceIncomplete(_)),
+        "期望 ImportSourceIncomplete，实际 {message}"
+    );
+    assert!(
+        message.contains("cards.json exists but is empty"),
+        "文案必须说清「cards.json 存在但为空」，不能误报成缺失: {message}"
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let import_err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("importer 同口径拒绝");
+    assert!(import_err.to_string().contains("import source incomplete"));
+    let campaigns: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(campaigns, 0);
+    let runs: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM import_runs WHERE status = 'completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        runs, 0,
+        "不得留下 completed 导入记录（否则会被当作权威快照）"
+    );
+
+    // cutover 层：拒绝且不发布 DB / 不写 marker（与 Rule A 同口径）。
+    let request = storyforge_infra_sqlite::CutoverRequest {
+        plan: storyforge_infra_sqlite::CutoverPlan::new(
+            dir.path(),
+            dir.path().join("storyforge.sqlite3"),
+        ),
+        label: "r13-empty-cards".into(),
+        allow_json_authoritative_flip: true,
+    };
+    let err = storyforge_infra_sqlite::run_cutover(&request).expect_err("cutover 必须 fail-closed");
+    assert!(
+        err.to_string().contains("import source incomplete"),
+        "got: {err}"
+    );
+    assert!(!dir.path().join("storyforge.sqlite3").exists());
+    assert!(!dir.path().join("storyforge.backend.json").exists());
+    assert_eq!(
+        storyforge_infra_sqlite::inspect_marker(&request.plan),
+        storyforge_infra_sqlite::MarkerStatus::Absent
+    );
+
+    // 反例（判据不得溢出）：cards.json **非空**而个别 campaign 悬空仍是合法
+    // 老数据（`save_card` 按 source_character_id 覆盖去重会留下悬空引用）——
+    // 沿用 Gate 8 P2-A3 的「跳过 + 计数」，不 fail-closed。
+    let dir2 = TempDir::new().unwrap();
+    write_json(
+        &dir2.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(
+        &dir2.path().join("campaigns.json"),
+        &json!([
+            { "id": "camp-1", "card_id": "card-1", "name": "Main",
+              "created_at": "2026-08-01T00:00:00Z", "lineage_id": "lin-1" },
+            { "id": "camp-2", "card_id": "card-gone", "name": "Ghost",
+              "created_at": "2026-08-01T00:00:00Z", "lineage_id": "lin-2" }
+        ]),
+    );
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir2.path())
+        .expect("部分悬空仍合法");
+    assert_eq!(report.campaigns, 1);
+    assert_eq!(report.skipped_orphan_rows, 1);
+    let mut db2 = Database::open_in_memory().unwrap();
+    let imported = JsonImporter::new(&mut db2)
+        .import_data_dir(dir2.path())
+        .expect("部分悬空必须可导入");
+    assert_eq!(imported.status, ImportStatus::Completed);
+    assert_eq!(imported.campaigns, 1);
+    assert_eq!(imported.skipped_orphan_rows, 1);
+}
+
+#[test]
+fn missing_campaigns_json_with_child_rows_fails_closed() {
+    // S-01 第三变体：campaigns.json **缺失**而子集合非空 → 旧行为会把全部子行
+    // 当孤儿跳过并发布空库。必须拒绝并指名哪些集合非空。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    // 不写 campaigns.json。
+    write_json(
+        &dir.path().join("instances.json"),
+        &json!([{
+            "id": "inst-1",
+            "campaign_id": "camp-gone",
+            "definition_id": "def-1",
+            "name": "Hero",
+            "variables": {}
+        }]),
+    );
+
+    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect_err("campaigns.json 缺失 + instances 非空必须 fail-closed");
+    let text = err.to_string();
+    assert!(text.contains("import source incomplete"), "got: {err}");
+    assert!(text.contains("instances=1"), "必须指名非空集合，got: {err}");
+}
+
+#[test]
+fn empty_campaigns_json_with_child_rows_is_skipped_with_audit() {
+    // S-01 边界：campaigns.json 存在但为空数组 + 子行残留（用户删光活动后的
+    // 孤儿行）→ 沿用 Gate 8「跳过 + 计数」语义，不阻断启动，但必须有明细。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(&dir.path().join("campaigns.json"), &json!([]));
+    write_json(
+        &dir.path().join("instances.json"),
+        &json!([{
+            "id": "inst-1",
+            "campaign_id": "camp-gone",
+            "definition_id": "def-1",
+            "name": "Hero",
+            "variables": {}
+        }]),
+    );
+
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect("campaigns.json 存在（空数组）不得 fail-closed");
+    assert_eq!(report.campaigns, 0);
+    assert!(
+        report
+            .skipped_detail
+            .iter()
+            .any(|(kind, count)| kind == "instances" && *count == 1),
+        "孤儿行跳过必须可审计，got {:?}",
+        report.skipped_detail
+    );
+}
+
+#[test]
+fn partial_dangling_campaigns_still_import_with_auditable_detail() {
+    // S-01 反例（不得过度拦截）：cards.json 完好、只有**部分** Campaign 悬空卡
+    // ——这是 JSON 应用删除单张卡后的正常残留（Gate 8 P2-A3），必须继续导入，
+    // 并把跳过计数 + 分集合明细暴露给调用方（可审计）。
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-live", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("campaigns.json"),
+        &json!([
+            {
+                "id": "camp-live", "card_id": "card-live", "name": "Live",
+                "created_at": "2026-08-01T00:00:00Z", "conversation_id": "conv-1",
+                "lineage_id": "lin-1"
+            },
+            {
+                "id": "camp-dangling", "card_id": "card-removed", "name": "Dangling",
+                "created_at": "2026-08-01T00:00:00Z", "conversation_id": "conv-2",
+                "lineage_id": "lin-2"
+            }
+        ]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-1.json"),
+        &json!({
+            "id": "conv-1", "campaign_id": "camp-live", "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T00:00:00Z", "nodes": []
+        }),
+    );
+    for name in [
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "turns.json",
+    ] {
+        write_json(&dir.path().join(name), &json!([]));
+    }
+
+    let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path()).unwrap();
+    assert_eq!(report.campaigns, 1);
+    assert_eq!(report.skipped_orphan_rows, 1);
+    assert_eq!(
+        report.skipped_detail,
+        vec![("campaigns_no_card".to_string(), 1)],
+        "跳过明细必须出现在 dry-run 报告里"
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let imported = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect("部分悬空不是 fail-closed 条件");
+    assert_eq!(imported.campaigns, 1);
+    assert_eq!(imported.skipped_orphan_rows, 1);
+    assert_eq!(
+        imported.skipped_detail,
+        vec![("campaigns_no_card".to_string(), 1)]
+    );
+
+    // cutover 报告的跳过明细同样可审计（供应用层记录健康事件）。
+    let request = storyforge_infra_sqlite::CutoverRequest {
+        plan: storyforge_infra_sqlite::CutoverPlan::new(
+            dir.path(),
+            dir.path().join("storyforge.sqlite3"),
+        ),
+        label: "s01-partial".into(),
+        allow_json_authoritative_flip: true,
+    };
+    match storyforge_infra_sqlite::run_cutover(&request).unwrap() {
+        storyforge_infra_sqlite::CutoverOutcome::Completed(report) => {
+            assert_eq!(report.skipped_orphan_rows, 1);
+            assert_eq!(
+                report.skipped_detail,
+                vec![("campaigns_no_card".to_string(), 1)]
+            );
+        }
+        storyforge_infra_sqlite::CutoverOutcome::AlreadyCutover(_) => panic!("首次 cutover 应完成"),
+    }
+}
+
+#[test]
+fn legitimate_empty_and_partial_layouts_are_not_rejected() {
+    // Lead R1 自检：合法老数据不得被 S-01 守卫误伤。逐组合验证：
+    // ① 全空布局（cards [] + campaigns []，无子集合）
+    // ② 只有 cards.json（campaigns 缺失，无子集合）
+    // ③ cards 完好 + campaigns 引用完好，且**没有** conversations（campaign
+    //    没有 conversation_id → 不需要会话文件）
+    // ④ cards 缺失 + campaigns 缺失 + 无子集合（全新但建过目录）
+    // ⑤ N-R1-01（P1 回归）：cards.json + `conversations/`（campaign_id: null）
+    //    + **无** campaigns.json。conversations 是唯一允许非 campaign 归属的
+    //    集合，非 Campaign 老用户升级后必须能启动；把「所有会话」都算成
+    //    campaign 依赖（Rule B 旧判据）会让这一组被 ImportSourceIncomplete
+    //    拒掉 → 启动即失败。改回旧判据本组必红。
+    for case in [
+        "all-empty",
+        "cards-only",
+        "no-conversations",
+        "core-missing",
+        "legacy-conversations-no-campaigns",
+    ] {
+        let dir = TempDir::new().unwrap();
+        match case {
+            "all-empty" => {
+                for name in [
+                    "cards.json",
+                    "campaigns.json",
+                    "instances.json",
+                    "knowledge.json",
+                ] {
+                    write_json(&dir.path().join(name), &json!([]));
+                }
+            }
+            "cards-only" => {
+                write_json(
+                    &dir.path().join("cards.json"),
+                    &json!([{ "id": "card-1", "name": "Hero" }]),
+                );
+            }
+            "no-conversations" => {
+                write_json(
+                    &dir.path().join("cards.json"),
+                    &json!([{ "id": "card-1", "name": "Hero" }]),
+                );
+                write_json(
+                    &dir.path().join("campaigns.json"),
+                    &json!([{
+                        "id": "camp-1", "card_id": "card-1", "name": "Main",
+                        "created_at": "2026-08-01T00:00:00Z", "lineage_id": "lin-1"
+                    }]),
+                );
+            }
+            "core-missing" => {}
+            "legacy-conversations-no-campaigns" => {
+                write_json(
+                    &dir.path().join("cards.json"),
+                    &json!([{ "id": "card-1", "name": "Hero" }]),
+                );
+                // 非 Campaign 聊天：campaign_id 为 null（领域允许），不依赖
+                // campaigns.json。
+                write_json(
+                    &dir.path().join("conversations").join("conv-legacy.json"),
+                    &json!({
+                        "id": "conv-legacy",
+                        "campaign_id": null,
+                        "character_id": "char-1",
+                        "nodes": [],
+                        "created_at": "2026-08-01T00:00:00Z",
+                        "updated_at": "2026-08-01T00:00:00Z"
+                    }),
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let report = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+            .unwrap_or_else(|e| panic!("组合 {case} 是合法数据，不得 fail-closed: {e}"));
+        assert!(report.issues.is_empty(), "组合 {case} 不应有校验问题");
+        let mut db = Database::open_in_memory().unwrap();
+        let imported = JsonImporter::new(&mut db)
+            .import_data_dir(dir.path())
+            .unwrap_or_else(|e| panic!("组合 {case} 必须可导入: {e}"));
+        assert_eq!(imported.status, ImportStatus::Completed, "组合 {case}");
+        assert_eq!(imported.skipped_orphan_rows, 0, "组合 {case} 不应有跳过");
+        if case == "legacy-conversations-no-campaigns" {
+            // 非 Campaign 会话必须真的落库（而不是被当孤儿丢掉）。
+            assert_eq!(imported.conversations, 1, "组合 {case} 会话必须导入");
+        }
+    }
+}
+
+/// N-R1-01 的反向锁：收窄 Rule B **不能**把 fail-closed 一起削弱——
+/// 只要存在 campaign 归属的会话，缺 campaigns.json 仍然是源目录不完整。
+#[test]
+fn campaign_scoped_conversations_still_require_campaigns_json() {
+    let dir = TempDir::new().unwrap();
+    write_json(
+        &dir.path().join("cards.json"),
+        &json!([{ "id": "card-1", "name": "Hero" }]),
+    );
+    write_json(
+        &dir.path().join("conversations").join("conv-camp.json"),
+        &json!({
+            "id": "conv-camp",
+            "campaign_id": "camp-1",
+            "character_id": "char-1",
+            "nodes": [],
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T00:00:00Z"
+        }),
+    );
+
+    let err = storyforge_infra_sqlite::readiness::validate_source_manifest(dir.path())
+        .expect_err("campaign 归属的会话 + 缺 campaigns.json 必须 fail-closed");
+    let message = err.to_string();
+    assert!(
+        matches!(err, SqliteError::ImportSourceIncomplete(_)),
+        "期望 ImportSourceIncomplete，实际 {message}"
+    );
+    assert!(
+        message.contains("conversations=1"),
+        "拒绝原因必须点名 conversations=1（Rule B 的精确判据）: {message}"
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let import_err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .expect_err("importer 同口径拒绝");
+    assert!(matches!(import_err, SqliteError::ImportSourceIncomplete(_)));
+}

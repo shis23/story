@@ -16,6 +16,31 @@ use crate::character::CharacterDefinition;
 use crate::character_knowledge::CharacterKnowledgeEntry;
 use crate::story_task::StoryTask;
 
+/// N-R7-01：实例身份归一（比较键）——`trim` + **Unicode 小写**。
+///
+/// 这是全仓唯一的实例身份归一语义：`CampaignRuntimeContext::with_temporaries_for`
+/// 的去重键与 `app-agent` 的实例匹配（`instance_name_matches` /
+/// `find_instance_normalized` / `get_character` 工具）**必须共用它**。
+///
+/// 两套语义曾并存（domain 用 `to_lowercase` 且不 trim；app-agent 用
+/// `trim + eq_ignore_ascii_case`），导致 `"Ähre"/"ähre"`、`" Alice "/"Alice"`
+/// 两侧结论相反：一侧认为"已存在"（不建临时实例）、另一侧 miss（子 Agent 丢
+/// instance 绑定，persona/知识/变量注入全部退化）。
+///
+/// 选型理由（不把不同角色误判为同一人优先，但也不能漏掉同一个人的大小写/空白变体）：
+/// - `trim`：名称外侧空白是导入/LLM 输出的噪声，不是身份差异；两侧都必须忽略。
+/// - Unicode 小写（而非 `eq_ignore_ascii_case`）：非 ASCII 名字（拉丁扩展、希腊、
+///   西里尔）的大小写变体同样是同一个人；ASCII-only 会静默 miss，正是 W-01/N-R7-01
+///   想消灭的失败模式。代价是极少数"看起来不同但 Unicode 小写相同"的字符会被并入
+///   同一键（如 KELVIN SIGN `U+212A` 与 `k`）——在角色名域内可接受，且并入后
+///   双方行为一致、不会出现"一半匹配一半不匹配"的分裂。
+/// - 土耳其 `İ`（`U+0130`）`to_lowercase()` = `i` + `U+0307`（组合点），因此
+///   `"İ"`/`"i"`/`"I"` **不会**被并成同一个键（保守方向：宁可不合并，不误合并）；
+///   德语 `ß` 小写仍是 `ß`，`"ß"` 与 `"ss"` 不会合并（同上）。
+pub fn normalize_instance_identity(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 /// Read-only snapshot of a Campaign's runtime state.
 ///
 /// Assembled by the Tauri layer from `CampaignStore`, consumed by
@@ -100,12 +125,18 @@ impl CampaignRuntimeContext {
     ) -> (Self, Vec<CharacterInstance>) {
         let mut new_instances = self.instances.clone();
         let mut new_temps = Vec::new();
+        // N-R7-01：去重键 = 共享归一语义（trim + Unicode 小写，见
+        // `normalize_instance_identity`）。此前名称侧不 trim、且与 app-agent 的
+        // ASCII 归一不一致，会出现"这边认为已存在、那边匹配不到"的分裂。
         let mut seen: std::collections::HashSet<String> = self
             .instances
             .iter()
-            // ID 与名称统一小写去重：混用大小写的实例 ID（"Inst-1" vs "inst-1"）
-            // 曾绕过去重生成重复临时实例（2026-09-01 全量审查修复）
-            .flat_map(|inst| [inst.id.as_str().to_lowercase(), inst.name.to_lowercase()])
+            .flat_map(|inst| {
+                [
+                    normalize_instance_identity(inst.id.as_str()),
+                    normalize_instance_identity(&inst.name),
+                ]
+            })
             .collect();
 
         for (cid, persona, behavior) in character_specs {
@@ -114,8 +145,9 @@ impl CampaignRuntimeContext {
                 continue;
             }
 
-            // Skip if already matched (IDs are case-insensitive UUIDs; names are lowercased)
-            if !seen.insert(cid.to_lowercase()) {
+            // Skip if already matched (IDs are case-insensitive UUIDs; names are
+            // normalized by the shared `normalize_instance_identity`).
+            if !seen.insert(normalize_instance_identity(cid)) {
                 continue;
             }
             // Create temporary instance with optional overrides

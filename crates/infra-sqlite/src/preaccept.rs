@@ -860,16 +860,22 @@ impl SqlitePreacceptRepository {
         let uow = UnitOfWork::begin(db.connection_mut())?;
         let tx = uow.transaction()?;
         let mut count = 0usize;
-        for mut turn in active {
+        for turn in active {
+            // S-15：预读在事务外，期间可能有并发 accept 提交。事务内重读当前记录，
+            // 已终态 → 跳过；否则用最新记录改写（绝不用旧快照覆盖提交结果）。
+            let Some(mut current) = crate::production::load_validated_turn(tx, &turn.turn_id)?
+            else {
+                continue;
+            };
             // Only fail pre-accept / incomplete states; leave Committing to production recovery.
-            if turn.status == TurnStatus::Committing {
+            if current.status == TurnStatus::Committing || current.status.is_terminal() {
                 continue;
             }
-            turn.status = TurnStatus::Failed;
-            turn.failure_reason = Some(
+            current.status = TurnStatus::Failed;
+            current.failure_reason = Some(
                 "sqlite preaccept recovery: incomplete turn failed after process restart".into(),
             );
-            for attempt in &mut turn.attempts {
+            for attempt in &mut current.attempts {
                 if matches!(
                     attempt.status,
                     AttemptStatus::Generating
@@ -880,7 +886,8 @@ impl SqlitePreacceptRepository {
                     attempt.status = AttemptStatus::Failed;
                 }
             }
-            turn.touch();
+            current.touch();
+            let turn = current;
             write_turn(tx, &turn)?;
             tx.execute(
                 r#"

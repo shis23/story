@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -100,11 +99,6 @@ struct PublicBeat {
 pub struct SequentialStageRecord {
     opening: String,
     beats: Vec<PublicBeat>,
-    // L-12：失败计数。生产路径只 record 不读（record_failure 被调用，但
-    // failure_count/should_stop_actor 仅在 #[cfg(test)] 下编译）。保留是为了
-    // 让「连续失败熔断」在测试里可验证；生产熔断逻辑未接入主循环——加 `#[cfg(test)]`
-    // 会割裂错误处理调用点，故保留为带观测语义的死字段，待熔断策略定稿后接入。
-    failures: HashMap<String, u8>,
 }
 
 impl SequentialStageRecord {
@@ -112,7 +106,6 @@ impl SequentialStageRecord {
         Self {
             opening: opening.into(),
             beats: Vec::new(),
-            failures: HashMap::new(),
         }
     }
 
@@ -138,28 +131,45 @@ impl SequentialStageRecord {
         );
         sections.join("\n\n")
     }
-
-    /// L-12：记录某 actor 的失败次数（观测用）。生产路径不消费该计数；测试通过
-    /// `failure_count`/`should_stop_actor` 验证熔断阈值。
-    pub fn record_failure(&mut self, actor_id: &str, _safe_class: &str) {
-        let count = self.failures.entry(actor_id.to_string()).or_default();
-        *count = count.saturating_add(1);
-    }
-
-    #[cfg(test)]
-    pub fn failure_count(&self, actor_id: &str) -> u8 {
-        self.failures.get(actor_id).copied().unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    pub fn should_stop_actor(&self, actor_id: &str) -> bool {
-        self.failure_count(actor_id) >= 2
-    }
 }
 
 /// Runs character performances one at a time. Only the monotonic public stage
 /// record is forwarded to the next actor; private thoughts and provider
 /// reasoning remain in the returned provenance payload.
+///
+/// W-07：返回每个坑位的真实结局（`SequentialActorOutcome`），不再把
+/// 「scene_close 跳过」与「真取消」都压成 `AgentError::Cancelled`，
+/// 也不再把尝试循环中观察到的取消包装成 `SubagentFailed`。
+#[derive(Debug)]
+pub(crate) enum SequentialActorOutcome {
+    /// cancel watch 已置位（上游取消），本拍未执行完
+    Cancelled,
+    /// 上游演员声明 scene_close=true，本拍按协议跳过（不是失败）
+    SceneClosed,
+    /// 尝试耗尽 / 结果缺失
+    Failed(String),
+}
+
+impl SequentialActorOutcome {
+    /// 映射为 `AgentError`（tauri-app 对 `AgentError` 穷举匹配，不能加变体）。
+    pub(crate) fn into_agent_error(self) -> AgentError {
+        match self {
+            Self::Cancelled | Self::SceneClosed => AgentError::Cancelled,
+            Self::Failed(message) => AgentError::SubagentFailed(message),
+        }
+    }
+}
+
+impl From<AgentError> for SequentialActorOutcome {
+    /// 并行子 Agent 路径的错误归一，便于与顺序剧组结果统一处理。
+    fn from(error: AgentError) -> Self {
+        match error {
+            AgentError::Cancelled => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sequential_crew(
     tasks: Vec<SubagentTask>,
@@ -173,7 +183,7 @@ pub(crate) async fn run_sequential_crew(
     recent_summary_block: Option<&str>,
     far_memory_block: Option<&str>,
     opening: &str,
-) -> Vec<Result<Performance, AgentError>> {
+) -> Vec<Result<Performance, SequentialActorOutcome>> {
     let total = tasks.len();
     run_sequential_crew_suffix(
         tasks,
@@ -213,7 +223,7 @@ pub(crate) async fn run_sequential_crew_suffix(
     recent_summary_block: Option<&str>,
     far_memory_block: Option<&str>,
     opening: &str,
-) -> Vec<Result<Performance, AgentError>> {
+) -> Vec<Result<Performance, SequentialActorOutcome>> {
     let total = beat_total.max(beat_offset.saturating_add(tasks.len()));
     let mut stage = SequentialStageRecord::new(opening);
     for performance in prefix_performances {
@@ -226,8 +236,13 @@ pub(crate) async fn run_sequential_crew_suffix(
     let mut scene_closed = false;
 
     for (index, original_task) in tasks.into_iter().enumerate() {
-        if *cancel.borrow() || scene_closed {
-            results.push(Err(AgentError::Cancelled));
+        if *cancel.borrow() {
+            results.push(Err(SequentialActorOutcome::Cancelled));
+            continue;
+        }
+        if scene_closed {
+            // W-07：上游 scene_close 导致的跳过不是失败，也不是取消
+            results.push(Err(SequentialActorOutcome::SceneClosed));
             continue;
         }
 
@@ -235,9 +250,12 @@ pub(crate) async fn run_sequential_crew_suffix(
         let original_instruction = original_task.context_package.task.clone();
         let mut accepted: Option<ParsedSequentialPerformance> = None;
         let mut last_error = String::new();
+        let mut cancelled_by_signal = false;
 
         for attempt in 1..=MAX_ATTEMPTS_PER_ACTOR {
             if *cancel.borrow() {
+                // W-07：取消要保真回传为 Cancelled，不能降级成 SubagentFailed
+                cancelled_by_signal = true;
                 last_error = "流水线已取消".into();
                 break;
             }
@@ -292,7 +310,6 @@ pub(crate) async fn run_sequential_crew_suffix(
 
             let Some(call_result) = call_results.pop() else {
                 last_error = "顺序剧组未返回演员结果".into();
-                stage.record_failure(&actor_id, "missing_result");
                 continue;
             };
             match call_result {
@@ -307,12 +324,10 @@ pub(crate) async fn run_sequential_crew_suffix(
                     }
                     Err(error) => {
                         last_error = error;
-                        stage.record_failure(&actor_id, "parse");
                     }
                 },
                 Err(error) => {
                     last_error = error.to_string();
-                    stage.record_failure(&actor_id, "agent");
                 }
             }
         }
@@ -323,7 +338,8 @@ pub(crate) async fn run_sequential_crew_suffix(
                 scene_closed = parsed.scene_close;
                 results.push(Ok(parsed.performance));
             }
-            None => results.push(Err(AgentError::SubagentFailed(format!(
+            None if cancelled_by_signal => results.push(Err(SequentialActorOutcome::Cancelled)),
+            None => results.push(Err(SequentialActorOutcome::Failed(format!(
                 "顺序剧组演员 {actor_id} 在 {MAX_ATTEMPTS_PER_ACTOR} 次尝试后失败: {last_error}"
             )))),
         }
@@ -578,31 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_actor_does_not_erase_existing_public_stage_record() {
-        let mut record = SequentialStageRecord::new("开场");
-        record.push_performance(&performance("a", "A 已经开口", "你好", "不要泄露"));
-
-        let before = record.render_for_actor("b");
-        record.record_failure("b", "timeout");
-        let after = record.render_for_actor("c");
-
-        assert!(after.contains("A 已经开口"));
-        assert!(after.contains("你好"));
-        assert_eq!(record.failure_count("b"), 1);
-        assert!(after.len() >= before.len());
-        assert!(!after.contains("timeout"));
-    }
-
-    #[test]
-    fn actor_is_stopped_after_two_failures() {
-        let mut record = SequentialStageRecord::new("开场");
-        record.record_failure("b", "network");
-        assert!(!record.should_stop_actor("b"));
-        record.record_failure("b", "parse");
-        assert!(record.should_stop_actor("b"));
-    }
-
-    #[test]
     fn structured_performance_keeps_inner_thoughts_out_of_public_full_text() {
         let parsed = parse_sequential_performance(
             "actor-a",
@@ -657,5 +648,130 @@ mod tests {
         assert!(instruction.contains("第 2/3 拍"));
         assert!(instruction.contains("scene_close"));
         assert!(!instruction.contains("希望 B 不敢拆"));
+    }
+
+    fn director_config() -> AgentConfig {
+        AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        }
+    }
+
+    /// W-07：尝试循环中观察到取消时，结果必须是 Cancelled，不能降级成 SubagentFailed。
+    #[tokio::test]
+    async fn cancel_during_attempt_is_reported_as_cancelled_not_subagent_failed() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "顺序剧组演员".into(),
+            // 非法 JSON → 第一次尝试解析失败，第二次尝试前 cancel 已置位
+            response_content: "这不是 JSON".into(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_for_hook = cancel_tx.clone();
+        let hook = Arc::new(
+            move |ctx: storyforge_app_agent::runtime::PromptHookContext| {
+                let cancel = cancel_for_hook.clone();
+                Box::pin(async move {
+                    let _ = cancel.send(true);
+                    Ok(ctx.messages)
+                }) as storyforge_app_agent::runtime::PromptHookFuture
+            },
+        );
+        let runtime = Arc::new(AgentRuntime::with_prompt_hook(
+            llm,
+            Arc::new(ToolContext::empty()),
+            hook,
+        ));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+
+        let results = run_sequential_crew(
+            vec![task("actor-a")],
+            runtime,
+            &director_config(),
+            "角色表演基础约束",
+            cancel_rx,
+            event_tx,
+            None,
+            None,
+            None,
+            None,
+            "开场",
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], Err(SequentialActorOutcome::Cancelled)),
+            "取消必须是 Cancelled，而不是 Failed: {:?}",
+            results[0]
+        );
+    }
+
+    /// W-07：上游 scene_close 之后的坑位是"按协议跳过"，不是失败也不是取消。
+    #[tokio::test]
+    async fn scene_close_marks_remaining_actors_as_skipped() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "顺序剧组演员".into(),
+            response_content: serde_json::json!({
+                "narrative": "演员拉上幕布。",
+                "dialogue": "散场了。",
+                "inner_thoughts": "戏演完了。",
+                "scene_close": true
+            })
+            .to_string(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let captured: CapturedPrompts = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_hook = captured.clone();
+        let hook = Arc::new(
+            move |ctx: storyforge_app_agent::runtime::PromptHookContext| {
+                let captured = captured_for_hook.clone();
+                Box::pin(async move {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((ctx.role, ctx.messages.clone()));
+                    Ok(ctx.messages)
+                }) as storyforge_app_agent::runtime::PromptHookFuture
+            },
+        );
+        let runtime = Arc::new(AgentRuntime::with_prompt_hook(
+            llm,
+            Arc::new(ToolContext::empty()),
+            hook,
+        ));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = run_sequential_crew(
+            vec![task("actor-a"), task("actor-b")],
+            runtime,
+            &director_config(),
+            "角色表演基础约束",
+            cancel_rx,
+            event_tx,
+            None,
+            None,
+            None,
+            None,
+            "开场",
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(
+            matches!(&results[1], Err(SequentialActorOutcome::SceneClosed)),
+            "scene_close 之后的坑位应标记为跳过: {:?}",
+            results[1]
+        );
+        // 跳过不得再调用 LLM
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }

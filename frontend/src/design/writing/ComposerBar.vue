@@ -20,6 +20,9 @@ const emit = defineEmits(['start-writing', 'cancel', 'update-generation-mode'])
 
 const intent = ref('')
 const textareaRef = ref(null)
+// IME 组合态守卫（F-01）：Vue 的按键修饰符只校验修饰键，不校验输入法组合态；
+// 中文/日文输入法在候选态按 Enter 会直接触发提交，提交的是尚未写入 model 的半截文本。
+const composing = ref(false)
 
 const generationModes = generationModeCatalog
 
@@ -27,6 +30,16 @@ function submit() {
   if (!intent.value.trim() || props.disabled || props.writing) return
   emit('start-writing', intent.value)
   intent.value = ''
+}
+
+function onKeydown(event) {
+  // 1) 组合态（含旧 IME 的 229 伪键）一律放行给输入法，绝不提交、不 preventDefault
+  if (event.isComposing || composing.value || event.keyCode === 229) return
+  if (event.key !== 'Enter') return
+  // 2) 只对"裸 Enter"提交，保持原 @keydown.enter.exact 语义（Shift/Ctrl/Alt/Meta + Enter 仍换行/放行）
+  if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return
+  event.preventDefault()
+  submit()
 }
 </script>
 
@@ -70,7 +83,9 @@ function submit() {
         :disabled="disabled || writing"
         rows="1"
         class="composer-textarea min-w-0 min-h-[3.5rem] max-h-36 flex-1 resize-none appearance-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-ink outline-none placeholder:text-ink-faint focus:outline-none focus:ring-0 disabled:opacity-50"
-        @keydown.enter.exact.prevent="submit"
+        @keydown="onKeydown"
+        @compositionstart="composing = true"
+        @compositionend="composing = false"
         @input="$event.target.style.height='auto'; $event.target.style.height=$event.target.scrollHeight+'px'"
       ></textarea>
 

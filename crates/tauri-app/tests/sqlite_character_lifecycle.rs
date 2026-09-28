@@ -85,8 +85,11 @@ fn to_character(stored: &storyforge_lib::storage_backend::StoredCharacter) -> Ch
     }
 }
 
-#[test]
-fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
+// T-12：`export_campaign_st_cards` 改为 async + spawn_blocking 后（避免大载荷命令在
+// IPC 线程内联执行），本测试需要 async 上下文；用法与 backend_parity_suite.rs /
+// sqlite_bigdata_perf.rs 的 `#[tokio::test]` 一致。
+#[tokio::test]
+async fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("storyforge.sqlite3");
     sqlite_runtime::activate(&db_path).expect("activate SQLite authority");
@@ -541,6 +544,7 @@ fn sqlite_character_library_world_info_bundle_roundtrip_and_png() {
             import_result.campaign_id.clone(),
             command_state,
         )
+        .await
         .unwrap();
         let shared: storyforge_domain::character::StWorldInfoBook =
             serde_json::from_str(&st.lorebook_json).unwrap();

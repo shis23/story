@@ -68,15 +68,18 @@ impl SqliteMetaRepository {
 
         // 前置：active-turn barrier 与 revision 校验在事务内执行——与写入同
         // 一事务，杜绝「先检查、后开事务」之间的竞态窗口（Gate 4 评审 P1-2）。
+        // S-20：active 状态清单来自 infra 唯一来源常量，避免领域枚举与 SQL 漂移。
         let active_turn_id: Option<String> = tx
             .query_row(
-                r#"
+                &format!(
+                    r#"
                 SELECT turn_id FROM turns
                 WHERE campaign_id = ?1
-                  AND status IN ('generating', 'draft_ready', 'deriving_state',
-                                 'awaiting_acceptance', 'committing')
+                  AND status IN ({})
                 LIMIT 1
                 "#,
+                    storyforge_infra_sqlite::production::ACTIVE_TURN_STATUS_SQL
+                ),
                 [campaign_id.as_str()],
                 |row| row.get(0),
             )

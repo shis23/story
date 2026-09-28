@@ -43,6 +43,9 @@ pub enum Permission {
     ReadVariables,
     /// 直接写变量（兼容旧插件；新插件应优先走提议更新/预览）
     WriteVariables,
+    /// 写回聊天记录（桥 `chat.save`）。M-31c：旧实现把 `chat.save` 放在通用权限门
+    /// 之前 `return`，等于给任何插件开了一条无权限写通道；现在必须显式声明本权限。
+    WriteChat,
     /// 提议变量更新，由宿主预览/确认后应用
     ProposeVariableUpdate,
     /// 读取并改写最终发送给 LLM 的 prompt/messages

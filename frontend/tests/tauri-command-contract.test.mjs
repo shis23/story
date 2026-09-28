@@ -14,14 +14,62 @@ test('every frontend Tauri invoke is registered by the backend', () => {
   assert.deepEqual(baseline.frontend.missingBackendCommands, [])
 })
 
+test('Gate 8 review: the invoke scan catches bare _invoke(...) call sites', () => {
+  // 2026-09-13 域4 修复 T-01 的回归锁。这 3 个命令只经
+  // frontend/src/utils/shellDocUrl.js 的裸 `_invoke('...')` 调用（模块局部
+  // 绑定，前面没有点号）。旧扫描正则 `\._invoke\(` 要求字面量点号，因此
+  // 漏掉它们：uniqueInvokeCount 停在假值 169，并且上面那条
+  // `missingBackendCommands == []` 对这 3 个 live 调用点永久失明——若它们
+  // 被改名或从 generate_handler! 移除，测试仍会全绿。
+  for (const name of [
+    'card_shell_register_doc',
+    'card_shell_register_module',
+    'card_shell_unregister_doc',
+  ]) {
+    assert.ok(
+      baseline.frontend.invokedCommands.includes(name),
+      `${name} 必须被 invoke 扫描捕获（shellDocUrl.js 的裸 _invoke 调用）`,
+    )
+  }
+  // 扫描结果自洽：唯一名计数必须等于集合大小，防止集合构造漂移。
+  assert.equal(baseline.frontend.uniqueInvokeCount, baseline.frontend.invokedCommands.length)
+})
+
 test('Gate 0 command registration baseline is stable', () => {
   assert.deepEqual(baseline.backend.duplicateRegisteredCommands, [])
+  // 命令总数是产品契约（README/CLAUDE.md 的「175 个命令」），保持硬编码。
+  // T-15 决策为"保留 + 声明"，因此数量不变。
   assert.equal(baseline.backend.commandAttributes, 175)
   assert.equal(baseline.backend.registeredCommandCount, 175)
-  // Gate 8 复评：扫描覆盖全部 frontend/src（tauri-api.js 静态 invoke +
-  // plugin-bridge command: 动态表 + shellDoc ._invoke + .vue 直调）。
-  // 2026-09-01 全量审查：移除零引用 wrapper softDeleteVariant/archiveConversation → 171→169。
-  assert.equal(baseline.frontend.uniqueInvokeCount, 169)
+  // 说明：此处曾硬编码前端 `uniqueInvokeCount`（169→172）。该数字是扫描的
+  // 中间产物、不是契约本身，且跨域并发增删 wrapper 时变动频繁（一次改动就
+  // 会让断言必须跟着改）。真正的契约由下面两条不变量 + 上面的扫描回归锁
+  // 覆盖；唯一的计数事实来源是 baseline.frontend.invokedCommands。
+  // 维护者：域4（scripts/architecture/backend-baseline.mjs）。
+})
+
+test('Gate 0 registry equals frontend reachable set ∪ declared retained API', () => {
+  // 核心契约（无魔数）：每条已注册命令要么被前端调用，要么被显式声明为
+  // "无前端入口的保留 API"。零入口命令不得静默遗留。
+  const expected = [
+    ...baseline.frontend.invokedCommands,
+    ...baseline.backend.retainedNoFrontendCaller,
+  ].sort()
+  assert.deepEqual(expected, baseline.backend.registeredCommands)
+  // 命名化诊断（与上面等价，失败时给出更直白的原因）：
+  assert.deepEqual(baseline.backend.undeclaredOrphanCommands, [])
+  assert.deepEqual(baseline.backend.staleRetainedDeclarations, [])
+  assert.deepEqual(baseline.orphanRegisteredCommands, baseline.backend.retainedNoFrontendCaller)
+})
+
+test('Gate 0 keeps every command inside commands/*.rs or an explicit allowlist', () => {
+  // 2026-09-13 域4 修复 T-13/T-16：docs/DOCS-CODE-AUDIT.md 曾声称"全部 175 个
+  // 命令位于 crates/tauri-app/src/commands/*.rs"，实测 156 个在 commands/、
+  // 19 个在 crates/tauri-app/src/card_studio_api.rs。位置本身可以接受，但必须
+  // 显式登记（见 backend-baseline.mjs 的 COMMAND_LOCATION_ALLOWLIST）；
+  // 任何新增的"commands/ 之外"命令都会让这条断言变红。
+  assert.deepEqual(baseline.backend.commandsOutsideAllowedLocations, [])
+  assert.equal(baseline.backend.definedCommandCount, baseline.backend.registeredCommandCount)
 })
 
 test('Gate 0 command registration matches the complete ordered snapshot', () => {

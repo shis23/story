@@ -7,13 +7,15 @@ import Input from '../ui/Input.vue'
 import Select from '../ui/Select.vue'
 
 // v-model:show 控制显隐；form 是 AppV2 持有的 useNewCampaignForm 实例
-// （单一状态源：AppV2 的 openNewCampaignDialog 已完成打开初始化，
-// 组件内不再自建实例 + watch 重复加载，此前每次打开都会 listCards/getCard 两次）
+// （单一状态源：AppV2 的 openNewCampaignDialog 已完成 listCards/getCard 初始化；
+// F-27/F-39：`created` emit 无任何监听者（AppV2:1016 只绑 update:show），
+// defineEmits 里的死 emit 已删除；下方 watch 只在用户换卡时触发一次
+// —— 去重逻辑在 useNewCampaignForm.loadNewCampaignCardDetail 内共享给调用方）。
 const props = defineProps({
   show: { type: Boolean, default: false },
   form: { type: Object, required: true },
 })
-const emit = defineEmits(['update:show', 'close', 'created'])
+const emit = defineEmits(['update:show', 'close'])
 
 const {
   newCampaignCards,
@@ -42,7 +44,6 @@ async function onCreate() {
   // 仅创建成功才关闭：失败时弹层保持打开，保住用户已填内容
   const ok = await handleCreateCampaign()
   if (ok) {
-    emit('created')
     emit('update:show', false)
   }
 }

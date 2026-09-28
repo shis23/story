@@ -46,6 +46,10 @@ pub struct SourceManifestReport {
     /// characters.json 角色库条目数（Gate 5）。
     pub characters: usize,
     pub issues: Vec<String>,
+    /// S-01：被跳过的孤儿行总数（父对象在源数据中不存在）。非零必须可审计。
+    pub skipped_orphan_rows: usize,
+    /// S-01：按集合的跳过明细（日志 / 报告 / 健康事件用）。
+    pub skipped_detail: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +110,63 @@ pub struct ImportSnapshot {
     pub issues: Vec<String>,
 }
 
+/// 路径存在性的三态判定结果（见 [`path_presence`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathPresence {
+    Missing,
+    Present,
+}
+
+impl PathPresence {
+    pub(crate) fn is_missing(self) -> bool {
+        matches!(self, PathPresence::Missing)
+    }
+}
+
+/// N-R1-04：区分「不存在」与「stat 失败（权限/IO 错误）」。
+///
+/// `Path::exists()` 内部就是 `fs::metadata(path).is_ok()`——**任何**失败都返回
+/// false。于是「文件在但读不了」（父目录缺 search 权限、ACL 拒绝、IO 错误）
+/// 会被当成「文件不存在」，而 `read_json_array(_, optional = true)` 对缺失的
+/// 语义是「空集合」：整个集合被静默按空导入 + 发布空库 + 写权威 marker。
+/// 这里只把 `ErrorKind::NotFound` 当缺失；其它错误 fail-closed 并报独立错误
+/// （`ImportSourceUnreadable`），让「文件没了」与「文件在但读不了」在日志/UI
+/// 上可区分（两者的处置完全不同：前者是数据丢失，后者是权限/磁盘问题）。
+pub(crate) fn path_presence(path: &Path) -> Result<PathPresence> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(PathPresence::Present),
+        Err(e) if stat_error_means_missing(&e) => Ok(PathPresence::Missing),
+        Err(e) => Err(SqliteError::ImportSourceUnreadable(format!(
+            "{}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// stat 失败是否等于「确实不存在」。**只有** `ErrorKind::NotFound` 算缺失；
+/// 权限拒绝、IO 错误、路径非法等一律不算（取出来单独成函数，便于单测锁定
+/// 这条判定，不必依赖某个平台上真的能造出 EACCES）。
+fn stat_error_means_missing(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// 会话是否绑定到某个 Campaign（`campaign_id` 是非空字符串）。
+///
+/// N-R1-01：conversations 是 legacy 布局里**唯一**允许非 Campaign 归属的集合
+/// （`strict_validate_entries` 的 conversations 分支用 `opt_str_strict`，而
+/// instances/knowledge/tasks/round_summaries/turns 用 `req_str`）。因此判断
+/// 「campaigns.json 缺失是否致命」时只能统计 campaign 作用域的会话；把
+/// `campaign_id: null` 的普通聊天算成 campaign 依赖 = 把合法老数据拒之门外。
+fn conversation_is_campaign_scoped(conversation: &Value) -> bool {
+    conversation
+        .get("campaign_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.trim().is_empty())
+}
+
 /// 构建导入快照（readiness 与 importer 共用）。
 pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
-    if !data_dir.exists() {
+    if path_presence(data_dir)?.is_missing() {
         return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
     }
 
@@ -161,11 +219,106 @@ pub(crate) fn build_import_snapshot(data_dir: &Path) -> Result<ImportSnapshot> {
         })
         .collect();
     let mut skipped: Vec<(&'static str, usize)> = Vec::new();
+    let campaigns_total = campaigns.len();
+    let cards_total = cards.len();
+    let cards_file_present = !path_presence(&data_dir.join("cards.json"))?.is_missing();
+    let campaigns_file_present = !path_presence(&data_dir.join("campaigns.json"))?.is_missing();
     let campaigns = filter_campaigns_without_card(campaigns, &card_ids, &mut skipped)?;
     let campaign_ids: HashSet<String> = campaigns
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
+
+    // ── S-01 守卫（默认后端 P0）：父集合**文件缺失/为空** + 依赖数据非空 = 拒绝 ──
+    //
+    // 背景：`read_json_array(optional)` 把「文件缺失」当空集合（与 JSON 同口径），
+    // 但它与「悬空卡 Campaign 过滤 / 孤儿行过滤」叠加会连锁：cards.json 缺失 →
+    // 全部 Campaign 判悬空丢弃 → 全部子行按孤儿跳过 → 空库 + completed 导入记录
+    // + 权威 marker 永久固化，用户数据静默消失（P0）。
+    //
+    // 判据刻意收窄到「**文件缺失**」而不是「过滤后为空」（Lead R1 复检）：
+    // - 文件缺失 + 依赖非空 = 源目录不完整（拷贝/迁移中断、磁盘故障、误删）。
+    //   任何由应用正常写出的数据目录都不会出现「有 campaigns 却没有 cards.json」，
+    //   因此 fail-closed 的误伤面≈0，而漏判代价是整库数据。
+    // - 文件存在但内容为空 / 行级悬空（用户确实删掉了唯一那张卡）属于**合法老
+    //   数据**，沿用 Gate 8 P2-A3 的「跳过 + 计数」语义：`skipped_orphan_rows` /
+    //   `skipped_detail` 进入报告，cutover 侧 `tracing::warn!` + 应用层健康事件
+    //   （`storage_health::record_backend_incident`）可见，不阻断启动。
+    if !cards_file_present && campaigns_total > 0 {
+        return Err(SqliteError::ImportSourceIncomplete(format!(
+            "cards.json is missing (cards read: {cards_total}) but campaigns.json contains \
+             {campaigns_total} campaign(s); refusing to import an incomplete source directory \
+             (restore cards.json, or clean up the inconsistent campaigns) and retry"
+        )));
+    }
+    // N-R1-02：Rule A 的「文件存在但为空数组」孪生情形。`cards.json` 存在且解析
+    // 出 **0 张卡**，同时 `campaigns.json` 有 campaign ⇒ 全部 campaign 必然悬空
+    // → 全被判孤儿丢弃 → 0 campaigns 落库 + `ImportStatus::Completed` + 权威
+    // marker：源目录里的 campaign/实例/知识/回合**永久静默消失**。
+    //
+    // 为什么这里可以 fail-closed（而不像「部分悬空」那样跳过+计数）：
+    // - 正常 UI 无法产生该状态：`CampaignStore::delete_card`（campaign_store.rs:298）
+    //   在同一次快照/补偿写里级联删 cards/campaigns/instances/knowledge/tasks/
+    //   summaries（且 **cards.json 先写、campaigns.json 后写**，:377-383），所以
+    //   写入完成后二者一致；「0 cards + 非 0 campaigns」只可能来自硬崩溃落在两次
+    //   写盘之间、部分拷贝/误编辑/磁盘故障——正是 S-01 要拦的「源目录不完整」。
+    // - 反例（不会误伤）：`cards.json` 非空但个别 campaign 引用被 replace 掉的
+    //   卡 id（`save_card` 按 source_character_id 覆盖去重）仍走「部分悬空 =
+    //   跳过 + 计数」；这条判据只在**一张卡都没有**时成立。
+    // 代价（诚实记录）：极罕见地，用户在「删最后一张卡」的过程中被强杀（cards.json
+    // 已写、campaigns.json 未写）会看到启动被拒；错误文案已给出可操作处置
+    // （恢复 cards.json，或确认后清理 campaigns.json 再重试）。
+    if cards_file_present && cards_total == 0 && campaigns_total > 0 {
+        return Err(SqliteError::ImportSourceIncomplete(format!(
+            "cards.json exists but is empty (0 cards) while campaigns.json contains \
+             {campaigns_total} campaign(s); every campaign would be dropped as a dangling \
+             orphan and the whole campaign tree would be lost — refusing to publish an empty \
+             authority (restore cards.json, or delete the stale campaigns.json if the campaigns \
+             were really removed) and retry"
+        )));
+    }
+    if !campaigns_file_present {
+        let mut dependent: Vec<(&'static str, usize)> = Vec::new();
+        // N-R1-01（P1 回归）：**只有 campaign 作用域的会话**依赖 campaigns.json。
+        // conversations 是唯一允许 `campaign_id: null/缺失` 的集合（非 Campaign
+        // 聊天），把「所有会话」都算成 campaign 依赖会让合法 legacy 布局
+        // 「cards.json + campaign_id: null 的会话 + 无 campaigns.json」被
+        // `ImportSourceIncomplete` 拒掉——而启动默认走 SQLite，等于非 Campaign
+        // 老用户升级后启动即失败。其余集合的 `campaign_id` 是领域必填
+        // （`strict_validate_entries` 的 `req_str(..., "campaign_id")`），
+        // `len()` 即 campaign 依赖数，不需要（也不应该）过滤。
+        let campaign_conversations = conversations
+            .iter()
+            .filter(|c| conversation_is_campaign_scoped(c))
+            .count();
+        for (name, count) in [
+            ("instances", instances.len()),
+            ("knowledge", knowledge.len()),
+            ("tasks", tasks.len()),
+            ("round_summaries", summaries.len()),
+            ("turns", turns.len()),
+            ("conversations", campaign_conversations),
+        ] {
+            if count > 0 {
+                dependent.push((name, count));
+            }
+        }
+        if !world_info.is_empty() {
+            dependent.push(("world_info", world_info.len()));
+        }
+        if !dependent.is_empty() {
+            let detail = dependent
+                .iter()
+                .map(|(name, count)| format!("{name}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(SqliteError::ImportSourceIncomplete(format!(
+                "campaigns.json is missing but dependent collections are non-empty ({detail}); \
+                 refusing to drop every dependent row as an orphan — restore campaigns.json and retry"
+            )));
+        }
+    }
+
     let conversation_ids: HashSet<String> = conversations
         .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
@@ -393,6 +546,12 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
         turns: snapshot.turns.len(),
         characters: snapshot.characters.len(),
         issues: snapshot.issues,
+        skipped_orphan_rows: snapshot.skipped_orphan_rows,
+        skipped_detail: snapshot
+            .skipped
+            .into_iter()
+            .map(|(kind, count)| (kind.to_string(), count))
+            .collect(),
     })
 }
 
@@ -400,8 +559,11 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
 /// importer 与 readiness 共用（hash 必须同投影）。
 ///
 /// 审查一.6：read_dir 的每个错误都必须传播（禁止 filter_map(...ok()) 吞错）。
+/// N-R1-04：`Path::exists()` 会把 stat 错误吞成 false——目录存在但读不了
+/// （权限/IO）时「读不了」会被当成「不存在」→ 整本世界书静默消失；只认
+/// NotFound。
 pub(crate) fn read_world_info_dir(dir: PathBuf) -> Result<Vec<(String, Value)>> {
-    if !dir.exists() {
+    if path_presence(&dir)?.is_missing() {
         return Ok(Vec::new());
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
@@ -1151,7 +1313,27 @@ pub fn create_backup_checkpoint(
     backup_dir: impl AsRef<Path>,
     label: &str,
 ) -> Result<BackupCheckpoint> {
-    let backup_dir = backup_dir.as_ref();
+    create_backup_checkpoint_inner(db, backup_dir.as_ref(), label, None)
+}
+
+/// S-09：带源 manifest hash 的 checkpoint——manifest 里额外记录 `content_hash`
+/// （DB 内容投影 hash）与 `source_manifest_hash`，使备份可与源/权威 marker 对账，
+/// 而不是只有一列「文件字节 SHA-256」无法判断它对应哪份数据。
+pub fn create_backup_checkpoint_with_source(
+    db: &Database,
+    backup_dir: impl AsRef<Path>,
+    label: &str,
+    source_manifest_hash: &str,
+) -> Result<BackupCheckpoint> {
+    create_backup_checkpoint_inner(db, backup_dir.as_ref(), label, Some(source_manifest_hash))
+}
+
+fn create_backup_checkpoint_inner(
+    db: &Database,
+    backup_dir: &Path,
+    label: &str,
+    source_manifest_hash: Option<&str>,
+) -> Result<BackupCheckpoint> {
     let live_path = canonicalize_existing(db.path()).unwrap_or_else(|| db.path().to_path_buf());
     if paths_equal(&live_path, backup_dir) {
         return Err(SqliteError::Other(
@@ -1247,6 +1429,8 @@ pub fn create_backup_checkpoint(
         )));
     }
     let schema_version = migrations::current_version(&backup_db)?;
+    // S-09：备份库的内容投影 hash（与源 manifest 同口径），用于对账。
+    let content_hash = crate::cutover::recompute_db_content_hash(&backup_db)?;
     let mut hasher = Sha256::new();
     hasher.update(fs::read(&backup_db_path)?);
     let manifest_hash = hex_encode(hasher.finalize());
@@ -1257,6 +1441,10 @@ pub fn create_backup_checkpoint(
         "schema_version": schema_version,
         "backup_db": backup_db_path.file_name().and_then(|s| s.to_str()),
         "manifest_hash": manifest_hash,
+        // S-09：对账字段——content_hash 应与权威 marker 的 manifest_hash 一致；
+        // 未提供源 hash 时（旧调用点）仍写出 content_hash。
+        "content_hash": content_hash,
+        "source_manifest_hash": source_manifest_hash,
     });
     // Refuse racey overwrite if another process created the manifest meanwhile.
     if manifest_path.exists() || is_symlink(&manifest_path) {
@@ -1879,7 +2067,10 @@ pub(crate) fn validate_attempt_ownership(turns: &[Value]) -> Vec<String> {
 }
 
 fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
-    if !path.exists() {
+    // N-R1-04：只有确认「不存在」（NotFound）才允许 optional 读法返回空集合；
+    // stat 报权限/IO 错误时必须 fail-closed（`path_presence` 返
+    // `ImportSourceUnreadable`），否则整个集合会被静默按空导入。
+    if path_presence(&path)?.is_missing() {
         if optional {
             return Ok(Vec::new());
         }
@@ -1902,7 +2093,9 @@ fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
     // 审查一.6：conversations 目录沿用既有 manifest 逻辑（可选——目录缺失 =
     // 无会话，应用运行时按需创建）；但目录**存在而不可读**（如被文件顶替）时
     // read_dir 错误必须传播，绝不静默当作空。
-    if !dir.exists() {
+    // N-R1-04：`Path::exists()` 对 stat 错误也返回 false——目录缺 search 权限
+    // 时「读不了」会被当成「不存在」而静默当作无会话，这里只认 NotFound。
+    if path_presence(&dir)?.is_missing() {
         return Ok(Vec::new());
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
@@ -2003,5 +2196,62 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
+    }
+}
+
+/// N-R1-04 的回归锁：`Path::exists()` 与「读得了吗」是两件事。
+#[cfg(test)]
+mod path_presence_tests {
+    use super::*;
+
+    #[test]
+    fn only_not_found_counts_as_missing() {
+        // 判定本身：只有 NotFound 算「不存在」；权限/IO/非法路径都要 fail-closed。
+        assert!(stat_error_means_missing(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                !stat_error_means_missing(&std::io::Error::from(kind)),
+                "{kind:?} 不是「不存在」，不得让 optional 读法按空集合放行"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_and_present_are_distinguished() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            path_presence(&dir.path().join("absent.json"))
+                .unwrap()
+                .is_missing()
+        );
+        let present = dir.path().join("present.json");
+        fs::write(&present, b"[]").unwrap();
+        assert_eq!(path_presence(&present).unwrap(), PathPresence::Present);
+        // 目录同样是「存在」（后续 read_dir 自己决定成败）。
+        assert_eq!(path_presence(dir.path()).unwrap(), PathPresence::Present);
+    }
+
+    #[test]
+    fn stat_failure_that_is_not_notfound_is_fail_closed() {
+        // 带 NUL 的路径在两个平台上都会让 stat 立刻失败，且不是 NotFound；
+        // 它必须变成 `ImportSourceUnreadable`，绝不能退化成「缺失 = 空集合」。
+        let bad = Path::new("r13-unreadable\u{0}suffix.json");
+        match path_presence(bad) {
+            Err(SqliteError::ImportSourceUnreadable(message)) => {
+                assert!(message.contains("r13-unreadable"), "{message}");
+            }
+            Ok(PathPresence::Present) => {
+                // 也算 fail-closed 方向（没被当成缺失），但记录一下平台差异。
+                panic!("平台把非法路径 stat 成 Present？请核对判定");
+            }
+            other => panic!("stat 失败（非 NotFound）必须 fail-closed: {other:?}"),
+        }
     }
 }

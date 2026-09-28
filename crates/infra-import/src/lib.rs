@@ -50,9 +50,37 @@ pub fn import_character(data: &[u8]) -> Result<Character, ImportError> {
     check_import_size(data.len(), MAX_IMPORT_SIZE)?;
     if is_png(data) {
         import_character_from_png(data)
-    } else {
+    } else if looks_like_json_card(data) {
         import_character_from_json(data)
+    } else {
+        // 既不是 PNG 也不是 JSON 对象（例如 .charx/zip、webp/jpeg 图片）：
+        // 明确报「不支持的格式」，而不是把它丢给 serde 解析后抛出难以理解的
+        // JSON 语法错误。错误只带长度与前导字节，不回显文件内容。
+        Err(ImportError::UnsupportedFormat(format!(
+            "既不是 PNG 也不是 JSON 角色卡（{} 字节，前导字节 {}）",
+            data.len(),
+            leading_bytes_hex(data)
+        )))
     }
+}
+
+/// JSON 角色卡的判据：BOM 与 ASCII 空白之后的首字节是 `{`。
+///
+/// 严格到只放行"看起来是 JSON 对象"的输入，避免把任意二进制当 JSON 解析。
+fn looks_like_json_card(data: &[u8]) -> bool {
+    strip_utf8_bom(data)
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(&b'{')
+}
+
+/// 前导字节的十六进制预览（最多 8 字节），用于错误文案。
+fn leading_bytes_hex(data: &[u8]) -> String {
+    data.iter()
+        .take(8)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 从 JSON 直接导入角色卡
@@ -122,6 +150,84 @@ pub fn strip_utf8_bom(data: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default real-card fixture path for the ignored real-card smoke test:
+    /// repo-local `data/local/test-card.png` (kept out of git, absent in CI).
+    fn default_real_card_fixture_path() -> std::path::PathBuf {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate lives two levels below the repo root");
+        repo_root.join("data").join("local").join("test-card.png")
+    }
+
+    #[test]
+    fn default_real_card_fixture_path_targets_data_local_test_card() {
+        let path = default_real_card_fixture_path();
+        assert!(
+            path.ends_with("data/local/test-card.png"),
+            "default real-card fixture path must point at data/local/test-card.png, got {}",
+            path.display()
+        );
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate lives two levels below the repo root");
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent()),
+            Some(repo_root),
+            "default real-card fixture must be resolved from the repo root"
+        );
+    }
+
+    #[test]
+    fn unsupported_non_png_non_json_input_uses_unsupported_format_error() {
+        // Inputs that cannot be a PNG card and cannot be a JSON card object.
+        for (label, input) in [
+            ("zip/charx", b"PK\x03\x04\x14\x00\x00\x00".as_slice()),
+            ("webp", b"RIFF\x24\x00\x00\x00WEBPVP8 ".as_slice()),
+            ("plain-text", b"this is not a card".as_slice()),
+            ("empty", b"".as_slice()),
+        ] {
+            let err = import_character(input).expect_err("unsupported input must be rejected");
+            assert!(
+                matches!(err, ImportError::UnsupportedFormat(_)),
+                "{label}: expected UnsupportedFormat, got {err:?}"
+            );
+        }
+
+        // A malformed JSON *object* still reports the JSON error, not "unsupported".
+        let err = import_character(br#"{"spec":"chara_card_v2","data":{"name":"x"}"#)
+            .expect_err("truncated JSON must stay a JSON error");
+        assert!(
+            matches!(err, ImportError::JsonError(_)),
+            "expected JsonError, got {err:?}"
+        );
+
+        // BOM + leading whitespace before `{` still takes the JSON path.
+        let mut bom_json = vec![0xEF, 0xBB, 0xBF];
+        bom_json.extend_from_slice(b"\n  ");
+        bom_json.extend(serde_json::to_vec(&make_test_card_json()).unwrap());
+        let character =
+            import_character(&bom_json).expect("BOM + whitespace prefixed JSON card must import");
+        assert_eq!(character.name, "测试角色");
+
+        // The error carries a short byte preview and never echoes file content.
+        let err = import_character(b"PK\x03\x04secret-payload-bytes")
+            .expect_err("zip-like input must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("不支持的文件格式"), "got: {msg}");
+        assert!(
+            msg.contains("50 4B 03 04"),
+            "expected a leading-byte preview, got: {msg}"
+        );
+        assert!(
+            !msg.contains("secret-payload-bytes"),
+            "error text must not echo file content: {msg}"
+        );
+    }
 
     #[test]
     fn real_card_evidence_write_failure_fails_the_smoke_contract_without_host_path() {
@@ -537,24 +643,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+    #[ignore = "local-only real ST card: needs data/local/test-card.png (absent in CI); set SF_COMPLEX_CARD_FIXTURE or run scripts/run-real-card-smoke.ps1, then re-run with -- --ignored --nocapture"]
     fn test_real_complex_card_fixture_preserves_core_st_fields() {
         let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("..")
-                    .join("test-card.png")
-            });
+            .unwrap_or_else(default_real_card_fixture_path);
         let bytes = std::fs::read(&fixture_path).unwrap_or_else(|err| {
             // Do not echo absolute host paths in failure text; keep the env/label only.
             let label = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
                 .map(|_| "SF_COMPLEX_CARD_FIXTURE")
-                .unwrap_or("test-card.png (repo root)");
+                .unwrap_or("data/local/test-card.png (repo-local, not committed)");
             panic!(
                 "REAL-CORPUS MODE requires a local real card fixture, but failed to read {label}: {err}.
-Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
+Set SF_COMPLEX_CARD_FIXTURE or place the real card at data/local/test-card.png."
             )
         });
 

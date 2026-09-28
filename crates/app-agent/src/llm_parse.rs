@@ -19,7 +19,9 @@ use storyforge_domain::llm::ChatResponse;
 /// 返回 `}` 的 byte index。若中途括号不匹配（如未闭合），返回 None。
 /// 比 regress 正则的贪心匹配更可靠（regress 对多字节字符的 range 可能有坑）。
 pub fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    let chars: Vec<char> = content[pos..].chars().collect();
+    // W-29：pos 可能落在多字节字符中间（字节扫描/正则 range 可能给出非字符边界），
+    // 直接 `content[pos..]` 会 panic；用 get() 失败即返回 None。
+    let chars: Vec<char> = content.get(pos..)?.chars().collect();
     if chars.is_empty() || chars[0] != '{' {
         return None;
     }
@@ -156,11 +158,23 @@ pub fn from_tool_call<T>(
     parse: impl Fn(&serde_json::Value) -> Option<T>,
 ) -> Option<T> {
     for tc in &resp.tool_calls {
-        if tc.function.name == tool_name
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-            && let Some(t) = parse(&args)
-        {
-            return Some(t);
+        if tc.function.name != tool_name {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+            Ok(args) => {
+                if let Some(t) = parse(&args) {
+                    return Some(t);
+                }
+            }
+            Err(error) => {
+                // W-29：原来静默忽略；工具参数不是合法 JSON 是模型输出缺陷，必须可观测
+                let raw: String = tc.function.arguments.chars().take(200).collect();
+                tracing::warn!(
+                    target: "llm_parse",
+                    "工具 {tool_name} 的 arguments 不是合法 JSON，已跳过: {error}; raw={raw}"
+                );
+            }
         }
     }
     None
@@ -200,6 +214,55 @@ mod tests {
         let s = "{\"a\": 1";
         let open = s.find('{').unwrap();
         assert!(match_braces(s, open).is_none());
+    }
+
+    /// W-29：非字符边界（多字节字符中间）不得 panic，返回 None。
+    #[test]
+    fn match_braces_non_char_boundary_returns_none() {
+        let s = "中文{\"ok\": true}";
+        // '中' 占 3 字节，pos=1 落在字符内部
+        assert!(!s.is_char_boundary(1));
+        assert!(match_braces(s, 1).is_none());
+        // 越界同样返回 None
+        assert!(match_braces(s, s.len() + 5).is_none());
+    }
+
+    /// W-29：工具参数不是合法 JSON 时跳过该调用并继续匹配后续同名调用。
+    #[test]
+    fn from_tool_call_skips_malformed_arguments_and_keeps_scanning() {
+        use storyforge_domain::llm::{ChatResponse, FunctionCall, ToolCall};
+
+        let resp = ChatResponse {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call-bad".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "emit_plan".into(),
+                        arguments: "{这不是 JSON".into(),
+                    },
+                },
+                ToolCall {
+                    id: "call-good".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "emit_plan".into(),
+                        arguments: "{\"scene_brief\":\"ok\"}".into(),
+                    },
+                },
+            ],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+        };
+
+        let parsed = from_tool_call(&resp, "emit_plan", |args| {
+            args.get("scene_brief")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        assert_eq!(parsed.as_deref(), Some("ok"));
     }
 
     #[test]

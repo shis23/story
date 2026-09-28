@@ -35,15 +35,20 @@ function recordKey(record) {
   return `${record.pluginId || ''}|${record.correlationId || ''}|${record.recordedAt || ''}`
 }
 function toggleExpand(row) {
-  const key = recordKey(record)
+  // F-41：此前这里写的是 `recordKey(record)`，而形参名是 row —— 点击展开直接抛
+  // ReferenceError: record is not defined，审计详情永远打不开。
+  const key = recordKey(row)
   const next = new Set(expanded.value)
   if (next.has(key)) next.delete(key)
   else next.add(key)
   expanded.value = next
 }
+// 只渲染已展开的详情，避免 ≤100 条记录全部常驻 DOM（F-47）
+const expandedRecords = computed(() => records.value.filter((row) => expanded.value.has(recordKey(row))))
 
 onUnmounted(() => {
   if (exportStatusTimer) clearTimeout(exportStatusTimer)
+  if (copyStatusTimer) clearTimeout(copyStatusTimer)
 })
 
 // ─── status → Badge variant ───
@@ -104,16 +109,22 @@ async function handleExport() {
 }
 
 // ─── 复制单条记录(脱敏 JSON) ───
-const copiedIndex = ref(null)
-async function copyRecord(record, index) {
+// F-20：状态此前按下标存（copiedIndex）—— 列表倒序且在增长，插入新记录会让
+// 「✓ 已复制」漂移到别的行。改为按 record 身份键。
+const copiedKey = ref(null)
+let copyStatusTimer = null
+async function copyRecord(record) {
+  const key = recordKey(record)
   try {
     await navigator.clipboard.writeText(JSON.stringify(record, null, 2))
-    copiedIndex.value = index
-    setTimeout(() => {
-      if (copiedIndex.value === index) copiedIndex.value = null
+    copiedKey.value = key
+    if (copyStatusTimer) clearTimeout(copyStatusTimer)
+    copyStatusTimer = setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = null
     }, 1500)
-  } catch {
-    // clipboard 不可用时静默
+  } catch (e) {
+    // 剪贴板不可用时给出反馈，而不是静默（F-47）
+    setExportStatus('复制失败: ' + errorText(e))
   }
 }
 
@@ -159,6 +170,7 @@ const columns = [
       v-else
       :columns="columns"
       :rows="records"
+      :row-key="recordKey"
       empty-title="无审计记录"
     >
       <template #cell-pluginId="{ row }">
@@ -199,19 +211,18 @@ const columns = [
             size="sm"
             variant="ghost"
             title="复制记录"
-            @click="copyRecord(row, index)"
+            @click="copyRecord(row)"
           >
-            <span class="text-xs">{{ copiedIndex === index ? '✓' : '⧉' }}</span>
+            <span class="text-xs">{{ copiedKey === recordKey(row) ? '✓' : '⧉' }}</span>
           </IconButton>
         </div>
       </template>
     </DataTable>
 
-    <!-- 展开详情:inputSummary / outputSummary / error -->
+    <!-- 展开详情:inputSummary / outputSummary / error（只渲染已展开项） -->
     <div
-      v-for="(row, index) in records"
-      v-show="expanded.has(recordKey(row))"
-      :key="`detail-${index}`"
+      v-for="row in expandedRecords"
+      :key="`detail-${recordKey(row)}`"
       class="bg-surface-2 rounded-lg border border-line p-3 space-y-3"
     >
       <div class="flex items-center gap-2">

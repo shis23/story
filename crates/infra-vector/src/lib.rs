@@ -216,9 +216,7 @@ impl BruteForceStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("向量库 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            HashMap::new()
+                            quarantine_unrecoverable_corruption(&path, &e.to_string())
                         })
                 }),
                 Err(e) => {
@@ -228,9 +226,7 @@ impl BruteForceStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("向量库文件读取失败且无可用备份，文件: {}, IO 错误: {}. 已保存 .corrupt 备份", path.display(), e);
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            HashMap::new()
+                            quarantine_unrecoverable_corruption(&path, &e.to_string())
                         })
                 }
             }
@@ -267,6 +263,49 @@ impl Default for BruteForceStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 主文件与 `.tmp` 备份都损坏时的兜底（D-03）。
+///
+/// 两件事都必须做，缺一即数据永久丢失：
+/// 1. 把损坏的原文件复制成 `.corrupt` 抢救副本——**复制失败不再是 `let _ =`**，
+///    而是显式 `error!`（这是用户数据唯一的抢救来源）；
+/// 2. 冻结该路径的写栅栏（V4）：损坏未确认前 `atomic_write` 一律拒绝，
+///    否则下一次 `upsert` 会把内存里的空集写回主文件，把"可抢救的损坏文件"
+///    变成"干净的空文件"。
+///
+/// 上层（tauri-app `storage_health`）应登记事件并提供解除入口；
+/// 域1 通过 `write_fence::storage_health_report()` 把"哪份文件被隔离、为什么、
+/// 怎么办"暴露出去（域4/域2 消费后前端可见），但应用内一键解除属产品决策
+/// （Lead N-03，本轮不做）。
+fn quarantine_unrecoverable_corruption(
+    path: &std::path::Path,
+    err: &str,
+) -> HashMap<Id, VectorRecord> {
+    let backup = path.with_extension("json.corrupt");
+    tracing::error!(
+        "向量库主文件与 .tmp 备份均损坏，文件: {}，错误: {}。尝试保存 .corrupt 备份并冻结写入（D-03）",
+        path.display(),
+        err
+    );
+    let backup_note = match std::fs::copy(path, &backup) {
+        Ok(_) => {
+            tracing::error!("已保存损坏备份: {}", backup.display());
+            format!("已保存抢救副本 {}", backup.display())
+        }
+        Err(copy_err) => {
+            tracing::error!(
+                "损坏备份保存失败({copy_err})，原文件保持原样: {}；已冻结写入避免覆盖未抢救数据",
+                path.display()
+            );
+            format!("抢救副本保存失败({copy_err})，原文件保持原样")
+        }
+    };
+    storyforge_infra_util::write_fence::freeze_with_reason(
+        path,
+        &format!("向量库主文件与 .tmp 均无法解析（{err}）；{backup_note}"),
+    );
+    HashMap::new()
 }
 
 impl VectorStore for BruteForceStore {
@@ -318,8 +357,12 @@ impl VectorStore for BruteForceStore {
             scored.push((score, r.id.clone()));
         }
 
-        // 按分数降序排序
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // 按分数降序排序；同分按 id 升序，保证 top-k 结果稳定（D-05）
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.as_str().cmp(b.1.as_str()))
+        });
         scored.truncate(top_k);
         // 二次查表克隆仅 top-k 条赢家
         let hits = scored
@@ -355,27 +398,46 @@ impl VectorStore for BruteForceStore {
         let records = self.records.read().unwrap_or_else(|p| p.into_inner());
         let keywords_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
 
-        let mut hits: Vec<VectorHit> = records
-            .values()
-            .filter(|r| filter.accepts(r))
-            .filter(|r| {
-                r.keywords.iter().any(|kw| {
+        // D-05：HashMap 迭代序随机，此前 `truncate(limit)` 会返回随机的子集。
+        // 先按"命中的关键词条数"降序、再按 id 升序排序，保证同输入同输出。
+        let match_count = |r: &VectorRecord| -> usize {
+            r.keywords
+                .iter()
+                .filter(|kw| {
                     let kw_lower = kw.to_lowercase();
                     keywords_lower.iter().any(|q| kw_lower.contains(q.as_str()))
                 })
-            })
-            .map(|r| VectorHit {
-                id: r.id.clone(),
-                content: r.content.clone(),
-                score: 1.0, // 关键词匹配无分数
-                kind: r.kind.clone(),
-                keywords: r.keywords.clone(),
-                metadata: r.metadata.clone(),
+                .count()
+        };
+        let mut hits: Vec<(usize, VectorHit)> = records
+            .values()
+            .filter(|r| filter.accepts(r))
+            .filter_map(|r| {
+                let matched = match_count(r);
+                if matched == 0 {
+                    return None;
+                }
+                Some((
+                    matched,
+                    VectorHit {
+                        id: r.id.clone(),
+                        content: r.content.clone(),
+                        // 关键词匹配无相似度分数（score 语义保持不变）
+                        score: 1.0,
+                        kind: r.kind.clone(),
+                        keywords: r.keywords.clone(),
+                        metadata: r.metadata.clone(),
+                    },
+                ))
             })
             .collect();
 
+        hits.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.id.as_str().cmp(b.1.id.as_str()))
+        });
         hits.truncate(limit);
-        Ok(hits)
+        Ok(hits.into_iter().map(|(_, hit)| hit).collect())
     }
 
     fn delete(&self, id: &Id) -> Result<(), VectorError> {
@@ -828,6 +890,185 @@ mod tests {
                 }
             ),
             "expected DimensionMismatch, got {err:?}"
+        );
+    }
+
+    // ─── D-03：不可恢复损坏必须备份 + 冻结写入，不得静默固化空态 ──────────
+
+    fn temp_store_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sf_vector_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("vectors.json")
+    }
+
+    #[test]
+    fn unrecoverable_corruption_freezes_writes_and_keeps_backup() {
+        let path = temp_store_path("corrupt");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let store = BruteForceStore::with_persistence(path.clone());
+        assert_eq!(store.count(), 0, "损坏文件按空库启动");
+
+        // 1) 抢救副本必须存在，且内容与损坏原文件一致
+        let backup = path.with_extension("json.corrupt");
+        assert!(backup.exists(), "必须留下 .corrupt 抢救副本（D-03）");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{ this is not json"
+        );
+
+        // 2) 写栅栏必须生效：下一次保存不得把空态固化到主文件
+        assert!(
+            storyforge_infra_util::write_fence::is_frozen(&path),
+            "不可恢复损坏必须冻结写入（D-03）"
+        );
+        let err = store
+            .upsert(make_record("r1", "新内容", vec![]))
+            .expect_err("冻结后写入必须失败，而不是把空库写回主文件");
+        assert!(
+            matches!(err, VectorError::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "expected PermissionDenied(Io)，实际 {err:?}"
+        );
+        // 原文件内容未被覆盖
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json"
+        );
+
+        // 3) 冻结状态必须在健康面可见：哪份文件被隔离、为什么、怎么处理（Lead 裁定）
+        let entries = storyforge_infra_util::write_fence::frozen_entries();
+        let entry = entries
+            .iter()
+            .find(|e| e.path.contains("vectors.json"))
+            .expect("冻结条目必须出现在 write_fence 诊断快照里");
+        assert!(
+            entry.reason.contains("无法解析"),
+            "原因必须写明解析失败：{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("corrupt"),
+            "原因必须指出抢救副本位置：{}",
+            entry.reason
+        );
+        let report = storyforge_infra_util::write_fence::storage_health_report();
+        let (kind, detail) = report
+            .iter()
+            .find(|(_, d)| d.contains("vectors.json"))
+            .expect("storage_health 报告必须包含被隔离的向量库");
+        assert_eq!(kind, "write_fence_frozen");
+        assert!(
+            detail.contains("已被隔离") && detail.contains("处理建议"),
+            "报告文案必须含隔离说明与人工处理步骤：{detail}"
+        );
+
+        // 清理全局栅栏状态，避免影响其它测试
+        storyforge_infra_util::write_fence::unfreeze(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tmp_backup_recovery_does_not_freeze() {
+        let path = temp_store_path("tmpbackup");
+        std::fs::write(&path, b"{ broken").unwrap();
+        // .tmp 里有合法内容 → 可恢复，不应冻结
+        let mut good = HashMap::new();
+        good.insert(
+            Id::from_str("r-recovered"),
+            make_record("r-recovered", "备份内容", vec!["备份"]),
+        );
+        std::fs::write(
+            PathBuf::from(format!("{}.tmp", path.display())),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+
+        let store = BruteForceStore::with_persistence(path.clone());
+        assert_eq!(store.count(), 1, "应从 .tmp 备份恢复");
+        assert!(
+            !storyforge_infra_util::write_fence::is_frozen(&path),
+            "可恢复时不得冻结写入"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ─── D-05：搜索顺序必须确定 ───────────────────────────────────────────
+
+    #[test]
+    fn keyword_search_truncation_is_deterministic() {
+        let store = BruteForceStore::new();
+        // 6 条记录都命中同一关键词，limit=3：此前 HashMap 序随机 → 结果子集随机
+        for i in 0..6 {
+            store
+                .upsert(make_record(&format!("r{i}"), "内容", vec!["龙"]))
+                .unwrap();
+        }
+        let first: Vec<String> = store
+            .search_by_keywords(&["龙".into()], 3)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            first,
+            vec!["r0", "r1", "r2"],
+            "必须按 id 升序稳定截断（D-05）"
+        );
+
+        for _ in 0..5 {
+            let again: Vec<String> = store
+                .search_by_keywords(&["龙".into()], 3)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id.as_str().to_string())
+                .collect();
+            assert_eq!(again, first, "同输入必须同输出（D-05）");
+        }
+    }
+
+    #[test]
+    fn keyword_search_ranks_more_matches_first() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(make_record("r-one", "单命中", vec!["龙"]))
+            .unwrap();
+        store
+            .upsert(make_record("r-two", "双命中", vec!["龙", "冒险"]))
+            .unwrap();
+        let hits = store
+            .search_by_keywords(&["龙".into(), "冒险".into()], 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id.as_str(), "r-two", "命中更多关键词的排前面");
+        assert_eq!(hits[0].score, 1.0, "score 语义保持不变");
+    }
+
+    #[test]
+    fn vector_search_ties_break_by_id() {
+        let store = BruteForceStore::new();
+        // 三条相同向量 → 分数完全相同，top-2 必须稳定
+        for i in 0..3 {
+            store
+                .upsert(make_record(&format!("r{i}"), "同分", vec![]))
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .search_by_vector(&[1.0, 0.0, 0.0], 2)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["r0", "r1"],
+            "同分必须按 id 升序决定 top-k（D-05）"
         );
     }
 }

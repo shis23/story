@@ -50,3 +50,27 @@ test('Select 对象选项：label 展示、value 透传', async () => {
   await w.findAll('[role="option"]')[1].trigger('click')
   expect(w.emitted('update:modelValue')).toEqual([['b']])
 })
+
+// F-22：`portal` 是真实的 opt-out —— 默认（false）面板留在组件内，
+// `portal: true` 才挂到 body。用 headlessui v1.7 的 `Portal` 做开关是错的
+// （它只有 `as` 一个 prop，永远 teleport），这条测试锁住这个区别。
+test('Select portal=false（默认）时选项面板留在组件内部', async () => {
+  const w = mount(Select, { props: baseProps })
+  await w.find('button').trigger('click')
+  expect(w.find('[role="listbox"]').exists()).toBe(true)
+  expect(document.body.querySelector('[role="listbox"]')).toBe(null)
+  w.unmount()
+})
+
+test('Select portal=true 时选项面板挂到 body 且仍可选中', async () => {
+  const w = mount(Select, { props: { ...baseProps, portal: true } })
+  await w.find('button').trigger('click')
+  expect(w.find('[role="listbox"]').exists()).toBe(false)
+  const panel = document.body.querySelector('[role="listbox"]')
+  expect(panel).not.toBe(null)
+  const options = Array.from(document.body.querySelectorAll('[role="option"]'))
+  options[1].dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await new Promise((r) => setTimeout(r, 50))
+  expect(w.emitted('update:modelValue')).toEqual([['乙']])
+  w.unmount()
+})

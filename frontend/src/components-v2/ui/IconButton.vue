@@ -5,6 +5,8 @@ const props = defineProps({
   disabled: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
   title: { type: String, default: '' },
+  // F-38：只有 title 时读屏可用性不稳，显式 aria-label 更可靠
+  ariaLabel: { type: String, default: '' },
 })
 
 defineEmits(['click'])
@@ -27,6 +29,8 @@ const sizeClass = {
   <button
     :type="'button'"
     :title="title"
+    :aria-label="ariaLabel || title || undefined"
+    :aria-busy="loading ? 'true' : undefined"
     :class="[
       'inline-flex items-center justify-center rounded-md transition-colors duration-150 select-none',
       'disabled:opacity-40 disabled:cursor-not-allowed',

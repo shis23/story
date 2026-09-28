@@ -47,6 +47,9 @@ const editorEvents = computed(() =>
   pipelineEvents.value.filter(
     (r) =>
       r.event.event_type.startsWith('editor_') ||
+      // F-44：续写档的执笔者事件（usePipeline.js:84-101 广播 writer_started/writer_progress/
+      // writer_done）此前不属于任何 tab，面板里"谁写的正文"完全不可见
+      r.event.event_type.startsWith('writer_') ||
       r.event.event_type === 'draft_ready' ||
       r.event.event_type === 'quality_checked',
   ),
@@ -55,15 +58,27 @@ const postprocessEvents = computed(() =>
   pipelineEvents.value.filter((r) => r.event.event_type.startsWith('postprocess_') || r.event.event_type === 'summary_done'),
 )
 
-// ─── 状态推断:取该阶段最后一条事件推导状态 ───
+// ─── 状态推断:取该阶段最后一条"带状态语义"的事件推导状态 ───
+// F-47：此前只看整段列表的最后一条 —— 末事件不是 *_started/_progress/_done/_failed
+// 时无条件回落 'running'，阶段会永久显示"运行中"（缓冲区不清空、无 pipeline state 参照）。
+// 现在从尾部往前找第一条能判定状态的事件；一条都没有才是 idle。
+// 残余局限（已在修复记录标注）：不做 writingStore.pipeline.state 交叉校验，
+// 进程被强杀（无 failed 事件）时仍可能停在 running/progress。
+function statusFromEventType(type) {
+  if (!type) return null
+  if (type.endsWith('_started') || type.endsWith('_progress')) return 'running'
+  if (type.endsWith('_done') || type === 'draft_ready' || type === 'quality_checked') return 'done'
+  if (type.endsWith('_failed') || type.endsWith('_cancelled') || type.endsWith('_error')) return 'error'
+  if (type.endsWith('_skipped')) return 'done'
+  return null
+}
+
 function lastStatus(events) {
-  if (events.length === 0) return 'idle'
-  const last = events[events.length - 1].event.event_type
-  if (last.endsWith('_started') || last.endsWith('_progress')) return 'running'
-  if (last.endsWith('_done') || last === 'draft_ready' || last === 'quality_checked') return 'done'
-  if (last.endsWith('_failed') || last.endsWith('_cancelled') || last.endsWith('_error')) return 'error'
-  if (last.endsWith('_skipped')) return 'done'
-  return 'running'
+  for (let i = events.length - 1; i >= 0; i--) {
+    const status = statusFromEventType(events[i]?.event?.event_type)
+    if (status) return status
+  }
+  return 'idle'
 }
 
 function statusVariant(status) {
@@ -120,7 +135,12 @@ const subagentRoles = computed(() => {
 const editorOutput = computed(() => {
   const parts = []
   for (const r of editorEvents.value) {
-    if (r.event.event_type === 'editor_progress' && r.event.data?.delta) {
+    // F-44：执笔者的流式输出同样累积（writer_progress），否则续写档下
+    // 「编剧」tab 显示"进行中"却没有正文
+    if (
+      (r.event.event_type === 'editor_progress' || r.event.event_type === 'writer_progress') &&
+      r.event.data?.delta
+    ) {
       parts.push(r.event.data.delta)
     }
   }
@@ -129,6 +149,9 @@ const editorOutput = computed(() => {
 
 const editorDetail = computed(() => {
   if (editorEvents.value.some((r) => r.event.event_type === 'draft_ready')) return '成文完成'
+  if (editorEvents.value.some((r) => r.event.event_type.startsWith('writer_'))) {
+    return '执笔者续写 · 产出正文'
+  }
   if (editorEvents.value.length > 0) return '合并 · 润色 · 成文'
   return ''
 })
@@ -157,6 +180,14 @@ function eventDetailJson(events) {
     2,
   )
 }
+
+// F-47：模板里直接调用 eventDetailJson(...) 会在每次重渲染时对全量事件
+// （上限 500 条，含流式 delta）重新 JSON.stringify。改为按阶段 computed 缓存，
+// 只有该阶段事件变化时才重算。
+const directorDetailJson = computed(() => eventDetailJson(directorEvents.value))
+const subagentDetailJson = computed(() => eventDetailJson(subagentEvents.value))
+const editorDetailJson = computed(() => eventDetailJson(editorEvents.value))
+const postprocessDetailJson = computed(() => eventDetailJson(postprocessEvents.value))
 </script>
 
 <template>
@@ -189,7 +220,7 @@ function eventDetailJson(events) {
         />
         <CodeBlock
           v-if="directorEvents.length > 0"
-          :code="eventDetailJson(directorEvents)"
+          :code="directorDetailJson"
           language="director.events"
         />
         <EmptyState v-else title="无导演事件" />
@@ -215,7 +246,7 @@ function eventDetailJson(events) {
         </ul>
         <CodeBlock
           v-if="subagentEvents.length > 0"
-          :code="eventDetailJson(subagentEvents)"
+          :code="subagentDetailJson"
           language="subagent.events"
         />
         <EmptyState v-else title="无子 Agent 事件" />
@@ -237,7 +268,7 @@ function eventDetailJson(events) {
         />
         <CodeBlock
           v-if="editorEvents.length > 0"
-          :code="eventDetailJson(editorEvents)"
+          :code="editorDetailJson"
           language="editor.events"
         />
         <EmptyState v-else title="无编剧事件" />
@@ -253,7 +284,7 @@ function eventDetailJson(events) {
         </div>
         <CodeBlock
           v-if="postprocessEvents.length > 0"
-          :code="eventDetailJson(postprocessEvents)"
+          :code="postprocessDetailJson"
           language="postprocess.events"
         />
         <EmptyState v-else title="无后处理事件" />

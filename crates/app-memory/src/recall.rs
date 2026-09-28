@@ -126,13 +126,16 @@ pub fn extract_query_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-/// 纯关键词远记忆召回（不依赖 Embedder）。
+/// 纯关键词远记忆召回（不依赖 Embedder），**不做 campaign 过滤**。
 ///
 /// 用于 ContextCompiler 最小版：写作开始时按用户意图检索 `ArchivedSummary`，
 /// 注入 Director volatile tail。无命中 / 无 token 时返回空。
 ///
-/// `campaign_id` 若提供，只返回 metadata.campaign_id 匹配或无 campaign 标签的旧记录
-///（兼容归档器尚未写 campaign 标签的历史向量）。
+/// N-R7-01/R2 更正：本入口无 campaign 参数，因此**接受任意 campaign 标签的记录**
+/// （等价于 `recall_archived_by_query_filtered(_, _, _, None)`）。需要按 campaign
+/// 隔离时必须走 `recall_archived_by_query_filtered(..., Some(cid))`——其语义是
+/// fail closed：无 `campaign_id` 标签的记录**会被丢弃**（见 `accepts_campaign`），
+/// 不存在的"兼容旧记录"回退不要把本函数读成 fail closed。
 pub fn recall_archived_by_query(
     store: &dyn VectorStore,
     query: &str,
@@ -161,15 +164,27 @@ pub fn recall_archived_by_query_filtered(
 /// 判断 ArchivedSummary 命中是否属于目标 campaign。
 ///
 /// - 无过滤条件：全部接受
-/// - 有 campaign 标签且不匹配：拒绝
-/// - 无标签的旧归档：接受（兼容 MemoryArchiver 历史记录）
+/// - 有 campaign 过滤：必须带 `campaign_id` 标签且匹配（fail closed）
+///
+/// W-14：旧实现把"无标签"当作匹配，legacy 会话归档会泄漏进任意 campaign 的远记忆。
+/// 生产归档唯一入口（`commands/conversations.rs` 的水位归档）对 campaign 会话始终
+/// 写入 `campaign_id`，因此无标签记录只可能来自无 campaign 的 legacy 会话或更早的
+/// 未标记数据；收紧后它们在 campaign 召回中不再出现，未过滤召回不受影响。
 fn accepts_campaign(hit: &VectorHit, campaign_id: Option<&str>) -> bool {
     let Some(cid) = campaign_id else {
         return true;
     };
     match hit.metadata.get("campaign_id").and_then(|v| v.as_str()) {
         Some(hit_cid) => hit_cid == cid,
-        None => true,
+        None => {
+            tracing::debug!(
+                target: "far_memory",
+                "召回丢弃未标记 campaign 的归档 {}（当前过滤 campaign={}）",
+                hit.id.as_str(),
+                cid
+            );
+            false
+        }
     }
 }
 
@@ -381,10 +396,16 @@ mod tests {
             .unwrap();
 
         let hits = recall_archived_by_query_filtered(&store, "诊所", 5, Some("camp-a")).unwrap();
-        assert_eq!(hits.len(), 2);
+        // W-14：campaign 过滤下只接受带匹配标签的记录；无标签的 legacy 归档不再泄漏进来
+        assert_eq!(hits.len(), 1);
         assert!(hits.iter().any(|h| h.content.contains("A 营")));
-        assert!(hits.iter().any(|h| h.content.contains("旧归档")));
+        assert!(!hits.iter().any(|h| h.content.contains("旧归档")));
         assert!(!hits.iter().any(|h| h.content.contains("B 营")));
+
+        // 未过滤召回仍可见 legacy 归档（legacy 用户的既有行为不变）
+        let unscoped = recall_archived_by_query_filtered(&store, "诊所", 5, None).unwrap();
+        assert_eq!(unscoped.len(), 3);
+        assert!(unscoped.iter().any(|h| h.content.contains("旧归档")));
     }
 
     #[test]

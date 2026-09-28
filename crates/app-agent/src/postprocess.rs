@@ -82,7 +82,8 @@ pub async fn run_postprocess(
         .await?;
 
     let result = parse_postprocess_from_response(&resp);
-    let result = if result.parse_succeeded && !result.is_empty() {
+    // W-09：空结果是"LLM 正常返回但本轮无更新"，不再触发第二次完整 LLM 调用。
+    let mut result = if result.parse_succeeded {
         result
     } else {
         run_direct_json_fallback(runtime, &config, &fallback_user_msg, fallback_cancel)
@@ -90,6 +91,8 @@ pub async fn run_postprocess(
             .map_err(PostProcessError::Agent)?
             .unwrap_or(result)
     };
+    // W-11：把名字解析为 CharacterInstance.id（持久化必须用实例 id）。
+    normalize_postprocess_identities(&mut result, runtime);
     info!(
         target: "postprocess",
         "后处理完成：知识 {} / 变量 {} / 任务 {}",
@@ -100,6 +103,69 @@ pub async fn run_postprocess(
     Ok(result)
 }
 
+/// W-11：把后处理输出里的名字/ID 归一为已存在的 `CharacterInstance.id`。
+///
+/// 只做"唯一命中才替换"：id 精确命中保持原样；名称（trim + 大小写不敏感）
+/// 唯一命中 → 替换为实例 id；未命中/歧义（含本轮临时实例，不在快照里）→ 保留原值，
+/// 由下游 `persist_postprocess_outcome` 的 extras/temps 解析兜底。
+fn normalize_postprocess_identities(result: &mut PostProcessResult, runtime: &AgentRuntime) {
+    let tool_ctx = runtime.tool_ctx();
+    let Some(campaign_runtime) = tool_ctx.campaign_runtime.as_deref() else {
+        return;
+    };
+
+    let resolve = |raw: &Id| -> Option<Id> {
+        let value = raw.as_str().trim();
+        if value.is_empty() {
+            return None;
+        }
+        if let Some(inst) = campaign_runtime
+            .instances
+            .iter()
+            .find(|inst| inst.id.as_str() == value)
+        {
+            return Some(inst.id.clone());
+        }
+        let mut by_name = campaign_runtime
+            .instances
+            .iter()
+            .filter(|inst| crate::runtime::instance_name_matches(&inst.name, value));
+        let first = by_name.next()?;
+        // 同名多实例 → 不猜，保留原值让下游诊断
+        if by_name.next().is_some() {
+            return None;
+        }
+        Some(first.id.clone())
+    };
+
+    for update in &mut result.knowledge_updates {
+        if let Some(resolved) = resolve(&update.character_id) {
+            update.character_id = resolved;
+        }
+        if let Some(source) = update.source_character_id.as_ref()
+            && let Some(resolved) = resolve(source)
+        {
+            update.source_character_id = Some(resolved);
+        }
+    }
+    for update in &mut result.variable_updates {
+        if let Some(instance_id) = update.instance_id.as_ref()
+            && let Some(resolved) = resolve(instance_id)
+        {
+            update.instance_id = Some(resolved);
+        }
+    }
+    for update in &mut result.task_updates {
+        if let Some(task) = update.new_task.as_mut() {
+            for related in &mut task.related_characters {
+                if let Some(resolved) = resolve(related) {
+                    *related = resolved;
+                }
+            }
+        }
+    }
+}
+
 async fn run_direct_json_fallback(
     runtime: &AgentRuntime,
     base_config: &AgentConfig,
@@ -108,7 +174,7 @@ async fn run_direct_json_fallback(
 ) -> Result<Option<PostProcessResult>, AgentError> {
     warn!(
         target: "postprocess",
-        "emit_postprocess/JSON parse missed or returned empty; retrying postprocess once without tools"
+        "emit_postprocess/JSON parse missed; retrying postprocess once without tools"
     );
 
     if *cancel.borrow() {
@@ -179,11 +245,54 @@ async fn run_direct_json_fallback(
 #[derive(Debug, serde::Deserialize)]
 struct PostProcessDto {
     #[serde(default)]
-    knowledge_updates: Vec<KnowledgeUpdateDto>,
+    knowledge_updates: Vec<serde_json::Value>,
     #[serde(default)]
-    variable_updates: Vec<VariableUpdateDto>,
+    variable_updates: Vec<serde_json::Value>,
     #[serde(default)]
-    task_updates: Vec<TaskUpdateDto>,
+    task_updates: Vec<serde_json::Value>,
+}
+
+/// W-05：逐条容错解析。单条畸形只丢该条（warn），不影响其他条目/其他类别。
+fn parse_entries<T: serde::de::DeserializeOwned>(
+    entries: Vec<serde_json::Value>,
+    kind: &str,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, value) in entries.into_iter().enumerate() {
+        match serde_json::from_value::<T>(value) {
+            Ok(item) => out.push(item),
+            Err(error) => warn!(
+                target: "postprocess",
+                "postprocess {kind}[{index}] 解析失败，已跳过该条: {error}"
+            ),
+        }
+    }
+    out
+}
+
+/// W-05：从任意 JSON object 构造 DTO；数组字段非数组时忽略并 warn，
+/// 至少含一个已知键才认作后处理结果（否则返回 None 走后续兜底层）。
+fn postprocess_dto_from_value(value: &serde_json::Value) -> Option<PostProcessDto> {
+    let object = value.as_object()?;
+    let known = ["knowledge_updates", "variable_updates", "task_updates"];
+    if !known.iter().any(|key| object.contains_key(*key)) {
+        return None;
+    }
+    let array_field = |key: &str| -> Vec<serde_json::Value> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => vec![],
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            Some(other) => {
+                warn!(target: "postprocess", "postprocess 字段 {key} 不是数组，已忽略: {other}");
+                vec![]
+            }
+        }
+    };
+    Some(PostProcessDto {
+        knowledge_updates: array_field("knowledge_updates"),
+        variable_updates: array_field("variable_updates"),
+        task_updates: array_field("task_updates"),
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -239,6 +348,18 @@ struct NewTaskDto {
     related_characters: Vec<String>,
 }
 
+/// W-10：广播目标归一（trim + 大小写不敏感）；"all"/"全体"/"所有人" → All。
+fn parse_broadcast(raw: &str) -> Option<BroadcastTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_lowercase().as_str() {
+        "all" | "全体" | "所有人" | "全部" => Some(BroadcastTarget::All),
+        _ => Some(BroadcastTarget::Group(trimmed.to_string())),
+    }
+}
+
 fn parse_source(s: &str) -> KnowledgeSource {
     match s.to_lowercase().as_str() {
         "told_by_other" | "被告知" => KnowledgeSource::ToldByOther,
@@ -278,36 +399,31 @@ fn parse_propagation(s: Option<&str>) -> PropagationPolicy {
 }
 
 fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
-    let knowledge_updates = dto
-        .knowledge_updates
-        .into_iter()
-        .map(|k| CharacterKnowledgeUpdate {
-            character_id: Id::from_str(&k.character_id),
-            knowledge_text: k.knowledge_text,
-            source: parse_source(&k.source),
-            source_character_id: k.source_character_id.map(|s| Id::from_str(&s)),
-            pinned: k.pinned,
-            broadcast: k.broadcast.and_then(|s| match s.as_str() {
-                "all" => Some(BroadcastTarget::All),
-                "" => None,
-                group => Some(BroadcastTarget::Group(group.to_string())),
-            }),
-            propagation: parse_propagation(k.propagation.as_deref()),
-        })
-        .collect();
+    let knowledge_updates =
+        parse_entries::<KnowledgeUpdateDto>(dto.knowledge_updates, "knowledge_updates")
+            .into_iter()
+            .map(|k| CharacterKnowledgeUpdate {
+                character_id: Id::from_str(&k.character_id),
+                knowledge_text: k.knowledge_text,
+                source: parse_source(&k.source),
+                source_character_id: k.source_character_id.map(|s| Id::from_str(&s)),
+                pinned: k.pinned,
+                broadcast: k.broadcast.as_deref().and_then(parse_broadcast),
+                propagation: parse_propagation(k.propagation.as_deref()),
+            })
+            .collect();
 
-    let variable_updates = dto
-        .variable_updates
-        .into_iter()
-        .map(|v| VariableUpdate {
-            instance_id: v.instance_id.map(|s| Id::from_str(&s)),
-            key: v.key,
-            value: v.value,
-        })
-        .collect();
+    let variable_updates =
+        parse_entries::<VariableUpdateDto>(dto.variable_updates, "variable_updates")
+            .into_iter()
+            .map(|v| VariableUpdate {
+                instance_id: v.instance_id.map(|s| Id::from_str(&s)),
+                key: v.key,
+                value: v.value,
+            })
+            .collect();
 
-    let task_updates = dto
-        .task_updates
+    let task_updates = parse_entries::<TaskUpdateDto>(dto.task_updates, "task_updates")
         .into_iter()
         .filter_map(|t| {
             let task_id = t.task_id.map(|s| Id::from_str(&s));
@@ -349,7 +465,7 @@ pub fn parse_postprocess_from_response(resp: &ChatResponse) -> PostProcessResult
     for tc in &resp.tool_calls {
         if tc.function.name == "emit_postprocess"
             && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-            && let Ok(dto) = serde_json::from_value::<PostProcessDto>(args)
+            && let Some(dto) = postprocess_dto_from_value(&args)
         {
             return dto_to_result(dto);
         }
@@ -373,24 +489,29 @@ pub fn parse_postprocess_from_response(resp: &ChatResponse) -> PostProcessResult
 
 fn parse_from_content(content: &str) -> Option<PostProcessResult> {
     // 层 2：整体 JSON
-    if let Ok(dto) = serde_json::from_str::<PostProcessDto>(content) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(dto) = postprocess_dto_from_value(&value)
+    {
         return Some(dto_to_result(dto));
     }
     // 层 3：```json 块
     if let Some(extracted) = extract_codeblock(content, "json")
-        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&extracted)
+        && let Some(dto) = postprocess_dto_from_value(&value)
     {
         return Some(dto_to_result(dto));
     }
     // 层 4：裸代码块
     if let Some(extracted) = extract_codeblock(content, "")
-        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&extracted)
+        && let Some(dto) = postprocess_dto_from_value(&value)
     {
         return Some(dto_to_result(dto));
     }
     // 层 5：手写括号配平（找第一个 {...}）
     if let Some(json_str) = extract_first_braces(content)
-        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&json_str)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str)
+        && let Some(dto) = postprocess_dto_from_value(&value)
     {
         return Some(dto_to_result(dto));
     }
@@ -531,6 +652,130 @@ mod tests {
             parse_source("inferred"),
             KnowledgeSource::Inferred
         ));
+    }
+
+    /// W-05：单条畸形条目只跳过该条，不影响其他类别（旧实现整批丢弃）。
+    #[test]
+    fn malformed_single_entry_does_not_drop_other_classes() {
+        let content = r#"{
+          "knowledge_updates": [ "不是对象", {"character_id": "城主", "knowledge_text": "戒严", "source": "witnessed"} ],
+          "variable_updates": [ {"instance_id": null, "key": "story_clock", "value": "第2天"} ],
+          "task_updates": [ {"task_id": null, "new_status": "pending", "new_task": {"title": "复仇", "description": "老王复仇", "triggers": [], "related_characters": []}} ]
+        }"#;
+        let r = parse_postprocess_from_response(&make_resp(content, vec![]));
+        assert!(r.parse_succeeded, "其余类别仍应解析成功");
+        assert_eq!(r.knowledge_updates.len(), 1, "畸形条目应被跳过而非整批丢弃");
+        assert_eq!(r.knowledge_updates[0].character_id.as_str(), "城主");
+        assert_eq!(r.variable_updates.len(), 1);
+        assert_eq!(r.task_updates.len(), 1);
+    }
+
+    /// W-05：已知键存在但类型不是数组（模型偶发输出）→ 该类别空 + 不算解析失败。
+    #[test]
+    fn non_array_field_is_empty_and_still_parses() {
+        let content = r#"{
+          "knowledge_updates": {"character_id": "城主"},
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+        let r = parse_postprocess_from_response(&make_resp(content, vec![]));
+        assert!(r.parse_succeeded);
+        assert!(r.knowledge_updates.is_empty());
+    }
+
+    /// W-10：broadcast 的 all 变体要大小写/空白归一，Group 名字要 trim。
+    #[test]
+    fn broadcast_normalizes_case_and_whitespace() {
+        let all = r#"{
+          "knowledge_updates": [{"character_id": "城主", "knowledge_text": "戒严", "source": "witnessed", "broadcast": "  ALL "}],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+        let r = parse_postprocess_from_response(&make_resp(all, vec![]));
+        assert_eq!(r.knowledge_updates[0].broadcast, Some(BroadcastTarget::All));
+
+        let group = r#"{
+          "knowledge_updates": [{"character_id": "城主", "knowledge_text": "密令", "source": "witnessed", "broadcast": "  守卫  "}],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+        let r = parse_postprocess_from_response(&make_resp(group, vec![]));
+        assert_eq!(
+            r.knowledge_updates[0].broadcast,
+            Some(BroadcastTarget::Group("守卫".into()))
+        );
+
+        let blank = r#"{
+          "knowledge_updates": [{"character_id": "城主", "knowledge_text": "私语", "source": "witnessed", "broadcast": "   "}],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+        let r = parse_postprocess_from_response(&make_resp(blank, vec![]));
+        assert_eq!(r.knowledge_updates[0].broadcast, None);
+    }
+
+    /// W-11：后处理输出里的**名字**必须归一为已存在的 `CharacterInstance.id`。
+    #[tokio::test]
+    async fn normalize_identities_resolves_unique_name_to_instance_id() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let campaign = Campaign::new(Id::new(), "测试战役");
+        let instance = storyforge_domain::campaign::CharacterInstance::temporary_with_overrides(
+            campaign.id.clone(),
+            "林医生",
+            None,
+            None,
+        );
+        let instance_id = instance.id.clone();
+        let runtime_ctx = CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        };
+        let tool_ctx = Arc::new(crate::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(Arc::new(runtime_ctx)),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let runtime = AgentRuntime::new(
+            Arc::new(storyforge_infra_llm::mock_client::MockLlmClient::new(
+                vec![],
+            )),
+            tool_ctx,
+        );
+
+        let content = r#"{
+          "knowledge_updates": [{"character_id": " 林医生 ", "knowledge_text": "看到尸体", "source": "witnessed"}],
+          "variable_updates": [{"instance_id": "林医生", "key": "state", "value": "受伤"}],
+          "task_updates": []
+        }"#;
+        let mut result = parse_postprocess_from_response(&make_resp(content, vec![]));
+        assert_eq!(
+            result.knowledge_updates[0].character_id.as_str(),
+            " 林医生 "
+        );
+
+        normalize_postprocess_identities(&mut result, &runtime);
+
+        assert_eq!(
+            result.knowledge_updates[0].character_id, instance_id,
+            "名字（含空白）应归一为实例 id"
+        );
+        assert_eq!(
+            result.variable_updates[0].instance_id.as_ref(),
+            Some(&instance_id),
+            "变量更新的 instance_id 应归一为实例 id"
+        );
     }
 
     #[test]
@@ -771,6 +1016,7 @@ mod tests {
 
     struct EmptyJsonThenUsefulJsonClient {
         calls: Arc<AtomicUsize>,
+        fallback_calls: Arc<AtomicUsize>,
         fallback_json: String,
     }
 
@@ -784,6 +1030,7 @@ mod tests {
                     vec![],
                 ));
             }
+            self.fallback_calls.fetch_add(1, Ordering::SeqCst);
             Ok(make_resp(&self.fallback_json, vec![]))
         }
 
@@ -805,10 +1052,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_postprocess_retries_direct_json_when_tool_path_returns_empty_json() {
+    async fn test_run_postprocess_empty_json_is_success_without_second_call() {
+        // W-09：合法但空的结果 = "本轮无更新"，是成功；不再触发第二次完整 LLM 调用
+        // （旧行为会白付一次调用与延迟）。真·解析失败仍走 fallback，见
+        // test_run_postprocess_retries_direct_json_when_tool_path_drifts。
         let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
         let llm = Arc::new(EmptyJsonThenUsefulJsonClient {
             calls: calls.clone(),
+            fallback_calls: fallback_calls.clone(),
             fallback_json: sample_json(),
         });
         let runtime = AgentRuntime::new(llm, empty_tool_context());
@@ -827,13 +1079,17 @@ mod tests {
             &[],
         )
         .await
-        .expect("postprocess should recover when primary tool path returns an empty JSON result");
+        .expect("空 JSON 结果应作为成功返回");
 
-        assert!(result.parse_succeeded);
-        assert_eq!(result.knowledge_updates.len(), 1);
-        assert!(
-            calls.load(Ordering::SeqCst) > 1,
-            "valid-but-empty primary JSON should trigger direct JSON fallback"
+        assert!(result.parse_succeeded, "合法空 JSON 是成功解析");
+        assert!(result.knowledge_updates.is_empty());
+        assert!(result.variable_updates.is_empty());
+        assert!(result.task_updates.is_empty());
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "合法空结果不得再发 direct-JSON fallback（W-09）；calls={}",
+            calls.load(Ordering::SeqCst)
         );
     }
 

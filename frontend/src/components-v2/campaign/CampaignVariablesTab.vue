@@ -190,6 +190,10 @@ async function syncCardSchema() {
   }
 }
 
+// F-25：控件是单向 `:value` 绑定，写入失败时 DOM 会保留用户输入的新值，
+// 界面看起来"已保存"。失败时递增 nonce，强制控件重挂载回真实值。
+const revertNonce = ref(0)
+
 async function persist(variable, rawValue, scope, instanceId = null) {
   const type = inferVarType(variable.value)
   const parsed = parseVariableInput(rawValue, type)
@@ -201,6 +205,7 @@ async function persist(variable, rawValue, scope, instanceId = null) {
     }
     variable.value = parsed
   } catch (e) {
+    revertNonce.value += 1
     await alertDialog(`设置变量失败：${errorText(e)}`)
   }
 }
@@ -356,6 +361,7 @@ defineExpose({ refresh: load })
             <input
               type="checkbox"
               class="h-4 w-4 rounded border-line bg-surface-2 text-accent focus:ring-accent"
+              :key="`camp-bool-${variable.key}-${revertNonce}`"
               :aria-label="variableLabel('全局', variable.key)"
               :checked="variable.value === true"
               @change="persist(variable, $event.target.checked, 'campaign')"
@@ -364,6 +370,7 @@ defineExpose({ refresh: load })
           </label>
           <textarea
             v-else-if="inferVarType(variable.value) === 'json'"
+            :key="`camp-json-${variable.key}-${revertNonce}`"
             :aria-label="variableLabel('全局', variable.key)"
             :value="controlValue(variable)"
             rows="3"
@@ -372,6 +379,7 @@ defineExpose({ refresh: load })
           ></textarea>
           <input
             v-else
+            :key="`camp-scalar-${variable.key}-${revertNonce}`"
             :type="inferVarType(variable.value) === 'string' ? 'text' : 'number'"
             :step="inferVarType(variable.value) === 'float' ? '0.01' : '1'"
             :aria-label="variableLabel('全局', variable.key)"
@@ -436,6 +444,7 @@ defineExpose({ refresh: load })
                 <input
                   type="checkbox"
                   class="h-4 w-4 rounded border-line bg-surface-2 text-accent focus:ring-accent"
+                  :key="`inst-bool-${group.id}-${variable.key}-${revertNonce}`"
                   :aria-label="variableLabel(`${group.name} `, variable.key)"
                   :checked="variable.value === true"
                   @change="persist(variable, $event.target.checked, 'instance', group.id)"
@@ -444,6 +453,7 @@ defineExpose({ refresh: load })
               </label>
               <textarea
                 v-else-if="inferVarType(variable.value) === 'json'"
+                :key="`inst-json-${group.id}-${variable.key}-${revertNonce}`"
                 :aria-label="variableLabel(`${group.name} `, variable.key)"
                 :value="controlValue(variable)"
                 rows="3"
@@ -452,6 +462,7 @@ defineExpose({ refresh: load })
               ></textarea>
               <input
                 v-else
+                :key="`inst-scalar-${group.id}-${variable.key}-${revertNonce}`"
                 :type="inferVarType(variable.value) === 'string' ? 'text' : 'number'"
                 :step="inferVarType(variable.value) === 'float' ? '0.01' : '1'"
                 :aria-label="variableLabel(`${group.name} `, variable.key)"

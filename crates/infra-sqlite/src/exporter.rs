@@ -240,7 +240,14 @@ fn publish_staged_export(stage_dir: &Path, export_dir: &Path, fault: ExportFault
         fs::create_dir_all(parent)?;
     }
     match fs::rename(stage_dir, export_dir) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // S-22.4：旧导出目录「让位」后此前永不清理——每次重导出都残留一份
+            // `.export.pre-export-*` 完整旧副本（含正文/角色卡），磁盘只增不减。
+            // 发布成功后做**有界保留**：只保留最新的 MAX_PRE_EXPORT_BACKUPS
+            // 份让位备份，其余 best-effort 清理（失败只告警，不影响本次导出）。
+            prune_old_pre_export_backups(parent, name, MAX_PRE_EXPORT_BACKUPS);
+            Ok(())
+        }
         Err(e) => {
             if let Some(a) = &aside {
                 fs::rename(a, export_dir).map_err(|r| {
@@ -386,6 +393,59 @@ fn unique_sibling_dir(parent: &Path, prefix: &str, name: &str) -> PathBuf {
         std::process::id(),
         now_nanos()
     ))
+}
+
+/// S-22.4：每次重导出都会把旧导出目录改名为 `.{name}.pre-export-<pid>-<nanos>`
+/// 让位，此前没有任何清理，磁盘无限增长。这里做有界保留：
+/// - 只匹配 `.{name}.pre-export-` 前缀的兄弟目录（唯一命名来自
+///   [`unique_sibling_dir`]），绝不碰用户目录；
+/// - 保留**最新** `keep` 份（按名字里的 nanos 升序取末尾），其余 best-effort
+///   删除，失败仅告警；
+/// - 非 UTF-8 名字或前缀不匹配的条目一律跳过（保守）。
+const MAX_PRE_EXPORT_BACKUPS: usize = 2;
+
+fn prune_old_pre_export_backups(parent: &Path, name: &str, keep: usize) {
+    let prefix = format!(".{name}.pre-export-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut backups: Vec<(u128, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(suffix) = file_name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        // 名字形如 `<pid>-<nanos>`：按 nanos 排序确定新旧（解析失败按 0 → 最先删）。
+        let nanos = suffix
+            .rsplit('-')
+            .next()
+            .and_then(|n| n.parse::<u128>().ok())
+            .unwrap_or(0);
+        backups.push((nanos, entry.path()));
+    }
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by_key(|(nanos, _)| *nanos);
+    let stale_count = backups.len() - keep;
+    for (_, path) in backups.into_iter().take(stale_count) {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "pruned an old pre-export backup (retention: keep newest {keep})"
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to prune an old pre-export backup; it will be retried on the next export"
+            ),
+        }
+    }
 }
 
 fn now_nanos() -> u128 {
@@ -1406,6 +1466,17 @@ fn compute_export_hash(tables: &[(&str, &[Value])], world_info: &[(String, Value
     hex_encode(hasher.finalize())
 }
 
+/// S-22.5：注意**两套 hash 命名空间不可互相比较**。
+///
+/// - 本函数（导出侧，`EXPORT_MANIFEST` 里的 hash）：`tables` 里所有集合**无条件**
+///   参与，空集合也写入 `<name>\0` 前缀（旧导出 hash 兼容性要求）。
+/// - `readiness::validate_source_manifest`（导入侧 manifest_hash）：可选集合
+///   （mvu_translations / world_info / compress_jobs / characters）**仅非空**才
+///   参与，空集合不写前缀。
+///
+/// 因此对同一份数据，两个 hash 一般**不相等**；代码中不存在跨比它们的路径
+/// （rollback 自检比较的是「staging 重新导入后的 DB 内容 hash」与导出侧 hash，
+/// 属于同侧比较）。若未来要跨比，必须先统一投影再比较。
 #[allow(clippy::too_many_arguments)]
 fn collect_export_hash(
     cards: &[Value],
@@ -1782,6 +1853,42 @@ pub fn read_export_manifest(path: &Path) -> Result<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_keeps_newest_pre_export_backups_and_touches_nothing_else() {
+        // S-22.4：有界保留——只删 `.{name}.pre-export-*` 前缀里的旧目录，
+        // 保留最新 keep 份，其它任何目录/文件都不碰。
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let make = |nanos: u128| {
+            let path = root.join(format!(".export.pre-export-{}-{nanos}", 42));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("campaigns.json"), b"[]").unwrap();
+            path
+        };
+        let oldest = make(100);
+        let middle = make(200);
+        let newest = make(300);
+        // 前缀相同但是普通文件 → 跳过；无关目录 → 跳过。
+        fs::write(root.join(".export.pre-export-42-400"), b"not a dir").unwrap();
+        let unrelated = root.join("keep-me");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        prune_old_pre_export_backups(root, "export", 2);
+
+        assert!(!oldest.exists(), "最旧的让位备份必须被清理");
+        assert!(middle.exists(), "保留最新 2 份：middle");
+        assert!(newest.exists(), "保留最新 2 份：newest");
+        assert!(unrelated.exists(), "无关目录绝不能被清理");
+        assert!(
+            root.join(".export.pre-export-42-400").exists(),
+            "同前缀的普通文件不得被当作备份删除"
+        );
+
+        // keep >= 数量时不删任何东西。
+        prune_old_pre_export_backups(root, "export", 5);
+        assert!(middle.exists() && newest.exists());
+    }
 
     #[test]
     fn conversation_filename_encoding_is_injective() {

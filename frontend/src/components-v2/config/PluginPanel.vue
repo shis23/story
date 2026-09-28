@@ -10,7 +10,12 @@ import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import { errorText } from '../../utils/errorText.js'
 
-const emit = defineEmits(['close'])
+// M-20：禁用/卸载/安装后必须让宿主侧（AppV2 的 loadSidebarPlugins）立刻重算
+// 侧栏插件、hookPlugins 与 hookPluginSlots——hookPlugins 是 getLivePluginPermissions
+// 的唯一数据源，原先只在面板 close 时刷新，面板开着就等于「禁用不生效」。
+// 面板不持有宿主状态，故只发信号：父级需接线
+// `@plugins-changed="loadSidebarPlugins"`（AppV2.vue:1003-1006）。
+const emit = defineEmits(['close', 'plugins-changed'])
 
 const plugins = ref([])
 const loading = ref(true)
@@ -50,6 +55,8 @@ async function doInstall() {
     installJson.value = ''
     showInstall.value = false
     await loadPlugins()
+    // 新装的插件如果是 enabled，侧栏/hook 列表要立刻能看到它。
+    emit('plugins-changed')
   } catch (e) {
     installError.value = errorText(e)
   } finally {
@@ -63,6 +70,8 @@ async function doUninstall(plugin) {
   try {
     await uninstallPlugin(plugin.id)
     await loadPlugins()
+    // 卸载后宿主必须立刻丢掉该插件的 hook/iframe，而不是等面板关闭。
+    emit('plugins-changed')
   } catch (e) {
     await alertDialog('卸载失败: ' + errorText(e))
   }
@@ -77,6 +86,8 @@ async function toggleEnabled(plugin, next) {
     // 乐观更新，避免整表 loading 造成「卡死」感
     const row = plugins.value.find((p) => p.id === plugin.id)
     if (row) row.enabled = target
+    // 权限/iframe 的吊销走宿主列表，禁用与启用都要立刻重算。
+    emit('plugins-changed')
   } catch (e) {
     await alertDialog('操作失败: ' + errorText(e))
     await loadPlugins()
@@ -154,6 +165,7 @@ onMounted(loadPlugins)
               <Toggle
                 :model-value="!!item.enabled"
                 :disabled="togglingId === item.id"
+                :aria-label="`${item.enabled ? '禁用' : '启用'}插件 ${item.name || item.id}`"
                 @update:model-value="(v) => toggleEnabled(item, v)"
               />
               <Button variant="danger" size="sm" @click="doUninstall(item)">卸载</Button>

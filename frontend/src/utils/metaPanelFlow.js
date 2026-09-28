@@ -1,3 +1,5 @@
+import { errorText } from './errorText.js'
+
 export function sortHealthIssues(issues) {
   return [...(issues || [])].sort((a, b) => {
     if (a?.severity === b?.severity) return 0
@@ -18,8 +20,12 @@ export async function loadTypedPatchesWithPreview({
       const preview = await previewTypedPatch(patch.id, campaignId)
       patch._stale = preview?.stale || false
       if (preview?.diff !== undefined) patch._previewDiff = preview.diff
-    } catch {
-      patch._stale = false
+    } catch (e) {
+      // M-27c：preview 失败必须 fail-closed。`_stale` 是接受按钮的唯一判据
+      // （HealthCheckPanel `:disabled="patch._stale"`），失败时置 false 会让
+      // 「先预览再接受」的约定静默失效；错误文案走 errorText 约定，随卡片展示。
+      patch._stale = true
+      patch._previewError = errorText(e)
     }
   }))
 

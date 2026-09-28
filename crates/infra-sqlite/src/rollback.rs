@@ -29,6 +29,8 @@ use crate::connection::Database;
 use crate::cutover::{BackendMarker, CutoverPlan, MarkerStatus, inspect_marker};
 use crate::error::{Result, SqliteError};
 use crate::exporter::{self, EXPORT_MANIFEST_FILENAME, ExportMode};
+// S-20：与 cutover 共用同一份 fsync 语义（本文件曾有一份静默吞错的副本）。
+use crate::fs_atomic::{fsync_file, fsync_parent_dir};
 use crate::importer::JsonImporter;
 use crate::lease::AuthorityLeaseGuard;
 
@@ -100,9 +102,10 @@ pub fn run_rollback_with_fault(
                 "rollback requires SqliteAuthoritative marker; found Absent".into(),
             ));
         }
-        MarkerStatus::Stale { reason } => {
+        MarkerStatus::Stale { kind, reason } => {
             return Err(SqliteError::Other(format!(
-                "rollback requires SqliteAuthoritative marker; found Stale: {reason}"
+                "rollback requires SqliteAuthoritative marker; found Stale ({kind}): {reason}",
+                kind = kind.as_str()
             )));
         }
     }
@@ -382,6 +385,11 @@ fn install_rollback_json_into_data_dir(stage_dir: &Path, data_dir: &Path) -> Res
     let ordered: Vec<(PathBuf, InstallPlan)> = plan.into_iter().collect();
     let mut written: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for (dst, InstallPlan::Overwrite { old, new }) in &ordered {
+        // S-12：先把**当前**路径登记进 written，再执行安装。旧实现只在成功后登记，
+        // 于是「rename 成功、紧随其后的 fsync/父目录 fsync 失败」会把已改写的文件
+        // 排除在恢复列表之外——回滚变成 all-or-nothing 的空话，data_dir 留下
+        // 半安装的 JSON。
+        written.push((dst.clone(), old.clone()));
         let install_result: Result<()> = (|| {
             if new.is_empty() && old.as_ref().is_some_and(|o| !o.is_empty()) {
                 // 删除目标（staging 已不含、data_dir 仍存在的旧文件）。
@@ -414,7 +422,6 @@ fn install_rollback_json_into_data_dir(stage_dir: &Path, data_dir: &Path) -> Res
                 )))
             };
         }
-        written.push((dst.clone(), old.clone()));
     }
     Ok(())
 }
@@ -488,29 +495,17 @@ fn write_json_authoritative_marker(plan: &CutoverPlan) -> Result<()> {
     fsync_file(&marker_path).map_err(|e| {
         SqliteError::Other(format!("failed to fsync json-authoritative marker: {e}"))
     })?;
-    fsync_parent_dir(&marker_path);
+    // S-12：父目录 fsync 失败不再静默。marker 是 rollback 的提交点，内容已落盘，
+    // 因此这里把「rename 的持久化不确定」明确告知调用方（unix 才能检测；Windows
+    // 恒 Ok）——绝不假装成功。
+    fsync_parent_dir(&marker_path).map_err(|e| {
+        SqliteError::Other(format!(
+            "json-authoritative marker written but its directory fsync failed \
+             (the rename may not survive a power loss): {e}"
+        ))
+    })?;
     Ok(())
 }
-
-/// fsync 文件（Windows 上 FlushFileBuffers 需要写访问，因此用写方式打开）。
-fn fsync_file(path: &Path) -> Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// fsync 父目录使 rename 本身持久化；Windows 不能对目录 fsync → unix only。
-#[cfg(unix)]
-fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) {}
 
 /// 唯一 rollback staging 目录（数据根兄弟：`.<name>.rollback-<pid>-<nanos>`）。
 fn unique_rollback_stage_dir(plan: &CutoverPlan) -> PathBuf {

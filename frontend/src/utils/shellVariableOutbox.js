@@ -93,6 +93,16 @@ export async function persistShellVariableWrite({
     scope = 'campaign'
   }
 
+  // M-28a：拆分/去前缀后的 writeKey 必须与入口同口径复核非空——`instance:<id>:`、
+  // `inst:`（带 instanceId）与 `campaign:` 的空后缀此前会带着空键直达
+  // setCharacterVariable/setCampaignVariable。
+  const trimmedWriteKey = writeKey.trim()
+  if (!trimmedWriteKey) {
+    if (log) await log('warn', `shell_var_write skip: empty key after prefix split key=${k}`)
+    return { ok: false, scope, key: '', error: 'empty key' }
+  }
+  writeKey = trimmedWriteKey
+
   // M-6：拆分后的 writeKey 也要复核（防 instance:foo:__storyforge_x 这类前缀伪装）。
   if (isReservedNamespace(writeKey)) {
     const err = `reserved namespace key rejected: ${writeKey}`

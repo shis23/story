@@ -47,6 +47,10 @@ pub struct RegexScript {
     pub find_regex: String,
     pub replace_string: String,
     /// 作用域（ST regex placement）。
+    ///
+    /// D-26：老数据可能整段缺少这些键，此前会让整个 `presets.json` 解析失败并回退默认。
+    /// 缺省值取 ST 的默认作用域（placement code 2 = AI Output）。
+    #[serde(default)]
     pub placement: RegexPlacement,
     /// ST 原始 placement 数组，用于恢复 User Input/Slash/World Info/Reasoning 等作用域语义。
     #[serde(default)]
@@ -54,8 +58,10 @@ pub struct RegexScript {
     #[serde(default)]
     pub source: RegexScriptSource,
     /// 是否禁用
+    #[serde(default)]
     pub disabled: bool,
     /// ST 原始字段（flags 等）
+    #[serde(default)]
     pub flags: String,
     pub only_format_formatting: Option<bool>,
     pub markdown_only: Option<bool>,
@@ -80,11 +86,12 @@ pub const ST_REGEX_PLACEMENT_WORLD_INFO: i32 = 5;
 pub const ST_REGEX_PLACEMENT_REASONING: i32 = 6;
 
 /// 正则作用域（ST regex placement）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegexPlacement {
     /// 输入正则：用户→导演前
     Input,
-    /// 输出正则：编剧成文后
+    /// 输出正则：编剧成文后（ST 默认 placement=2，也是缺省值的来源）
+    #[default]
     Output,
     /// Slash command 正则：斜杠命令值处理
     SlashCommand,
@@ -201,14 +208,6 @@ impl Preset {
             regex_scripts,
             source: Source::ImportedFromST,
         }
-    }
-
-    /// 获取所有启用的系统提示词（按 ST 的 prompt_order 顺序，这里简化为原始顺序）
-    pub fn enabled_system_prompts(&self) -> Vec<&PresetPrompt> {
-        self.prompts
-            .iter()
-            .filter(|p| p.enabled && p.role == PromptRole::System && !p.marker)
-            .collect()
     }
 
     /// 获取输入正则（作用于用户→导演前）
@@ -507,5 +506,78 @@ mod tests {
         .expect("old regex script should deserialize");
 
         assert_eq!(script.source, RegexScriptSource::Preset);
+    }
+
+    // ─── D-26：老 JSON 缺字段不得让整份 presets.json 解析失败 ──────────────
+
+    #[test]
+    fn regex_script_tolerates_missing_scalar_fields() {
+        // 最小老数据：只有 4 个核心字段
+        let script: RegexScript = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "script_name": "legacy",
+            "find_regex": "a",
+            "replace_string": "b"
+        }))
+        .expect("缺省字段必须可解析（D-26）");
+        assert_eq!(
+            script.placement,
+            RegexPlacement::Output,
+            "placement 缺省取 ST 默认作用域（code 2 = AI Output）"
+        );
+        assert!(!script.disabled);
+        assert_eq!(script.flags, "");
+        assert!(script.trim_strings.is_empty());
+        assert_eq!(script.source, RegexScriptSource::Preset);
+
+        // 整份 Preset 级别也不应因单条老脚本而失败
+        let preset: Preset = serde_json::from_value(serde_json::json!({
+            "name": "老预设",
+            "prompts": [],
+            "regex_scripts": [{
+                "id": "legacy",
+                "script_name": "legacy",
+                "find_regex": "a",
+                "replace_string": "b"
+            }],
+            "source": "ImportedFromST"
+        }))
+        .expect("整份预设必须可解析");
+        assert_eq!(preset.regex_scripts.len(), 1);
+        assert_eq!(preset.regex_scripts[0].placement, RegexPlacement::Output);
+    }
+
+    #[test]
+    fn regex_script_missing_find_regex_still_fails_closed() {
+        // D-26 的反面：find_regex/replace_string 不设 default——
+        // 空正则会在所有文本上命中，静默改文比解析失败危险得多。
+        assert!(
+            serde_json::from_value::<RegexScript>(serde_json::json!({
+                "id": "bad",
+                "script_name": "bad",
+                "replace_string": "b"
+            }))
+            .is_err(),
+            "缺少 find_regex 必须报错，不得默认成空正则"
+        );
+    }
+
+    #[test]
+    fn input_placement_filter_still_works_with_defaulted_scripts() {
+        let preset: Preset = serde_json::from_value(serde_json::json!({
+            "name": "p",
+            "prompts": [],
+            "regex_scripts": [
+                { "id": "a", "script_name": "缺 placement", "find_regex": "x", "replace_string": "y" },
+                { "id": "b", "script_name": "输入", "find_regex": "x", "replace_string": "y",
+                  "placement": "Input", "placement_codes": [1] }
+            ],
+            "source": "ImportedFromST"
+        }))
+        .unwrap();
+        let inputs = preset.input_regex_scripts();
+        assert_eq!(inputs.len(), 1, "缺省 placement 不应被当作 Input");
+        assert_eq!(inputs[0].id, "b");
+        assert_eq!(preset.output_regex_scripts().len(), 1);
     }
 }

@@ -1323,7 +1323,14 @@ Describe 'Release evidence verifier CLI (real process)' {
     }
 }
 
-Describe 'Release workflow static governance (runner readiness)' {
+# LEGACY CONTRACT (G-06, review-2026-09-13): Gitea Actions was decommissioned on
+# 2026-09-06, so the `.gitea/workflows/*` files exercised below are retained history,
+# not an active CI provider. These checks keep that retained configuration from
+# rotting and remain useful for the host-evidence package format, but they must not
+# be cited as "CI gates are green"; the release path is GitHub Actions
+# (.github/workflows/release.yml) and the decommission marker is
+# .gitea/DECOMMISSIONED.md.
+Describe 'Release workflow static governance (LEGACY: Gitea Actions decommissioned 2026-09-06; retained as historical contract)' {
     It 'parses both tracked workflows with a real YAML parser engine' {
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
         $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File)

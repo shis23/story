@@ -102,6 +102,7 @@ import {
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
 import { errorText } from './utils/errorText.js'
+import { setupConsoleForwarding } from './utils/consoleForwarding.js'
 import { persistShellVariableWrite } from './utils/shellVariableOutbox.js'
 import {
   takeShellVariableProposal,
@@ -183,21 +184,17 @@ async function loadSidebarPlugins() {
     plugin.sidebarPlugins = enabled.filter((p) => p.ui_slots?.includes('SidebarPanel'))
   } catch (e) {
     console.error('加载侧栏插件失败:', e)
-    logAppendFrontend('error', `loadSidebarPlugins: ${e}`).catch(() => {})
+    logAppendFrontend('error', `loadSidebarPlugins: ${errorText(e)}`).catch(() => {})
   }
 }
 
-// setupConsoleForwarding（App.vue:402-412）：拦截 console 转发到后端 LogStore
-function setupConsoleForwarding() {
-  const levels = { log: 'info', warn: 'warn', error: 'error', debug: 'debug' }
-  for (const [method, level] of Object.entries(levels)) {
-    const original = console[method]
-    console[method] = (...args) => {
-      original.apply(console, args)
-      const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
-      logAppendFrontend(level, msg).catch(() => {})
-    }
-  }
+// setupConsoleForwarding：统一走 utils/consoleForwarding.js（F-28）。
+// 此前这里有一份内联副本，而 util 版本只被它自己的单测覆盖——测试保护的实现
+// 与生产跑的实现不是同一份。现在生产与测试共用同一实现。
+function installConsoleForwarding() {
+  setupConsoleForwarding((level, msg) => {
+    logAppendFrontend(level, msg).catch(() => {})
+  })
 }
 
 // ─── 视图滚动桥：WritingScreen 暴露 scrollToBottom，AppV2 转发为函数引用 ───
@@ -244,6 +241,14 @@ const showCardShellOpening = computed(() => shouldShowOpeningShell({
   messageCount: writing.messages.length,
   isWriting: writing.isWriting,
 }))
+// F-03：cardShellLoading 此前只被写、从未被读 → 序章壳加载期间界面完全空白。
+// 会话开场态（≤1 条消息）且 manifest 尚在拉取时，给一个可见的占位。
+const showCardShellOpeningLoading = computed(() =>
+  cardShellLoading.value &&
+  !cardShellOpeningUrl.value &&
+  writing.messages.length <= 1 &&
+  !writing.isWriting,
+)
 // window.innerHeight 非响应式：computed 直读只在其它依赖变化时重算，
 // 旋转/缩放后会拿到过期高度。用 resize 监听的 ref 承载（同 AppFrame 做法）。
 const viewportHeight = ref(typeof window !== 'undefined' ? window.innerHeight : 900)
@@ -555,7 +560,7 @@ async function onOpeningShellApplied(payload) {
           await applyCampaignOpening(campaign.activeCampaign.id, selection.content)
         } catch (e) {
           console.error('applyCampaignOpening:', e)
-          logAppendFrontend('warn', `开场选择落库失败: ${e}`).catch(() => {})
+          logAppendFrontend('warn', `开场选择落库失败: ${errorText(e)}`).catch(() => {})
           // 静默失败会让下一轮生成回退到旧开场，用户必须知情
           await alertDialog('开场选择已显示，但落库失败（下一轮生成仍将使用旧开场）: ' + errorText(e))
         }
@@ -782,7 +787,7 @@ onMounted(async () => {
     await refreshCardShellManifest()
   } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
-  setupConsoleForwarding()
+  installConsoleForwarding()
   broadcastPluginEvent(ST_EVENT_TYPES.APP_READY, chatEventPayload({ version: ui.appVersion }))
 })
 
@@ -873,12 +878,20 @@ onUnmounted(() => {
         ref="writingScreenRef"
         class="sf-view-enter h-full min-h-0"
         v-bind="writingScreenProps"
-        :show-opening="showCardShellOpening"
+        :show-opening="showCardShellOpening || showCardShellOpeningLoading"
         v-on="writingScreenEvents"
       >
         <template #opening>
+          <div
+            v-if="showCardShellOpeningLoading"
+            class="flex min-h-[72px] items-center justify-center gap-2 rounded-xl border border-line bg-surface text-xs text-ink-soft"
+            role="status"
+          >
+            <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-running" aria-hidden="true"></span>
+            序章准备中…
+          </div>
           <CardShellHost
-            v-if="showCardShellOpening"
+            v-else-if="showCardShellOpening"
             :url="cardShellOpeningUrl"
             :campaign-id="campaign.activeCampaign?.id || null"
             label="序章"
@@ -986,10 +999,12 @@ onUnmounted(() => {
         @close="ui.showPresetPanel = false"
       />
 
-      <!-- 插件面板（关后刷新侧栏插件） -->
+      <!-- 插件面板（关后刷新侧栏插件；M-20：安装/卸载/启停后立即刷新，
+           否则被禁用的插件在下一次关闭面板前仍挂在 hook 链上） -->
       <PluginPanel
         v-if="ui.showPluginPanel"
         @close="ui.showPluginPanel = false; loadSidebarPlugins()"
+        @plugins-changed="loadSidebarPlugins"
       />
 
       <!-- Agent Profile 配置面板（Phase 8 补挂,P3-5） -->

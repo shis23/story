@@ -16,6 +16,14 @@ use storyforge_domain::world_info::WorldInfoBook;
 pub enum CompatSeverity {
     /// Confirmed data loss / corruption risk that must be fixed or documented.
     Loss,
+    /// Wire-level representation change with no declared equivalence mapping
+    /// (for example a `position` value that maps to no known code). A hard
+    /// finding: it is counted by [`CompatReport::has_losses`].
+    WireDrift,
+    /// Wire-level representation change whose values are equivalent under an
+    /// explicit mapping declared in code (see [`POSITION_WIRE_MAPPING`]).
+    /// Recorded with `before`/`after` evidence — never a blanket "intentional".
+    Normalized,
     /// Intentional StoryForge normalization (not treated as a bug).
     Intentional,
     /// Unknown / opaque field survived as opaque payload.
@@ -88,6 +96,13 @@ pub struct CompatReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatSummary {
     pub loss: usize,
+    /// Wire-contract drifts with no declared equivalence mapping.
+    #[serde(default)]
+    pub wire_drift: usize,
+    /// Representation changes that are equivalent under a mapping declared in
+    /// code, recorded with `before`/`after` evidence.
+    #[serde(default)]
+    pub normalized: usize,
     pub intentional: usize,
     pub preserved: usize,
     pub rejected: usize,
@@ -96,7 +111,10 @@ pub struct CompatSummary {
 impl CompatReport {
     pub const FORMAT_VERSION: u32 = 1;
     /// Current matrix row schema version.
-    pub const MATRIX_VERSION: u32 = 1;
+    ///
+    /// Bumped 1 → 2 when the report payload gained the `wire_drift` /
+    /// `normalized` severity values and summary counters (M-06 wire leg).
+    pub const MATRIX_VERSION: u32 = 2;
 
     pub fn new(generated_by: impl Into<String>, seed: Option<u64>) -> Self {
         Self {
@@ -107,6 +125,8 @@ impl CompatReport {
             findings: Vec::new(),
             summary: CompatSummary {
                 loss: 0,
+                wire_drift: 0,
+                normalized: 0,
                 intentional: 0,
                 preserved: 0,
                 rejected: 0,
@@ -118,6 +138,8 @@ impl CompatReport {
     pub fn push(&mut self, finding: CompatFinding) {
         match finding.severity {
             CompatSeverity::Loss => self.summary.loss += 1,
+            CompatSeverity::WireDrift => self.summary.wire_drift += 1,
+            CompatSeverity::Normalized => self.summary.normalized += 1,
             CompatSeverity::Intentional => self.summary.intentional += 1,
             CompatSeverity::Preserved => self.summary.preserved += 1,
             CompatSeverity::Rejected => self.summary.rejected += 1,
@@ -171,8 +193,20 @@ impl CompatReport {
         Ok(())
     }
 
+    /// True when the report carries a hard defect: a `Loss` or a wire-level
+    /// drift with no declared equivalence mapping (`WireDrift`).
+    ///
+    /// An explicit `Normalized` transition is *not* a hard defect, but it is
+    /// still reported with `before`/`after` evidence so a wire contract change
+    /// stays visible in the machine-readable report.
     pub fn has_losses(&self) -> bool {
-        self.summary.loss > 0
+        self.summary.loss > 0 || self.summary.wire_drift > 0
+    }
+
+    /// True when the report carries a wire-level representation change that no
+    /// declared in-code mapping explains.
+    pub fn has_wire_drift(&self) -> bool {
+        self.summary.wire_drift > 0
     }
 
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
@@ -182,9 +216,10 @@ impl CompatReport {
     /// Render a stable Markdown summary of this report.
     ///
     /// Carries the matrix version, generator/seed, classified-finding counts,
-    /// the registered matrix rows, and (if present) the loss/intentional
-    /// findings. No raw card body is ever emitted: findings are summarized by
-    /// area / field_path / severity / detail only.
+    /// the registered matrix rows, and (if present) the loss / wire-drift /
+    /// explicit-normalization / intentional findings. No raw card body is ever
+    /// emitted: findings are summarized by area / field_path / severity /
+    /// detail only (the `before`/`after` evidence lives in the JSON report).
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str(&format!(
@@ -195,11 +230,13 @@ impl CompatReport {
             md.push_str(&format!("- seed: `0x{seed:08X}`\n"));
         }
         md.push_str("\n## Summary\n\n");
-        md.push_str("| loss | intentional | preserved | rejected |\n");
-        md.push_str("|------|-------------|-----------|----------|\n");
+        md.push_str("| loss | wire_drift | normalized | intentional | preserved | rejected |\n");
+        md.push_str("|------|------------|------------|-------------|-----------|----------|\n");
         md.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             self.summary.loss,
+            self.summary.wire_drift,
+            self.summary.normalized,
             self.summary.intentional,
             self.summary.preserved,
             self.summary.rejected
@@ -255,6 +292,40 @@ impl CompatReport {
             }
         }
 
+        let normalized: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::Normalized)
+            .collect();
+        if !normalized.is_empty() {
+            md.push_str("\n## Explicit normalizations (equivalence declared in code)\n\n");
+            md.push_str("| area | field_path | detail |\n");
+            md.push_str("|------|-------------|--------|\n");
+            for f in normalized {
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    f.area, f.field_path, f.detail
+                ));
+            }
+        }
+
+        let wire_drift: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::WireDrift)
+            .collect();
+        if !wire_drift.is_empty() {
+            md.push_str("\n## Wire drift findings\n\n");
+            md.push_str("| area | field_path | detail |\n");
+            md.push_str("|------|-------------|--------|\n");
+            for f in wire_drift {
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    f.area, f.field_path, f.detail
+                ));
+            }
+        }
+
         md
     }
 }
@@ -288,7 +359,7 @@ pub fn compare_st_data(
 ///
 /// `source` is the original ST card JSON (its `.data` object), `imported` is
 /// the first-imported Character, and `intentional_paths` lists fields that are
-/// documented intentional normalizations (e.g. `key`, `keysecondary`, `position`).
+/// documented intentional normalizations (e.g. `key`, `keysecondary`).
 ///
 /// Equivalent empty forms are treated as intentional: `[]` ↔ `null` for
 /// `secondary_keys` (first import stores empty secondary keys as `None`).
@@ -301,25 +372,33 @@ pub fn compare_source_to_first_import(
     let source_data = source.get("data").unwrap_or(source);
     let findings = compare_st_data(source_data, &imported.raw_card_json, intentional_paths);
     for finding in findings {
-        // Empty secondary_keys [] is normalized to null/None on first import.
-        if finding.severity == CompatSeverity::Loss
-            && finding.field_path.contains("secondary_keys")
-            && is_empty_list_or_null(finding.before.as_ref())
-            && is_empty_list_or_null(finding.after.as_ref())
-        {
-            report.push(CompatFinding {
-                area: finding.area,
-                field_path: finding.field_path,
-                severity: CompatSeverity::Intentional,
-                detail: "empty secondary_keys [] normalized to null/None on first import".into(),
-                before: finding.before,
-                after: finding.after,
-            });
-            continue;
-        }
-        report.push(finding);
+        report.push(reclassify_normalizations(finding));
     }
     report
+}
+
+/// Reclassify documented, evidence-free normalizations that are identical on
+/// every wire-level comparison leg.
+///
+/// Empty `secondary_keys` (`[]` on the source card) is stored as `null`/`None`
+/// on first import, so an `[] ↔ null` pair is an intentional normalization
+/// rather than a loss.
+fn reclassify_normalizations(finding: CompatFinding) -> CompatFinding {
+    if finding.severity == CompatSeverity::Loss
+        && finding.field_path.contains("secondary_keys")
+        && is_empty_list_or_null(finding.before.as_ref())
+        && is_empty_list_or_null(finding.after.as_ref())
+    {
+        return CompatFinding {
+            area: finding.area,
+            field_path: finding.field_path,
+            severity: CompatSeverity::Intentional,
+            detail: "empty secondary_keys [] normalized to null/None on first import".into(),
+            before: finding.before,
+            after: finding.after,
+        };
+    }
+    finding
 }
 
 fn is_empty_list_or_null(value: Option<&Value>) -> bool {
@@ -329,6 +408,53 @@ fn is_empty_list_or_null(value: Option<&Value>) -> bool {
         Some(Value::Array(items)) => items.is_empty(),
         _ => false,
     }
+}
+
+/// Extract the ST card `data` object from a PNG produced by
+/// [`crate::png::write_st_card_png`] — i.e. the exact wire bytes a third-party
+/// ST tool reads out of the `chara` tEXt chunk.
+pub fn exported_png_card_data(png_bytes: &[u8]) -> Result<Value, String> {
+    let chunks =
+        crate::png::parse_png(png_bytes).map_err(|e| format!("parse exported PNG: {e}"))?;
+    let payload = chunks
+        .iter()
+        .find_map(|chunk| match chunk {
+            crate::png::PngChunk::Text { keyword, text }
+                if keyword.eq_ignore_ascii_case("chara") =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| "exported PNG has no chara tEXt chunk".to_string())?;
+    let json_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload)
+        .map_err(|e| format!("decode exported chara payload: {e}"))?;
+    let card: Value = serde_json::from_slice(crate::strip_utf8_bom(&json_bytes))
+        .map_err(|e| format!("parse exported chara JSON: {e}"))?;
+    Ok(card.get("data").cloned().unwrap_or(card))
+}
+
+/// Wire-level comparison leg: exported card JSON vs the SOURCE card JSON,
+/// field by field.
+///
+/// This is a distinct leg from [`compare_source_to_first_import`] (source vs
+/// first import) and [`compare_character_roundtrip`] (domain object → export →
+/// domain object). Both of those compare *domain* values, so a wire-level
+/// representation change — `position` written as a numeric code instead of the
+/// ST string label, for example — is structurally invisible to them. This leg
+/// compares the JSON that actually lands in the exported PNG/JSON card against
+/// the JSON that came in, so wire drift is visible to CI.
+///
+/// `source` is the original ST card JSON (its `.data` object is used when
+/// present); `exported_wire` is the exported card `data` object (see
+/// [`exported_png_card_data`]).
+pub fn compare_export_wire_to_source(source: &Value, exported_wire: &Value) -> CompatReport {
+    let mut report = CompatReport::new("compare_export_wire_to_source", None);
+    let source_data = source.get("data").unwrap_or(source);
+    for finding in compare_st_data(source_data, exported_wire, INTENTIONAL_WIRE_PATHS) {
+        report.push(reclassify_normalizations(finding));
+    }
+    report
 }
 
 /// Build a high-level inventory of fields StoryForge currently understands from a Character.
@@ -687,16 +813,16 @@ pub fn compare_character_roundtrip(original: &Character, roundtripped: &Characte
         roundtripped.embedded_world_info.as_ref(),
     );
 
-    // Position string → number is intentional normalization on export via to_st_entry.
-    report.push(CompatFinding {
-        area: "character_book.entry".into(),
-        field_path: "position".into(),
-        severity: CompatSeverity::Intentional,
-        detail: "ST position may be normalized from string labels to numeric codes on export"
-            .into(),
-        before: None,
-        after: None,
-    });
+    // Wire-level `position` verdict. The former code pushed an unconditional
+    // `Intentional` row here with no `before`/`after` evidence, which hid every
+    // label ⇄ code transition from the gate. The actual representation change is
+    // now read from the preserved raw ST JSON of both sides and classified
+    // (`Normalized` under an explicit mapping, `WireDrift` otherwise).
+    compare_wire_positions(
+        &mut report,
+        &original.raw_card_json,
+        &roundtripped.raw_card_json,
+    );
 
     report
 }
@@ -826,8 +952,10 @@ fn compare_world_books(
             }
 
             for (idx, (le, re)) in a.entries.iter().zip(b.entries.iter()).enumerate() {
-                let mut entry_loss = false;
-                if le.keys != re.keys
+                // Entry-level `extra` (unknown ST fields such as `insertion_order`,
+                // `case_sensitive`, `group`, `probability`) is exactly what this
+                // crate claims to preserve, so it is part of the entry verdict.
+                let mut entry_loss = le.keys != re.keys
                     || le.secondary_keys != re.secondary_keys
                     || le.content != re.content
                     || le.constant != re.constant
@@ -837,20 +965,13 @@ fn compare_world_books(
                     || le.depth != re.depth
                     || le.st_id != re.st_id
                     || canonicalize(&le.extensions) != canonicalize(&re.extensions)
-                {
-                    entry_loss = true;
-                }
-                // position may be intentionally normalized (string label → number).
+                    || le.extra != re.extra;
+                // Both sides are already-normalized internal codes here, so a
+                // difference is a real injection-position change: it is counted
+                // as an entry loss (the wire label ⇄ code verdict is produced by
+                // `compare_wire_positions` and by the wire comparison leg).
                 if le.position != re.position {
-                    report.push(CompatFinding {
-                        area: "character_book.entry".into(),
-                        field_path: format!("entries[{idx}].position"),
-                        severity: CompatSeverity::Intentional,
-                        detail: "position normalized between ST string labels and numeric codes"
-                            .into(),
-                        before: Some(Value::from(le.position)),
-                        after: Some(Value::from(re.position)),
-                    });
+                    entry_loss = true;
                 }
                 if entry_loss {
                     report.push(CompatFinding {
@@ -866,7 +987,9 @@ fn compare_world_books(
                             "selective": le.selective,
                             "order": le.order,
                             "depth": le.depth,
+                            "position": le.position,
                             "st_id": le.st_id,
+                            "extra": le.extra,
                         })),
                         after: Some(serde_json::json!({
                             "keys": re.keys,
@@ -876,7 +999,9 @@ fn compare_world_books(
                             "selective": re.selective,
                             "order": re.order,
                             "depth": re.depth,
+                            "position": re.position,
                             "st_id": re.st_id,
+                            "extra": re.extra,
                         })),
                     });
                 } else {
@@ -939,6 +1064,123 @@ fn path_is_intentional(path: &str, full: &str, intentional_paths: &[&str]) -> bo
             || full.ends_with(&format!(".{p}"))
             || path.ends_with(&format!(".{p}"))
     })
+}
+
+/// Explicit ST `position` wire mapping: v2/v3 string labels ⇄ StoryForge's
+/// internal numeric code.
+///
+/// The numeric side is pinned to the domain source of truth
+/// [`storyforge_domain::character::StWorldInfoEntry::position_as_i32`]
+/// (crates/domain/src/character.rs:153) by
+/// `position_wire_mapping_matches_domain_mapping`. The table exists because
+/// that function folds *unknown* labels into `0`, which would otherwise make an
+/// unknown label look equivalent to `before_char`.
+const POSITION_WIRE_MAPPING: &[(&str, i64)] = &[
+    ("before_char", 0),
+    ("after_char", 1),
+    ("in_roleplay", 2),
+    ("before_examples", 3),
+    ("after_examples", 4),
+];
+
+/// Code reference for the `position` label ⇄ code equivalence.
+const POSITION_MAPPING_REFERENCE: &str = "storyforge_domain::character::StWorldInfoEntry::position_as_i32 (crates/domain/src/character.rs:153)";
+
+/// Last dotted segment of a comparison path (`entries[3].position` → `position`).
+fn leaf_key(path: &str) -> &str {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    leaf.split('[').next().unwrap_or(leaf)
+}
+
+fn position_label_matches_code(label: &str, code: Option<i64>) -> bool {
+    match code {
+        Some(code) => POSITION_WIRE_MAPPING
+            .iter()
+            .any(|(known_label, known_code)| *known_label == label && *known_code == code),
+        None => false,
+    }
+}
+
+/// Evidence-based verdict for a wire-level `position` change.
+///
+/// ST v2/v3 cards declare `position` as a string label, while StoryForge's
+/// export path writes the internal numeric code, so a label ⇄ code transition is
+/// a **wire-contract** change. It is reported as `Normalized` (still
+/// non-`Intentional`, with `before`/`after` evidence) only when the two values
+/// are equivalent under [`POSITION_WIRE_MAPPING`]; every other change — unknown
+/// label, unmapped code, or an unrelated value — is a hard `WireDrift`.
+fn classify_wire_position_change(before: &Value, after: &Value) -> (CompatSeverity, String) {
+    let equivalent = match (before, after) {
+        (Value::String(label), Value::Number(code))
+        | (Value::Number(code), Value::String(label)) => {
+            position_label_matches_code(label, code.as_i64())
+        }
+        _ => false,
+    };
+    if equivalent {
+        (
+            CompatSeverity::Normalized,
+            format!(
+                "position wire type changed (string label ⇄ numeric code); values are equivalent under {POSITION_MAPPING_REFERENCE}, but the ST card spec declares a string so third-party consumers see a type change"
+            ),
+        )
+    } else {
+        (
+            CompatSeverity::WireDrift,
+            "position wire value changed with no declared equivalence mapping".into(),
+        )
+    }
+}
+
+/// Wire-level verdict for a changed `position` leaf, or `None` for any other path.
+fn classify_wire_change(
+    path: &str,
+    before: &Value,
+    after: &Value,
+) -> Option<(CompatSeverity, String)> {
+    if leaf_key(path) != "position" {
+        return None;
+    }
+    Some(classify_wire_position_change(before, after))
+}
+
+/// Raw (wire) `position` values in book order from a preserved ST `data` JSON.
+fn wire_positions(data: &Value) -> Vec<Value> {
+    data.get("character_book")
+        .and_then(|book| book.get("entries"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.get("position").cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Evidence-based wire-level `position` verdict between two preserved raw ST
+/// JSON payloads.
+///
+/// Replaces the former blanket "position string → number is intentional"
+/// finding in [`compare_character_roundtrip`]: the actual representation change
+/// is read from the preserved wire JSON of both sides and classified per entry.
+fn compare_wire_positions(report: &mut CompatReport, left_data: &Value, right_data: &Value) {
+    let left = wire_positions(left_data);
+    let right = wire_positions(right_data);
+    for (idx, (before, after)) in left.iter().zip(right.iter()).enumerate() {
+        if before == after {
+            continue;
+        }
+        let (severity, detail) = classify_wire_position_change(before, after);
+        report.push(CompatFinding {
+            area: "character_book.entry".into(),
+            field_path: format!("entries[{idx}].position"),
+            severity,
+            detail,
+            before: Some(before.clone()),
+            after: Some(after.clone()),
+        });
+    }
 }
 
 fn compare_value(
@@ -1046,11 +1288,16 @@ fn compare_value(
             });
         }
         (a, b) => {
+            // A changed wire value is judged on evidence: a `position` change is
+            // classified as `Normalized` (explicit mapping) or `WireDrift`, every
+            // other value change stays a `Loss`.
+            let (severity, detail) = classify_wire_change(path, a, b)
+                .unwrap_or((CompatSeverity::Loss, "value changed".into()));
             out.push(CompatFinding {
                 area: area.into(),
                 field_path: path.into(),
-                severity: CompatSeverity::Loss,
-                detail: "value changed".into(),
+                severity,
+                detail,
                 before: Some(a.clone()),
                 after: Some(b.clone()),
             });
@@ -1523,8 +1770,19 @@ pub const KNOWN_EXTENSION_KEYS: &[&str] = &[
     "unknown_plugin",
 ];
 
-/// Paths that are intentional normalizations on first import / round-trip.
-pub const INTENTIONAL_FIRST_IMPORT_PATHS: &[&str] = &["key", "keysecondary", "position"];
+/// Paths that are intentional normalizations on first import.
+///
+/// Only the legacy ST alias fields are listed: first import materializes
+/// `key` → `keys` and `keysecondary` → `secondary_keys` and drops the alias
+/// payload. `position` is deliberately **not** listed — first import keeps the
+/// wire value verbatim, and every later `position` change is classified on
+/// evidence by [`classify_wire_position_change`].
+pub const INTENTIONAL_FIRST_IMPORT_PATHS: &[&str] = &["key", "keysecondary"];
+
+/// Declared normalizations for the wire-level leg (source JSON vs exported
+/// JSON). Same alias materialization as [`INTENTIONAL_FIRST_IMPORT_PATHS`];
+/// `position` is again excluded so its verdict comes from the explicit mapping.
+pub const INTENTIONAL_WIRE_PATHS: &[&str] = &["key", "keysecondary"];
 
 /// Fixture ids that form the exact expected matrix set for the corpus report.
 pub const EXPECTED_MATRIX_FIXTURE_IDS: &[&str] = &[
@@ -1648,9 +1906,10 @@ pub fn load_fixture_bytes(name: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Build a full corpus `CompatReport` from committed fixtures + multi-seed
-/// property cases. Runs **both** comparison legs for every case:
+/// property cases. Runs **three** comparison legs for every case:
 /// 1. source JSON → first import
 /// 2. first import → export → reimport
+/// 3. source JSON → exported wire JSON (the bytes written into the PNG)
 ///
 /// Registers unique matrix rows and asserts exact completeness against
 /// [`EXPECTED_MATRIX_FIXTURE_IDS`].
@@ -1660,7 +1919,7 @@ pub fn build_corpus_compat_report() -> Result<CompatReport, String> {
 
     let mut report = CompatReport::new("build_corpus_compat_report", None);
 
-    // --- committed fixtures: both comparison legs ---
+    // --- committed fixtures: all three comparison legs ---
     let fixtures: &[(&str, &str)] = &[
         ("st_v2_minimal", "st_v2_minimal.json"),
         ("st_v3_matrix", "st_v3_matrix.json"),
@@ -1704,6 +1963,15 @@ pub fn build_corpus_compat_report() -> Result<CompatReport, String> {
             report.push(f);
         }
 
+        // Leg 3: source JSON → exported wire JSON (the PNG chara payload).
+        let exported_wire = exported_png_card_data(&png_bytes)
+            .map_err(|e| format!("fixture {fixture_id} exported wire: {e}"))?;
+        let wire = compare_export_wire_to_source(&source, &exported_wire);
+        fixture_loss = fixture_loss || wire.has_losses();
+        for f in wire.findings {
+            report.push(f);
+        }
+
         report.register_row(MatrixRow {
             fixture_id: (*fixture_id).into(),
             seed: None,
@@ -1716,7 +1984,7 @@ pub fn build_corpus_compat_report() -> Result<CompatReport, String> {
         });
     }
 
-    // --- multi-seed property suite: both comparison legs ---
+    // --- multi-seed property suite: all three comparison legs ---
     type CardGen = fn(&mut SeedRng) -> Value;
     let generators: &[(&str, CardGen)] = &[
         ("property:edge", generate_edge_card_json),
@@ -1772,9 +2040,21 @@ pub fn build_corpus_compat_report() -> Result<CompatReport, String> {
                 for f in roundtrip.findings {
                     report.push(f);
                 }
+
+                // Leg 3: source JSON → exported wire JSON (the PNG chara payload).
+                let exported_wire = exported_png_card_data(&png_bytes).map_err(|e| {
+                    format!("{fixture_id} seed={seed:#X} case={case} exported wire: {e}")
+                })?;
+                let wire = compare_export_wire_to_source(&card, &exported_wire);
+                if wire.has_losses() {
+                    return Err(record_failure_output(seed, case, fixture_id, &wire));
+                }
+                for f in wire.findings {
+                    report.push(f);
+                }
             }
         }
-        // Reached only when every seed/case on both legs had zero losses.
+        // Reached only when every seed/case on all three legs had zero losses.
         report.register_row(MatrixRow {
             fixture_id: (*fixture_id).into(),
             seed: None,
@@ -2075,6 +2355,257 @@ mod tests {
     }
 
     #[test]
+    fn position_wire_mapping_matches_domain_mapping() {
+        use storyforge_domain::character::StWorldInfoEntry;
+
+        // Every label declared here must agree with the domain source of truth.
+        for (label, code) in POSITION_WIRE_MAPPING {
+            let entry: StWorldInfoEntry = serde_json::from_value(serde_json::json!({
+                "id": null,
+                "content": null,
+                "position": label,
+            }))
+            .expect("label-only entry should deserialize");
+            assert_eq!(
+                entry.position_as_i32() as i64,
+                *code,
+                "POSITION_WIRE_MAPPING disagrees with default position mapping for {label}"
+            );
+        }
+
+        // ... and the table is required: the domain function folds *unknown*
+        // labels into 0, so without the table an unknown label would look
+        // equivalent to `before_char`.
+        let unknown: StWorldInfoEntry = serde_json::from_value(serde_json::json!({
+            "id": null,
+            "content": null,
+            "position": "no_such_position",
+        }))
+        .expect("label-only entry should deserialize");
+        assert_eq!(unknown.position_as_i32(), 0);
+        assert!(!position_label_matches_code("no_such_position", Some(0)));
+        assert!(position_label_matches_code("before_char", Some(0)));
+        assert!(!position_label_matches_code("before_char", Some(1)));
+        assert_eq!(
+            leaf_key("character_book.entries[7].position"),
+            "position",
+            "position verdicts must be found at any entry index"
+        );
+    }
+
+    /// Build the source card JSON → exported PNG wire JSON → reimported
+    /// character triple used by the wire-leg tests.
+    fn export_wire_probe(source: &Value) -> (Value, Character, Character) {
+        let imported =
+            import_character_from_json(&serde_json::to_vec(source).unwrap()).expect("import");
+        let exported = to_st_data(
+            &imported,
+            None,
+            imported
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.to_st_book()),
+        );
+        let st_card = png::make_st_card(exported, &imported.spec_version);
+        let png_bytes = png::write_st_card_png(&st_card, None).expect("export");
+        let exported_wire = exported_png_card_data(&png_bytes).expect("exported wire data");
+        let round = import_character(&png_bytes).expect("reimport");
+        (exported_wire, imported, round)
+    }
+
+    #[test]
+    fn wire_leg_keeps_st_spec_string_position_byte_exact() {
+        let source = sample_card_json(); // entry position: "after_char" (ST spec string)
+        let (exported_wire, _, _) = export_wire_probe(&source);
+        assert_eq!(
+            exported_wire["character_book"]["entries"][0]["position"],
+            Value::String("after_char".into()),
+            "the ST card spec declares a string label; the export must keep it"
+        );
+
+        let report = compare_export_wire_to_source(&source, &exported_wire);
+        let positions: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| leaf_key(&f.field_path) == "position")
+            .collect();
+        assert!(
+            positions
+                .iter()
+                .any(|f| f.severity == CompatSeverity::Preserved),
+            "the wire leg must actually compare the position field: {positions:?}"
+        );
+        assert!(
+            positions
+                .iter()
+                .all(|f| f.severity == CompatSeverity::Preserved),
+            "a spec-conformant string position must not produce a drift/normalization finding: {positions:?}"
+        );
+        assert!(!report.has_losses());
+    }
+
+    #[test]
+    fn wire_leg_records_legacy_numeric_position_normalized_to_spec_label() {
+        // Legacy / ST-internal cards may carry the numeric code; 0/1 are exported
+        // back as the ST spec label, which is an explicit, mapped normalization.
+        let mut source = sample_card_json();
+        source["data"]["character_book"]["entries"][0]["position"] = Value::from(1);
+        let (exported_wire, _, _) = export_wire_probe(&source);
+        assert_eq!(
+            exported_wire["character_book"]["entries"][0]["position"],
+            Value::String("after_char".into()),
+            "legacy numeric 1 must be exported as the ST spec label"
+        );
+
+        let report = compare_export_wire_to_source(&source, &exported_wire);
+        let positions: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| leaf_key(&f.field_path) == "position")
+            .collect();
+        assert_eq!(
+            positions.len(),
+            1,
+            "expected exactly one position verdict: {positions:?}"
+        );
+        assert_eq!(positions[0].severity, CompatSeverity::Normalized);
+        assert_eq!(positions[0].before, Some(Value::from(1)));
+        assert_eq!(positions[0].after, Some(Value::String("after_char".into())));
+        assert!(
+            positions[0]
+                .detail
+                .contains("crates/domain/src/character.rs:153"),
+            "the verdict must cite the explicit mapping: {}",
+            positions[0].detail
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| leaf_key(&f.field_path) == "position"
+                    && f.severity == CompatSeverity::Intentional),
+            "position must never be triaged as a blanket Intentional row"
+        );
+        assert_eq!(report.summary.normalized, 1);
+        assert!(!report.has_wire_drift());
+        assert!(!report.has_losses());
+    }
+
+    #[test]
+    fn wire_leg_flags_unmapped_position_change_as_wire_drift() {
+        let source = serde_json::json!({
+            "data": {
+                "name": "drift",
+                "character_book": { "entries": [
+                    {"id": 1, "keys": ["k"], "position": "sideways_char"}
+                ]}
+            }
+        });
+        let exported = serde_json::json!({
+            "name": "drift",
+            "character_book": { "entries": [
+                {"id": 1, "keys": ["k"], "position": 0}
+            ]}
+        });
+
+        let report = compare_export_wire_to_source(&source, &exported);
+        let position = report
+            .findings
+            .iter()
+            .find(|f| leaf_key(&f.field_path) == "position")
+            .expect("a position verdict is required");
+        assert_eq!(position.severity, CompatSeverity::WireDrift);
+        assert_eq!(position.before, Some(Value::String("sideways_char".into())));
+        assert_eq!(position.after, Some(Value::from(0)));
+        assert!(report.has_wire_drift());
+        assert!(
+            report.has_losses(),
+            "an unmapped wire drift must count as a hard finding"
+        );
+    }
+
+    #[test]
+    fn roundtrip_position_verdict_is_evidence_based_not_blanket_intentional() {
+        // Legacy numeric wire value: first import keeps `1` in raw_card_json while
+        // the export/reimport carries the ST spec label, so the round-trip gate
+        // must report the real transition instead of a blanket Intentional row.
+        let mut source = sample_card_json();
+        source["data"]["character_book"]["entries"][0]["position"] = Value::from(1);
+        let (_, original, round) = export_wire_probe(&source);
+        assert_eq!(
+            original.raw_card_json["character_book"]["entries"][0]["position"],
+            Value::from(1),
+            "first import must preserve the legacy numeric wire value verbatim"
+        );
+
+        let report = compare_character_roundtrip(&original, &round);
+        let positions: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| leaf_key(&f.field_path) == "position")
+            .collect();
+        assert_eq!(
+            positions.len(),
+            1,
+            "the round-trip must carry the real position change, not a blanket row: {positions:?}"
+        );
+        assert_eq!(positions[0].severity, CompatSeverity::Normalized);
+        assert_eq!(positions[0].before, Some(Value::from(1)));
+        assert_eq!(positions[0].after, Some(Value::String("after_char".into())));
+        assert!(!report.has_losses());
+        assert!(!report.has_wire_drift());
+    }
+
+    #[test]
+    fn roundtrip_flags_world_book_entry_extra_drift() {
+        let left = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Entry Extra Drift",
+                "character_book": { "entries": [
+                    {
+                        "id": 1,
+                        "keys": ["k"],
+                        "content": "lore",
+                        "position": 0,
+                        "order": 1,
+                        "case_sensitive": true
+                    }
+                ]}
+            }
+        });
+        let mut right = left.clone();
+        right["data"]["character_book"]["entries"][0]["case_sensitive"] = Value::Bool(false);
+
+        let a = import_character_from_json(&serde_json::to_vec(&left).unwrap()).unwrap();
+        let b = import_character_from_json(&serde_json::to_vec(&right).unwrap()).unwrap();
+        let report = compare_character_roundtrip(&a, &b);
+
+        let losses: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::Loss)
+            .collect();
+        assert!(
+            report.has_losses(),
+            "entry-level `extra` drift must be reported: {losses:?}"
+        );
+        let entry_loss = losses
+            .iter()
+            .find(|f| f.field_path == "entries[0]")
+            .expect("entry-level loss finding is required");
+        assert_eq!(
+            entry_loss.before.as_ref().unwrap()["extra"]["case_sensitive"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            entry_loss.after.as_ref().unwrap()["extra"]["case_sensitive"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
     fn oversized_import_is_rejected() {
         let mut huge = Vec::new();
         huge.extend_from_slice(br#"{"spec":"chara_card_v2","data":{"name":""#);
@@ -2192,6 +2723,83 @@ mod tests {
             !book.metadata.is_empty(),
             "expected book-level metadata to survive import"
         );
+    }
+
+    /// M-06: the large-worldbook fixture must carry the v3 entry-level metadata
+    /// fields and preserve them byte-exactly through import → exported wire JSON
+    /// → reimport.
+    #[test]
+    fn large_worldbook_fixture_v3_entry_metadata_roundtrips_byte_exact() {
+        const V3_METADATA_FIELDS: [&str; 7] = [
+            "insertion_order",
+            "case_sensitive",
+            "match_whole_words",
+            "group",
+            "automation_id",
+            "vectorized",
+            "probability",
+        ];
+
+        let bytes = fixture_bytes("st_v3_large_worldbook.json");
+        let source: Value =
+            serde_json::from_slice(crate::strip_utf8_bom(&bytes)).expect("fixture JSON");
+        let source_entry = source["data"]["character_book"]["entries"]
+            .as_array()
+            .expect("fixture entries array")
+            .iter()
+            .find(|entry| entry["id"] == 900)
+            .expect("fixture must carry the v3 entry-metadata probe (id 900)");
+        for field in V3_METADATA_FIELDS {
+            assert!(
+                source_entry.get(field).is_some(),
+                "fixture entry 900 is missing `{field}`"
+            );
+        }
+
+        let imported = import_character_from_json(&bytes).expect("fixture import");
+        let exported = to_st_data(
+            &imported,
+            None,
+            imported
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.to_st_book()),
+        );
+        let st_card = png::make_st_card(exported, &imported.spec_version);
+        let png_bytes = png::write_st_card_png(&st_card, None).expect("fixture export");
+        let exported_wire = exported_png_card_data(&png_bytes).expect("exported wire data");
+        let exported_entry = exported_wire["character_book"]["entries"]
+            .as_array()
+            .expect("exported entries array")
+            .iter()
+            .find(|entry| entry["id"] == 900)
+            .expect("exported wire must keep fixture entry 900");
+
+        for field in V3_METADATA_FIELDS {
+            assert_eq!(
+                exported_entry.get(field),
+                source_entry.get(field),
+                "exported wire must keep `{field}` byte-exact"
+            );
+        }
+
+        // The same values must survive a reimport of the exported PNG.
+        let round = import_character(&png_bytes).expect("fixture reimport");
+        let round_entry = round
+            .embedded_world_info
+            .as_ref()
+            .expect("reimported book")
+            .entries
+            .iter()
+            .find(|entry| entry.st_id == Some(900))
+            .expect("reimported book must keep entry 900");
+        for field in V3_METADATA_FIELDS {
+            assert_eq!(
+                round_entry.extra.get(field),
+                source_entry.get(field),
+                "reimport dropped or mutated entry-level `{field}`"
+            );
+        }
     }
 
     #[test]
@@ -2369,6 +2977,66 @@ mod tests {
         assert!(
             err.contains("extra") || err.contains("unexpected_extra"),
             "error must name the extra row: {err}"
+        );
+    }
+
+    /// Live CI gate for the wire-level leg: the corpus matrix (fixtures + the
+    /// multi-seed property suite) must record every wire representation change
+    /// explicitly and produce no *unmapped* drift.
+    #[test]
+    fn corpus_wire_leg_records_position_normalization_without_unmapped_drift() {
+        let report = build_corpus_compat_report().expect("corpus report must build");
+        assert!(
+            report.summary.normalized > 0,
+            "the wire leg must record the position label ⇄ code transition explicitly"
+        );
+        let drifted: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::WireDrift)
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "no unmapped wire drift expected in the corpus: {drifted:?}"
+        );
+        let unexpected: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.severity == CompatSeverity::Normalized && leaf_key(&f.field_path) != "position"
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "unexpected non-position explicit normalization: {unexpected:?}"
+        );
+    }
+
+    /// Wire-contract gate for M-05: ST v2/v3 declare
+    /// `character_book.entries[].position` as a string label, so the export must
+    /// never replace a string label with a numeric code. (The reverse direction —
+    /// a legacy numeric `0`/`1` exported as its spec label — is a legitimate,
+    /// explicitly mapped `Normalized` transition and is allowed here.)
+    ///
+    /// This gate is live: it is green only while `crates/domain` keeps writing
+    /// labels back (`WorldInfoEntry::position_for_export`).
+    #[test]
+    fn exported_wire_position_never_replaces_a_string_label_with_a_number() {
+        let report = build_corpus_compat_report().expect("corpus report must build");
+        let violations: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| {
+                leaf_key(&f.field_path) == "position"
+                    && f.before.as_ref().is_some_and(Value::is_string)
+                    && f.after.as_ref().is_some_and(Value::is_number)
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "ST v2/v3 declare position as a string label, but the export wrote a number for {} entry/entries: {:?}",
+            violations.len(),
+            &violations[..violations.len().min(3)]
         );
     }
 

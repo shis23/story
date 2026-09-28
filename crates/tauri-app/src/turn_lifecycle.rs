@@ -162,6 +162,20 @@ pub fn append_regenerate_attempt(record: &mut TurnRecord, new_attempt: TurnAttem
     record.touch();
 }
 
+/// S-05：JSON 回退路径的写入守卫（与 SQLite 的显式拒绝同语义）。
+///
+/// regenerate / mark-stale 这类「提交前的回写」只允许在**未开始副作用**且
+/// **非终态**的 Turn 上执行：
+/// - `Committing` = 副作用（Campaign 批 + Draft→Final）已经开始，此时改写
+///   Attempt/Turn 会破坏幂等重放日志；
+/// - `Committed/Degraded/Failed/Abandoned` = 终态，尤其是 Degraded 不可逆。
+///
+/// SQLite 侧由 preaccept UoW 在事务内显式拒绝；JSON 侧此前只在个别调用点
+/// 用 `update_turn_record` 无条件写入，状态语义不一致。
+pub fn json_writeback_allowed(status: &TurnStatus) -> bool {
+    !status.has_side_effects_started() && !status.is_terminal()
+}
+
 /// Build a DraftReady attempt after pipeline returns final text.
 pub fn new_draft_attempt(
     attempt_id: Id,
@@ -197,6 +211,10 @@ pub enum AcceptError {
         current: u64,
     },
     DraftHashMismatch,
+    /// S-16：待采纳变体的正文读不出来（会话/节点/active 版本缺失）。
+    /// 与 `DraftHashMismatch` 严格区分：后者是「草稿被编辑」，前者是「数据缺失」，
+    /// 让用户看到的提示指向真实原因（旧实现把缺失读成空串 → 误报 draft_hash 不匹配）。
+    VariantContentUnavailable(String),
     CasFailed,
     CampaignMissing,
     CampaignScopeMismatch {
@@ -238,6 +256,10 @@ impl std::fmt::Display for AcceptError {
             Self::DraftHashMismatch => write!(
                 f,
                 "draft_hash 不匹配：草稿已被编辑但未重新推导状态。请重新推导后再 accept，或 Discard 后 regenerate。"
+            ),
+            Self::VariantContentUnavailable(detail) => write!(
+                f,
+                "待采纳变体的正文不可用（{detail}）。请刷新会话后重试；若会话已被删除请 regenerate。"
             ),
             Self::CasFailed => write!(
                 f,
@@ -375,10 +397,14 @@ pub(crate) fn evaluate_accept_replay(
 /// Performs the full permanent-guard sequence exactly once:
 /// campaign/conversation scope → idempotent terminal replay → attempt status →
 /// derivation → quality gate → draft-hash → revision → batch/terminal-status.
-/// Returns `Replay` when the turn is already terminal, or `Commit` with the
-/// prepared batch and intended terminal status. The caller owns the durable
-/// write (JSON CAS sequence or SQLite atomic UoW) and must preserve the typed
-/// error taxonomy returned here.
+/// Returns `Replay` when the turn is already terminal in a way that is provably
+/// the same accept (see [`evaluate_accept_replay`]) — the caller must then
+/// **re-confirm durability** in its own store before returning success, and must
+/// fail closed if the persisted revision/terminal status does not cover this
+/// accept (S-16). Otherwise returns `Commit` with the prepared batch and
+/// intended terminal status. The caller owns the durable write (JSON CAS
+/// sequence or SQLite atomic UoW) and must preserve the typed error taxonomy
+/// returned here.
 pub fn evaluate_accept_decision(
     input: &AcceptDecisionInput<'_>,
 ) -> Result<AcceptDecision, AcceptError> {
@@ -474,17 +500,23 @@ impl<'a> TurnLifecycleService<'a> {
         }
     }
 
-    pub fn read_variant_content(&self, conv_id: &Id, node_id: &Id) -> String {
-        let conv = match self.conv_store.get(conv_id) {
-            Some(c) => c,
-            None => return String::new(),
-        };
-        conv.nodes
+    /// S-16/S-19：读取待采纳变体正文。缺失（会话/节点/active 版本）→ Err 并指名
+    /// 原因；旧实现返回空串，把「数据缺失」伪装成「draft_hash 不匹配」。
+    pub fn read_variant_content(&self, conv_id: &Id, node_id: &Id) -> Result<String, AcceptError> {
+        let conv = self.conv_store.get(conv_id).ok_or_else(|| {
+            AcceptError::VariantContentUnavailable(format!("会话 {conv_id} 不存在"))
+        })?;
+        let node = conv
+            .nodes
             .iter()
             .find(|n| &n.id == node_id)
-            .and_then(|node| node.active())
-            .map(|v| v.content.clone())
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                AcceptError::VariantContentUnavailable(format!("会话中缺少节点 {node_id}"))
+            })?;
+        let variant = node.active().ok_or_else(|| {
+            AcceptError::VariantContentUnavailable(format!("节点 {node_id} 没有 active 版本"))
+        })?;
+        Ok(variant.content.clone())
     }
 
     fn preflight_variant_acceptance(
@@ -601,7 +633,13 @@ impl<'a> TurnLifecycleService<'a> {
             .get_campaign(&owner_campaign_id)
             .ok_or(AcceptError::CampaignMissing)?;
         let campaign_revision_before = camp.revision;
-        let current_text = self.read_variant_content(conversation_id, variant_id);
+        // S-16 前置：**作用域校验先于「读正文」**（与 SQLite 适配器同序）。
+        // 请求的 campaign/conversation 与 Turn 不一致时必须得到
+        // CampaignScopeMismatch/ConversationScopeMismatch —— 若先读正文，缺失的
+        // 请求会话会先报 VariantContentUnavailable，把「调错会话」误报成「数据缺失」
+        // （`accept_rejects_conversation_scope_mismatch` 钉住该优先级）。
+        ensure_accept_scope(campaign_id, conversation_id, &turn)?;
+        let current_text = self.read_variant_content(conversation_id, variant_id)?;
 
         // Shared backend-agnostic decision prologue (Gate 2).
         let decision = evaluate_accept_decision(&AcceptDecisionInput {
@@ -616,7 +654,23 @@ impl<'a> TurnLifecycleService<'a> {
         })?;
 
         match decision {
-            AcceptDecision::Replay(outcome) => Ok(outcome),
+            AcceptDecision::Replay(outcome) => {
+                // S-16/S-19：Replay 不是无条件返回——契约要求「重新确认持久化」。
+                // JSON 侧的确证 = journal 声称的副作用确实落盘：Campaign revision
+                // 已推进到 batch.target_revision。不满足则 fail-closed，绝不把
+                // 「journal 说已提交、磁盘状态没跟上」当成功返回给调用方。
+                let durable = self
+                    .campaign_store
+                    .get_campaign(&owner_campaign_id)
+                    .is_some_and(|c| c.revision >= outcome.campaign_revision_after);
+                if !durable {
+                    return Err(AcceptError::Storage(format!(
+                        "Turn {} 的提交记录存在，但 Campaign {} revision 未达到 {}——拒绝当作成功重放",
+                        outcome.turn_id, owner_campaign_id, outcome.campaign_revision_after
+                    )));
+                }
+                Ok(outcome)
+            }
             AcceptDecision::Commit {
                 batch,
                 terminal_status: final_status,
@@ -698,13 +752,67 @@ impl<'a> TurnLifecycleService<'a> {
                 }
 
                 // Side effects landed: terminal mark must surface persistence failure.
-                self.mark_terminal_after_side_effects(&turn_id, &attempt_id, final_status.clone())?;
+                // S-04：JSON 与 SQLite 语义对齐——副作用已落盘后终态收口失败时，
+                // ① 立刻重试一次（写盘失败常是瞬时竞争）；② 仍然失败则明确报
+                // 「已提交但未收口、Turn 保持 Committing、重启自动收口」，并登记
+                // 健康事件，避免旧实现只抛一句 storage 错误让用户以为提交失败。
+                if let Err(error) = self.mark_terminal_after_side_effects(
+                    &turn_id,
+                    &attempt_id,
+                    final_status.clone(),
+                ) {
+                    // 先确认是否其实已经落盘（persist 报错但文件已写入的极端情形）。
+                    let already_terminal =
+                        self.turn_store.get_turn(&turn_id).is_some_and(|record| {
+                            record.status == final_status.clone()
+                                && record.accepted_attempt_id.as_ref() == Some(&attempt_id)
+                        });
+                    if !already_terminal {
+                        tracing::error!(
+                            target: "turn_accept",
+                            turn_id = %turn_id,
+                            "accept 终态标记失败，立即重试一次: {error}"
+                        );
+                        if let Err(retry_error) = self.mark_terminal_after_side_effects(
+                            &turn_id,
+                            &attempt_id,
+                            final_status.clone(),
+                        ) {
+                            crate::storage_health::record_backend_incident(
+                                "json_accept_terminal_mark_failed",
+                                &format!(
+                                    "Turn {turn_id} 的正文/状态副作用已落盘，但终态标记连续两次失败\
+                                     （{retry_error}）；Turn 保持 Committing，下次启动会自动幂等收口"
+                                ),
+                            );
+                            return Err(AcceptError::Commit(format!(
+                                "副作用已落盘但终态标记失败（Turn 保持 Committing，重启后自动收口）: {retry_error}"
+                            )));
+                        }
+                    }
+                }
 
-                let campaign_revision_after = self
-                    .campaign_store
-                    .get_campaign(&owner_campaign_id)
-                    .map(|c| c.revision)
-                    .unwrap_or(campaign_revision_before);
+                // S-16：revision 真值来自 UoW/CAS 日志本身（batch.target_revision），
+                // 不再用「读失败就回退到 before」伪造——那会把未推进的 revision
+                // 当成功返回值。实读值仅用于交叉诊断。
+                let campaign_revision_after = batch.target_revision;
+                if let Some(live) = self.campaign_store.get_campaign(&owner_campaign_id) {
+                    if live.revision != campaign_revision_after {
+                        tracing::error!(
+                            target: "turn_accept",
+                            campaign_id = %owner_campaign_id,
+                            expected = campaign_revision_after,
+                            actual = live.revision,
+                            "accept 后 Campaign revision 与 batch.target_revision 不一致"
+                        );
+                    }
+                } else {
+                    tracing::error!(
+                        target: "turn_accept",
+                        campaign_id = %owner_campaign_id,
+                        "accept 后读取 Campaign 失败，revision 以 journal target 为准"
+                    );
+                }
 
                 Ok(AcceptOutcome {
                     turn_id,
@@ -764,10 +872,23 @@ impl<'a> TurnLifecycleService<'a> {
             if record.recovery_retries > MAX_RECOVERY_RETRIES {
                 record.status = TurnStatus::Failed;
                 record.intended_terminal_status = None;
-                if let Some(attempt_id) = attempt_id
-                    && let Some(attempt) = record.find_attempt_mut(attempt_id)
-                {
-                    attempt.status = AttemptStatus::Failed;
+                // S-21：升级 Failed 必须把所有**活动 Attempt** 一并收口。旧实现只在
+                // 显式传入 attempt_id 时才标它 Failed，而两个调用点都传 None →
+                // 长期存在「Turn=Failed + Attempt=Committing」：终态 Turn 上挂着
+                // 活动 Attempt，依赖 active attempt 的读取/重放会把这一轮继续当成
+                // 未完成（AttemptStatus::is_active() 对 Committing 为 true）。
+                if let Some(id) = attempt_id {
+                    tracing::debug!(
+                        target: "turn_recovery",
+                        turn_id = %turn_id,
+                        attempt_id = %id,
+                        "recovery retries exceeded; failing every active attempt on this turn"
+                    );
+                }
+                for attempt in record.attempts.iter_mut() {
+                    if !attempt.status.is_terminal() {
+                        attempt.status = AttemptStatus::Failed;
+                    }
                 }
             }
             record.touch();
@@ -934,12 +1055,35 @@ impl<'a> TurnLifecycleService<'a> {
             }
             let turn_id = turn.turn_id.clone();
             let status = turn.status.clone();
-            let _ = self.update_turn_record(&turn_id, |record| {
+            // S-07：崩溃时处于未提交副作用前的活动态 → 标 Failed。此写入失败必须
+            // 可见（旧实现 `let _ =` 吞掉后无任何日志，Turn 会永远卡在活动态、
+            // 下一轮 start_writing 永久等待），这里 error 日志 + 健康事件。
+            // S-21：同时把该 Turn 的**活动 Attempt** 收口为 Failed，避免留下
+            // 「Turn=Failed + Attempt 仍 Generating/DraftReady」的混合状态。
+            if let Err(error) = self.update_turn_record(&turn_id, |record| {
                 record.status = TurnStatus::Failed;
                 record.failure_reason = Some(format!("启动恢复：崩溃时处于 {status:?} 态"));
                 record.intended_terminal_status = None;
+                for attempt in record.attempts.iter_mut() {
+                    if !attempt.status.is_terminal() {
+                        attempt.status = AttemptStatus::Failed;
+                    }
+                }
                 record.touch();
-            });
+            }) {
+                tracing::error!(
+                    target: "turn_recovery",
+                    turn_id = %turn_id,
+                    "启动恢复标记 Failed 失败，Turn 仍为 {status:?}（会阻塞后续 start_writing）: {error}"
+                );
+                crate::storage_health::record_backend_incident(
+                    "turn_recovery_failed_mark",
+                    &format!(
+                        "启动恢复无法把 Turn {turn_id}（{status:?}）标记为 Failed：{error}；\
+                         该 Campaign 的下一轮写作可能被永久阻塞"
+                    ),
+                );
+            }
         }
     }
 }
@@ -1574,6 +1718,77 @@ mod tests {
     }
 
     #[test]
+    fn accept_reports_missing_variant_content_separately_from_hash_mismatch() {
+        // S-16：会话/节点/active 版本缺失时，旧实现把正文读成空串 → 报
+        // DraftHashMismatch（误导用户去「重新推导」）。现在必须是独立的
+        // VariantContentUnavailable，且指明是会话还是节点缺失。
+        let fx = Fixture::new("variant_content_missing");
+        let draft = "会话被删除后正文不可用。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+
+        // 删除会话文件（模拟外部清理/损坏），store 缓存失效后读取返回 None。
+        let conv_path = fx
+            ._data_dir
+            .join("conversations")
+            .join(format!("{}.json", fx.conversation_id.as_str()));
+        std::fs::remove_file(&conv_path).expect("remove conversation file");
+        fx.conv_store.invalidate();
+
+        let err = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
+            .expect_err("missing conversation content must fail closed");
+        match &err {
+            AcceptError::VariantContentUnavailable(detail) => {
+                assert!(
+                    detail.contains(fx.conversation_id.as_str()),
+                    "错误必须指名缺失的会话，got: {detail}"
+                );
+            }
+            other => panic!("必须是 VariantContentUnavailable，不得误报 hash 不匹配: {other:?}"),
+        }
+
+        // 节点缺失（会话存在但 nodes 里没有该 variant）同样独立报错。
+        let fx2 = Fixture::new("variant_node_missing");
+        let draft2 = "节点缺失时正文不可用。".repeat(3);
+        let variant_id2 = fx2.append_draft(&draft2);
+        fx2.prepare_awaiting(
+            &variant_id2,
+            &draft2,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        let conv_path2 = fx2
+            ._data_dir
+            .join("conversations")
+            .join(format!("{}.json", fx2.conversation_id.as_str()));
+        let mut conv_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&conv_path2).unwrap()).unwrap();
+        conv_json["nodes"] = serde_json::json!([]);
+        std::fs::write(&conv_path2, serde_json::to_vec(&conv_json).unwrap()).unwrap();
+        fx2.conv_store.invalidate();
+        let err2 = fx2
+            .service()
+            .accept_by_variant(&fx2.campaign_id, &fx2.conversation_id, &variant_id2, false)
+            .expect_err("missing variant node must fail closed");
+        match &err2 {
+            AcceptError::VariantContentUnavailable(detail) => {
+                assert!(
+                    detail.contains("节点"),
+                    "错误必须指名节点缺失，got: {detail}"
+                );
+            }
+            other => panic!("必须是 VariantContentUnavailable，不得误报 hash 不匹配: {other:?}"),
+        }
+    }
+
+    #[test]
     fn regenerate_supersedes_old_attempt_and_accepts_only_new() {
         let fx = Fixture::new("regen");
         let old_text = "旧 regenerate 草稿不可复活。".repeat(3);
@@ -1691,6 +1906,49 @@ mod tests {
         );
         let camp = fx.campaign_store.get_campaign(&fx.campaign_id).unwrap();
         assert_eq!(camp.revision, 1, "revision must bump only once");
+    }
+
+    #[test]
+    fn replay_fails_closed_when_persisted_revision_lags_the_journal() {
+        // S-04：Replay 不是无条件成功——契约要求「重新确认持久化」。这里模拟
+        // 「Turn/Attempt 已终态（journal 说提交了）但 Campaign revision 没跟上」
+        // 的损坏现场：旧实现直接返回 Ok(replay)，调用方会以为提交成功。
+        let fx = Fixture::new("replay_not_durable");
+        let draft = "journal 与磁盘不一致时不得报成功。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        let first = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
+            .expect("first accept");
+
+        // 回退 campaign revision（模拟副作用未真正落盘/被外部回滚）。
+        let mut camp = fx.campaign_store.get_campaign(&fx.campaign_id).unwrap();
+        camp.revision = 0;
+        fx.campaign_store.update_campaign(camp).unwrap();
+
+        let err = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
+            .expect_err("journal 声称提交但 revision 未达 target 时必须 fail-closed");
+        match err {
+            AcceptError::Storage(message) => {
+                assert!(
+                    message.contains("拒绝当作成功重放"),
+                    "错误必须说明为何拒绝重放，got: {message}"
+                );
+                assert!(
+                    message.contains(&first.campaign_revision_after.to_string()),
+                    "错误必须报出期望的 target revision，got: {message}"
+                );
+            }
+            other => panic!("期望 Storage，got {other:?}"),
+        }
     }
 
     #[test]
@@ -2287,6 +2545,75 @@ mod tests {
                 .unwrap()
                 .status,
             AttemptStatus::Failed
+        );
+    }
+
+    #[test]
+    fn recovery_upgrade_to_failed_closes_active_attempts() {
+        // S-21：恢复升级为 Failed 时必须把活动 Attempt 一并收口。旧实现只对
+        // 显式传入的 attempt_id 标 Failed，而「缺 intended_terminal_status /
+        // 缺 Committing Attempt」两条路径都传 None → 留下
+        // 「Turn=Failed + Attempt 仍 Committing」的混合状态。
+        let fx = Fixture::new("recover_failed_closes_attempts");
+        let draft = "缺 intended_terminal_status 的旧 Turn 恢复行为。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let mut record = TurnRecord::new(
+            fx.campaign_id.clone(),
+            Id::from_str("conversation-legacy"),
+            Id::from_str("input-legacy"),
+            0,
+        );
+        record.status = TurnStatus::Committing;
+        // 旧日志缺 intended_terminal_status，且质量报告无 Error 级告警 →
+        // 恢复无法证明终态，只能按「拒绝自动升级」处理（走 None 分支）。
+        record.intended_terminal_status = None;
+        record.attempts.push(TurnAttempt {
+            attempt_id: Id::from_str("attempt-legacy-committing"),
+            variant_id: variant_id.clone(),
+            draft_hash: compute_draft_hash(&draft),
+            status: AttemptStatus::Committing,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "t".into(),
+        });
+        let turn_id = record.turn_id.clone();
+        fx.turn_store.create_turn(record).unwrap();
+
+        // MAX 次内：Turn/Attempt 都保持可重放（不得提前终态化）。
+        for _ in 0..MAX_RECOVERY_RETRIES {
+            fx.service().recover_turns_on_startup(|_| {});
+            let now = fx.turn_store.get_turn(&turn_id).unwrap();
+            assert_eq!(now.status, TurnStatus::Committing);
+            assert_eq!(
+                now.find_attempt(&Id::from_str("attempt-legacy-committing"))
+                    .unwrap()
+                    .status,
+                AttemptStatus::Committing,
+                "未超限前不得把活动 Attempt 终态化"
+            );
+        }
+
+        // 第 MAX+1 次：Turn 升级 Failed，且活动 Attempt 必须同时收口。
+        fx.service().recover_turns_on_startup(|_| {});
+        let after = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(after.status, TurnStatus::Failed);
+        assert_eq!(
+            after
+                .find_attempt(&Id::from_str("attempt-legacy-committing"))
+                .unwrap()
+                .status,
+            AttemptStatus::Failed,
+            "S-21：Turn=Failed 时不得留下活动 Attempt（Committing 会被当作未完成）"
+        );
+        assert!(
+            !after
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status.is_active()),
+            "终态 Turn 上不允许残留任何活动 Attempt"
         );
     }
 

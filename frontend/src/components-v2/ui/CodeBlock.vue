@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onBeforeUnmount } from 'vue'
 
 const props = defineProps({
   code: { type: String, default: '' },
@@ -7,13 +7,25 @@ const props = defineProps({
   wrap: { type: Boolean, default: false },
 })
 const copied = ref(false)
+const copyFailed = ref(false)
+let copiedTimer = null
+
+onBeforeUnmount(() => {
+  // F-36：定时器此前不清理，卸载后仍会改已卸载组件的 ref
+  if (copiedTimer) clearTimeout(copiedTimer)
+})
+
 async function copy() {
   try {
     await navigator.clipboard.writeText(props.code)
     copied.value = true
-    setTimeout(() => (copied.value = false), 1500)
+    copyFailed.value = false
+    if (copiedTimer) clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => (copied.value = false), 1500)
   } catch {
-    // clipboard 不可用时静默
+    // F-36：剪贴板不可用（非 https / 权限拒绝）时给反馈，而不是静默
+    copied.value = false
+    copyFailed.value = true
   }
 }
 </script>
@@ -40,16 +52,16 @@ async function copy() {
     <button
       v-else
       type="button"
-      class="absolute top-1.5 right-1.5 inline-flex items-center gap-1 text-xs text-ink-faint hover:text-ink transition-colors"
+      class="absolute top-1.5 right-1.5 inline-flex items-center gap-1 rounded bg-surface px-1 text-xs text-ink-faint hover:text-ink transition-colors"
       @click="copy"
     >
       <svg v-if="!copied" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
       <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-ok" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"/></svg>
-      {{ copied ? '已复制' : '复制' }}
+      {{ copied ? '已复制' : copyFailed ? '复制失败' : '复制' }}
     </button>
     <pre
       class="p-3 text-xs font-mono text-ink-soft overflow-auto"
-      :class="wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
+      :class="[wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre', !language && !$slots.toolbar ? 'pr-16' : '']"
     ><code>{{ code }}</code></pre>
   </div>
 </template>

@@ -39,8 +39,6 @@ const shellMode = ref('manage') // 'manage' | 'cards'
 // cards 模式下的子视图：library | studio
 const cardsView = ref('library')
 const studioSeed = ref(null) // { characterId, brief? }
-// 兼容旧 activeTab 语义：cards | campaigns | detail
-const activeTab = ref('detail')
 
 // ─── Cards 状态(CardLibrary 自管;此处仅持有 ref 用于导入后刷新) ───
 const cardLibraryRef = ref(null)
@@ -74,8 +72,13 @@ async function loadSelectedCampaignCardDetail() {
   selectedCampaignCardDetail.value = null
   newCampaignGreetingIndex.value = 0
   if (!selectedCardId.value) return
-  selectedCampaignCardDetail.value = await getCard(selectedCardId.value)
-  normalizeNewCampaignGreetingSelection()
+  try {
+    selectedCampaignCardDetail.value = await getCard(selectedCardId.value)
+    normalizeNewCampaignGreetingSelection()
+  } catch (e) {
+    // 详情拉取失败只影响"开场白可选"，不该让整个面板挂掉（F-09 同类）
+    await alertDialog('读取角色卡详情失败（新建档时将无法选择开场白）: ' + errorText(e))
+  }
 }
 
 // ─── Detail 状态 ───
@@ -103,20 +106,32 @@ const exporting = ref(false)
 const exportStatus = ref('')
 const importingBundle = ref(false)
 const importStatus = ref('')
+// 活动列表加载错误（F-10）：与"没有数据"区分，交给 CampaignScreen 显示并提供重试
+const campaignsError = ref(null)
+
+/** 屏幕级刷新：同时刷新活动列表与当前 detail 子 tab */
+async function onScreenRefresh() {
+  refreshActiveDetailTab()
+  await refreshCampaigns()
+}
 
 // ─── 初始化 ───
 onMounted(async () => {
-  // Cards 由 CardLibrary 自管(其 setup 内自动加载);此处只取活跃 Campaign
-  activeCampaign.value = await getActiveCampaign()
-  // 若已有活跃 Campaign,根据其 card_id 回填 selectedCardId 并预加载游玩档,
-  // 避免用户进入「游玩档」tab 看到空白(P1-4);且默认直入档详情(P2-5 入口扁平化,
-  // 让用户可直接看到知识/任务/摘要后处理结果,无需 5 步嵌套导航)。
-  if (activeCampaign.value?.card_id) {
-    selectedCardId.value = activeCampaign.value.card_id
-    selectedCampaignId.value = activeCampaign.value.id
-    await loadSelectedCampaignCardDetail()
-    activeTab.value = 'detail'
-    shellMode.value = 'manage'
+  try {
+    // Cards 由 CardLibrary 自管(其 setup 内自动加载);此处只取活跃 Campaign
+    activeCampaign.value = await getActiveCampaign()
+    // 若已有活跃 Campaign,根据其 card_id 回填 selectedCardId 并预加载游玩档,
+    // 避免用户进入「游玩档」tab 看到空白(P1-4);且默认直入档详情(P2-5 入口扁平化,
+    // 让用户可直接看到知识/任务/摘要后处理结果,无需 5 步嵌套导航)。
+    if (activeCampaign.value?.card_id) {
+      selectedCardId.value = activeCampaign.value.card_id
+      selectedCampaignId.value = activeCampaign.value.id
+      await loadSelectedCampaignCardDetail()
+      shellMode.value = 'manage'
+    }
+  } catch (e) {
+    // F-10：onMounted 此前无 catch，getActiveCampaign 失败会让后续列表加载整段跳过
+    await alertDialog('初始化活动面板失败: ' + errorText(e))
   }
   // 双栏列表展示全部活动（创建时仍用 selectedCardId 限定角色卡）
   const savedCardId = selectedCardId.value
@@ -141,9 +156,14 @@ async function refreshCards() {
 // ─── Campaigns 操作 ───
 async function refreshCampaigns() {
   loadingCampaigns.value = true
+  campaignsError.value = null
   try {
     // 有选中角色卡时按卡过滤；否则列出全部（对齐 design 双栏「我的活动」）
     campaigns.value = await listCampaigns(selectedCardId.value || null)
+  } catch (e) {
+    // F-10：此前没有 catch —— 加载失败会让侧栏渲染「还没有活动档」，
+    // 用户把读取错误当成"没有数据"，且 onMounted 里是未处理的 rejection。
+    campaignsError.value = errorText(e)
   } finally {
     loadingCampaigns.value = false
   }
@@ -152,7 +172,6 @@ async function refreshCampaigns() {
 async function openCampaignsForCard(card) {
   selectedCardId.value = card.id
   shellMode.value = 'manage'
-  activeTab.value = 'campaigns'
   showNewCampaign.value = false
   await loadSelectedCampaignCardDetail()
   await refreshCampaigns()
@@ -179,6 +198,8 @@ async function handleCreateCampaign() {
     newCampaignGreetingIndex.value = 0
     showNewCampaign.value = false
     await refreshCampaigns()
+    // F-09：切换当前指针失败不代表"创建失败"——档案已经建好了，
+    // 此前失败会被外层 catch 报成「创建失败」，诱导用户重复建档。
     await handleSetActive(result.id)
   } catch (e) {
     await alertDialog('创建失败: ' + errorText(e))
@@ -187,21 +208,34 @@ async function handleCreateCampaign() {
   }
 }
 
+/**
+ * 把某个游玩档设为当前活动。
+ * @returns {Promise<boolean>} 指针切换是否成功
+ */
 async function handleSetActive(campaignId) {
-  await setActiveCampaign(campaignId)
-  activeCampaign.value = await getActiveCampaign()
-  // 同步到 store
-  campaignStore.activeCampaign = activeCampaign.value
-  // 回填活动 Turn 质量报告（若有）
+  if (!campaignId) return false
   try {
-    if (activeCampaign.value?.id) {
-      const dto = await getActiveTurnQuality(activeCampaign.value.id)
-      writingStore.applyQualityFromTurn(dto)
+    await setActiveCampaign(campaignId)
+    activeCampaign.value = await getActiveCampaign()
+    // 同步到 store
+    campaignStore.activeCampaign = activeCampaign.value
+    // 回填活动 Turn 质量报告（若有）
+    try {
+      if (activeCampaign.value?.id) {
+        const dto = await getActiveTurnQuality(activeCampaign.value.id)
+        writingStore.applyQualityFromTurn(dto)
+      }
+    } catch (e) {
+      console.error('getActiveTurnQuality:', e)
     }
+    emit('campaign-changed', activeCampaign.value)
+    return true
   } catch (e) {
-    console.error('getActiveTurnQuality:', e)
+    // F-09：此前没有 try/catch —— 失败时界面无任何反馈，调用方还会把它
+    // 误报成「创建失败/导入失败」，诱导用户重复建档。
+    await alertDialog('切换当前活动失败（档案本身已保存，请在列表中重新选择）: ' + errorText(e))
+    return false
   }
-  emit('campaign-changed', activeCampaign.value)
 }
 
 /** 删除整局活动（一活动一对话：级联会话 + 实例/知识/任务/总结） */
@@ -249,7 +283,6 @@ async function handleDeleteCampaign(camp) {
 async function openCampaignDetail(campaignId) {
   selectedCampaignId.value = campaignId
   shellMode.value = 'manage'
-  activeTab.value = 'detail'
   // 子组件各自 onMounted 加载，不需要 refreshDetail 全拉
 }
 
@@ -260,7 +293,6 @@ function onSelectCampaign(camp) {
 
 function onChangeMode(mode) {
   shellMode.value = mode
-  activeTab.value = mode === 'cards' ? 'cards' : (selectedCampaignId.value ? 'detail' : 'campaigns')
   if (mode !== 'cards') {
     cardsView.value = 'library'
     studioSeed.value = null
@@ -277,19 +309,16 @@ function openStudioForRevise(card) {
     nonce: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   }
   shellMode.value = 'cards'
-  activeTab.value = 'cards'
   cardsView.value = 'studio'
 }
 
 function onChangeDetailTab(tab) {
   detailSubTab.value = tab
-  activeTab.value = 'detail'
 }
 
 async function onNewCampaignFromShell() {
   if (!selectedCardId.value) {
     shellMode.value = 'cards'
-    activeTab.value = 'cards'
     return
   }
   await openNewCampaignForm()
@@ -433,7 +462,6 @@ async function handleImportBundle() {
     await refreshCampaigns()
     selectedCampaignId.value = result.campaign_id
     await handleSetActive(result.campaign_id)
-    activeTab.value = 'detail'
     const message = [`导入完成：${result.instance_count} 个角色，${result.knowledge_count} 条知识`,
       ...(result.warnings || [])].join(' ')
     importStatus.value = message
@@ -459,6 +487,7 @@ defineExpose({ refreshActiveDetailTab })
       :selected-campaign-id="selectedCampaignId"
       :selected-campaign="selectedCampaign"
       :loading-campaigns="loadingCampaigns"
+      :list-error="campaignsError || ''"
       :detail-tab="detailSubTab"
       :export-status="exportStatus"
       :import-status="importStatus"
@@ -474,7 +503,7 @@ defineExpose({ refreshActiveDetailTab })
       @export-st="handleExportStCards"
       @export-bundle="handleExportBundle"
       @import-bundle="handleImportBundle"
-      @refresh="refreshActiveDetailTab"
+      @refresh="onScreenRefresh"
     >
       <template #cards>
         <div class="space-y-3 max-w-4xl">

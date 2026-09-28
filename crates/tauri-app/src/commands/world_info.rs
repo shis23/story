@@ -252,9 +252,7 @@ pub(crate) fn add_campaign_world_info_entry(
         .storage()
         .add_world_info_entry(&id, entry)
         .map_err(TauriCommandError::storage)?;
-    if let Ok(book) = state.storage().get_world_info(&id) {
-        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    }
+    refresh_tool_ctx_world_info(state.inner(), &id, "add_campaign_world_info_entry");
     Ok(idx)
 }
 
@@ -300,9 +298,7 @@ pub(crate) fn update_campaign_world_info_entry(
         .storage()
         .update_world_info_entry(&id, req.entry_index, entry)
         .map_err(TauriCommandError::storage)?;
-    if let Ok(book) = state.storage().get_world_info(&id) {
-        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    }
+    refresh_tool_ctx_world_info(state.inner(), &id, "update_campaign_world_info_entry");
     Ok(())
 }
 
@@ -337,9 +333,7 @@ pub(crate) fn delete_campaign_world_info_entry(
         .storage()
         .delete_world_info_entry(&id, entry_index)
         .map_err(TauriCommandError::storage)?;
-    if let Ok(book) = state.storage().get_world_info(&id) {
-        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    }
+    refresh_tool_ctx_world_info(state.inner(), &id, "delete_campaign_world_info_entry");
     Ok(())
 }
 
@@ -357,9 +351,7 @@ pub(crate) fn set_campaign_world_info_route(
         .storage()
         .set_world_info_route(&id, entry_index, lore)
         .map_err(TauriCommandError::storage)?;
-    if let Ok(book) = state.storage().get_world_info(&id) {
-        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    }
+    refresh_tool_ctx_world_info(state.inner(), &id, "set_campaign_world_info_route");
     Ok(())
 }
 
@@ -453,6 +445,29 @@ pub(crate) fn get_campaign_world_info_entry(
         TauriCommandError::not_found(format!("世界书条目索引越界: {entry_index}"))
     })?;
     Ok(world_info_entry_to_dto_full(entry_index, entry))
+}
+
+/// 落盘成功后的 tool_ctx 世界书刷新（`active_campaign` 不匹配时内部直接返回）。
+///
+/// 2026-09-13 域4 修复 T-08：四处写命令此前写的是
+/// `if let Ok(book) = state.storage().get_world_info(&id) { apply(...) }`——
+/// 重读失败时**静默跳过**刷新，于是世界书已落盘、进程内 `tool_ctx` 却仍是旧快照，
+/// 后续写作轮次按旧条目注入，且没有任何日志。这与 `commands/cards.rs` 已确立的
+/// 约定（"不得用 if let Ok / .ok() 吞掉"）相矛盾。
+///
+/// 这里至少留下 error 级日志。**不把命令改成返回 Err** 的理由：写操作已经持久化
+/// 成功，报错会诱导调用方重试，而 `add_campaign_world_info_entry` 重试会重复插入
+/// 一条条目（非幂等），把"快照过期"升级成"数据重复"反而更糟。
+fn refresh_tool_ctx_world_info(state: &AppState, campaign_id: &Id, command: &'static str) {
+    match state.storage().get_world_info(campaign_id) {
+        Ok(book) => apply_campaign_world_info_to_tool_ctx(state, campaign_id, &book),
+        Err(e) => tracing::error!(
+            campaign = %campaign_id,
+            command,
+            error = %e,
+            "世界书已落盘，但 tool_ctx 刷新失败：本轮之后的写作可能仍按旧世界书注入"
+        ),
+    }
 }
 
 /// 若 `campaign_id` 是当前活跃活动，则把本局世界书写入 tool_ctx（写作注入真相源）。

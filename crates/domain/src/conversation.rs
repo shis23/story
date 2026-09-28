@@ -411,14 +411,25 @@ impl Conversation {
     }
 
     /// 共享：收集 before_node 截止的活跃非空非 Discarded 变体（时间正序）。
+    ///
+    /// D-09：`before_node_id` 找不到时必须退化成"空前缀"（不返回任何历史），
+    /// 而不是 `unwrap_or(nodes.len())`（返回全量历史，把正在被重写的草稿也喂回模型）。
+    /// 契约见 [`Conversation::recent_messages_as_chat`] 的 `before_node_id` 说明。
     fn collect_active_variants(&self, before_node_id: Option<&Id>) -> Vec<&MessageVariant> {
-        let end_idx = if let Some(bid) = before_node_id {
-            self.nodes
-                .iter()
-                .position(|node| &node.id == bid)
-                .unwrap_or(self.nodes.len())
-        } else {
-            self.nodes.len()
+        let end_idx = match before_node_id {
+            None => self.nodes.len(),
+            Some(bid) => match self.nodes.iter().position(|node| &node.id == bid) {
+                Some(idx) => idx,
+                None => {
+                    // 显式降级：宁可不给历史，也不泄漏"即将被替换的草稿"
+                    tracing::warn!(
+                        before_node_id = %bid,
+                        "conversation::collect_active_variants: unknown before_node_id; \
+                         falling back to an empty history prefix"
+                    );
+                    0
+                }
+            },
         };
         self.nodes[..end_idx]
             .iter()
@@ -837,5 +848,31 @@ mod tests {
         assert_eq!(as_chat.len(), with_role.len());
         assert_eq!(as_chat[0].content, "意图");
         assert!(with_role[0].contains("意图"));
+    }
+
+    #[test]
+    fn test_unknown_before_node_id_yields_empty_history_prefix() {
+        // D-09：未知 before_node_id 此前退化 `unwrap_or(nodes.len())` → 返回全量历史，
+        // 会把"正在被重写的草稿"也喂回模型。现在必须退化成空前缀。
+        let c = conv(vec![
+            node("n1", variant(Role::User, "u1", VariantStatus::Final)),
+            node(
+                "n2",
+                variant(Role::Assistant, "旧草稿", VariantStatus::Final),
+            ),
+            node("n3", variant(Role::User, "u2", VariantStatus::Final)),
+        ]);
+        let unknown = Id::from_str("no-such-node");
+        let msgs = c.recent_messages_as_chat(10, Some(&unknown));
+        assert!(
+            msgs.is_empty(),
+            "未知 before_node_id 必须返回空前缀，实际: {:?}",
+            msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>()
+        );
+
+        // 已知 id 的行为不变
+        let known = c.recent_messages_as_chat(10, Some(&Id::from_str("n2")));
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].content, "u1");
     }
 }

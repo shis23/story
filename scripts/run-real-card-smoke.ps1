@@ -1,5 +1,5 @@
 param(
-  [string]$FixturePath = "test-card.png",
+  [string]$FixturePath = "data/local/test-card.png",
   [switch]$SkipTauriOnLoaderError
 )
 
@@ -55,14 +55,31 @@ or pass -SkipTauriOnLoaderError to run only the Tauri-free real-card import smok
 }
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$fixture = if ([System.IO.Path]::IsPathRooted($FixturePath)) {
-  $FixturePath
+
+# Default fixture location aligned with the Rust default
+# (crates/infra-import/src/lib.rs default_real_card_fixture_path()):
+# data/local/test-card.png. That directory is local-only (.gitignore:18 data/)
+# and absent in CI, so the real-card smoke stays an opt-in local run.
+# A repository-root "test-card.png" is still accepted as a legacy fallback when
+# -FixturePath was not passed explicitly.
+$candidates = if ([System.IO.Path]::IsPathRooted($FixturePath)) {
+  @($FixturePath)
+} elseif ($PSBoundParameters.ContainsKey("FixturePath")) {
+  @((Join-Path $root $FixturePath))
 } else {
-  Join-Path $root $FixturePath
+  @((Join-Path $root $FixturePath), (Join-Path $root "test-card.png"))
 }
 
-if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
-  throw "Complex card fixture not found: use -FixturePath or place test-card.png at the repository root."
+$fixture = $null
+foreach ($candidate in $candidates) {
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+    $fixture = $candidate
+    break
+  }
+}
+
+if (-not $fixture) {
+  throw "Complex card fixture not found. Default location is data/local/test-card.png (local-only, not in git); the legacy repository-root test-card.png is also accepted. Use -FixturePath to point at another file."
 }
 
 $resolvedFixture = (Resolve-Path -LiteralPath $fixture).Path

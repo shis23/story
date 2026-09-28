@@ -16,11 +16,24 @@ test('Button disabled 时 button 元素也 disabled', () => {
   expect(w.attributes('disabled')).toBeDefined()
 })
 
-test('Button loading 时不渲染 slot,显示 spinner', () => {
+// F-38 契约变更：loading 不再替换整段文案（旧断言锁死了"文案消失"这一缺陷），
+// 现在 spinner 插在文案前 + aria-busy，文案保留（生产证据见 ConnectionConfigPanel
+// 的「测试中…」「保存中…」此前永不显示）。
+test('Button loading 时保留文案并额外渲染 spinner', () => {
   const w = mount(Button, { props: { loading: true }, slots: { default: '发送' } })
-  expect(w.text()).not.toContain('发送')
-  // 纸上编辑部皮肤:spinner 为内联 SVG(animate-spin),不再用 ◌ 字符
+  expect(w.text()).toContain('发送')
   expect(w.html()).toContain('animate-spin')
+})
+
+test('Button loading 时输出 aria-busy 且仍 disabled', () => {
+  const w = mount(Button, { props: { loading: true }, slots: { default: '发送' } })
+  expect(w.attributes('aria-busy')).toBe('true')
+  expect(w.attributes('disabled')).toBeDefined()
+})
+
+test('Button 非 loading 时不输出 aria-busy', () => {
+  const w = mount(Button, { slots: { default: '发送' } })
+  expect(w.attributes('aria-busy')).toBeUndefined()
 })
 
 test('Button 点击触发 click 事件', async () => {

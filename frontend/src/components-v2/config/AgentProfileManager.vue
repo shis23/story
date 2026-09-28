@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   listAgentProfileConfigs,
   getAgentProfileConfig,
@@ -32,6 +32,9 @@ const emit = defineEmits(['close'])
 // Subagent 用通配符 "*" 覆盖所有子 Agent（后端 run_config_for 支持 Subagent:* 回退）
 const ROLES = [
   { key: 'Director', label: '导演' },
+  // F-43：续写档（continue）的执笔者角色此前不在列表里，用户无法为它配
+  // model_override / max_tool_rounds（后端 AgentRole::Writer 一直存在）
+  { key: 'Writer', label: '执笔' },
   { key: 'Editor', label: '编剧' },
   { key: 'Subagent:*', label: '子 Agent（通配）' },
   { key: 'Summarizer', label: '总结器' },
@@ -58,9 +61,6 @@ const editing = ref(null) // 当前编辑的完整 config（深拷贝）
 const loading = ref(false)
 const saving = ref(false)
 const errorMsg = ref('')
-
-const activeId = computed(() => summaries.value.find((s) => s.is_active)?.id || null)
-void activeId // 保留用于将来展示活跃态汇总
 
 onMounted(async () => {
   await refresh()
@@ -280,12 +280,10 @@ function readonly() {
 </script>
 
 <template>
-  <component
-    :is="embedded ? 'div' : PanelHost"
-    v-bind="embedded ? {} : { show: true, title: 'Agent Profile 配置', side: 'left' }"
-    v-on="embedded ? {} : { close: () => emit('close') }"
-  >
-    <div :class="embedded ? '' : 'p-4'">
+  <!-- F-47：`embedded` prop 无任何调用点（唯一挂载点 AppV2:1009 只传 @close），
+       两条分支永远走 PanelHost；死 prop + 三处三元已删除。 -->
+  <PanelHost show :title="'Agent Profile 配置'" side="left" @close="emit('close')">
+    <div class="p-4">
       <!-- 标题栏 -->
       <div class="flex items-center gap-2 mb-2">
         <span class="text-base">🧩</span>
@@ -397,6 +395,7 @@ function readonly() {
                   <Toggle
                     :model-value="!!editing.enable_postprocess"
                     :disabled="readonly()"
+                    label="后处理"
                     @update:model-value="readonly() ? null : (editing.enable_postprocess = $event)"
                   />
                 </div>
@@ -405,6 +404,7 @@ function readonly() {
                   <Toggle
                     :model-value="!!editing.enable_summarizer"
                     :disabled="readonly()"
+                    label="剧情总结"
                     @update:model-value="readonly() ? null : (editing.enable_summarizer = $event)"
                   />
                 </div>
@@ -491,5 +491,5 @@ function readonly() {
         </div>
       </Tabs>
     </div>
-  </component>
+  </PanelHost>
 </template>

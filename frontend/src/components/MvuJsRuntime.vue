@@ -49,6 +49,7 @@ import {
   registerShellDoc,
   releaseShellDoc,
 } from '../utils/shellDocUrl.js'
+import { buildMvuExecuteResultData } from '../utils/mvuExecuteResult.js'
 
 const iframeRef = ref(null)
 const iframeReady = ref(false)
@@ -444,12 +445,10 @@ function onWindowMessage(event) {
       clearTimeout(timer)
       executeTimers.delete(d.request_id)
     }
-    invoke('mvu_execute_result', {
-      requestId: d.request_id,
-      variableUpdates: d.variable_updates || {},
-      sideEffects: d.side_effects || [],
-      error: d.error || null,
-    }).catch(err => console.error('[MVU] execute_result invoke failed:', err))
+    // M-04：保留命名空间（__storyforge*）的键在这里丢弃后才回传后端
+    // （后端写入边界暂无镜像守卫，见 utils/mvuExecuteResult.js 注释）。
+    invoke('mvu_execute_result', buildMvuExecuteResultData(d))
+      .catch(err => console.error('[MVU] execute_result invoke failed:', err))
   }
 }
 

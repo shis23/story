@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import {
   Dialog,
   DialogPanel,
+  DialogTitle,
   TransitionRoot,
   TransitionChild,
 } from '@headlessui/vue'
@@ -37,8 +38,10 @@ const isOpen = computed({
     return props.show
   },
   set(val) {
-    emit('update:show', val)
-    emit('update:modelValue', val)
+    // F-15：调用方只会用其中一个 prop（`:show` 或 `v-model`），
+    // 此前两个事件都发，未绑定的那个会变成"没人处理的 emit"。
+    if (props.modelValue !== null) emit('update:modelValue', val)
+    else emit('update:show', val)
     if (!val) emit('close')
   },
 })
@@ -134,13 +137,15 @@ const overlayTransition = {
 
       <div :class="panelWrapperClass">
         <TransitionChild as="template" v-bind="panelTransition">
-          <DialogPanel :class="panelClass">
+          <DialogPanel :class="panelClass" :aria-label="title || undefined">
             <div
               v-if="title"
               class="sf-toolbar flex items-center justify-between px-4 border-b border-line"
             >
-              <h2 class="min-w-0 truncate text-sm font-semibold text-ink">{{ title }}</h2>
+              <DialogTitle class="min-w-0 truncate text-sm font-semibold text-ink">{{ title }}</DialogTitle>
+              <!-- F-14：标题分支此前无视 showClose，传 :show-close="false" 会静默失效（双 ×） -->
               <button
+                v-if="showClose"
                 type="button"
                 class="sf-toolbar-icon transition-colors"
                 @click="isOpen = false"

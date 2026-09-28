@@ -24,7 +24,8 @@ use storyforge_infra_sqlite::backend::{
     BackendDiagnostics, BackendSelection, PinnedBackend, StorageBackend,
 };
 use storyforge_infra_sqlite::cutover::{
-    CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, inspect_marker, recover_or_verify,
+    CutoverOutcome, CutoverPlan, CutoverRequest, MarkerStatus, StaleKind, inspect_marker,
+    recover_or_verify,
 };
 use storyforge_infra_sqlite::lease::hold_process_shared_lease;
 use storyforge_infra_sqlite::migrations::current_version;
@@ -283,11 +284,46 @@ impl StorageFacade {
     /// handle do not describe the same authority.
     pub fn validate_runtime_authority(&self) -> Result<(), String> {
         if self.is_sqlite() {
-            sqlite_runtime::validate_active_path(&self.data_dir.join(SQLITE_DB_FILENAME))
+            sqlite_runtime::validate_active_path(&self.data_dir.join(SQLITE_DB_FILENAME))?;
+            self.revalidate_marker_authority()
         } else if sqlite_runtime::is_sqlite_active() {
             Err("JSON facade cannot coexist with an active SQLite runtime".to_string())
         } else {
             Ok(())
+        }
+    }
+
+    /// S-17：启动时**再读一次** marker，确认本进程选定的 SQLite 权威仍然成立。
+    ///
+    /// 只比路径不够：`resolve_backend` 到 AppState 构造之间存在 TOCTOU 窗口，
+    /// marker 可能被另一个进程 rollback 成 json-authoritative、被删掉、或指向
+    /// 另一个库。放行会让本进程继续往一个已不再权威的库写入（双权威/丢数据）。
+    ///
+    /// 判定刻意保守但不过度：
+    /// - `SqliteAuthoritative` → 通过（绑定已由 inspect_marker 校验）。
+    /// - `Absent` / `MarkerAbsentOrphanDb` → 通过。这两种只在「进程内直接
+    ///   activate、不走 cutover」的测试/嵌入场景出现；此时库就是我们刚选的，
+    ///   没有任何相反证据，直接拒绝会误伤（其风险由运行期 single-writer 兜底）。
+    /// - 其余（翻成 JSON / marker 损坏 / 绑定不一致 / 版本不一致 / 探测失败 /
+    ///   后端未知）→ 明确矛盾，fail-closed 并给出 typed 原因。
+    fn revalidate_marker_authority(&self) -> Result<(), String> {
+        // 复用 `check_marker_status`（此前无生产调用方，仅测试用）。
+        match check_marker_status(&self.data_dir) {
+            MarkerStatus::SqliteAuthoritative { .. }
+            | MarkerStatus::Absent
+            | MarkerStatus::Stale {
+                kind: StaleKind::MarkerAbsentOrphanDb,
+                ..
+            } => Ok(()),
+            MarkerStatus::JsonAuthoritative => Err(
+                "storage authority changed underneath this process: backend marker is now \
+                 json-authoritative; refusing to open the SQLite facade"
+                    .to_string(),
+            ),
+            MarkerStatus::Stale { kind, reason } => Err(format!(
+                "storage authority is no longer verifiable ({}): {reason}",
+                kind.as_str()
+            )),
         }
     }
 
@@ -1407,25 +1443,46 @@ impl StorageFacade {
             // JSON 路径：沿用 CharacterStore + CampaignStore 既有级联。
             let character_store = self
                 .json_character_store(BackendCapability::CharacterCommands, "delete character")?;
-            let removed = character_store.delete(id)?;
             let campaign_store =
                 self.json_campaign_store(BackendCapability::CampaignLifecycle, "delete character")?;
+            // S-13：源 id 必须在**删除主记录之前**取（旧实现在 delete 之后
+            // `character_store.get(id)` —— 记录已删，该分支恒不可达，级联形同虚设）。
+            let stored = character_store.get(id);
+            let mut source_ids: Vec<Id> = Vec::new();
             for source_id in extra_source_ids {
-                let _ = campaign_store.delete_mvu(source_id);
-                if let Some(stored_card) = campaign_store.get_card_by_source(source_id) {
-                    let _ = campaign_store.delete_card(&stored_card.card.id);
+                if !source_ids.iter().any(|existing| existing == source_id) {
+                    source_ids.push(source_id.clone());
                 }
             }
-            if let Some(stored) = character_store.get(id)
-                && let Some(source_id) = stored.info.source_character_id.as_ref()
+            if let Some(source_id) = stored
+                .as_ref()
+                .and_then(|s| s.info.source_character_id.as_ref())
             {
                 let source_id = Id::from_str(source_id);
-                let _ = campaign_store.delete_mvu(&source_id);
-                if let Some(stored_card) = campaign_store.get_card_by_source(&source_id) {
-                    let _ = campaign_store.delete_card(&stored_card.card.id);
+                if !source_ids.iter().any(|existing| existing == &source_id) {
+                    source_ids.push(source_id);
                 }
             }
-            Ok(removed)
+            // S-13：级联失败必须传播。旧实现每个 `let _ =` 都把 delete_mvu /
+            // delete_card 的错误吞掉，命令照样返回 Ok——用户以为删干净了，实际
+            // MVU 翻译与卡壳残留（与 SQLite 单事务级联语义不一致）。
+            // 顺序：先级联、后删主记录。级联失败 → 主记录仍在，可重试且不丢数据。
+            for source_id in &source_ids {
+                if let Err(e) = campaign_store.delete_mvu(source_id) {
+                    return Err(format!(
+                        "删除角色级联失败（MVU {source_id} 未清理，角色未删除，可重试）: {e}"
+                    ));
+                }
+                if let Some(stored_card) = campaign_store.get_card_by_source(source_id)
+                    && let Err(e) = campaign_store.delete_card(&stored_card.card.id)
+                {
+                    return Err(format!(
+                        "删除角色级联失败（卡 {} 未清理，角色未删除，可重试）: {e}",
+                        stored_card.card.id
+                    ));
+                }
+            }
+            character_store.delete(id)
         }
     }
 
@@ -1882,11 +1939,47 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
             recover_or_verify(&request).map_err(|e| BackendWiringError::Cutover(format!("{e}")))?;
 
         let cutover_performed = matches!(outcome, CutoverOutcome::Completed(_));
+        // S-01/S-17：真实非零跳过计数必须可审计——只活在 tracing 里等于不可追溯。
+        if let CutoverOutcome::Completed(report) = &outcome
+            && report.skipped_orphan_rows > 0
+        {
+            let detail = report
+                .skipped_detail
+                .iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                skipped_orphan_rows = report.skipped_orphan_rows,
+                skipped_detail = %detail,
+                "JSON→SQLite 导入跳过了孤儿行（源树缺少父集合）；请核对源数据是否完整"
+            );
+            crate::storage_health::record_backend_incident(
+                "cutover_skipped_orphans",
+                &format!(
+                    "JSON→SQLite 导入跳过了 {} 行（{detail}）；源目录可能不完整，\
+                         请在清理 JSON 前核对数据",
+                    report.skipped_orphan_rows
+                ),
+            );
+        }
 
         let schema_version = {
             let db = storyforge_infra_sqlite::Database::open(&db_path)
                 .map_err(|e| BackendWiringError::Cutover(format!("reopen: {e}")))?;
-            current_version(&db).unwrap_or(0)
+            // S-14：诊断不得谎报 0（此前 `unwrap_or(0)` 会把「读不出来」显示成
+            // schema 0）；读取失败如实降级为 None 并记录。
+            match current_version(&db) {
+                Ok(version) => Some(version),
+                Err(e) => {
+                    tracing::warn!(
+                        db = %db_path.display(),
+                        error = %e,
+                        "schema version unreadable after backend resolution"
+                    );
+                    None
+                }
+            }
         };
 
         // SQLite 权威决议成功：持有进程级 SHARED 租约，阻挡并发 cutover。
@@ -1894,10 +1987,12 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
             .map_err(|e| BackendWiringError::Lease(format!("{e}")))?;
 
         let sqlite_pinned = PinnedBackend::new(StorageBackend::Sqlite, pinned_source);
-        let diag = BackendDiagnostics::from_pinned(&sqlite_pinned, Some(schema_version));
+        let diag = BackendDiagnostics::from_pinned(&sqlite_pinned, schema_version);
         Ok(BackendResolution {
             pinned: sqlite_pinned,
-            db_path: Some(db_path),
+            // S-02：这里 clone 而不是 move——Stale 分支需要 `&db_path` 调
+            // reconcile/stale_recovery_eligible，闭包若 move 走 db_path 就借不到了。
+            db_path: Some(db_path.clone()),
             diagnostics: diag,
             cutover_performed,
         })
@@ -1949,10 +2044,49 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
                 run_sqlite()
             }
         }
-        MarkerStatus::Stale { reason } => {
+        MarkerStatus::Stale { kind, reason } => {
+            // S-02：Stale 不再一律永久拒启（此前 publish→marker 之间崩溃 / 新
+            // migration 提交后崩溃都会让应用**永远**启动不了，而库层本已具备幂等
+            // 自愈能力）。分类处理，仍然 fail-closed 于真正不可自愈的情形：
+            //
+            //  (a) DbVersionAhead：更新版二进制迁移过 DB、marker 未对账。把
+            //      `reconcile_marker_schema_version` 提到闸门之前（原来只在
+            //      sqlite_runtime::activate 里、晚于闸门），回写 marker 后重新
+            //      inspect；绝不允许回退成「用陈旧 JSON 重导入」。
+            //  (b) 身份 + 内容双匹配的中断残留（marker 缺失但有自身孤儿库 /
+            //      发布前 DB 缺失）：调 run_sqlite() → recover_or_verify 幂等续跑。
+            //  (c) 其余（探测失败 / 绑定不一致 / marker 损坏 / 版本过新/落后 /
+            //      后端未知）：维持硬失败，并给出可操作的原因。
+            if kind == StaleKind::DbVersionAhead {
+                match storyforge_infra_sqlite::reconcile_marker_schema_version(&db_path) {
+                    Ok(Some((old, new))) => {
+                        tracing::warn!(
+                            old,
+                            new,
+                            "reconciled backend marker schema version before the start gate"
+                        );
+                        if let MarkerStatus::SqliteAuthoritative { .. } = inspect_marker(&plan) {
+                            return run_sqlite();
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "marker schema reconcile failed");
+                    }
+                }
+            }
+            if storyforge_infra_sqlite::stale_recovery_eligible(&plan) {
+                tracing::warn!(
+                    stale_kind = kind.as_str(),
+                    reason = %reason,
+                    "recovering interrupted cutover at startup (stale marker with own identity and content)"
+                );
+                return run_sqlite();
+            }
             // 无论 env 是什么都拒绝：JSON 与 SQLite 都不放行。
             Err(BackendWiringError::Selection(format!(
-                "stale backend marker; refusing to start until resolved: {reason}"
+                "stale backend marker ({}); refusing to start until resolved: {reason}",
+                kind.as_str()
             )))
         }
     }
@@ -2415,6 +2549,49 @@ mod tests {
             "stale marker + env=sqlite must fail closed, got: {err_sqlite}"
         );
         clear_env();
+    }
+
+    #[test]
+    fn sqlite_facade_revalidates_marker_authority_after_resolution() {
+        // S-17：启动/运行期必须**复检 marker**，不能只比 DB 路径——`resolve_backend`
+        // 到 facade 构造之间存在 TOCTOU 窗口（marker 可能被另一进程 rollback 成
+        // json-authoritative 或损坏）。
+        let dir = TempDir::new().unwrap();
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        sample_source(dir.path());
+        set_env_sqlite();
+        let resolution = resolve_backend_inner(dir.path()).unwrap();
+        clear_env();
+        assert!(resolution.is_sqlite(), "cutover must pin sqlite authority");
+
+        let facade = StorageFacade::new(dir.path().to_path_buf(), resolution.pinned.clone());
+        facade
+            .revalidate_marker_authority()
+            .expect("有效 sqlite marker 必须通过复检");
+
+        // 另一进程把权威翻回 json-authoritative → 本进程必须 fail-closed。
+        let marker_path = dir.path().join("storyforge.backend.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["backend"] = serde_json::json!("json");
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+        let err = facade
+            .revalidate_marker_authority()
+            .expect_err("marker 翻成 JSON 权威后必须拒绝");
+        assert!(
+            err.contains("changed underneath"),
+            "错误必须说明权威已被改变，got: {err}"
+        );
+
+        // marker 损坏 → 同样拒绝，且带 typed kind（不再靠自由文本子串）。
+        std::fs::write(&marker_path, b"{ this is not json").unwrap();
+        let err = facade
+            .revalidate_marker_authority()
+            .expect_err("marker 损坏后必须拒绝");
+        assert!(
+            err.contains("marker-corrupt"),
+            "错误必须带 typed StaleKind，got: {err}"
+        );
     }
 
     #[test]

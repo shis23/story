@@ -207,11 +207,14 @@ export function usePluginBridge() {
   }
 
   // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage / timeout / cancel / onAudit。
+  // M-08：appliedPluginIds 由调用方传入的数组会被就地填充"实际改写了 payload 的插件 id"，
+  // 供 pluginPromptHookResult 的 modifierPluginIds 参数声明改写者。
   async function emitPromptHookEventAndWait(
     event,
     data = {},
     stage = '',
     generation = ensurePromptHookGeneration(),
+    appliedPluginIds = null,
   ) {
     if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
     nextPromptHookCorrelationSeq += 1
@@ -230,6 +233,7 @@ export function usePluginBridge() {
         maxPayloadBytesPerPlugin: promptHookMaxPayloadBytes,
         getPluginPermissions: getLivePluginPermissions,
         onAudit: recordPromptHookAudit,
+        appliedPluginIds: Array.isArray(appliedPluginIds) ? appliedPluginIds : undefined,
       },
     )
   }
@@ -295,6 +299,8 @@ export function usePluginBridge() {
 
     if (!activePromptHookGeneration) beginPromptHookGeneration()
     const generation = activePromptHookGeneration
+    // M-08：收集本次链里真正改写了消息的插件（后端要求 messages 必须附带改写者声明）
+    const appliedPluginIds = []
     try {
       if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
       const payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, {
@@ -305,11 +311,13 @@ export function usePluginBridge() {
           model: data.model || '',
         }),
         messages: originalMessages,
-      }, 'llm_messages', generation)
+      }, 'llm_messages', generation, appliedPluginIds)
       const messagesForBackend = resolveHookedMessages(payload, originalMessages)
-      await pluginPromptHookResult(requestId, messagesForBackend, null)
+      await pluginPromptHookResult(requestId, messagesForBackend, null, { modifierPluginIds: appliedPluginIds })
     } catch (err) {
-      await pluginPromptHookResult(requestId, originalMessages, err?.message || String(err))
+      await pluginPromptHookResult(requestId, originalMessages, err?.message || String(err), {
+        modifierPluginIds: appliedPluginIds,
+      })
     }
   }
 

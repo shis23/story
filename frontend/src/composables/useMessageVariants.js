@@ -295,11 +295,17 @@ export function useMessageVariants(options = {}) {
                 skipReceipt: true,
               })
             }
+            // 用户在强制采纳确认框里点了取消：这是主动选择，不是失败，
+            // 不能再补一条"采纳失败"错误（F-02）。
+            return
           } catch (dialogErr) {
             console.error('强制采纳确认失败:', dialogErr)
           }
         }
+        // F-02：采纳失败此前只写 console，界面毫无反馈（兄弟路径都用
+        // alertDialog + errorText）。采纳是终态写入动作，失败必须让用户看见。
         console.error('采纳失败:', e)
+        await alertDialog('采纳失败: ' + errorText(e))
       }
     })()
     pendingAccepts.set(pendingKey, task)

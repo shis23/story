@@ -303,15 +303,26 @@ enum TargetRef {
 }
 
 /// 执行单个 PatchAction
+///
+/// M-13：target 越界或所需上下文缺失时必须返回 `ExecutionFailed`，绝不静默
+/// no-op——调用方会据此把 patch 标为 `applied` 并持久化，静默成功是假成功
+/// （用户看到"采纳成功"但数据未变，且 `applied` 会被 `PatchStore::pending()`
+/// 过滤，无法重试）。
 fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), MetaError> {
     match action {
         PatchAction::Create { target, data } => {
             let (kind, _target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
-                    if let Some(ref mut entries) = ctx.world_info_entries {
-                        entries.push(data.clone());
-                    }
+                    // M-13 残点：缺 context 时旧实现静默 no-op 却让 action 计入
+                    // "已应用"，与本次审查的头号缺陷类型（静默失败）同族。现在
+                    // 与 Update/Delete 分支同风格返回明确错误。
+                    let Some(ref mut entries) = ctx.world_info_entries else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "缺少 world_info_entries，无法创建 world_info 条目: {target}"
+                        )));
+                    };
+                    entries.push(data.clone());
                 }
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持创建 {kind}"))),
             }
@@ -324,20 +335,41 @@ fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), Me
             let (kind, target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
-                    if let Some(TargetRef::Index(idx)) = target_ref
-                        && let Some(ref mut entries) = ctx.world_info_entries
-                        && let Some(entry) = entries.get_mut(idx)
-                        && let Some(obj) = entry.as_object_mut()
-                    {
-                        obj.insert(field.clone(), value.clone());
-                    }
+                    let Some(TargetRef::Index(idx)) = target_ref else {
+                        return Err(MetaError::InvalidTarget(format!(
+                            "更新 world_info 需要条目索引（world_info[N]）: {target}"
+                        )));
+                    };
+                    let Some(ref mut entries) = ctx.world_info_entries else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "缺少 world_info 上下文，无法更新 {target}"
+                        )));
+                    };
+                    let Some(entry) = entries.get_mut(idx) else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "world_info 条目索引越界: {idx}（共 {} 条）",
+                            entries.len()
+                        )));
+                    };
+                    let Some(obj) = entry.as_object_mut() else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "world_info 条目 {idx} 不是 JSON 对象，无法更新字段 {field}"
+                        )));
+                    };
+                    obj.insert(field.clone(), value.clone());
                 }
                 "character" => {
-                    if let Some(ref mut char_json) = ctx.character_fields
-                        && let Some(obj) = char_json.as_object_mut()
-                    {
-                        obj.insert(field.clone(), value.clone());
-                    }
+                    let Some(ref mut char_json) = ctx.character_fields else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "缺少 character_fields 上下文，无法更新 {target}"
+                        )));
+                    };
+                    let Some(obj) = char_json.as_object_mut() else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "character_fields 不是 JSON 对象，无法更新字段 {field}"
+                        )));
+                    };
+                    obj.insert(field.clone(), value.clone());
                 }
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持更新 {kind}"))),
             }
@@ -346,12 +378,23 @@ fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), Me
             let (kind, target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
-                    if let Some(TargetRef::Index(idx)) = target_ref
-                        && let Some(ref mut entries) = ctx.world_info_entries
-                        && idx < entries.len()
-                    {
-                        entries.remove(idx);
+                    let Some(TargetRef::Index(idx)) = target_ref else {
+                        return Err(MetaError::InvalidTarget(format!(
+                            "删除 world_info 需要条目索引（world_info[N]）: {target}"
+                        )));
+                    };
+                    let Some(ref mut entries) = ctx.world_info_entries else {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "缺少 world_info 上下文，无法删除 {target}"
+                        )));
+                    };
+                    if idx >= entries.len() {
+                        return Err(MetaError::ExecutionFailed(format!(
+                            "world_info 条目索引越界: {idx}（共 {} 条）",
+                            entries.len()
+                        )));
                     }
+                    entries.remove(idx);
                 }
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持删除 {kind}"))),
             }
@@ -555,5 +598,155 @@ mod tests {
         assert_eq!(character_fields["personality"], "reckless");
         assert_eq!(world_info_entries.len(), 2);
         assert_eq!(world_info_entries[1]["content"], "new lore");
+    }
+
+    // ── M-13：越界/缺失上下文必须报错，不得静默 no-op 后标 applied ──────────
+
+    /// 构造单 action patch（M-13 用例共用）
+    fn one_action_patch(action: PatchAction) -> Patch {
+        Patch {
+            id: "patch-m13".into(),
+            description: "M-13 execute_action 错误传播".into(),
+            actions: vec![action],
+            created_at: chrono::Utc::now(),
+            applied: false,
+        }
+    }
+
+    #[test]
+    fn test_execute_action_update_world_info_out_of_range_errors() {
+        let mut world_info_entries = vec![serde_json::json!({"content": "old lore"})];
+        let patch = one_action_patch(PatchAction::Update {
+            target: "world_info[5]".into(),
+            field: "content".into(),
+            value: serde_json::json!("new lore"),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: Some(&mut world_info_entries),
+            character_fields: None,
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ExecutionFailed(_)),
+            "越界索引必须返回 ExecutionFailed，实际: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("越界"),
+            "错误应说明越界，实际: {err}"
+        );
+        // 数据未被改动（越界写入不得静默成功）
+        assert_eq!(world_info_entries[0]["content"], "old lore");
+    }
+
+    #[test]
+    fn test_execute_action_create_world_info_without_context_errors() {
+        // M-13 残点：Create 缺 context 不得静默 no-op（否则 patch 会被记为已应用）。
+        let patch = one_action_patch(PatchAction::Create {
+            target: "world_info".into(),
+            data: serde_json::json!({"content": "new lore"}),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: None,
+            character_fields: None,
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ExecutionFailed(_)),
+            "缺少 world_info_entries 必须返回 ExecutionFailed，实际: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("world_info"),
+            "错误应点名缺失的上下文，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn test_execute_action_update_character_without_context_errors() {
+        let patch = one_action_patch(PatchAction::Update {
+            target: "character.personality".into(),
+            field: "personality".into(),
+            value: serde_json::json!("reckless"),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: None,
+            character_fields: None,
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ExecutionFailed(_)),
+            "缺少 character_fields 必须返回 ExecutionFailed，实际: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("character_fields"),
+            "错误应点名缺失的上下文，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn test_execute_action_delete_world_info_out_of_range_errors() {
+        let mut world_info_entries = vec![serde_json::json!({"content": "only"})];
+        let patch = one_action_patch(PatchAction::Delete {
+            target: "world_info[1]".into(),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: Some(&mut world_info_entries),
+            character_fields: None,
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ExecutionFailed(_)),
+            "删除越界必须返回 ExecutionFailed，实际: {err:?}"
+        );
+        assert_eq!(world_info_entries.len(), 1, "越界删除不得改动数据");
+    }
+
+    #[test]
+    fn test_execute_action_update_world_info_without_context_errors() {
+        let patch = one_action_patch(PatchAction::Update {
+            target: "world_info[0]".into(),
+            field: "content".into(),
+            value: serde_json::json!("new lore"),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: None,
+            character_fields: None,
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, MetaError::ExecutionFailed(_)),
+            "缺少 world_info_entries 必须返回 ExecutionFailed，实际: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("world_info"),
+            "错误应点名缺失的上下文，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn test_execute_action_update_world_info_happy_path() {
+        let mut world_info_entries = vec![
+            serde_json::json!({"content": "old lore", "keys": ["old"]}),
+            serde_json::json!({"content": "keep me"}),
+        ];
+        let patch = one_action_patch(PatchAction::Update {
+            target: "world_info[0]".into(),
+            field: "content".into(),
+            value: serde_json::json!("new lore"),
+        });
+        let mut ctx = PatchContext {
+            world_info_entries: Some(&mut world_info_entries),
+            character_fields: None,
+        };
+
+        execute_patch(&patch, &mut ctx).expect("合法索引应更新成功");
+        assert_eq!(world_info_entries[0]["content"], "new lore");
+        // 其它字段与其它条目不受影响
+        assert_eq!(world_info_entries[0]["keys"][0], "old");
+        assert_eq!(world_info_entries[1]["content"], "keep me");
     }
 }

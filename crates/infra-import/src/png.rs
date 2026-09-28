@@ -231,11 +231,23 @@ pub fn write_st_card_png(
 }
 
 /// 将 StCharacterData 包装为 StCharacterCard（导出辅助）
+///
+/// `spec` 与 `spec_version` 必须一致：v3 卡写 `chara_card_v3`，否则严格校验的
+/// 第三方工具会看到 `chara_card_v2` + `spec_version: "3.0"` 这种非法组合。
 pub fn make_st_card(data: StCharacterData, spec_version: &str) -> StCharacterCard {
     StCharacterCard {
-        spec: Some("chara_card_v2".into()),
+        spec: Some(st_card_spec_for_version(spec_version).into()),
         spec_version: Some(spec_version.into()),
         data,
+    }
+}
+
+/// `spec_version` → ST 卡 `spec` 判别值（v3 ⇒ `chara_card_v3`）。
+fn st_card_spec_for_version(spec_version: &str) -> &'static str {
+    if spec_version.trim().starts_with('3') {
+        "chara_card_v3"
+    } else {
+        "chara_card_v2"
     }
 }
 
@@ -371,6 +383,61 @@ mod tests {
     }
 
     #[test]
+    fn make_st_card_spec_matches_spec_version() {
+        use storyforge_domain::character::StCharacterData;
+
+        fn data(name: &str) -> StCharacterData {
+            StCharacterData {
+                name: name.into(),
+                description: String::new(),
+                personality: String::new(),
+                scenario: String::new(),
+                first_mes: String::new(),
+                mes_example: String::new(),
+                system_prompt: String::new(),
+                post_history_instructions: String::new(),
+                tags: vec![],
+                creator: String::new(),
+                character_version: String::new(),
+                alternate_greetings: vec![],
+                extensions: serde_json::json!({}),
+                character_book: None,
+                extra: Default::default(),
+            }
+        }
+
+        // A v3 card must not be exported as `chara_card_v2` + spec_version "3.0".
+        let v3 = make_st_card(data("v3"), "3.0");
+        assert_eq!(v3.spec.as_deref(), Some("chara_card_v3"));
+        assert_eq!(v3.spec_version.as_deref(), Some("3.0"));
+
+        // v2 stays v2, and the unknown-version fallback stays the v2 discriminator.
+        let v2 = make_st_card(data("v2"), "2.0");
+        assert_eq!(v2.spec.as_deref(), Some("chara_card_v2"));
+        assert_eq!(v2.spec_version.as_deref(), Some("2.0"));
+        let fallback = make_st_card(data("fallback"), "");
+        assert_eq!(fallback.spec.as_deref(), Some("chara_card_v2"));
+
+        // The PNG wire payload carries the same discriminator.
+        let png_bytes = write_st_card_png(&v3, None).expect("v3 export should succeed");
+        let chunks = parse_png(&png_bytes).expect("exported PNG should parse");
+        let chara_text = chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                PngChunk::Text { keyword, text } if keyword == "chara" => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("exported PNG should contain a chara chunk");
+        let json_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)
+                .expect("chara payload should be base64");
+        let exported: StCharacterCard =
+            serde_json::from_slice(&json_bytes).expect("chara payload should be ST JSON");
+        assert_eq!(exported.spec.as_deref(), Some("chara_card_v3"));
+        assert_eq!(exported.spec_version.as_deref(), Some("3.0"));
+    }
+
+    #[test]
     fn test_write_st_card_png_preserves_v3_extensions_extra_and_book_payload() {
         use std::collections::BTreeMap;
         use storyforge_domain::character::{StCharacterData, StWorldInfoBook, StWorldInfoEntry};
@@ -462,7 +529,7 @@ mod tests {
             serde_json::from_slice(&json_bytes).expect("chara payload should be ST JSON");
         let exported_json = serde_json::to_value(&exported.data).unwrap();
 
-        assert_eq!(exported.spec, Some("chara_card_v2".into()));
+        assert_eq!(exported.spec, Some("chara_card_v3".into()));
         assert_eq!(exported.spec_version, Some("3.0".into()));
         assert_eq!(exported.data.name, "V3 PNG Fidelity");
         assert_eq!(exported.data.alternate_greetings, vec!["alt 1", "alt 2"]);

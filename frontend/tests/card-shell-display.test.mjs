@@ -5,6 +5,7 @@ import {
   classifyShellUrl,
   resolveShellSurfaces,
   segmentShellContent,
+  trustedInlineShellDocStarts,
 } from '../src/utils/cardShellDisplay.js'
 
 const HOME =
@@ -126,6 +127,60 @@ test('parseStFindRegex + matchesAnyInlineShellTrigger anchor docs to card regex 
   assert.ok(!matchesAnyInlineShellTrigger('普通叙事', triggers))
   assert.ok(!matchesAnyInlineShellTrigger('', triggers))
   assert.ok(!matchesAnyInlineShellTrigger('【修炼界面】…【/修炼界面】', []))
+})
+
+test('trustedInlineShellDocStarts backs each inline doc with its own trigger hit (M-19)', async () => {
+  const { trustedInlineShellDocStarts: trustDocs } =
+    await import('../src/utils/cardShellDisplay.js')
+
+  const TRIGGERS = [{ label: '修炼界面', trigger: '【修炼界面】' }]
+  const doc = '<body class="cultivation"><script>boot()</script></body>'
+
+  // 单文档 + 单次命中：正常路径自动挂载。
+  const single = `境界提升。\n${doc}`
+  assert.deepEqual(
+    [...trustDocs(single, '【修炼界面】境界：筑基', TRIGGERS)],
+    [single.indexOf('<body')],
+  )
+
+  // M-19 核心：一条消息里两个可执行文档，但源文只命中一次 trigger ⇒
+  // 只有第一个文档获背书，第二个必须走确认卡（旧实现整条放行）。
+  const first = `<body class="a"><script>legit()</script></body>`
+  const second = `<body class="b"><script>attacker()</script></body>`
+  const display = `叙事。\n${first}\n中段。\n${second}`
+  const trusted = trustDocs(display, '【修炼界面】开场', TRIGGERS)
+  assert.deepEqual([...trusted], [display.indexOf('<body class="a"')])
+  assert.equal(trusted.has(display.indexOf('<body class="b"')), false)
+
+  // 两次命中 ⇒ 两个文档都获背书（合法卡的多文档消息不被误伤）。
+  const both = trustDocs(
+    display,
+    '【修炼界面】开场\n【修炼界面】再开一次',
+    TRIGGERS,
+  )
+  assert.deepEqual(
+    [...both].sort((a, b) => a - b),
+    [display.indexOf('<body class="a"'), display.indexOf('<body class="b"')].sort((a, b) => a - b),
+  )
+
+  // 无命中 / 无 trigger / 空文本：fail closed，返回空集合。
+  assert.equal(trustDocs(display, '模型凭空输出的可执行文档', TRIGGERS).size, 0)
+  assert.equal(trustDocs(display, '【修炼界面】开场', []).size, 0)
+  assert.equal(trustDocs('', '【修炼界面】', TRIGGERS).size, 0)
+  assert.equal(trustDocs(display, '', TRIGGERS).size, 0)
+
+  // 无 script 的静态 HTML 不参与配对，不会占掉命中名额。
+  const mixed = `叙事。\n<body class="static"><p>纯静态</p></body>\n${first}`
+  const mixedTrusted = trustDocs(mixed, '【修炼界面】开场', TRIGGERS)
+  assert.deepEqual([...mixedTrusted], [mixed.indexOf('<body class="a"')])
+
+  // 同一条 trigger 命中两个文档：第二次命中才给第二个文档背书，
+  // 不允许一次命中放行多个文档。
+  const oneHitTwoDocs = `叙事。\n${first}\n${second}`
+  assert.equal(
+    trustDocs(oneHitTwoDocs, '【修炼界面】只出现一次', TRIGGERS).size,
+    1,
+  )
 })
 
 // ─── segmentShellContent（原地渲染分段器）───────────────────────────────

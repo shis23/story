@@ -275,26 +275,47 @@ impl TurnWorkflow {
         let new_attempt_id = new_attempt.attempt_id.clone();
         // P0-4：regenerate Attempt 落盘失败不能吞掉，否则后处理会把 Turn
         // 推到 AwaitingAcceptance 却找不到 Attempt，形成无法 accept 的死锁。
-        if let Err(e) = self.storage.update_turn_record(request.turn_id, |record| {
-            turn_lifecycle::append_regenerate_attempt(record, new_attempt);
-        }) {
-            if let Err(comp_e) = self
-                .conv_store
-                .soft_delete_variant(request.conversation_id, request.previous_variant_id)
-            {
-                tracing::error!(
-                    "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
-                    request.previous_variant_id
-                );
+        // S-05：与 SQLite preaccept UoW 同语义——Turn 一旦进入 Committing
+        // （副作用已开始）或终态，拒绝改写 Attempt（否则会破坏幂等重放日志 /
+        // 覆盖 Degraded 终态）。
+        match self.storage.mutate_turn_if(
+            request.turn_id,
+            |record| turn_lifecycle::json_writeback_allowed(&record.status),
+            |record| {
+                turn_lifecycle::append_regenerate_attempt(record, new_attempt);
+            },
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "Turn {} 已进入提交/终态，拒绝 regenerate（与 SQLite 同语义）",
+                    request.turn_id
+                ));
             }
-            let _ = self.storage.update_turn_record(request.turn_id, |record| {
-                record.status = TurnStatus::Failed;
-                record.failure_reason = Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
-                record.touch();
-            });
-            return Err(format!(
-                "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
-            ));
+            Err(e) => {
+                if let Err(comp_e) = self
+                    .conv_store
+                    .soft_delete_variant(request.conversation_id, request.previous_variant_id)
+                {
+                    tracing::error!(
+                        "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
+                        request.previous_variant_id
+                    );
+                }
+                // S-14：补偿写入失败也必须可见（旧实现 `let _ =` 静默吞掉）。
+                if let Err(comp_e) = self.storage.update_turn_record(request.turn_id, |record| {
+                    record.status = TurnStatus::Failed;
+                    record.failure_reason = Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
+                    record.touch();
+                }) {
+                    tracing::error!(
+                        "regenerate Attempt 持久化失败后，标记 Turn Failed 也失败: {comp_e}（原错误: {e}）"
+                    );
+                }
+                return Err(format!(
+                    "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
+                ));
+            }
         }
         Ok(DraftAttemptOutcome {
             attempt_id: new_attempt_id,
@@ -381,9 +402,15 @@ impl TurnWorkflow {
             let turn_id = turn.turn_id.clone();
             if let Some(att) = turn.find_attempt_by_variant(node_id) {
                 let attempt_id = att.attempt_id.clone();
+                // S-05：mark-stale 属于「提交前回写」，与 SQLite preaccept UoW 同语义：
+                // Turn 进入 Committing / 终态后拒绝改写（否则会覆盖 Degraded 终态或
+                // 破坏幂等重放日志）。
                 match self.storage.mutate_turn_if(
                     &turn_id,
-                    |record| record.find_attempt(&attempt_id).is_some(),
+                    |record| {
+                        turn_lifecycle::json_writeback_allowed(&record.status)
+                            && record.find_attempt(&attempt_id).is_some()
+                    },
                     |record| {
                         if let Some(a) = record.find_attempt_mut(&attempt_id) {
                             a.status = storyforge_domain::turn::AttemptStatus::Stale;
@@ -391,7 +418,13 @@ impl TurnWorkflow {
                         record.touch();
                     },
                 ) {
-                    Ok(_) => {}
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // 编辑尚未提交——整体失败，保持原子语义（与 SQLite 同文案）。
+                        return Err(format!(
+                            "Turn {turn_id} 已进入提交/终态，拒绝标记 Attempt 为 Stale（与 SQLite 同语义）"
+                        ));
+                    }
                     Err(write_error) => {
                         // 编辑尚未提交——整体失败，保持原子语义。
                         return Err(format!(
@@ -1413,6 +1446,13 @@ pub fn preview_mvu_apply_for_backend(
             .get_card_by_source(source_character_id)
             .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?
     };
+    // M-16（跨域委派 review-meta-plugin）：preview 必须与 apply 同参——两条 apply
+    // 路径（JSON `meta_apply_mvu_schema_in_store`、SQLite `sqlite_mvu_repo::apply_schema`）
+    // 都在应用边界归一旧记法键，preview 若用未归一 schema，会把「覆盖」报成「新增」，
+    // 且存量旧记法下 `has_changes=false` 会把 apply 按钮误置灰。
+    let normalized_mvu_schema = storyforge_domain::variables::normalize_schema_keys(
+        mvu.translation.variable_schema.clone(),
+    );
     let previews: Vec<storyforge_app_meta::MvuApplyPreview> = stored_card
         .card
         .character_definitions
@@ -1420,7 +1460,7 @@ pub fn preview_mvu_apply_for_backend(
         .map(|def| {
             storyforge_app_meta::compute_apply_preview(
                 &def.variable_schema,
-                &mvu.translation.variable_schema,
+                &normalized_mvu_schema,
                 def.id.as_str(),
                 &def.name,
                 source_character_id.as_str(),

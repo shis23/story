@@ -262,7 +262,7 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 写作和重 roll 通过 `PipelineEvent` 推给前端（定义在 `crates/domain/src/agent.rs`），完整变体：
 
 - `Started { session_id }`
-- `StateChanged { state }`（PipelineState：Generating / Editing / Review / Committed / Aborted）
+- `StateChanged { state }`（PipelineState，`crates/domain/src/agent.rs:371-386` 共 7 个变体：Idle / Directing / Delegating / Editing / Review / Committed / Aborted；2026-09-13 更正：原文写的 `Generating` 不存在，且缺 Idle/Directing/Delegating）
 - `DirectorStarted`
 - `DirectorProgress { delta }`
 - `DirectorDone { scene_brief, subagent_count }`
@@ -278,9 +278,15 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 - `PostProcessStarted`
 - `PostProcessDone { knowledge_count, variable_count, task_count }`
 - `PostProcessFailed { reason }`（best-effort，不阻断成文）
-- `PostProcessSkipped { reason }`（AgentProfileConfig 关闭 postprocess/summarizer 时发出，区别于真失败）
+- `PostProcessSkipped { reason }`（两种情况：① `AgentProfileConfig` 关闭 postprocess/summarizer 时发出，区别于真失败；② **取消**——`crates/tauri-app/src/runtime_support.rs:131-177` 的 `postprocess_pipeline_event`：runner 前/后取消或结果 `skipped_reason="cancelled"` 时发恰好一个 `PostProcessSkipped { reason: "postprocess cancelled" }`。`PostProcessFailed` 只在持久化真失败（`Err`）时发出，其它 skipped 原因不发事件；2026-09-13 回写，W-28）
 - `SummaryDone { char_count }`
 - `Committed { session_id, variant_id }`
 - `Error { message }`
 
 前端应把这些事件视为流水线观察信号，不应把临时事件当成持久状态真相源。
+
+## 轮次内部结果：取消 / 跳过 / 失败（2026-09-13 回写，W-07 / D-04 / M-08）
+
+- `SequentialActorOutcome`（`crates/app-pipeline/src/sequential_crew.rs`）：`pub(crate) enum SequentialActorOutcome { Cancelled, SceneClosed, Failed(String) }`，配 `into_agent_error()` 与 `impl From<AgentError>`；顺序子 Agent 的结果类型为 `Vec<Result<Performance, SequentialActorOutcome>>`，据此区分「取消」「场景已关闭（正常跳过）」与「真失败」，三者不再合并成一个模糊错误。
+- `compile_turn_dossier` 签名（`crates/app-pipeline/src/turn_dossier.rs`）：`compile_turn_dossier(intent, runtime, pending_tasks, story_clock: &str, max_full_actors)`。`story_clock` 为新增参数，两处调用点（`app-pipeline/src/lib.rs:1029`、`:1225`）由硬编码 `""` 改为 `&ctx.story_clock`——修复前 StoryTime 类任务在 writer 路径永不命中（D-04）。
+- 插件 prompt hook 回调契约（M-08）：`pluginPromptHookResult(requestId, messages, error, pluginId?, modifierPluginIds?)`；后端 `prompt_mutation_denial(registry, plugin_id, modifier_plugin_ids)` 只在**声明了改写权限的插件**存在时接受改写，未声明改写者时后端丢弃 messages 并记审计。

@@ -64,6 +64,10 @@ jobs:
           npm ci
           npm run build
 
+      - name: Contract test (frontend invoke ↔ Tauri command registry)
+        working-directory: frontend
+        run: node --test tests/tauri-command-contract.test.mjs
+
       - name: Install pinned tauri-cli
         shell: pwsh
         run: |
@@ -72,6 +76,14 @@ jobs:
           if ($ver -notmatch [regex]::Escape($env:TAURI_CLI_VERSION)) {
             throw "Expected tauri-cli $($env:TAURI_CLI_VERSION), got: $ver"
           }
+
+      # G-07 (review-2026-09-13): fail closed before building when the pushed tag
+      # disagrees with the application version in tauri.conf.json / Cargo.toml.
+      # workflow_dispatch runs are branch-based, so this check is tag-only.
+      - name: Verify tag matches app version (fail closed)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/release-build/verify-tag-version.ps1 -Tag '${{ github.ref_name }}'
 
       - name: Build Windows bundle (msi + nsis)
         run: cargo tauri build --ci
@@ -148,6 +160,10 @@ jobs:
         run: |
           npm ci
           npm run build
+
+      - name: Contract test (frontend invoke ↔ Tauri command registry)
+        working-directory: frontend
+        run: node --test tests/tauri-command-contract.test.mjs
 
       - name: Install pinned tauri-cli
         run: |
@@ -244,7 +260,7 @@ jobs:
 
             - **Windows**：下载 `*-setup.exe`（NSIS 安装器）或 `*.msi`，双击安装。
               首次运行可能有 SmartScreen 警告，点「更多信息 → 仍要运行」即可（EXE 未做代码签名）。
-            - **Android**：下载 `*-arm64-*-release.apk`，手机允许「安装未知来源应用」后安装。
+            - **Android**：下载 `*arm64-release.apk`（实际资产名 `app-arm64-release.apk`），手机允许「安装未知来源应用」后安装。
               仅支持 arm64（主流 Android 手机）。
 
             构建详情见 Actions 运行记录；每个产物都有按平台分文件的校验和（`SHA256SUMS-windows.txt` / `SHA256SUMS-android.txt`）。

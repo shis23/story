@@ -34,11 +34,15 @@ function classes() {
     :type="type"
     :class="classes()"
     :disabled="disabled || loading"
+    :aria-busy="loading ? 'true' : undefined"
     @click="$emit('click', $event)"
   >
+    <!-- F-38：loading 时此前整段默认槽被 spinner 替换 —— 按钮文案（"测试连接"、
+         "保存中…"）永远不会显示，同一工具条内按钮还会跳动。现在保留文案，
+         spinner 插在文案前；测试契约同步更新（button.test.mjs）。 -->
     <span v-if="loading" class="inline-block animate-spin opacity-70" aria-hidden="true">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
     </span>
-    <slot v-else />
+    <slot />
   </button>
 </template>

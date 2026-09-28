@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, reactive, computed } from 'vue'
 import { useCampaignStore } from './campaign.js'
 import { buildGreetingOptionsFromDetail } from '../utils/campaignGreetingOptions.js'
+import { generationModeCatalog } from '../utils/generationModes.js'
 
 // 写作 / 流水线运行时状态。
 // 来源 App.vue:26-27, 285-292, 307-311, 314-317, 320-322, 326-333, 342。
@@ -13,12 +14,12 @@ export const useWritingStore = defineStore('writing', () => {
   const selectedGreetingIndex = ref(0) // App.vue:326 — 开场白选择索引
   const generationModeByCampaign = ref({})
   const pendingReceipt = ref(null)
-  const validGenerationModes = new Set([
-    'continuation',
-    'duet',
-    'sequential_crew',
-    'big_scene',
-  ])
+  // 校验集从档位目录派生（单一事实源）：ComposerBar 只渲染目录里的档位，任何不在
+  // 目录中的值都不得成为当前档位。典型是历史遗留的 `big_scene`——它在后端仍是显式
+  // 兼容模式（docs/AGENT_INTERFACES.md:12、README.md:19），但前端产品面只提供三档；
+  // 若把它当合法值接受，旧 localStorage 里的 `big_scene` 会让用户处在"看不到选中项"
+  // 的昂贵模式（W-31 / N-R2-09）。派生写法同时保证"校验集 == 目录值集"。
+  const validGenerationModes = new Set(generationModeCatalog.map((mode) => mode.value))
   try {
     const saved = globalThis.localStorage?.getItem('storyforge:generation-mode-by-campaign')
     const parsed = saved ? JSON.parse(saved) : null

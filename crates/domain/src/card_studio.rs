@@ -5,9 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::character::{
-    Character, StCharacterCard, StCharacterData, StWorldInfoBook, StWorldInfoEntry,
-};
+use crate::character::{Character, StCharacterCard, StCharacterData};
 use crate::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
 use crate::{Id, Source};
 
@@ -149,8 +147,11 @@ pub struct CardArtifacts {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardProject {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub mode: CardProjectMode,
     #[serde(default)]
     pub brief: String,
@@ -188,7 +189,9 @@ pub struct CardProject {
     /// B 路径：切分后的摘录（用于 prefill / style）
     #[serde(default)]
     pub novel_excerpts: Vec<String>,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -536,10 +539,11 @@ pub fn apply_novel_prefill_json(
                 .get("constant")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(keys.is_empty());
+            // D-12：越界 order 不得静默回绕（4294967297 as i32 == 1 会打乱注入顺序）
             let order = item
                 .get("order")
                 .and_then(|v| v.as_i64())
-                .map(|n| n as i32)
+                .and_then(|n| i32::try_from(n).ok())
                 .unwrap_or(((i as i32) + 1) * 10);
             entries.push(WorldviewDraftEntry {
                 keys,
@@ -569,7 +573,40 @@ pub fn apply_novel_prefill_json(
     Ok(())
 }
 
+/// 从 ST 条目取触发概率（导出侧写 `extensions.probability`，ST 原生为 entry-level）。
+fn reverse_parse_probability(e: &WorldInfoEntry) -> Option<u8> {
+    e.extensions
+        .get("probability")
+        .or_else(|| e.extra.get("probability"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u8::try_from(v.min(100)).ok())
+}
+
+/// 从 ST 条目取"排除递归触发"（兼容 snake/camel 两种键名）。
+fn reverse_parse_exclude_recursion(e: &WorldInfoEntry) -> Option<bool> {
+    e.extensions
+        .get("exclude_recursion")
+        .or_else(|| e.extra.get("exclude_recursion"))
+        .or_else(|| e.extra.get("excludeRecursion"))
+        .and_then(|v| v.as_bool())
+}
+
+/// 从 ST 条目取分组名（空白视为未分组）。
+fn reverse_parse_group(e: &WorldInfoEntry) -> Option<String> {
+    e.extensions
+        .get("group")
+        .or_else(|| e.extra.get("group"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|g| !g.trim().is_empty())
+}
+
 /// Reverse-parse a domain Character into editable CardArtifacts.
+///
+/// D-24：高级策略位（probability / exclude_recursion / group）此前被
+/// `..Default::default()` 静默丢弃，Mode-C 修订会丢触发概率/递归排除/分组。
+/// 导出侧写在 `extensions`，ST 原生写法是 entry-level（落在 flatten 的 `extra`），
+/// 两侧都读。
 pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
     let worldview_entries = character
         .embedded_world_info
@@ -584,7 +621,9 @@ pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
                     constant: e.constant
                         || matches!(e.route, LoreRoute::Constant | LoreRoute::Both),
                     order: e.order,
-                    ..WorldviewDraftEntry::default()
+                    probability: reverse_parse_probability(e),
+                    exclude_recursion: reverse_parse_exclude_recursion(e),
+                    group: reverse_parse_group(e),
                 })
                 .collect::<Vec<_>>()
         })
@@ -667,6 +706,27 @@ fn issue(
 
 fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
+}
+
+/// `run_checks` 产出的确定性规则 code（不含下标族的 `worldview_{idx}_*`）。
+const KNOWN_RULE_CODES: &[&str] = &[
+    "name_required",
+    "description_required",
+    "first_mes_required",
+    "personality_missing",
+    "description_has_personality",
+    "bagua_wording",
+    "worldview_empty",
+    "opening_no_hook",
+    "personality_pending_handwrite",
+];
+
+/// LLM 报的 `code` 是否指向确定性规则族（D-16）。
+///
+/// 只有指向真实规则的 code 才允许保持 `Error`；其余一律降级 `Warning`——
+/// 判据是规则 code 本身，而不是模型可以自由选择的子串。
+fn is_known_rule_code(code: &str) -> bool {
+    KNOWN_RULE_CODES.contains(&code) || code.starts_with("worldview_")
 }
 
 /// Structural + lightweight methodology heuristics (L1/L2).
@@ -911,12 +971,10 @@ pub fn merge_review_reports(base: CheckReport, llm_value: &serde_json::Value) ->
                 "info" => CheckSeverity::Info,
                 _ => CheckSeverity::Warning,
             };
-            // LLM cannot alone invent hard blockers for missing core fields; demote unknown errors to warning
-            // unless code is clearly aligned with methodology.
-            let severity = if matches!(severity, CheckSeverity::Error)
-                && !code.contains("required")
-                && !code.contains("keys")
-                && !code.contains("empty")
+            // LLM cannot alone invent hard blockers for missing core fields; demote
+            // errors that do not point at a real deterministic rule to warning.
+            // D-16：判据改为"code 是否属于确定性规则族"，不再用模型可自由选择的子串。
+            let severity = if matches!(severity, CheckSeverity::Error) && !is_known_rule_code(&code)
             {
                 CheckSeverity::Warning
             } else {
@@ -990,7 +1048,7 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
         return Err(format!("编译前检查失败: {}", msgs.join("; ")));
     }
 
-    let mut warnings: Vec<String> = report
+    let warnings: Vec<String> = report
         .issues
         .iter()
         .filter(|i| matches!(i.severity, CheckSeverity::Warning))
@@ -1018,11 +1076,9 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
                     .map(|k| k.trim().to_string())
                     .filter(|k| !k.is_empty())
                     .collect();
-                if keys.is_empty() && !constant {
-                    warnings.push(format!(
-                        "条目 #{i} 无 keys，已跳过 keys 校验（应被 checks 拦住）"
-                    ));
-                }
+                // D-22：此处原有一条"无 keys，已跳过 keys 校验"告警，但该条件
+                // 已被上面的 `!report.ok` 提前返回拦死（run_checks 的
+                // `worldview_{idx}_keys` 是 Error），属不可达分支，已删除。
                 // Phase 3 骨架：高级策略进 extensions（ST 一等字段全量映射后续做）
                 let mut ext = serde_json::Map::new();
                 if let Some(p) = e.probability {
@@ -1615,10 +1671,16 @@ pub fn apply_stage_json(
             {
                 artifacts.name = s.trim().to_string();
             }
-            if let Some(s) = value.get("description").and_then(|v| v.as_str()) {
+            // D-08：空串是 JSON-mode 模型常见的失败形态，不得静默清空用户已有内容
+            // （name 早有守卫，description/scenario 此前没有）。
+            if let Some(s) = value.get("description").and_then(|v| v.as_str())
+                && !s.trim().is_empty()
+            {
                 artifacts.description = s.to_string();
             }
-            if let Some(s) = value.get("scenario").and_then(|v| v.as_str()) {
+            if let Some(s) = value.get("scenario").and_then(|v| v.as_str())
+                && !s.trim().is_empty()
+            {
                 artifacts.scenario = s.to_string();
             }
             if let Some(arr) = value.get("tags").and_then(|v| v.as_array()) {
@@ -1667,7 +1729,12 @@ pub fn apply_stage_json(
                     .get("constant")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let order = item.get("order").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
+                // D-12：越界 order 回退默认值，不静默回绕
+                let order = item
+                    .get("order")
+                    .and_then(|v| v.as_i64())
+                    .and_then(|n| i32::try_from(n).ok())
+                    .unwrap_or(100);
                 let keys = item
                     .get("keys")
                     .and_then(|v| v.as_array())
@@ -1752,35 +1819,6 @@ pub fn extract_json_object(text: &str) -> Result<serde_json::Value, String> {
         }
     }
     Err("模型输出中未找到可用 JSON 对象".into())
-}
-
-/// Helper used by compile tests / export: ensure StWorldInfoBook can be built from drafts.
-#[allow(dead_code)]
-pub fn drafts_to_st_book(entries: &[WorldviewDraftEntry]) -> StWorldInfoBook {
-    StWorldInfoBook {
-        entries: entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| StWorldInfoEntry {
-                id: Some(i as i32),
-                keys: e.keys.clone(),
-                key_alias: None,
-                secondary_keys: None,
-                keysecondary_alias: None,
-                content: Some(e.content.clone()),
-                constant: e.constant,
-                selective: !e.constant,
-                selective_logic: Some(0),
-                order: Some(e.order),
-                position: Some(serde_json::Value::Number(0.into())),
-                disable: Some(false),
-                depth: Some(4),
-                extensions: serde_json::json!({}),
-                extra: Default::default(),
-            })
-            .collect(),
-        extra: Default::default(),
-    }
 }
 
 #[cfg(test)]
@@ -2369,5 +2407,161 @@ mod tests {
         assert_eq!(arts.worldview_entries.len(), 2);
         assert!(arts.style_notes.as_deref().unwrap_or("").contains("白描"));
         assert!(arts.notes.contains("配角"));
+    }
+
+    // ─── D-08：空串不得清空用户已有 description/scenario ───────────────────
+
+    #[test]
+    fn basic_stage_json_does_not_wipe_with_empty_strings() {
+        let mut arts = CardArtifacts {
+            name: "已有名字".into(),
+            description: "用户手写的简介".into(),
+            scenario: "用户手写的场景".into(),
+            ..CardArtifacts::default()
+        };
+        // JSON-mode 模型常见的失败形态：字段存在但为空串
+        let value = serde_json::json!({
+            "name": "   ",
+            "description": "",
+            "scenario": "   "
+        });
+        apply_stage_json(STAGE_BASIC, &mut arts, &value).expect("空值不应报错");
+        assert_eq!(arts.name, "已有名字");
+        assert_eq!(
+            arts.description, "用户手写的简介",
+            "空 description 不得清空（D-08）"
+        );
+        assert_eq!(
+            arts.scenario, "用户手写的场景",
+            "空 scenario 不得清空（D-08）"
+        );
+
+        // 非空值仍然覆盖
+        let ok = serde_json::json!({"description": "新的简介", "scenario": "新的场景"});
+        apply_stage_json(STAGE_BASIC, &mut arts, &ok).unwrap();
+        assert_eq!(arts.description, "新的简介");
+        assert_eq!(arts.scenario, "新的场景");
+    }
+
+    // ─── D-12：越界 order 不得静默回绕 ────────────────────────────────────
+
+    #[test]
+    fn out_of_range_order_is_not_wrapped_silently() {
+        let mut arts = CardArtifacts::default();
+        let v = serde_json::json!({
+            "worldview_entries": [
+                {"keys": ["k"], "content": "条目", "order": 4_294_967_297i64},
+                {"keys": ["k2"], "content": "条目2", "order": 20}
+            ]
+        });
+        apply_novel_prefill_json(&mut arts, &v).unwrap();
+        assert_eq!(
+            arts.worldview_entries[0].order, 10,
+            "越界 order 必须回退默认序号，不得回绕成 1（D-12）"
+        );
+        assert_eq!(arts.worldview_entries[1].order, 20, "合法 order 保留");
+    }
+
+    // ─── D-15：CardProject 向后兼容 ────────────────────────────────────────
+
+    #[test]
+    fn card_project_deserializes_legacy_missing_fields() {
+        // 老/残缺记录（缺 id/name/mode/created_at/updated_at）必须能单独反序列化，
+        // 否则整份 card_projects.json 会回退空列表（D-15）
+        let legacy = serde_json::json!({
+            "brief": "旧记录",
+            "artifacts": { "name": "旧卡" }
+        });
+        let project: CardProject =
+            serde_json::from_value(legacy).expect("缺字段的旧记录必须可反序列化");
+        assert_eq!(project.id, "");
+        assert_eq!(project.name, "");
+        assert_eq!(project.mode, CardProjectMode::FromScratch);
+        assert_eq!(project.created_at, "");
+        assert_eq!(project.updated_at, "");
+        assert_eq!(project.current_stage, STAGE_BRIEF);
+    }
+
+    // ─── D-16：LLM 严重度判据改为规则码，而非任意子串 ─────────────────────
+
+    #[test]
+    fn llm_error_severity_requires_known_rule_code() {
+        let base = run_checks(&sample_ok_artifacts());
+        assert!(base.ok);
+
+        // 凭空发明的 code：即使模型自称 severity=error、code 里带 empty/keys/required 也只能是 Warning
+        let invented = serde_json::json!({
+            "issues": [
+                {"severity": "error", "code": "my_empty_keys_required_blocker", "message": "模型自创硬阻断"},
+                {"severity": "error", "code": "fatal", "message": "模型自创致命错误"}
+            ]
+        });
+        let report = merge_review_reports(base.clone(), &invented);
+        assert!(report.ok, "自创 code 不得把报告变成不可通过（D-16）");
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !matches!(i.severity, CheckSeverity::Error)),
+            "自创 code 必须降级为 Warning：{:?}",
+            report
+                .issues
+                .iter()
+                .map(|i| (&i.code, &i.severity))
+                .collect::<Vec<_>>()
+        );
+
+        // 指向真实规则族的 code 才保留 Error
+        let real = serde_json::json!({
+            "issues": [
+                {"severity": "error", "code": "description_required", "message": "描述缺失"},
+                {"severity": "error", "code": "worldview_0_empty", "message": "世界书条目空"}
+            ]
+        });
+        let report = merge_review_reports(base, &real);
+        assert!(!report.ok);
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|i| matches!(i.severity, CheckSeverity::Error))
+                .count(),
+            2
+        );
+    }
+
+    // ─── D-24：反解析必须带回高级策略位 ───────────────────────────────────
+
+    #[test]
+    fn reverse_parse_keeps_advanced_worldview_policy_fields() {
+        let arts = CardArtifacts {
+            name: "策略卡".into(),
+            description: "d".into(),
+            first_mes: "f".into(),
+            worldview_entries: vec![WorldviewDraftEntry {
+                keys: vec!["暗号".into()],
+                content: "概率触发条目。".into(),
+                constant: false,
+                order: 10,
+                probability: Some(30),
+                exclude_recursion: Some(true),
+                group: Some("支线".into()),
+            }],
+            ..CardArtifacts::default()
+        };
+        let compiled = compile_artifacts(&arts).expect("编译成功");
+        let reversed = reverse_parse_character(&compiled.character);
+        let entry = &reversed.worldview_entries[0];
+        assert_eq!(
+            entry.probability,
+            Some(30),
+            "反解析不得丢 probability（D-24）"
+        );
+        assert_eq!(
+            entry.exclude_recursion,
+            Some(true),
+            "反解析不得丢 exclude_recursion"
+        );
+        assert_eq!(entry.group.as_deref(), Some("支线"), "反解析不得丢 group");
     }
 }

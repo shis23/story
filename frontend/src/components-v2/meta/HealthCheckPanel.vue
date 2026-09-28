@@ -233,6 +233,11 @@ defineExpose({ refreshTypedPatches })
           <div v-if="patch.affected_id" class="text-ink-soft mb-1 break-all text-[11px]">
             ID: {{ patch.affected_id }}
           </div>
+          <!-- M-27c：preview 失败时 _stale 已 fail-closed，这里把原因显示出来，
+               否则用户只看到「已过期 + 接受置灰」而无从判断。 -->
+          <div v-if="patch._previewError" class="text-err mb-1 break-all text-[11px]">
+            预览失败（已标记过期）: {{ patch._previewError }}
+          </div>
 
           <!-- diff 展开区 -->
           <button

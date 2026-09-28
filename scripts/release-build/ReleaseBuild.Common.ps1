@@ -479,11 +479,44 @@ function Test-ReleaseArtifactIsFresh {
     return ($writeUtc -ge $NotBeforeUtc.AddSeconds(-2))
 }
 
+# Single source of truth for where the unquoted-assignment rule applies. The rule
+# false-positives on source/prose idioms (`let secret = ...`,
+# `api_key: String` followed by a long unspaced sentence), so both the tracked
+# scan and the untracked-input scan restrict it to config/script formats.
+function Get-ReleaseSecretAssignmentExtensions {
+    return @(
+        '.json', '.yaml', '.yml', '.toml', '.sh', '.ps1', '.psm1', '.psd1',
+        '.ini', '.conf', '.cfg', '.env', '.properties'
+    )
+}
+
+function Test-ReleaseUnquotedSecretScanAppliesToPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $fileName = [System.IO.Path]::GetFileName($RelativePath)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    if ([string]::IsNullOrEmpty($extension)) {
+        # Dotfiles such as `.env` carry assignments but expose no extension.
+        return $fileName.StartsWith('.')
+    }
+    return ((Get-ReleaseSecretAssignmentExtensions) -contains $extension.ToLowerInvariant())
+}
+
 function Find-ReleaseSecretPatternFindings {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
-        [string]$Text
+        [string]$Text,
+
+        # Prose and source files (Markdown notes, Rust/TS sources) legitimately
+        # contain text such as "api_key: String" followed by prose; the
+        # unquoted-assignment rule only carries signal in config/script files.
+        # Callers scanning arbitrary untracked inputs pass this switch for
+        # non-config paths, mirroring the tracked scan's config-only pathspec
+        # scope (see Get-ReleaseSecretAssignmentExtensions).
+        [Switch]$SkipUnquotedAssignment
     )
 
     if ([string]::IsNullOrEmpty($Text)) {
@@ -527,6 +560,7 @@ function Find-ReleaseSecretPatternFindings {
 
     $findings = @()
     foreach ($rule in $rules) {
+        if ($SkipUnquotedAssignment -and $rule.Name -eq 'unquoted secret assignment') { continue }
         if ([regex]::IsMatch($Text, $rule.Pattern)) {
             $findings += ("secret-pattern:{0}" -f $rule.Name)
         }
@@ -717,13 +751,12 @@ function Invoke-ReleaseSecretScan {
     )
 
     # Files where unquoted secret assignments carry real signal: config and
-    # script formats, not Rust/JS/TS source. Git pathspec globs match at any
+    # script formats, not Rust/JS/TS/Markdown. Git pathspec globs match at any
     # depth (a leading ':' denotes a pathspec magic; (glob) matches across /).
-    $configOnlyPaths = @(
-        ':(glob)*.json', ':(glob)*.yaml', ':(glob)*.yml', ':(glob)*.toml',
-        ':(glob)*.sh', ':(glob)*.ps1', ':(glob)*.psm1', ':(glob)*.ini',
-        ':(glob)*.conf', ':(glob)*.cfg', ':(glob)*.env', ':(glob)*.properties'
-    )
+    # Derived from Get-ReleaseSecretAssignmentExtensions so the tracked scan and
+    # the untracked-input scan cannot drift apart.
+    $configOnlyPaths = @((Get-ReleaseSecretAssignmentExtensions) |
+            ForEach-Object { ":(glob)*$_" })
 
 
     $findings = New-Object System.Collections.Generic.List[string]
@@ -817,7 +850,11 @@ function Invoke-ReleaseSecretScan {
         } catch {
             throw ("Secret scan failed: cannot read untracked build-input '{0}'." -f (Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot))
         }
-        $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
+        # The unquoted-assignment rule is scoped to config/script formats, exactly
+        # like the tracked scan: review notes and other prose legitimately contain
+        # text such as "api_key: String" and would otherwise fail the gate.
+        $skipUnquotedAssignment = -not (Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath $normalized)
+        $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text -SkipUnquotedAssignment:$skipUnquotedAssignment)
         foreach ($hit in $patternHits) {
             # Report rule name + path only; never echo secret values.
             $ruleName = $hit -replace '^secret-pattern:', ''
@@ -861,7 +898,12 @@ function Invoke-ReleaseSecretScan {
                 # Unreadable/binary content: skip, do not treat as scan input.
                 continue
             }
-            $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
+            # Same scope as the repo-side scans (task-24): the unquoted-assignment
+            # rule only carries signal for config/script files. Evidence roots also
+            # hold prose reports (review notes, summary.md) where a bare type
+            # annotation plus an unspaced line would otherwise fail the gate.
+            $skipUnquotedAssignment = -not (Test-ReleaseUnquotedSecretScanAppliesToPath -RelativePath $file.Name)
+            $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text -SkipUnquotedAssignment:$skipUnquotedAssignment)
             foreach ($hit in $patternHits) {
                 # Report rule name + path only; never echo secret values.
                 $ruleName = $hit -replace '^secret-pattern:', ''
@@ -6698,7 +6740,15 @@ if ((Get-Module Pester | Select-Object -First 1).Version -ne $requiredPester) {
 function Assert-ReleaseWorkflowStaticContract {
     <#
     .SYNOPSIS
-    Static governance checks for tracked Gitea release workflows.
+    Static governance checks for the retained (legacy) Gitea release workflows.
+
+    .DESCRIPTION
+    LEGACY as of 2026-09-06: Gitea Actions was decommissioned (see
+    .gitea/DECOMMISSIONED.md). The tracked `.gitea/workflows/*` files are kept
+    as historical records and this contract keeps them from silently rotting. It is NOT
+    an active CI gate: the release path is .github/workflows/release.yml and the release
+    entry scripts must not depend on `.gitea` (asserted in ReleaseBuild.CI.Tests.ps1).
+    See docs/review-2026-09-13/fixes/09-goals-scripts-fixes.md (G-06).
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepoRoot

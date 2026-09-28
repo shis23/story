@@ -78,6 +78,12 @@ pub struct TypedPatch {
     pub diff: Vec<FieldDiff>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub status: TypedPatchStatus,
+    /// 提案时所绑定的 Campaign id（Gate 3 作用域绑定，M-03）。
+    /// propose 时从 `PreviewInput.campaign` 盖章；accept 只允许写进同一 Campaign，
+    /// 否则 A 战役的提案会被应用到 B 战役的同名变量/core 数据上。
+    /// 旧内存 patch 无此字段（serde default）时不做跨战役校验，保持向后兼容。
+    #[serde(default)]
+    pub campaign_id: Option<String>,
     /// 提案时的 campaign revision（Gate 4 revision 校验）。
     /// propose 时盖章；accept 时若与当前 revision 不一致则拒绝（stale）。
     /// 旧内存 patch 无此字段（serde default）时跳过校验，保持向后兼容。
@@ -183,15 +189,54 @@ fn action_target_missing(action: &TypedPatchAction, input: &PreviewInput) -> boo
     }
 }
 
+/// 变量写入键（`UpdateCampaignVariable` / `UpdateInstanceVariable`）的取键。
+/// 其它 action 变体不写变量键，返回 `None`。
+fn written_variable_key(action: &TypedPatchAction) -> Option<&str> {
+    match action {
+        TypedPatchAction::UpdateCampaignVariable { key, .. }
+        | TypedPatchAction::UpdateInstanceVariable { key, .. } => Some(key.as_str()),
+        _ => None,
+    }
+}
+
+/// StoryForge 内部保留命名空间前缀（镜像前端 `shellVariableOutbox.js`
+/// 的 `isReservedNamespace`：`key.startsWith('__storyforge')`）。
+const RESERVED_VARIABLE_NAMESPACE: &str = "__storyforge";
+
+/// 校验变量写入键（M-12）：先按 MVU 记法归一（`stat_data.` 前缀 / 斜杠记法
+/// 剥掉后再判保留位，避免 `stat_data.__storyforge_x` 绕过），再拒绝空键与
+/// `__storyforge*` 保留命名空间（大小写不敏感）。
+///
+/// propose（[`build_patch_from_action`]）与 accept（[`validate_patch_preconditions`]）
+/// 共用本函数，判定只有一份。
+fn validate_variable_write_key(action: &TypedPatchAction) -> Result<(), TypedPatchError> {
+    let Some(raw_key) = written_variable_key(action) else {
+        return Ok(());
+    };
+    let key = storyforge_domain::variables::normalize_mvu_key(raw_key);
+    if key.is_empty() {
+        return Err(TypedPatchError::PreconditionFailed(
+            "变量 key 不能为空".into(),
+        ));
+    }
+    if key.to_lowercase().starts_with(RESERVED_VARIABLE_NAMESPACE) {
+        return Err(TypedPatchError::PreconditionFailed(format!(
+            "变量 key「{raw_key}」属于 StoryForge 内部保留命名空间（{RESERVED_VARIABLE_NAMESPACE}*），禁止经 Meta patch 写入"
+        )));
+    }
+    Ok(())
+}
+
 /// 校验 patch 在应用前的全部前置条件（target 存在 + definition/schema 一致）。
 ///
 /// 这是 Preview 与 Accept **共用**的单一权威校验纯函数（Gate 2 Batch 2.4）：
 /// - target 存在性复用 [`action_target_missing`]（与 [`is_patch_stale`] 同源）；
 /// - `SyncInstanceVariables` 额外校验 instance.definition_id 与 action 的 definition_id
 ///   一致、definition 存在、add_keys 均在 schema 内（既有
-///   `meta_typed::validate_typed_patch_targets` 的检查归并于此）。
+///   `meta_typed::validate_typed_patch_targets` 的检查归并于此）；
+/// - 变量写入键（M-12）拒绝空键与 `__storyforge*` 保留命名空间。
 ///
-/// 缺失 target 返回 `TypedPatchError::TargetMissing`；definition/schema 不匹配返回
+/// 缺失 target 返回 `TypedPatchError::TargetMissing`；definition/schema/key 不合法返回
 /// `TypedPatchError::PreconditionFailed`。调用方（Preview/Accept）各自决定如何映射到
 /// 用户可见错误或 stale 标记，但**判定逻辑只此一份**。
 pub fn validate_patch_preconditions(
@@ -203,7 +248,9 @@ pub fn validate_patch_preconditions(
         if action_target_missing(action, input) {
             return Err(target_missing_error(action));
         }
-        // 2. SyncInstanceVariables 的严格前置条件
+        // 2. 变量写入键的保留命名空间/空键校验（M-12，propose 侧同源）
+        validate_variable_write_key(action)?;
+        // 3. SyncInstanceVariables 的严格前置条件
         if let TypedPatchAction::SyncInstanceVariables {
             instance_id,
             definition_id,
@@ -244,7 +291,7 @@ pub fn validate_patch_preconditions(
                 }
             }
         }
-        // 3. RepointInstanceDefinition：若指定新 definition_id，必须存在于快照中。
+        // 4. RepointInstanceDefinition：若指定新 definition_id，必须存在于快照中。
         if let TypedPatchAction::RepointInstanceDefinition {
             new_definition_id: Some(definition_id),
             ..
@@ -297,6 +344,17 @@ pub fn apply_to_snapshot(
 
 // ─── 内部 helpers ────────────────────────────────────────────────────────────
 
+/// 给新建的 patch 盖上作用域章（M-03 / M-09）：`campaign_id` 来自 builder 输入里
+/// 已经可用的 `PreviewInput.campaign`，`campaign_revision` 取同一快照的 revision。
+/// 无 active Campaign（`campaign == None`）时两者保持 `None`，与旧行为一致。
+fn stamp_campaign_scope(mut patch: TypedPatch, input: &PreviewInput) -> TypedPatch {
+    if let Some(campaign) = input.campaign {
+        patch.campaign_id = Some(campaign.id.to_string());
+        patch.campaign_revision = Some(campaign.revision);
+    }
+    patch
+}
+
 fn build_orphan_instance_patch(issue: &HealthIssue, input: &PreviewInput) -> Option<TypedPatch> {
     let affected_id = issue.affected_id.as_deref()?;
     let inst = input
@@ -321,17 +379,21 @@ fn build_orphan_instance_patch(issue: &HealthIssue, input: &PreviewInput) -> Opt
         after: serde_json::Value::Null,
     }];
 
-    Some(TypedPatch {
-        id: uuid::Uuid::new_v4().to_string(),
-        description: format!("将孤立实例 {name} 的 definition_id 清空（降为临时角色）"),
-        source_issue_category: "orphan_instance".into(),
-        affected_id: Some(affected_id.into()),
-        actions,
-        diff,
-        created_at: chrono::Utc::now(),
-        status: TypedPatchStatus::Pending,
-        campaign_revision: None,
-    })
+    Some(stamp_campaign_scope(
+        TypedPatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: format!("将孤立实例 {name} 的 definition_id 清空（降为临时角色）"),
+            source_issue_category: "orphan_instance".into(),
+            affected_id: Some(affected_id.into()),
+            actions,
+            diff,
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: None,
+            campaign_revision: None,
+        },
+        input,
+    ))
 }
 
 fn build_unresolved_knowledge_patch(
@@ -359,17 +421,21 @@ fn build_unresolved_knowledge_patch(
         after: serde_json::Value::Null,
     }];
 
-    Some(TypedPatch {
-        id: uuid::Uuid::new_v4().to_string(),
-        description: format!("删除未解析的知识条目「{truncated}」"),
-        source_issue_category: "unresolved_knowledge".into(),
-        affected_id: Some(affected_id.into()),
-        actions,
-        diff,
-        created_at: chrono::Utc::now(),
-        status: TypedPatchStatus::Pending,
-        campaign_revision: None,
-    })
+    Some(stamp_campaign_scope(
+        TypedPatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: format!("删除未解析的知识条目「{truncated}」"),
+            source_issue_category: "unresolved_knowledge".into(),
+            affected_id: Some(affected_id.into()),
+            actions,
+            diff,
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: None,
+            campaign_revision: None,
+        },
+        input,
+    ))
 }
 
 fn build_orphan_task_reference_patch(
@@ -421,17 +487,21 @@ fn build_orphan_task_reference_patch(
         after: serde_json::Value::Array(after_vec),
     }];
 
-    Some(TypedPatch {
-        id: uuid::Uuid::new_v4().to_string(),
-        description: format!("从任务「{}」移除孤儿角色引用", task.title),
-        source_issue_category: "orphan_task_reference".into(),
-        affected_id: Some(affected_id.into()),
-        actions,
-        diff,
-        created_at: chrono::Utc::now(),
-        status: TypedPatchStatus::Pending,
-        campaign_revision: None,
-    })
+    Some(stamp_campaign_scope(
+        TypedPatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: format!("从任务「{}」移除孤儿角色引用", task.title),
+            source_issue_category: "orphan_task_reference".into(),
+            affected_id: Some(affected_id.into()),
+            actions,
+            diff,
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: None,
+            campaign_revision: None,
+        },
+        input,
+    ))
 }
 
 fn build_variable_schema_mismatch_patch(
@@ -505,22 +575,26 @@ fn build_variable_schema_mismatch_patch(
         remove_keys: remove_keys.clone(),
     }];
 
-    Some(TypedPatch {
-        id: uuid::Uuid::new_v4().to_string(),
-        description: format!(
-            "同步实例「{}」的变量 schema（补 {} 个、删 {} 个字段）",
-            inst.name,
-            add_keys.len(),
-            remove_keys.len()
-        ),
-        source_issue_category: "variable_schema_mismatch".into(),
-        affected_id: Some(affected_id.into()),
-        actions,
-        diff,
-        created_at: chrono::Utc::now(),
-        status: TypedPatchStatus::Pending,
-        campaign_revision: None,
-    })
+    Some(stamp_campaign_scope(
+        TypedPatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: format!(
+                "同步实例「{}」的变量 schema（补 {} 个、删 {} 个字段）",
+                inst.name,
+                add_keys.len(),
+                remove_keys.len()
+            ),
+            source_issue_category: "variable_schema_mismatch".into(),
+            affected_id: Some(affected_id.into()),
+            actions,
+            diff,
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: None,
+            campaign_revision: None,
+        },
+        input,
+    ))
 }
 
 fn apply_action(
@@ -702,6 +776,10 @@ pub fn build_patch_from_action(
     action: TypedPatchAction,
     input: &PreviewInput,
 ) -> Result<TypedPatch, TypedPatchError> {
+    // 变量写入 key 的保留命名空间/空键校验（M-12）：与 accept 侧的
+    // `validate_patch_preconditions` 共用同一判定，propose 阶段即拒绝。
+    validate_variable_write_key(&action)?;
+
     // 校验 target 存在
     match &action {
         TypedPatchAction::UpdateCampaignVariable { .. } => {
@@ -752,17 +830,21 @@ pub fn build_patch_from_action(
         _ => None,
     };
 
-    Ok(TypedPatch {
-        id: uuid::Uuid::new_v4().to_string(),
-        description,
-        source_issue_category: "agent_proposed".into(),
-        affected_id,
-        actions: vec![action],
-        diff,
-        created_at: chrono::Utc::now(),
-        status: TypedPatchStatus::Pending,
-        campaign_revision: None,
-    })
+    Ok(stamp_campaign_scope(
+        TypedPatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            description,
+            source_issue_category: "agent_proposed".into(),
+            affected_id,
+            actions: vec![action],
+            diff,
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: None,
+            campaign_revision: None,
+        },
+        input,
+    ))
 }
 
 /// 为单个 action 构造 diff entries（纯函数，只读 input）。
@@ -1193,6 +1275,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1260,6 +1343,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1311,6 +1395,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1352,6 +1437,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1390,6 +1476,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1614,6 +1701,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1656,6 +1744,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1695,6 +1784,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1743,6 +1833,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
 
@@ -1766,6 +1857,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
         let input = PreviewInput {
@@ -1793,6 +1885,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
         let input = PreviewInput {
@@ -1819,6 +1912,7 @@ mod tests {
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: TypedPatchStatus::Pending,
+            campaign_id: None,
             campaign_revision: None,
         };
         let input = PreviewInput {
@@ -1829,5 +1923,319 @@ mod tests {
             campaign: None,
         };
         assert!(is_patch_stale(&patch, &input));
+    }
+
+    // ── M-03 / M-09：propose 时盖章 campaign 作用域 ────────────────────────
+
+    #[test]
+    fn test_build_patch_from_action_stamps_campaign_id_and_revision() {
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
+        campaign.revision = 7;
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+
+        let patch = build_patch_from_action(
+            "改故事时间".into(),
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "story_clock".into(),
+                value: serde_json::json!("Night 5"),
+            },
+            &input,
+        )
+        .unwrap();
+
+        assert_eq!(
+            patch.campaign_id.as_deref(),
+            Some(campaign.id.as_str()),
+            "agent 提案必须带上提案时所在 Campaign id"
+        );
+        assert_eq!(
+            patch.campaign_revision,
+            Some(7),
+            "agent 提案必须盖 revision，否则 accept 的陈旧性校验恒被跳过"
+        );
+    }
+
+    #[test]
+    fn test_build_patch_from_action_without_campaign_keeps_scope_none() {
+        // 无 active Campaign（legacy 路径）时不盖章，保持向后兼容语义
+        let inst = make_instance("inst-1", Some("def-1"));
+        let input = PreviewInput {
+            instances: &[inst],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let patch = build_patch_from_action(
+            "改 HP".into(),
+            TypedPatchAction::UpdateInstanceVariable {
+                instance_id: Id::from_str("inst-1"),
+                key: "hp".into(),
+                value: serde_json::json!(80),
+            },
+            &input,
+        )
+        .unwrap();
+        assert!(patch.campaign_id.is_none());
+        assert!(patch.campaign_revision.is_none());
+    }
+
+    #[test]
+    fn test_build_patch_for_issue_stamps_campaign_id_and_revision() {
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
+        campaign.revision = 3;
+        let inst = make_instance("inst-1", Some("def-ghost"));
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Error,
+            category: "orphan_instance".into(),
+            message: "孤立实例".into(),
+            affected_id: Some("inst-1".into()),
+        };
+        let input = PreviewInput {
+            instances: std::slice::from_ref(&inst),
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert_eq!(patch.campaign_id.as_deref(), Some(campaign.id.as_str()));
+        assert_eq!(patch.campaign_revision, Some(3));
+    }
+
+    #[test]
+    fn test_build_patch_for_issue_without_campaign_keeps_scope_none() {
+        let inst = make_instance("inst-1", Some("def-ghost"));
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Error,
+            category: "orphan_instance".into(),
+            message: "孤立实例".into(),
+            affected_id: Some("inst-1".into()),
+        };
+        let input = PreviewInput {
+            instances: std::slice::from_ref(&inst),
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert!(patch.campaign_id.is_none());
+        assert!(patch.campaign_revision.is_none());
+    }
+
+    // ── M-12：变量写入键的保留命名空间 / 空键拒绝 ─────────────────────────
+
+    /// 构造一个「能通过 target 存在性」的变量写入 patch（键由调用方指定）
+    fn variable_key_patch(action: TypedPatchAction) -> TypedPatch {
+        TypedPatch {
+            id: "test-key-guard".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: None,
+            actions: vec![action],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+            campaign_id: Some("camp-1".into()),
+            campaign_revision: None,
+        }
+    }
+
+    fn precondition_error(patch: &TypedPatch, input: &PreviewInput) -> TypedPatchError {
+        validate_patch_preconditions(patch, input).expect_err("保留命名空间/空键必须被拒绝")
+    }
+
+    #[test]
+    fn test_preconditions_reject_reserved_campaign_variable_key() {
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+        let patch = variable_key_patch(TypedPatchAction::UpdateCampaignVariable {
+            key: "__storyforge_card_shell_variables".into(),
+            value: serde_json::json!({}),
+        });
+
+        match precondition_error(&patch, &input) {
+            TypedPatchError::PreconditionFailed(msg) => {
+                assert!(msg.contains("__storyforge"), "错误应点名保留前缀: {msg}");
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preconditions_reject_reserved_instance_variable_key() {
+        let inst = make_instance("inst-1", Some("def-1"));
+        let input = PreviewInput {
+            instances: std::slice::from_ref(&inst),
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let patch = variable_key_patch(TypedPatchAction::UpdateInstanceVariable {
+            instance_id: Id::from_str("inst-1"),
+            key: "stat_data.__storyforge_hidden".into(),
+            value: serde_json::json!(1),
+        });
+
+        match precondition_error(&patch, &input) {
+            TypedPatchError::PreconditionFailed(msg) => {
+                assert!(
+                    msg.contains("__storyforge"),
+                    "归一后仍应命中保留前缀: {msg}"
+                );
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preconditions_reject_reserved_key_case_insensitively() {
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+        let patch = variable_key_patch(TypedPatchAction::UpdateCampaignVariable {
+            key: "__StoryForge_Shell".into(),
+            value: serde_json::json!(1),
+        });
+        assert!(matches!(
+            precondition_error(&patch, &input),
+            TypedPatchError::PreconditionFailed(_)
+        ));
+    }
+
+    #[test]
+    fn test_preconditions_reject_empty_variable_keys() {
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+        for key in ["", "   ", "stat_data."] {
+            let patch = variable_key_patch(TypedPatchAction::UpdateCampaignVariable {
+                key: key.into(),
+                value: serde_json::json!(1),
+            });
+            match precondition_error(&patch, &input) {
+                TypedPatchError::PreconditionFailed(msg) => {
+                    assert!(msg.contains("空"), "空键错误消息: {msg}");
+                }
+                other => panic!("expected PreconditionFailed for {key:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_preconditions_accept_normal_variable_keys() {
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let inst = make_instance("inst-1", Some("def-1"));
+        let input = PreviewInput {
+            instances: std::slice::from_ref(&inst),
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+        // 普通键（campaign + instance）必须照旧通过
+        validate_patch_preconditions(
+            &variable_key_patch(TypedPatchAction::UpdateCampaignVariable {
+                key: "story_clock".into(),
+                value: serde_json::json!("Night 5"),
+            }),
+            &input,
+        )
+        .expect("普通 campaign 变量键应通过");
+        validate_patch_preconditions(
+            &variable_key_patch(TypedPatchAction::UpdateInstanceVariable {
+                instance_id: Id::from_str("inst-1"),
+                key: "hp".into(),
+                value: serde_json::json!(80),
+            }),
+            &input,
+        )
+        .expect("普通 instance 变量键应通过");
+        // 前缀相似但不是保留命名空间的键不得误伤
+        validate_patch_preconditions(
+            &variable_key_patch(TypedPatchAction::UpdateCampaignVariable {
+                key: "_storyforge_public".into(),
+                value: serde_json::json!(1),
+            }),
+            &input,
+        )
+        .expect("非 __storyforge 前缀的键应通过");
+    }
+
+    #[test]
+    fn test_build_patch_from_action_rejects_reserved_variable_key() {
+        // propose 阶段即拒绝（与 accept 侧同一判定函数）
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+        let err = build_patch_from_action(
+            "写内部键".into(),
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "__storyforge_card_shell_variables".into(),
+                value: serde_json::json!({}),
+            },
+            &input,
+        )
+        .expect_err("保留命名空间键必须在 propose 阶段被拒绝");
+        assert!(matches!(err, TypedPatchError::PreconditionFailed(_)));
+
+        let err = build_patch_from_action(
+            "空键".into(),
+            TypedPatchAction::UpdateCampaignVariable {
+                key: "  ".into(),
+                value: serde_json::json!(1),
+            },
+            &input,
+        )
+        .expect_err("空键必须在 propose 阶段被拒绝");
+        assert!(matches!(err, TypedPatchError::PreconditionFailed(_)));
+    }
+
+    #[test]
+    fn test_typed_patch_campaign_scope_fields_default_for_legacy_json() {
+        // 旧内存 patch 序列化产物（无 campaign_id / campaign_revision）仍可反序列化
+        let legacy = serde_json::json!({
+            "id": "legacy-1",
+            "description": "旧 patch",
+            "source_issue_category": "agent_proposed",
+            "affected_id": null,
+            "actions": [],
+            "diff": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "pending"
+        });
+        let patch: TypedPatch = serde_json::from_value(legacy).expect("旧格式必须保持可反序列化");
+        assert!(patch.campaign_id.is_none());
+        assert!(patch.campaign_revision.is_none());
     }
 }

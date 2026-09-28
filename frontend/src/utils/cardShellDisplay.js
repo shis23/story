@@ -251,6 +251,10 @@ export function parseStFindRegex(trigger) {
  * display_content only auto-mounts when the message actually contains the
  * marker the card's find_regex rewrites (模型凭空输出的 <script> 文档不算).
  *
+ * 消息级判据。M-19 之后组件改用逐文档的
+ * {@link trustedInlineShellDocStarts}；本函数保留给单文档/整条消息的粗判
+ * （测试与外部调用），不要再用它给「一条消息里的全部内联文档」放行。
+ *
  * @param {string} sourceText message source (pre-display-regex) content
  * @param {Array<{trigger?: string} | string>} triggers manifest InlineHtml shells
  */
@@ -266,6 +270,72 @@ export function matchesAnyInlineShellTrigger(sourceText, triggers) {
     if (re && re.test(cappedText)) return true
   }
   return false
+}
+
+/**
+ * M-19：把「消息源文命中 manifest trigger」的信任粒度收敛到「单个内联文档」。
+ *
+ * 旧实现是 `matchesAnyInlineShellTrigger(整条 sourceContent)` 求值一次，然后
+ * 放行该消息内的**所有**内联 script 文档——只要消息任意一处命中卡的
+ * find_regex（例如模型复述了触发词），其余凭空输出的可执行文档也一并自动
+ * 挂载。判定改为：每个内联文档必须由**一次独立**的 trigger 命中来背书。
+ *
+ * 映射模型（与卡的 display regex 语义对齐）：display_content 由「源文 → 逐
+ * 命中替换」产出，替换保留顺序，因此按出现顺序把第 i 个内联文档配给第 i 个
+ * 源文命中（`displayDoc[i] ↔ sourceMatch[i]`）。这条配对只可能「少配」（某次
+ * 命中被替换成非文档内容）或「截断」（流式期后半个文档还没闭合 ⇒ docs 更少），
+ * 两者都是保守方向——不会把未背书文档配上号。
+ *
+ * 该函数是纯函数：只读文本，不做任何挂载决定（fail closed 由调用方处理：
+ * 未列出的 start 一律走确认卡）。
+ *
+ * @param {string} displayContent MessageItem 渲染用 display_content
+ * @param {string} sourceContent 原始模型文本（display regex 之前）
+ * @param {Array<{trigger?: string} | string>} triggers manifest InlineHtml shells
+ * @returns {Set<number>} 可信内联文档在 displayContent 中的 start 偏移集合
+ */
+export function trustedInlineShellDocStarts(displayContent, sourceContent, triggers) {
+  const trusted = new Set()
+  const displayText = String(displayContent || '')
+  const sourceText = String(sourceContent || '')
+  if (!displayText || !sourceText) return trusted
+
+  const triggerList = Array.isArray(triggers) ? triggers : []
+  if (!triggerList.length) return trusted
+
+  // 与 matchesAnyInlineShellTrigger 同一道 M-7 长度闸（回溯代价随输入增长）。
+  const cappedSource = sourceText.length > MAX_TRIGGER_TEXT_LEN
+    ? sourceText.slice(0, MAX_TRIGGER_TEXT_LEN)
+    : sourceText
+
+  const matchedStarts = []
+  for (const item of triggerList) {
+    const trigger = typeof item === 'string' ? item : item?.trigger
+    const re = parseStFindRegex(trigger)
+    if (!re) continue
+    // 只取「命中起点」：source 命中数与 display 文档数按顺序配对。
+    // 不能用带 g 的 exec 循环（lastIndex 有状态），先去掉 g 再 matchAll。
+    const globalRe = re.global ? re : new RegExp(re.source, `${re.flags}g`)
+    for (const match of cappedSource.matchAll(globalRe)) {
+      matchedStarts.push(match.index)
+    }
+  }
+  if (!matchedStarts.length) return trusted
+  matchedStarts.sort((a, b) => a - b)
+
+  // 与 segmentShellContent 的 INLINE_DOC_RE 完全一致（含「必须带 script」的
+  // 判定），否则 ordinal 配对会错位。
+  const inlineDocRe =
+    /<!DOCTYPE\s+html[\s\S]*?<\/html\s*>|<html[\s>][\s\S]*?<\/html\s*>|<body[\s>][\s\S]*?<\/body\s*>/gi
+  let index = 0
+  let match
+  while ((match = inlineDocRe.exec(displayText)) !== null) {
+    if (!/<script[\s>]/i.test(match[0])) continue
+    if (index >= matchedStarts.length) break
+    trusted.add(match.index)
+    index += 1
+  }
+  return trusted
 }
 
 /**

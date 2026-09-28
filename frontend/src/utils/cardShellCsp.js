@@ -55,7 +55,11 @@ export function buildShellCspContent(allowedHosts = []) {
     `media-src ${join(['data:', 'blob:', ...cache, ...net])}`,
     // WebView2 evaluates custom-protocol import() against connect-src too.
     // The shell origin exposes only bounded, lease-scoped opaque-token resources.
-    `connect-src ${join(['data:', 'blob:', ...cache, ...modules, ...net])}`,
+    // M-01 卫生项：显式保留 Tauri 自定义协议 IPC 来源（`ipc:` / `http://ipc.localhost`），
+    // 与 Rust 侧 shell_doc_protocol.rs 的 SHELL_DOC_CSP 及主窗 CSP 对齐。缺少它们时
+    // tauri 的 ipc-protocol.js 会回退到不受 CSP 约束的 window.ipc.postMessage。
+    // 注意：这只是消除"回退路径"的依赖，**不构成 M-01（子帧仍可达 IPC）的修复**。
+    `connect-src ${join(['data:', 'blob:', 'ipc:', 'http://ipc.localhost', ...cache, ...modules, ...net])}`,
     'frame-src blob: data:',
     'worker-src blob:',
     'child-src blob:',

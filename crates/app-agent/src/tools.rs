@@ -380,37 +380,76 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ToolError::BadArgs("缺少 name 参数".into()))?;
-
-                // 阶段 3：优先从 campaign_runtime 查实例
-                if let Some(runtime) = &ctx.campaign_runtime
-                    && let Some(inst) = runtime.find_instance_by_id_or_name(name)
-                {
-                    let def = runtime.definition_for_instance(inst);
-                    let persona = runtime.resolved_persona_for(inst);
-                    let behavior = runtime.resolved_behavior_for(inst);
-                    let role_type = def.map(|d| format!("{:?}", d.role_type));
-                    let backstory = def.map(|d| d.base_backstory.clone());
-
-                    return Ok(serde_json::json!({
-                        "id": inst.id.as_str(),
-                        "instance_id": inst.id.as_str(),
-                        "name": inst.name,
-                        "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
-                        "role_type": role_type,
-                        "persona": persona,
-                        "behavior": behavior,
-                        "backstory": backstory,
-                        "variables": inst.variables,
-                        "is_temporary": inst.is_temporary,
-                        "source": "campaign_instance",
-                    }));
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(ToolError::BadArgs("name 不能为空".into()));
                 }
 
-                // fallback：旧的扁平 Character 逻辑
-                let character = ctx
-                    .characters
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name));
+                // 阶段 3 + W-01/W-08：优先从 campaign_runtime 查实例。
+                // 归一 = `normalize_instance_identity`（trim + Unicode 小写，与
+                // with_temporaries_for 去重同语义，N-R7-01）；
+                // 同名多实例且未给 instance_id → 可恢复错误，避免静默绑定第一个。
+                if let Some(runtime) = &ctx.campaign_runtime {
+                    let by_id = runtime
+                        .instances
+                        .iter()
+                        .find(|i| i.id.as_str() == name)
+                        .or_else(|| {
+                            runtime.instances.iter().find(|i| {
+                                storyforge_domain::campaign_runtime::normalize_instance_identity(
+                                    i.id.as_str(),
+                                ) == storyforge_domain::campaign_runtime::normalize_instance_identity(
+                                    name,
+                                )
+                            })
+                        });
+                    let matched = match by_id {
+                        Some(inst) => Some(inst),
+                        None => {
+                            let by_name: Vec<_> = runtime
+                                .instances
+                                .iter()
+                                .filter(|i| crate::runtime::instance_name_matches(&i.name, name))
+                                .collect();
+                            match by_name.len() {
+                                0 => None,
+                                1 => Some(by_name[0]),
+                                _ => {
+                                    return Err(ToolError::BadArgs(format_ambiguous_instance(
+                                        name, &by_name,
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    if let Some(inst) = matched {
+                        let def = runtime.definition_for_instance(inst);
+                        let persona = runtime.resolved_persona_for(inst);
+                        let behavior = runtime.resolved_behavior_for(inst);
+                        let role_type = def.map(|d| format!("{:?}", d.role_type));
+                        let backstory = def.map(|d| d.base_backstory.clone());
+
+                        return Ok(serde_json::json!({
+                            "id": inst.id.as_str(),
+                            "instance_id": inst.id.as_str(),
+                            "name": inst.name,
+                            "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
+                            "role_type": role_type,
+                            "persona": persona,
+                            "behavior": behavior,
+                            "backstory": backstory,
+                            "variables": inst.variables,
+                            "is_temporary": inst.is_temporary,
+                            "source": "campaign_instance",
+                        }));
+                    }
+                }
+
+                // fallback：旧的扁平 Character 逻辑（归一与实例路径同语义）
+                let character = ctx.characters.iter().find(|c| {
+                    storyforge_domain::campaign_runtime::normalize_instance_identity(&c.name)
+                        == storyforge_domain::campaign_runtime::normalize_instance_identity(name)
+                });
                 if let Some(character) = character {
                     return Ok(serde_json::json!({
                         "name": character.name,
@@ -876,6 +915,23 @@ fn character_roster_entries(ctx: &ToolContext) -> Vec<Value> {
         .collect()
 }
 
+/// 同名多实例且查询串未给 instance_id 时的可恢复错误（W-08）。
+fn format_ambiguous_instance(
+    name: &str,
+    matches: &[&storyforge_domain::campaign::CharacterInstance],
+) -> String {
+    let preview: Vec<String> = matches
+        .iter()
+        .take(8)
+        .map(|inst| format!("{}({})", inst.name, inst.id.as_str()))
+        .collect();
+    format!(
+        "角色名 '{name}' 对应 {} 个同名实例: {}。请改用 instance_id（可先 list_characters 获取）",
+        matches.len(),
+        preview.join(", ")
+    )
+}
+
 /// Director get_character 未命中时的可恢复错误文案：附候选与 list 提示。
 fn format_character_not_found(query: &str, ctx: &ToolContext) -> String {
     let candidates = character_roster_entries(ctx);
@@ -945,8 +1001,10 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                             let role_type = def.map(|d| format!("{:?}", d.role_type));
                             let backstory = def.map(|d| d.base_backstory.clone());
 
-                            // 验证 name 参数匹配（允许传自己的名字或 id）
-                            if inst.name.eq_ignore_ascii_case(name) || inst.id.as_str() == name {
+                            // 验证 name 参数匹配（允许传自己的名字或 id；归一与实例路径同语义）
+                            if crate::runtime::instance_name_matches(&inst.name, name)
+                                || inst.id.as_str() == name
+                            {
                                 return Ok(serde_json::json!({
                                     "id": inst.id.as_str(),
                                     "instance_id": inst.id.as_str(),
@@ -979,11 +1037,14 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                         }
                 }
 
-                // fallback：旧的扁平 Character 逻辑（无 Campaign 时）
+                // fallback：旧的扁平 Character 逻辑（无 Campaign 时；归一与实例路径同语义）
                 let character = ctx
                     .characters
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .find(|c| {
+                        storyforge_domain::campaign_runtime::normalize_instance_identity(&c.name)
+                            == storyforge_domain::campaign_runtime::normalize_instance_identity(name)
+                    })
                     .ok_or_else(|| ToolError::NotFound(format!("角色 '{name}' 不存在")))?;
 
                 Ok(serde_json::json!({
@@ -1354,6 +1415,81 @@ mod tests {
         assert!(err.contains("inst-docker-a"), "{err}");
         assert!(err.contains("inst-docker-b"), "{err}");
         assert!(err.contains("list_characters"), "{err}");
+    }
+
+    /// W-08：同名多实例且只给名字 → 可恢复错误（附候选 instance_id），不得静默绑定第一个。
+    #[tokio::test]
+    async fn test_get_character_rejects_ambiguous_duplicate_name() {
+        let runtime = make_campaign_runtime_with_duplicate_dockers();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let err = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": " 码头工人 "}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("码头工人"), "{err}");
+        assert!(err.contains("inst-docker-a"), "{err}");
+        assert!(err.contains("inst-docker-b"), "{err}");
+        assert!(err.contains("instance_id"), "{err}");
+
+        // 显式 instance_id 仍可精确命中（歧义不影响 id 查询）
+        let ok = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "INST-DOCKER-B"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok["instance_id"], "inst-docker-b");
+        assert_eq!(ok["source"], "campaign_instance");
+    }
+
+    /// W-01：名称/ID 的 trim + 大小写变体必须命中同一实例（与临时实例去重语义一致）。
+    #[tokio::test]
+    async fn test_get_character_normalizes_case_and_whitespace_variant() {
+        let runtime = make_campaign_runtime_with_duplicate_dockers();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        // "码头工人" 同名歧义，但 instance_id 的大小写/空白变体必须命中
+        let ok = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": " inst-docker-a "}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok["instance_id"], "inst-docker-a");
     }
 
     #[tokio::test]
@@ -1935,5 +2071,40 @@ mod tests {
         c.covers = vec![b.id.clone()];
         let catalog = vec![a1, a2, a3, a4, b, c.clone()];
         assert_eq!(expand_source_turn_ids(&c, &catalog), vec![1, 2, 3, 4]);
+    }
+
+    /// W-22：注册表工具名必须是扁平真实名——旧的 `tool_center.rs` 死模块
+    /// 内置了 `subagent.get_character` / `compose` 这类点记法幻影名（已删除）。
+    #[test]
+    fn registered_tool_names_are_flat_and_free_of_tool_center_phantoms() {
+        let mut director = ToolRegistry::new();
+        register_director_tools(&mut director);
+        let names: Vec<String> = director
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "get_character"), "{names:?}");
+        assert!(names.iter().any(|n| n == "emit_plan"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains('.')),
+            "工具名不得含点记法幻影名: {names:?}"
+        );
+
+        let mut subagent = ToolRegistry::new();
+        register_subagent_tools(&mut subagent);
+        let sub_names: Vec<String> = subagent
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+        assert!(
+            sub_names.iter().any(|n| n == "get_character"),
+            "{sub_names:?}"
+        );
+        assert!(
+            !sub_names.iter().any(|n| n == "subagent.get_character"),
+            "幻影名不得回归: {sub_names:?}"
+        );
     }
 }

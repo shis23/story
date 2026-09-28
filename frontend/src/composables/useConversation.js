@@ -78,10 +78,21 @@ export function useConversation(handlers = {}) {
         campaign.conversationHistory = []
         return
       }
-      convList.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      // F-13：updated_at 可能缺失（老数据/后端 DTO 未带）——此前 `b.updated_at.localeCompare`
+      // 会抛 TypeError，被同一个 catch 吞掉，导致**整张历史列表被清空式失败**。
+      // 缺失时间戳排到最后，并保持原顺序稳定。
+      const ts = (c) => (typeof c?.updated_at === 'string' && c.updated_at ? c.updated_at : '')
       campaign.conversationHistory = convList
+        .map((conv, index) => ({ conv, index }))
+        .sort((a, b) => {
+          const byTime = ts(b.conv).localeCompare(ts(a.conv))
+          return byTime !== 0 ? byTime : a.index - b.index
+        })
+        .map((entry) => entry.conv)
     } catch (e) {
+      // F-13：加载失败此前只写 console，界面显示"没有历史会话"（错误伪装成空态）
       console.error('加载会话历史失败:', e)
+      await alertDialog('加载会话历史失败: ' + errorText(e))
     }
   }
 

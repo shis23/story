@@ -47,7 +47,8 @@ test('proposeRepairsFlow marks typed patches stale from preview results', async 
   ])
 })
 
-test('refreshTypedPatchesFlow tolerates preview failures per patch', async () => {
+// M-27c：preview 失败必须 fail-closed（`_stale` 是接受按钮的唯一判据）
+test('refreshTypedPatchesFlow fails closed when a preview throws', async () => {
   const patches = await refreshTypedPatchesFlow({
     campaignId: 'camp-1',
     listTypedPatches: async () => [{ id: 'patch-a' }, { id: 'patch-b' }],
@@ -59,8 +60,23 @@ test('refreshTypedPatchesFlow tolerates preview failures per patch', async () =>
 
   assert.deepEqual(patches, [
     { id: 'patch-a', _stale: true },
-    { id: 'patch-b', _stale: false },
+    { id: 'patch-b', _stale: true, _previewError: 'Error: preview failed' },
   ])
+  // 过期卡片没有 diff 可展示（preview 未返回）
+  assert.equal(patches[1]._previewDiff, undefined)
+})
+
+test('refreshTypedPatchesFlow surfaces structured Tauri preview errors via errorText', async () => {
+  const patches = await refreshTypedPatchesFlow({
+    campaignId: 'camp-1',
+    listTypedPatches: async () => [{ id: 'patch-dto' }],
+    previewTypedPatch: async () => {
+      throw { type: 'validation', message: 'patch 不存在' }
+    },
+  })
+
+  assert.equal(patches[0]._stale, true)
+  assert.equal(patches[0]._previewError, 'patch 不存在')
 })
 
 test('acceptTypedPatchFlow removes accepted patch and refreshes health', async () => {

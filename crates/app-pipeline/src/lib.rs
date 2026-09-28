@@ -11,7 +11,7 @@ mod sequential_crew;
 mod turn_dossier;
 
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use storyforge_domain::Id;
 use storyforge_domain::agent::{
@@ -1026,7 +1026,13 @@ impl PipelineOrchestrator {
             Err(error) => return Err(self.abort_with(&event_tx, error)),
         };
         let dossier = if let Some(runtime) = ctx.campaign_runtime.as_deref() {
-            turn_dossier::compile_turn_dossier(&writer_intent, runtime, &ctx.pending_tasks, 3)
+            turn_dossier::compile_turn_dossier(
+                &writer_intent,
+                runtime,
+                &ctx.pending_tasks,
+                &ctx.story_clock,
+                3,
+            )
         } else {
             turn_dossier::compile_legacy_turn_dossier(&writer_intent, &ctx.characters, 3)
         };
@@ -1216,7 +1222,13 @@ impl PipelineOrchestrator {
             Err(error) => return Err(self.abort_with(&event_tx, error)),
         };
         let mut dossier = if let Some(runtime) = ctx.campaign_runtime.as_deref() {
-            turn_dossier::compile_turn_dossier(&duet_intent, runtime, &ctx.pending_tasks, 2)
+            turn_dossier::compile_turn_dossier(
+                &duet_intent,
+                runtime,
+                &ctx.pending_tasks,
+                &ctx.story_clock,
+                2,
+            )
         } else {
             turn_dossier::compile_legacy_turn_dossier(&duet_intent, &ctx.characters, 2)
         };
@@ -1324,13 +1336,27 @@ impl PipelineOrchestrator {
                     });
                     performances.push(performance);
                 }
-                Err(error) => {
+                Err(outcome) => {
                     let character_id = plan.subagent_tasks[index].character_id.clone();
                     let _ = event_tx.send(PipelineEvent::SubagentCancelled {
                         character_id: character_id.clone(),
                         index,
                     });
-                    error!(target: "app-pipeline", "对手戏第 {} 拍（{}）失败: {}", index + 1, character_id, error);
+                    // W-07：区分"场景收束跳过"与真实失败/取消
+                    if matches!(
+                        &outcome,
+                        sequential_crew::SequentialActorOutcome::SceneClosed
+                    ) {
+                        info!(
+                            target: "app-pipeline",
+                            "对手戏第 {} 拍（{}）因场景已收束跳过",
+                            index + 1,
+                            character_id
+                        );
+                    } else {
+                        let error = outcome.into_agent_error();
+                        error!(target: "app-pipeline", "对手戏第 {} 拍（{}）失败: {}", index + 1, character_id, error);
+                    }
                 }
             }
         }
@@ -1475,6 +1501,8 @@ impl PipelineOrchestrator {
             &ctx.recent_summaries,
             RECENT_SUMMARIES_INJECT_LIMIT,
         );
+        // W-28：取消会让后处理返回 None；用它区分"被取消"与"真失败"
+        let cancel_probe = cancel.clone();
         let mut outcome = storyforge_app_agent::run_postprocess_pipeline_with_prompt(
             &self.runtime,
             final_text,
@@ -1527,22 +1555,24 @@ impl PipelineOrchestrator {
                                     );
                                 }
                                 // variable_updates 追加到 outcome（走现有落盘路径）
-                                let js_var_count = exec_result.variable_updates.len();
-                                if js_var_count > 0 {
+                                if !exec_result.variable_updates.is_empty() {
                                     let pp =
                                         outcome.post_process.get_or_insert_with(Default::default);
-                                    for (key, value) in exec_result.variable_updates {
-                                        pp.variable_updates.push(
-                                            storyforge_domain::agent::VariableUpdate {
-                                                instance_id: None, // JS 产出默认为 campaign 级变量
-                                                key,
-                                                value,
-                                            },
+                                    // M-04/W-12：保留命名空间 + 键归一在进入 outcome 前完成。
+                                    let (accepted, dropped) = push_mvu_js_variable_updates(
+                                        exec_result.variable_updates,
+                                        pp,
+                                        ctx.campaign_runtime.as_deref(),
+                                    );
+                                    if dropped > 0 {
+                                        warn!(
+                                            target: "app-pipeline",
+                                            "[MVU JS] 丢弃 {dropped} 条保留命名空间/空键变量更新（__storyforge* 由宿主管理）"
                                         );
                                     }
                                     info!(
                                         target: "app-pipeline",
-                                        "[MVU JS] 追加 {js_var_count} 条变量更新到后处理产出"
+                                        "[MVU JS] 追加 {accepted} 条变量更新到后处理产出"
                                     );
                                 }
                             }
@@ -1595,10 +1625,15 @@ impl PipelineOrchestrator {
                 });
             }
             None => {
-                if enable_postprocess {
+                if *cancel_probe.borrow() {
+                    // W-28：取消不是失败——发 Skipped，避免把用户取消报成 PostProcessFailed
+                    let _ = event_tx.send(PipelineEvent::PostProcessSkipped {
+                        reason: "流水线已取消，后处理未完成（best-effort，不阻断成文）".into(),
+                    });
+                } else if enable_postprocess {
                     // 开了但失败（best-effort）：发 Failed
                     let _ = event_tx.send(PipelineEvent::PostProcessFailed {
-                        reason: "后处理 Agent 调用失败或被取消（best-effort，不阻断成文）".into(),
+                        reason: "后处理 Agent 调用失败（best-effort，不阻断成文）".into(),
                     });
                 } else {
                     // 明确关闭：发 Skipped，不发误导性的 Failed
@@ -1669,8 +1704,15 @@ impl PipelineOrchestrator {
                 .ok_or_else(|| PipelineError::Regenerate("旧 variant 无溯源信息".into()))?
         };
 
+        // W-03：generation_mode=None（前端非 Campaign 会话整卷重 roll 的取值）不再直接
+        // 落回 legacy big_scene 全流程：未指定时继承旧 provenance 的模式；旧产物本身是
+        // BigScene 或无模式记录时才保持 legacy 行为。
+        let effective_mode = effective_reroll_mode(
+            req.generation_mode.as_ref(),
+            provenance_old.generation_mode.as_ref(),
+        );
         let requests_legacy_partial = !req.targets.is_empty()
-            && matches!(req.generation_mode, None | Some(GenerationMode::BigScene));
+            && matches!(effective_mode, None | Some(GenerationMode::BigScene));
         if requests_legacy_partial
             && provenance_old.generation_mode != Some(GenerationMode::BigScene)
         {
@@ -1687,9 +1729,8 @@ impl PipelineOrchestrator {
         // the draft. Fine-grained legacy rerolls do not have valid reusable
         // artifacts for Writer, duet beats, or a sequential crew, so they are
         // deliberately rejected instead of silently switching orchestration.
-        if let Some(generation_mode) = req
-            .generation_mode
-            .filter(|mode| *mode != GenerationMode::BigScene)
+        if let Some(generation_mode) =
+            effective_mode.filter(|mode| *mode != GenerationMode::BigScene)
         {
             if generation_mode == GenerationMode::SequentialCrew && !req.targets.is_empty() {
                 return self
@@ -2024,14 +2065,11 @@ impl PipelineOrchestrator {
                             }
                             t
                         });
-                    let config = AgentConfig {
-                        role: AgentRole::Subagent(target_id.clone()),
-                        system_prompt: String::new(), // layout 版不使用此字段
-                        max_tool_rounds: 10,
-                        model: director_config.model.clone(),
-                        tools: vec![],
-                        terminal_tools: vec![],
-                    };
+                    let config = make_single_subagent_config(
+                        target_id,
+                        &director_config,
+                        ctx.agent_profile_config.as_ref(),
+                    );
                     // M1 子 Agent 无工具（纯表演）
                     let registry = ToolRegistry::new();
 
@@ -2350,12 +2388,25 @@ impl PipelineOrchestrator {
                     });
                     replayed.push(performance);
                 }
-                Err(error) => {
+                Err(outcome) => {
                     let _ = event_tx.send(PipelineEvent::SubagentCancelled {
                         character_id: plan.subagent_tasks[absolute_index].character_id.clone(),
                         index: absolute_index,
                     });
-                    error!(target: "app-pipeline", "Sequential Crew 后缀重演失败: {error}");
+                    // W-07：区分"场景收束跳过"与真实失败/取消
+                    if matches!(
+                        &outcome,
+                        sequential_crew::SequentialActorOutcome::SceneClosed
+                    ) {
+                        info!(
+                            target: "app-pipeline",
+                            "Sequential Crew 后缀第 {} 拍因场景已收束跳过",
+                            absolute_index + 1
+                        );
+                    } else {
+                        let error = outcome.into_agent_error();
+                        error!(target: "app-pipeline", "Sequential Crew 后缀重演失败: {error}");
+                    }
                 }
             }
         }
@@ -2636,6 +2687,9 @@ impl PipelineOrchestrator {
                 far_block.as_deref(),
             )
             .await
+            .into_iter()
+            .map(|result| result.map_err(sequential_crew::SequentialActorOutcome::from))
+            .collect()
         };
 
         let mut performances = Vec::new();
@@ -2649,13 +2703,25 @@ impl PipelineOrchestrator {
                     });
                     performances.push(performance);
                 }
-                Err(error) => {
+                Err(outcome) => {
                     let character_id = input.plan.subagent_tasks[index].character_id.clone();
                     let _ = event_tx.send(PipelineEvent::SubagentCancelled {
                         character_id: character_id.clone(),
                         index,
                     });
-                    error!(target: "app-pipeline", "子 Agent {character_id} 失败: {error}");
+                    // W-07：场景收束跳过不算失败
+                    if matches!(
+                        &outcome,
+                        sequential_crew::SequentialActorOutcome::SceneClosed
+                    ) {
+                        info!(
+                            target: "app-pipeline",
+                            "子 Agent {character_id} 因场景已收束跳过"
+                        );
+                    } else {
+                        let error = outcome.into_agent_error();
+                        error!(target: "app-pipeline", "子 Agent {character_id} 失败: {error}");
+                    }
                 }
             }
         }
@@ -3212,14 +3278,38 @@ fn template_variable_value(value: &serde_json::Value) -> String {
 ///
 /// 从 CampaignRuntimeContext 的所有 CharacterInstance.variables 收集，
 /// key 格式保持 VariableValue.key 原样。无 campaign_runtime 时返回空 map。
+///
+/// W-25：扁平键在跨实例同名时 last-wins（保留兼容），同时额外提供
+/// `instance.<instance_id>.<key>` 作用域别名，JS 片段可用它精确读写某个实例的变量
+/// （写回由 `parse_scoped_variable_key` 还原为 `VariableUpdate.instance_id`）。
 fn build_current_variables(
     ctx: &WritingContext,
 ) -> std::collections::HashMap<String, serde_json::Value> {
     let mut vars = std::collections::HashMap::new();
     if let Some(runtime) = &ctx.campaign_runtime {
+        let mut owners: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for inst in &runtime.instances {
             for vv in &inst.variables {
+                if let Some(previous) = owners.get(&vv.key)
+                    && previous != inst.id.as_str()
+                {
+                    // 只告警不改语义：扁平键保留 last-wins，精确作用域请用实例别名键
+                    tracing::debug!(
+                        target: "app-pipeline",
+                        "[MVU JS] 变量键 '{}' 同时存在于实例 {} 与 {}，扁平键取值后者；精确读写请用 {}",
+                        vv.key,
+                        previous,
+                        inst.id,
+                        scoped_variable_key(inst.id.as_str(), &vv.key)
+                    );
+                }
+                owners.insert(vv.key.clone(), inst.id.as_str().to_string());
                 vars.insert(vv.key.clone(), vv.value.clone());
+                vars.insert(
+                    scoped_variable_key(inst.id.as_str(), &vv.key),
+                    vv.value.clone(),
+                );
             }
         }
     }
@@ -3512,6 +3602,34 @@ fn format_instance_variables(variables: &[storyforge_domain::variables::Variable
 /// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive + 蓝灯进 system）
 ///
 /// 如果提供了 `agent_profile_config`，从中读取 Director 的 `model_override` 和 `max_tool_rounds` 覆盖默认值。
+/// W-19：路径 C（只重某子 Agent）使用的子 Agent 配置。
+///
+/// 必须与 `spawn_subagents` 的 profile 语义一致：`model_override` /
+/// `max_tool_rounds` 取自 `AgentProfileConfig`（含 Subagent 通配回退），
+/// 无配置时保持历史默认（10 轮 + 导演模型）。
+fn make_single_subagent_config(
+    target_id: &str,
+    director_config: &AgentConfig,
+    agent_profile_config: Option<&AgentProfileConfig>,
+) -> AgentConfig {
+    let run = agent_profile_config
+        .map(|apc| apc.run_config_for(&AgentRole::Subagent(target_id.to_string())));
+    AgentConfig {
+        role: AgentRole::Subagent(target_id.to_string()),
+        system_prompt: String::new(), // layout 版不使用此字段
+        max_tool_rounds: run
+            .as_ref()
+            .and_then(|run| run.max_tool_rounds)
+            .unwrap_or(10),
+        model: run
+            .as_ref()
+            .and_then(|run| run.model_override.clone())
+            .unwrap_or_else(|| director_config.model.clone()),
+        tools: vec![],
+        terminal_tools: vec![],
+    }
+}
+
 fn make_director_config(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
     modules: &[storyforge_domain::prompt_module::PromptModule],
@@ -3896,6 +4014,100 @@ fn parse_plan_from_response(
 }
 
 /// 解析 Plan JSON（宽松：允许 subagent_tasks 缺失或为空）
+/// M-04/W-12/W-25：卡派生 JS 片段产出的变量更新在进入 `outcome.post_process` 前的守卫。
+///
+/// - 保留命名空间 `__storyforge*`（卡壳变量桶/宿主状态）一律丢弃（大小写/空白不敏感）；
+/// - `instance.<instance_id>.<key>` 形式（W-25 快照别名）解析为实例作用域写入；
+///   实例 id 不存在时退回 campaign 级字面键，不猜；
+/// - 其余键走 `normalize_mvu_key` 归一（点记法、去 `stat_data.` 前缀、模板段归一）；
+/// - 空键丢弃。
+///
+/// 返回 `(accepted, dropped)`。这是后端边界：前端镜像过滤只是纵深防御，
+/// MVU JS 通道不经过 Tauri 命令层的保留键守卫。
+fn push_mvu_js_variable_updates(
+    updates: impl IntoIterator<Item = (String, serde_json::Value)>,
+    pp: &mut storyforge_domain::agent::PostProcessResult,
+    campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+) -> (usize, usize) {
+    let mut accepted = 0usize;
+    let mut dropped = 0usize;
+    for (key, value) in updates {
+        if is_reserved_mvu_key(&key) {
+            dropped += 1;
+            continue;
+        }
+        let (instance_id, raw_key) = match parse_scoped_variable_key(&key, campaign_runtime) {
+            Some((id, rest)) => (Some(id), rest),
+            None => (None, key.clone()),
+        };
+        let normalized = storyforge_domain::variables::normalize_mvu_key(&raw_key);
+        if normalized.trim().is_empty() {
+            dropped += 1;
+            continue;
+        }
+        pp.variable_updates
+            .push(storyforge_domain::agent::VariableUpdate {
+                instance_id, // None = campaign 级变量（JS 产出默认）
+                key: normalized,
+                value,
+            });
+        accepted += 1;
+    }
+    (accepted, dropped)
+}
+
+/// 保留命名空间判定：`__storyforge` 前缀，trim + ASCII 大小写不敏感（M-04）。
+fn is_reserved_mvu_key(key: &str) -> bool {
+    key.trim().to_ascii_lowercase().starts_with("__storyforge")
+}
+
+/// W-25：实例作用域变量在 JS 快照里的别名键（`instance.<instance_id>.<key>`）。
+fn scoped_variable_key(instance_id: &str, key: &str) -> String {
+    format!("instance.{instance_id}.{key}")
+}
+
+/// W-25：解析 JS 写回的 `instance.<instance_id>.<key>`；实例 id 必须真实存在，
+/// 否则返回 None（按 campaign 级字面键处理，不猜实例）。
+fn parse_scoped_variable_key(
+    key: &str,
+    campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+) -> Option<(storyforge_domain::Id, String)> {
+    let rest = key.trim().strip_prefix("instance.")?;
+    let (instance_id, variable_key) = rest.split_once('.')?;
+    let variable_key = variable_key.trim();
+    if instance_id.trim().is_empty() || variable_key.is_empty() {
+        return None;
+    }
+    let runtime = campaign_runtime?;
+    let instance = runtime
+        .instances
+        .iter()
+        .find(|inst| inst.id.as_str() == instance_id.trim())?;
+    Some((instance.id.clone(), variable_key.to_string()))
+}
+
+/// W-02：畸形 subagent_task 的告警摘要（截断原始 JSON，便于定位模型输出）。
+fn summarize_invalid_task(task: &serde_json::Value) -> String {
+    let raw = task.to_string();
+    let mut preview: String = raw.chars().take(120).collect();
+    if raw.chars().count() > 120 {
+        preview.push('…');
+    }
+    preview
+}
+
+/// W-03：重 roll 的有效模式解析。
+///
+/// 请求未指定模式时继承旧 provenance 的模式（前端非 Campaign 会话整卷重 roll 会传
+/// `None`；旧实现直接落回 legacy `big_scene` 全流程，导致产物与来源模式漂移）。
+/// 请求显式指定时以请求为准。
+fn effective_reroll_mode(
+    requested: Option<&GenerationMode>,
+    previous: Option<&GenerationMode>,
+) -> Option<GenerationMode> {
+    requested.or(previous).cloned()
+}
+
 fn parse_plan_json(v: &serde_json::Value) -> Result<Plan, PipelineError> {
     // 必须包含 scene_brief 或 subagent_tasks 之一
     let has_scene = v.get("scene_brief").and_then(|v| v.as_str()).is_some();
@@ -3915,14 +4127,36 @@ fn parse_plan_json(v: &serde_json::Value) -> Result<Plan, PipelineError> {
     let empty_tasks = vec![];
     let tasks = tasks_arr.unwrap_or(&empty_tasks);
 
+    // W-02：丢弃缺失/空白 character_id 的任务（旧行为会静默变成 "unknown" 幽灵实例），
+    // 并按 trim + 大小写不敏感去重（与 with_temporaries_for 的归一同语义）。
+    let mut seen_character_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let subagent_tasks: Vec<SubagentTask> = tasks
         .iter()
-        .map(|t| {
-            let character_id = t
+        .filter_map(|t| {
+            let character_id = match t
                 .get("character_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(id) => id.to_string(),
+                None => {
+                    warn!(
+                        target: "app-pipeline",
+                        "Plan subagent_task 缺少 character_id，已丢弃该任务: {}",
+                        summarize_invalid_task(t)
+                    );
+                    return None;
+                }
+            };
+            if !seen_character_ids.insert(character_id.to_lowercase()) {
+                warn!(
+                    target: "app-pipeline",
+                    "Plan subagent_task character_id '{character_id}' 重复，已去重"
+                );
+                return None;
+            }
             let brief = t
                 .get("brief")
                 .and_then(|v| v.as_str())
@@ -3964,14 +4198,14 @@ fn parse_plan_json(v: &serde_json::Value) -> Result<Plan, PipelineError> {
                 (1..=6).contains(&n).then_some(n)
             });
 
-            SubagentTask {
+            Some(SubagentTask {
                 character_id,
                 brief,
                 context_package,
                 current_desire,
                 ongoing_action,
                 emotion_stage,
-            }
+            })
         })
         .collect();
 
@@ -4109,47 +4343,16 @@ fn rand_seed() -> u64 {
         .as_nanos() as u64
 }
 
-/// 格式化 ContextPackage 的**稳定部分**（子 Agent system 段，§22，重 roll 子 Agent 时用）
-///
-/// 与 `app-agent/src/runtime.rs::format_context_stable` 保持同步（同算法，独立实现避免跨 crate 耦合）。
+/// W-32：删除了与 `app-agent` 重复的两份实现，统一复用 app-agent 的单一实现
+/// （`storyforge_app_agent::format_context_stable/volatile`）。
+#[inline]
 fn format_subagent_context_stable(pkg: &ContextPackage) -> String {
-    let mut out = String::new();
-    if !pkg.character_brief.is_empty() {
-        out.push_str(&format!("## 你的角色设定\n{}\n\n", pkg.character_brief));
-    }
-    if !pkg.constant_lore.is_empty() {
-        out.push_str("## 世界设定（常驻）\n");
-        for lore in &pkg.constant_lore {
-            out.push_str(&format!("- {}: {}\n", lore.keys.join(", "), lore.content));
-        }
-        out.push('\n');
-    }
-    out
+    storyforge_app_agent::format_context_stable(pkg)
 }
 
-/// 格式化 ContextPackage 的**易变部分**（子 Agent tail 段，§22，重 roll 子 Agent 时用）
-///
-/// 与 `app-agent/src/runtime.rs::format_context_volatile` 保持同步。
+#[inline]
 fn format_subagent_context_volatile(pkg: &ContextPackage) -> String {
-    let mut out = String::new();
-    if !pkg.scene_brief.is_empty() {
-        out.push_str(&format!("## 当前场景\n{}\n\n", pkg.scene_brief));
-    }
-    if !pkg.relevant_lore.is_empty() {
-        out.push_str("## 相关世界设定\n");
-        for lore in &pkg.relevant_lore {
-            out.push_str(&format!("- {}: {}\n", lore.keys.join(", "), lore.content));
-        }
-        out.push('\n');
-    }
-    if !pkg.recent_window.is_empty() {
-        out.push_str("## 最近对话\n");
-        for msg in &pkg.recent_window {
-            out.push_str(&format!("{msg}\n"));
-        }
-        out.push('\n');
-    }
-    out
+    storyforge_app_agent::format_context_volatile(pkg)
 }
 
 #[cfg(test)]
@@ -4164,6 +4367,81 @@ mod tests {
         ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
     };
     use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
+
+    /// W-32（R6/R9 收口）：路径 C 的 `format_subagent_context_stable/volatile` 是
+    /// 委托到 `storyforge_app_agent` 单一实现的薄壳（`lib.rs:4348-4356`）。
+    ///
+    /// 本测试钉两件事，避免"去重后又长回一份会漂移的副本"：
+    /// 1) 委托产出与 app-agent 唯一实现**逐字节相同**；
+    /// 2) 对同一 `ContextPackage` 的产出等于**冻结的 golden 文本**——因此任何一侧
+    ///    改了分区标题/空行/`keys.join` 分隔符都会红（这些字节直接影响 LLM 缓存的
+    ///    stable/tail 分段，属产品契约）。
+    #[test]
+    fn path_c_context_formatters_delegate_byte_for_byte_and_match_golden() {
+        use storyforge_domain::agent::{ContextPackage, LoreEntryLight};
+
+        let pkg = ContextPackage {
+            character_brief: "冷静的外科医生，习惯先救人再解释。".into(),
+            scene_brief: "林秋在雨夜推开诊所的门，手心还攥着那把钥匙。".into(),
+            relevant_lore: vec![
+                LoreEntryLight {
+                    keys: vec!["诊所".into(), "clinic".into()],
+                    content: "诊所后门常年不锁。".into(),
+                },
+                LoreEntryLight {
+                    keys: vec!["钥匙".into()],
+                    content: "钥匙上有三道刻痕。".into(),
+                },
+            ],
+            constant_lore: vec![LoreEntryLight {
+                keys: vec!["世界观".into()],
+                content: "港口城市常年多雨。".into(),
+            }],
+            recent_window: vec!["用户：你终于来了。".into(), "林秋：我答应过你。".into()],
+            task: "演出林秋进门后的第一拍".into(),
+        };
+
+        // 1) 委托等价（薄壳 ↔ app-agent 唯一实现）
+        assert_eq!(
+            format_subagent_context_stable(&pkg),
+            storyforge_app_agent::format_context_stable(&pkg),
+            "路径 C stable 格式器必须与 app-agent 唯一实现逐字节一致"
+        );
+        assert_eq!(
+            format_subagent_context_volatile(&pkg),
+            storyforge_app_agent::format_context_volatile(&pkg),
+            "路径 C volatile 格式器必须与 app-agent 唯一实现逐字节一致"
+        );
+
+        // 2) golden：分区标题、空行、`keys.join(", ")` 分隔符都属契约
+        let expected_stable = "## 你的角色设定\n冷静的外科医生，习惯先救人再解释。\n\n\
+                                ## 世界设定（常驻）\n- 世界观: 港口城市常年多雨。\n\n";
+        let expected_volatile = "## 当前场景\n林秋在雨夜推开诊所的门，手心还攥着那把钥匙。\n\n\
+                                 ## 相关世界设定\n- 诊所, clinic: 诊所后门常年不锁。\n- 钥匙: 钥匙上有三道刻痕。\n\n\
+                                 ## 最近对话\n用户：你终于来了。\n林秋：我答应过你。\n\n";
+        assert_eq!(
+            format_subagent_context_stable(&pkg),
+            expected_stable,
+            "stable 分段文本已变更（会影响 system 段缓存键）"
+        );
+        assert_eq!(
+            format_subagent_context_volatile(&pkg),
+            expected_volatile,
+            "volatile 分段文本已变更（会影响 tail 段缓存键）"
+        );
+
+        // 3) 空包必须两边都为空串（`recent_window` 的 task 字段不进分区）
+        let empty = ContextPackage {
+            character_brief: String::new(),
+            scene_brief: String::new(),
+            relevant_lore: vec![],
+            constant_lore: vec![],
+            recent_window: vec![],
+            task: "任务只进 prompt，不进分区".into(),
+        };
+        assert_eq!(format_subagent_context_stable(&empty), "");
+        assert_eq!(format_subagent_context_volatile(&empty), "");
+    }
 
     #[test]
     fn provenance_reasoning_total_budget_fails_closed() {
@@ -7268,6 +7546,56 @@ mod tests {
         );
     }
 
+    /// W-28：取消导致后处理无产出时必须发 Skipped，而不是误导性的 PostProcessFailed。
+    #[tokio::test]
+    async fn test_postprocess_cancelled_emits_skipped_not_failed() {
+        let (orch, conv_store) = make_orchestrator();
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
+        ctx.campaign_id = Some(Id::new());
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let _ = cancel_tx.send(true); // 调用前已取消
+
+        let outcome = orch
+            .run_postprocess(
+                "成文",
+                "场景",
+                &["林医生".into()],
+                &["hp".into()],
+                &ctx,
+                &event_tx,
+                cancel,
+                &[],
+                &[],
+            )
+            .await;
+        assert!(
+            outcome
+                .as_ref()
+                .map(|o| o.post_process.is_none())
+                .unwrap_or(true),
+            "取消后后处理不应有产出"
+        );
+
+        let mut events = vec![];
+        while let Ok(e) = event_rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessFailed { .. })),
+            "取消不应发 PostProcessFailed: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessSkipped { .. })),
+            "取消应发 PostProcessSkipped: {events:?}"
+        );
+    }
+
     /// 有 campaign + 任务待注入 → build_director_tail 含任务块（§22：任务压在 volatile tail）
     #[test]
     fn test_director_tail_includes_pending_tasks() {
@@ -8123,6 +8451,92 @@ mod tests {
         assert!(plan.subagent_tasks[0].current_desire.is_none());
     }
 
+    /// W-02：缺 character_id / 空白的任务必须跳过（不再退化成 "unknown" 幽灵实例），
+    /// 且大小写/空白变体的重复角色只保留首个。
+    #[test]
+    fn parse_plan_json_skips_blank_character_id_and_dedups() {
+        let v = serde_json::json!({
+            "scene_brief": "场景",
+            "subagent_tasks": [
+                {"character_id": "A", "brief": "第一拍"},
+                {"character_id": "   ", "brief": "空 id 应跳过"},
+                {"brief": "缺 id 应跳过"},
+                {"character_id": "a", "brief": "重复变体应跳过"},
+                {"character_id": "B", "brief": "第二拍"}
+            ]
+        });
+        let plan = parse_plan_json(&v).expect("plan");
+        assert_eq!(plan.subagent_tasks.len(), 2, "{:?}", plan.subagent_tasks);
+        assert_eq!(plan.subagent_tasks[0].character_id, "A");
+        assert_eq!(plan.subagent_tasks[0].brief, "第一拍");
+        assert_eq!(plan.subagent_tasks[1].character_id, "B");
+    }
+
+    /// W-19：路径 C 的子 Agent 配置必须走 profile（含 Subagent 通配回退），
+    /// 无配置时保持历史默认（10 轮 + 导演模型）。
+    #[test]
+    fn single_subagent_config_follows_profile_then_default() {
+        use std::collections::HashMap;
+        use storyforge_domain::agent_profile_config::{AgentProfileConfig, AgentRunConfig};
+        use storyforge_domain::prompt_module::ProfileSource;
+
+        let director = make_director_config(None, &[], "", None, None, &Default::default());
+
+        // 无 profile → 历史默认
+        let fallback = make_single_subagent_config("林医生", &director, None);
+        assert_eq!(fallback.max_tool_rounds, 10);
+        assert_eq!(fallback.model, director.model);
+        assert!(matches!(fallback.role, AgentRole::Subagent(id) if id == "林医生"));
+
+        // 只有 Subagent("*") 通配 → 命中通配
+        let mut configs = HashMap::new();
+        configs.insert(
+            AgentRole::Subagent("*".into()),
+            AgentRunConfig {
+                model_override: Some("sub-model".into()),
+                max_tool_rounds: Some(3),
+                tool_whitelist: None,
+            },
+        );
+        let profile = AgentProfileConfig::new(
+            Id::from_str("subagent-config-test"),
+            "test".into(),
+            String::new(),
+            configs,
+            2,
+            true,
+            true,
+            ProfileSource::UserCreated,
+            1,
+        );
+        let profiled = make_single_subagent_config("林医生", &director, Some(&profile));
+        assert_eq!(profiled.max_tool_rounds, 3, "profile 的轮数必须生效");
+        assert_eq!(profiled.model, "sub-model", "profile 的模型必须生效");
+    }
+
+    /// W-03：整卷重 roll 未指定模式时必须继承旧 provenance，而不是落回 legacy BigScene。
+    #[test]
+    fn effective_reroll_mode_inherits_previous_and_prefers_request() {
+        use GenerationMode::{BigScene, Continuation, Duet};
+
+        assert_eq!(
+            effective_reroll_mode(None, Some(&Continuation)),
+            Some(Continuation)
+        );
+        assert_eq!(effective_reroll_mode(None, Some(&Duet)), Some(Duet));
+        assert_eq!(
+            effective_reroll_mode(Some(&Duet), Some(&Continuation)),
+            Some(Duet),
+            "请求显式指定时以请求为准"
+        );
+        assert_eq!(
+            effective_reroll_mode(None, Some(&BigScene)),
+            Some(BigScene),
+            "旧产物本身是 legacy BigScene 时保持 legacy 行为"
+        );
+        assert_eq!(effective_reroll_mode(None, None), None);
+    }
+
     #[test]
     fn test_parse_plan_json_rejects_out_of_range_emotion_stage() {
         let v = serde_json::json!({
@@ -8867,6 +9281,7 @@ mod tests {
             variable_schema: vec![],
         };
         let mut inst = CharacterInstance::from_definition(Id::new(), &def);
+        let inst_id = inst.id.clone();
         inst.variables = vec![
             VariableValue::new("hp", serde_json::json!(80), 1),
             VariableValue::new("state", serde_json::json!("calm"), 1),
@@ -8888,9 +9303,113 @@ mod tests {
         ctx.campaign_runtime = Some(runtime);
 
         let vars = build_current_variables(&ctx);
-        assert_eq!(vars.len(), 2, "应收集到 2 个变量");
+        // W-25：2 个扁平键 + 2 个 instance.<id>.<key> 作用域别名
+        assert_eq!(vars.len(), 4, "应收集到 2 个变量及其作用域别名");
         assert_eq!(vars.get("hp").unwrap(), &serde_json::json!(80));
         assert_eq!(vars.get("state").unwrap(), &serde_json::json!("calm"));
+        let scoped_hp = vars
+            .get(&scoped_variable_key(inst_id.as_str(), "hp"))
+            .unwrap();
+        assert_eq!(scoped_hp, &serde_json::json!(80));
+    }
+
+    /// M-04：MVU JS 回写不得触碰 __storyforge* 保留命名空间，且键要归一。
+    #[test]
+    fn mvu_js_fallback_drops_reserved_namespace_keys() {
+        use storyforge_domain::agent::PostProcessResult;
+
+        let mut pp = PostProcessResult::default();
+        let (accepted, dropped) = push_mvu_js_variable_updates(
+            vec![
+                (
+                    "__storyforge_card_shell_variables".to_string(),
+                    serde_json::json!("x"),
+                ),
+                ("  __STORYFORGE_host ".to_string(), serde_json::json!(1)),
+                ("stat_data.hp".to_string(), serde_json::json!(42)),
+                ("hp".to_string(), serde_json::json!(7)),
+            ],
+            &mut pp,
+            None,
+        );
+
+        assert_eq!(accepted, 2, "保留键应被丢弃，只接受普通键");
+        assert_eq!(dropped, 2);
+        assert_eq!(pp.variable_updates.len(), 2);
+        assert!(
+            pp.variable_updates
+                .iter()
+                .all(|u| !u.key.to_ascii_lowercase().contains("__storyforge")),
+            "保留命名空间不得进入 outcome: {:?}",
+            pp.variable_updates
+        );
+        // normalize_mvu_key 去掉 stat_data. 前缀
+        assert!(
+            pp.variable_updates.iter().any(|u| u.key == "hp"),
+            "{:?}",
+            pp.variable_updates
+        );
+        assert!(pp.variable_updates.iter().all(|u| u.key != "stat_data.hp"));
+        assert!(
+            pp.variable_updates.iter().all(|u| u.instance_id.is_none()),
+            "无 campaign_runtime 时只能写 campaign 级变量"
+        );
+    }
+
+    /// W-25：`instance.<id>.<key>` 写回解析为实例作用域；未知实例不猜。
+    #[test]
+    fn mvu_js_scoped_key_targets_instance() {
+        use storyforge_domain::agent::PostProcessResult;
+        use storyforge_domain::campaign::Campaign;
+
+        let card_id = Id::new();
+        let inst = CharacterInstance::temporary_with_overrides(
+            Id::new(),
+            "Lin",
+            Some("persona".into()),
+            None,
+        );
+        let inst_id = inst.id.clone();
+        let campaign = Campaign::new(card_id, "camp");
+        let runtime = storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+            campaign,
+            instances: vec![inst],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        };
+
+        let scoped = scoped_variable_key(inst_id.as_str(), "hp");
+        assert_eq!(scoped, format!("instance.{}.hp", inst_id.as_str()));
+
+        let mut pp = PostProcessResult::default();
+        let (accepted, dropped) = push_mvu_js_variable_updates(
+            vec![
+                (scoped, serde_json::json!(50)),
+                ("instance.ghost.hp".to_string(), serde_json::json!(1)),
+            ],
+            &mut pp,
+            Some(&runtime),
+        );
+        assert_eq!((accepted, dropped), (2, 0));
+
+        let scoped_update = pp
+            .variable_updates
+            .iter()
+            .find(|u| u.key == "hp")
+            .expect("作用域键应归一为 hp");
+        assert_eq!(
+            scoped_update.instance_id.as_ref().map(|id| id.as_str()),
+            Some(inst_id.as_str()),
+            "合法实例 id 必须解析为 instance 作用域"
+        );
+        let ghost = pp
+            .variable_updates
+            .iter()
+            .find(|u| u.key.contains("ghost"))
+            .expect("未知实例退回 campaign 级字面键");
+        assert!(ghost.instance_id.is_none(), "未知实例 id 不得猜作用域");
     }
 
     #[test]

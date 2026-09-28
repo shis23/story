@@ -632,6 +632,10 @@ pub(crate) fn next_chronicle_a_seq(existing: &[storyforge_domain::agent::RoundSu
 ///
 /// Phase A: Campaign 模式下同时把对应 TurnAttempt 标 Discarded。
 /// Turn 仍开放，允许 regenerate（Discard Attempt ≠ Abandon Turn）。
+// 保留 API：当前无前端入口（wrapper 于 2026-09-01 移除），保留原因见 docs/review-2026-09-13/fixes/04-tauri-fixes.md
+// （T-15：显式登记在 scripts/architecture/backend-baseline.mjs 的
+// RETAINED_NO_FRONTEND_CALLER 中；同名 store 方法仍被 backend_workflows 的
+// 补偿路径使用，本命令只是它的手动入口。）
 #[tauri::command]
 pub(crate) fn soft_delete_variant(
     conversation_id: String,
@@ -669,6 +673,11 @@ pub(crate) fn soft_delete_variant(
 /// 与 Discard Attempt 的区别：
 /// - Discard Attempt 只丢弃单个 AI 变体，Turn 仍开放。
 /// - Abandon Turn 终止整个 Turn，同时把 input user 变体和所有未 accept 的 AI 变体标记 Discarded。
+// 保留 API：当前无前端入口（wrapper 于 2026-09-01 移除），保留原因见 docs/review-2026-09-13/fixes/04-tauri-fixes.md
+// （T-15：显式登记在 scripts/architecture/backend-baseline.mjs 的
+// RETAINED_NO_FRONTEND_CALLER 中；本命令承载 Gate 8 复评加固的 Turn CAS
+// 谓词——先 CAS 置 Abandoned 再软删变体，防止并发 Accept 已提交的故事被
+// 静默回退，见下方 :697 起的长注释。）
 #[tauri::command]
 pub(crate) async fn abandon_turn(
     conversation_id: String,
@@ -764,18 +773,26 @@ pub(crate) fn delete_message_from(
 }
 
 /// 添加新变体（分支/swipe）
+///
+/// `provenance` 对应前端 `addVariant(conversationId, nodeId, content, provenance)`
+/// （`frontend/src/tauri-api.js`，invoke 时发 `provenance: provenance || null`）。
+/// 2026-09-13 域4 修复 T-04：此前本命令**没有**该形参，而 Tauri 只按 camelCase
+/// 键逐个取参（`v.get(self.key)`）、对多余的键静默忽略，因此前端传的
+/// `provenance` 被丢弃、store 层被硬编码为 `None` —— API 表面承诺了"记录来源"
+/// 的能力却永不生效。`Option<T>` 形参可缺省，故这是向后兼容的修正。
 #[tauri::command]
 pub(crate) fn add_variant(
     conversation_id: String,
     node_id: String,
     content: String,
+    provenance: Option<Provenance>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
-        .add_variant(&conv_id, &nid, content, None)
+        .add_variant(&conv_id, &nid, content, provenance)
         .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 

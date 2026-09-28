@@ -99,10 +99,17 @@ pub fn default_character_variables() -> Vec<VariableField> {
     ]
 }
 
+/// story_clock 的唯一默认值来源。
+///
+/// `Campaign.story_clock`（旧兼容镜像）与 `Campaign.variable_schema` /
+/// `variables["story_clock"]`（权威）必须使用同一常量，否则新建 Campaign 会
+/// 立刻处于"双表示分歧"状态（D-06）。
+pub const DEFAULT_STORY_CLOCK: &str = "第1天";
+
 /// Campaign 级基础变量 schema（全局状态，含 story_clock）
 pub fn default_campaign_variables() -> Vec<VariableField> {
     vec![
-        VariableField::string("story_clock", "故事时间", "第1天", "全局"),
+        VariableField::string("story_clock", "故事时间", DEFAULT_STORY_CLOCK, "全局"),
         VariableField::string("weather", "天气", "晴", "全局"),
         VariableField::string("world_state", "大势", "和平", "全局"),
     ]
@@ -236,7 +243,9 @@ pub fn extract_mvu_schema_from_extensions(extensions: &serde_json::Value) -> Vec
 
     for path in candidates {
         if let Some(serde_json::Value::Object(map)) = pick_nested(extensions, path) {
-            let fields = parse_variable_objects(map);
+            // M-28d：归一化必须在探测边界做（与 `extract_campaign_variable_schema_from_extensions`
+            // 对齐），否则斜杠记法 / `stat_data.` 前缀 / `<角色名>` 模板段会以原样进 schema。
+            let fields = normalize_schema_keys(parse_variable_objects(map));
             if !fields.is_empty() {
                 return fields;
             }
@@ -276,47 +285,81 @@ fn pick_nested<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_
 
 /// 把 stat_data / initvar 对象解析成 Vec<VariableField>
 ///
-/// 兼容两种 MVU 写法：
+/// 兼容三种 MVU 写法：
 /// - 标量值：`"hp": 100` → label 推断为 "hp"，类型按值推断
 /// - 完整对象：`"hp": {"label": "生命值", "type": "int", "default": 100}`
+/// - 嵌套容器（M-28d）：`"主角": {"hp": 100}` → 递归展开为点记法叶子
+///   `主角.hp`，不再产出 `主角 = null` 这类垃圾字段
 fn parse_variable_objects(map: &serde_json::Map<String, serde_json::Value>) -> Vec<VariableField> {
-    map.iter()
-        .filter_map(|(key, val)| match val {
+    parse_variable_objects_prefixed(map, "")
+}
+
+/// 判定一个 JSON 对象是"字段定义"还是"嵌套容器"。
+///
+/// 只要出现 `label`/`type`/`default`/`initial` 之一即视为字段定义；仅含
+/// `description`/`group` 等装饰键不足以判定（避免把 `{"group":"状态","hp":100}`
+/// 这类容器误当成单字段）。
+fn is_field_definition(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    ["label", "type", "default", "initial"]
+        .iter()
+        .any(|k| o.contains_key(*k))
+}
+
+fn parse_variable_objects_prefixed(
+    map: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+) -> Vec<VariableField> {
+    let mut out = Vec::new();
+    for (key, val) in map {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match val {
             // 完整字段定义对象
-            serde_json::Value::Object(o) => {
+            serde_json::Value::Object(o) if is_field_definition(o) => {
                 let label = o
                     .get("label")
                     .and_then(|v| v.as_str())
                     .unwrap_or(key)
                     .to_string();
                 let type_str = o.get("type").and_then(|v| v.as_str()).unwrap_or("string");
-                let default = o.get("default").cloned().unwrap_or(serde_json::Value::Null);
+                let default = o
+                    .get("default")
+                    .or_else(|| o.get("initial"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let value_type = parse_type(type_str, &default);
                 let description = o
                     .get("description")
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 let group = o.get("group").and_then(|v| v.as_str()).map(String::from);
-                Some(VariableField {
-                    key: key.clone(),
+                out.push(VariableField {
+                    key: full_key,
                     label,
                     value_type,
                     default,
                     description,
                     group,
-                })
+                });
+            }
+            // 嵌套容器：递归展开为点记法叶子
+            serde_json::Value::Object(o) => {
+                out.extend(parse_variable_objects_prefixed(o, &full_key));
             }
             // 标量值（直接当默认值）
-            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(VariableField {
-                key: key.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => out.push(VariableField {
+                key: full_key,
                 label: key.clone(),
                 value_type: infer_scalar_type(val),
                 default: val.clone(),
                 description: None,
                 group: None,
             }),
-            serde_json::Value::String(s) => Some(VariableField {
-                key: key.clone(),
+            serde_json::Value::String(s) => out.push(VariableField {
+                key: full_key,
                 label: key.clone(),
                 value_type: VariableType::String,
                 default: serde_json::Value::String(s.clone()),
@@ -324,9 +367,10 @@ fn parse_variable_objects(map: &serde_json::Map<String, serde_json::Value>) -> V
                 group: None,
             }),
             // null / array / 其他形态跳过（保守，宁缺勿错）
-            _ => None,
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 根据 type 字符串 + 默认值推断 VariableType
@@ -692,5 +736,67 @@ mod tests {
         assert_eq!(hp.default.as_i64(), Some(200), "hp 应被 MVU 覆盖");
         assert!(merged.iter().any(|f| f.key == "fatigue"), "应有新增字段");
         assert!(merged.iter().any(|f| f.key == "mp"), "基础字段不丢");
+    }
+
+    // ─── M-28d：嵌套 initvar 展开 + 探测边界归一化 ──────────────────────────
+
+    #[test]
+    fn test_extract_mvu_nested_initvar_expands_to_dotted_leaves() {
+        let ext = serde_json::json!({
+            "mvu": { "initvar": { "主角": { "hp": 100, "name": "林" }, "flat": 3 } }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        let keys: Vec<&str> = schema.iter().map(|f| f.key.as_str()).collect();
+        assert!(
+            keys.contains(&"主角.hp"),
+            "嵌套 initvar 应展开为点记法叶子（M-28d）：{keys:?}"
+        );
+        assert!(keys.contains(&"主角.name"), "{keys:?}");
+        assert!(keys.contains(&"flat"), "{keys:?}");
+        assert!(
+            !keys.contains(&"主角"),
+            "不得再把嵌套容器当成 default=null 的垃圾字段：{keys:?}"
+        );
+        assert_eq!(
+            schema.iter().find(|f| f.key == "主角.hp").unwrap().default,
+            serde_json::json!(100)
+        );
+    }
+
+    #[test]
+    fn test_extract_mvu_normalizes_detected_keys() {
+        // 探测边界必须归一（斜杠记法 / stat_data 前缀 / <角色名> 模板段）
+        let ext = serde_json::json!({
+            "mvu": { "initvar": { "stat_data/hp": 100, "/<主角>/好感度": 5 } }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        let keys: Vec<&str> = schema.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains(&"hp"), "应剥离 stat_data 前缀：{keys:?}");
+        assert!(keys.contains(&"{主角}.好感度"), "模板段应归一：{keys:?}");
+    }
+
+    #[test]
+    fn test_extract_mvu_field_definition_object_is_not_recursed() {
+        // 带 label/type/default 的对象仍是字段定义（不递归展开）
+        let ext = serde_json::json!({
+            "stat_data": { "hp": {"label": "生命值", "type": "int", "default": 200} }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].key, "hp");
+        assert_eq!(schema[0].label, "生命值");
+        assert_eq!(schema[0].default, serde_json::json!(200));
+    }
+
+    #[test]
+    fn test_extract_mvu_supports_initial_key_as_default() {
+        // MVU 插件常写 `initial` 而不是 `default`
+        let ext = serde_json::json!({
+            "mvu": { "initvar": { "hp": {"type": "int", "initial": 42} } }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].default, serde_json::json!(42));
+        assert_eq!(schema[0].value_type, VariableType::Int);
     }
 }

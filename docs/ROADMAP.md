@@ -74,7 +74,7 @@
 - ~~Meta patch 类型化。~~ ✅ 阶段 3：`typed_patch.rs`（8 action：4 health-issue + 4 agent-proposed）+ preview/accept/dismiss 闭环
 - ~~patch 需要 preview、accept、dismiss。~~ ✅ 阶段 3：4 个 Tauri 命令闭环
 - ~~MVU 分析结果接入 variable schema。~~ ✅ 阶段 5：`mvu_apply.rs` + `meta_preview_mvu_apply`/`meta_apply_mvu_schema`
-- ~~统一 tool 注册中心。~~ ✅ 第四轮 E：`tool_center.rs` + 按角色选配
+- ~~统一 tool 注册中心。~~ ✅ 第四轮 E：按角色选配（**2026-09-13 更正**：该实现所在的 `crates/app-agent/src/tool_center.rs` 已在 2026-09-13 审查修复 W-22 中**删除**——它是零生产调用者的死模块且内置"幻影工具名"；现役能力在 `crates/app-agent/src/tools.rs` 的 `ToolRegistry` + `register_director_tools`/`register_subagent_tools`/…，白名单收敛走 `ToolRegistry::retain`）
 - ~~Campaign-aware Meta Tools。~~ ✅ 阶段 4：6 工具（inspect_campaign/instance/variables/knowledge/tasks + propose_campaign_patch）
 
 验收：
@@ -120,7 +120,7 @@
 - ~~明确 ST V2/V3 导入保真范围。~~ ✅ V2/V3 兼容
 - ~~保留 raw JSON 和 extensions。~~ ✅ `raw_card_json` + `extensions` 保留
 - ~~多角色识别失败时稳定 fallback。~~ ✅ `fallback_from_character`
-- ~~设计 StoryForge Campaign 导出格式。~~ ✅ JSON bundle（`format_version`）
+- ~~设计 StoryForge Campaign 导出格式。~~ ✅ JSON bundle（`format_version`；**2026-09-13 更正（task-31，M-30-②）**：导出端不是单一 v2——无正文快照的导出写 **v2**（`BUNDLE_FORMAT_VERSION = 2`，`commands/import_export.rs:22/:603`），携正文快照的 SQLite 导出路径写 **v3**（`sqlite_runtime.rs:278`）；导入端接受 **1..=3**（`import_export.rs:654/:1047` 拒绝 `0` 与 `>3`），且 **v3 必须带 `runtime` 正文快照**，否则报"v3 Bundle 缺少正文快照"（`commands/bundle_runtime.rs:20`）。口径与代码一致，无代码缺陷）
 - ~~评估是否支持导出回 ST 卡或 Lorebook。~~ ✅ ST 卡 PNG（tEXt 写入）+ 多角色共享 lorebook
 - ~~MVU apply 前端接线：后端 `meta_preview_mvu_apply`/`meta_apply_mvu_schema` 命令已有，前端 API 未接。~~ ✅ W9 已实现：tauri-api.js 补 API + MetaPanel 加 preview diff + 确认 apply + 变量 tab 刷新
 - ~~JS Fallback WebView Runtime 接通写作流程：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。~~ ✅ W10 已实现：DI 注入 + postprocess 调 execute_fragment，harness 传 None 降级；2026-07-06 已将 WebView/Tauri adapter 从 `infra-plugin-host` 拆到 `tauri-app/src/mvu_webview_runtime.rs`
@@ -146,7 +146,7 @@
 
 ## Phase 6: Android 打磨
 
-**状态：主体完成**（2026-08 收口：Slice 1 数据目录 fail-closed 重构已合并，见 `docs/workstreams/ANDROID-PHASE6-SLICE1-RESULT-2026-07-27.md`；Android 模拟器 15 项现场验收 PASS 见 `docs/HANDOFF.md` §11.3。剩余为真机回归与发布级打磨。）
+**状态：主体完成**（2026-08 收口：Slice 1 数据目录 fail-closed 重构已合并，见 `docs/workstreams/ANDROID-PHASE6-SLICE1-RESULT-2026-07-27.md`；Android 模拟器 15 项现场验收 PASS 的证据在 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md` §11.3（`:373`「验证证据」）——**2026-09-13 更正**：原文指向的 `docs/HANDOFF.md` §11.3 不存在。注意 `docs/workstreams/**` 与 `docs/HANDOFF.md` 都被 `.gitignore` 忽略（`:102`/`:92`），属本机笔记，新克隆读不到。剩余为真机回归与发布级打磨。）
 
 目标：把桌面调试能力收束为移动端可用体验。
 
@@ -167,6 +167,8 @@
 （该阶段剩余项为真机回归；详细执行计划文档已不随仓库分发。）
 
 ## Phase 7: 收口、验收和发布准备
+
+**状态：部分完成**（2026-09-13 复核，依据 `docs/review-2026-09-13/07-goals-and-claims.md` §4 与 `docs/review-2026-09-13/fixes/09-goals-scripts-fixes.md` §7.3）：端到端验收矩阵、固定回归与 LLM 质量样例、备份/迁移/恢复与排障 bundle、发布包（v0.1.2 三资产）与首次使用文档（`docs/USER-GUIDE.md`）、下一阶段优先级（`docs/PLAN-POST-MAINLINE.md`，本机未入库）均有证据；**长会话性能与 Agent 调用成本没有专门证据**（只有单轮 33 次调用的延迟中位数与未封口的 100 轮耐力记录）；验收①「新用户能按文档完成第一局 Campaign」**无用户实操记录，无法判定**，验收②③已满足。
 
 目标：当前所有专项计划完成后，把项目从“功能打通”推进到“可验证、可发布、可继续迭代”。
 
@@ -199,7 +201,7 @@
 - ~~建 24 个基础 UI 组件（19 手写 + 5 Headless UI 承载），补组件挂载测试层。~~ ✅ 阶段 2
 - ~~把 App.vue 内联业务逻辑抽成 8 个 composable + 3 个纯 util。~~ ✅ 阶段 3
 - ~~搭 shell 应用框架（AppShell/TopBar/PrimarySidebar/InspectorDrawer/PanelHost）。~~ ✅ 阶段 4
-- ~~重写写作工作台（ChatMessage 保留 8 emit 契约）+ AppV2 首次组装。~~ ✅ 阶段 5
+- ~~重写写作工作台（ChatMessage 保留 8 emit 契约）+ AppV2 首次组装。~~ ✅ 阶段 5（**2026-09-13 更正**：8 emit 契约的真实载体是 `frontend/src/design/writing/MessageItem.vue`（8 个 emit 全部接线）；旧的 `components-v2/writing/ChatMessage.vue` 零引用，属阶段 8 遗留、未接线）
 - ~~重写 Campaign 面板（CampaignPanel 保留 refreshActiveDetailTab 契约）+ 4 个 tab。~~ ✅ 阶段 6
 - ~~重写 meta/st/config/debug 面板（MetaPanel 保留 mvu-applied 契约）。~~ ✅ 阶段 7
 - ~~main.js 切换到 AppV2 + Pinia，旧 App.vue 保留可回退。~~ ✅ 阶段 8
@@ -207,9 +209,9 @@
 
 验收：
 
-- ✅ 双轨测试：node --test 212 pass + vitest 21 pass，不破坏既有护城河（含 16 个半脆弱测试）。
-- ✅ 构建产物 422KB，仅存已知 Vite dynamic import warning。
-- ✅ 契约红线全部保留：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`；`tauri-api.js`/`plugin-bridge.js`/`utils/*.js` 签名零改动。
+- ✅ 双轨测试（**2026-07-08 时点数据**）：node --test 212 pass + vitest 21 pass，不破坏既有护城河（含 16 个半脆弱测试）。**当前计数（2026-09-13）：node:test 67 文件 / 532 通过（域5 单进程直跑）；vitest 侧 `frontend/tests/components-v2/` 31 个文件，通过数待 Lead 收口门禁确认后回填**。
+- ✅ 构建产物 422KB（2026-07-08 时点），仅存已知 Vite dynamic import warning。最新构建产物大小与告警以 `docs/RELEASE-STATUS.md` 为准。
+- ✅ 契约红线保留（2026-07-08 时点）：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`。**2026-09-13 更新**：`tauri-api.js` 已删除 20 个零引用 wrapper（`cardstudioListStages` 等保留入口已接线），因此"`tauri-api.js` 签名零改动"只对 2026-07-08 时点成立；后端 175 条命令一条未删，其中 23 条为"无前端入口的声明的保留 API"（`scripts/architecture/backend-baseline.mjs` 的 `RETAINED_NO_FRONTEND_CALLER`）。
 
 详细计划见 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。
 

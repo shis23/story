@@ -535,6 +535,26 @@ impl ConversationStore {
         provenance: Option<Provenance>,
     ) -> Result<usize, ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
+            // W-17：本方法的契约是"重 roll 对话最后一条 AI 消息"（见上方 doc）。
+            // 对中间节点调用会原地改写后续历史，这里显式拒绝，要求改用 add_variant 开分支。
+            let is_last_assistant = conv
+                .nodes
+                .last()
+                .map(|last| {
+                    last.id == *node_id
+                        && last
+                            .active()
+                            .map(|v| v.role == Role::Assistant)
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !is_last_assistant {
+                return Err(ConversationError::PartialRollViolation(
+                    "replace_active_variant 只能用于对话最后一条 AI 消息；中间节点请用 add_variant 开分支"
+                        .into(),
+                ));
+            }
+
             let node = conv
                 .find_node_mut(node_id)
                 .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
@@ -799,6 +819,36 @@ impl ConversationStore {
         let provenance = variant.provenance.as_ref().ok_or_else(|| {
             ConversationError::PartialRollViolation("该变体无溯源信息，无法部分重 roll".into())
         })?;
+
+        // W-16：targets 自身校验——重复目标会双跑（白付一次 LLM + 重复事件），
+        // 未知 Subagent 目标旧行为要到 pipeline 才报错；此处提前拒绝。
+        let mut seen_targets = std::collections::HashSet::new();
+        for target in targets {
+            let key = match target {
+                PartialRollTarget::Director => "director".to_string(),
+                PartialRollTarget::Editor => "editor".to_string(),
+                PartialRollTarget::Subagent(id) => format!("subagent:{id}"),
+            };
+            if !seen_targets.insert(key) {
+                return Err(ConversationError::PartialRollViolation(format!(
+                    "重 roll 目标重复：{target:?}"
+                )));
+            }
+        }
+        if let Some(plan) = provenance.plan.as_ref() {
+            for target in targets {
+                if let PartialRollTarget::Subagent(id) = target
+                    && !plan
+                        .subagent_tasks
+                        .iter()
+                        .any(|task| task.character_id == *id)
+                {
+                    return Err(ConversationError::PartialRollViolation(format!(
+                        "目标子 Agent '{id}' 不在旧 Plan 中"
+                    )));
+                }
+            }
+        }
 
         // 检查约束：不能只重导演却保留旧子产出
         let rerun_director = targets
@@ -1530,6 +1580,119 @@ mod tests {
         // 只重编剧 → 应成功
         let result = store.validate_partial_roll(&conv.id, &node_id, &[PartialRollTarget::Editor]);
         assert!(result.is_ok());
+
+        let _ = store.delete(&conv.id);
+    }
+
+    /// W-16：重复/未知的 targets 必须在 validate 阶段拒绝（否则 pipeline 双跑或迟到报错）。
+    #[test]
+    fn test_partial_roll_validation_rejects_duplicate_and_unknown_targets() {
+        let store = temp_store();
+        let conv = store.create(None, None);
+        let node_id = store
+            .append_ai_draft(&conv.id, "成文".into(), None)
+            .unwrap();
+
+        let plan = storyforge_domain::agent::Plan {
+            scene_brief: "场景".into(),
+            subagent_tasks: vec![storyforge_domain::agent::SubagentTask {
+                character_id: "A".into(),
+                brief: "演出".into(),
+                context_package: storyforge_domain::agent::ContextPackage {
+                    character_brief: String::new(),
+                    scene_brief: "场景".into(),
+                    relevant_lore: vec![],
+                    constant_lore: vec![],
+                    recent_window: vec![],
+                    task: "演出".into(),
+                },
+                current_desire: None,
+                ongoing_action: None,
+                emotion_stage: None,
+            }],
+            scene_plan: None,
+        };
+        let provenance = Provenance {
+            session_id: Id::new(),
+            plan: Some(plan),
+            subagent_results: vec![],
+            profile_id: None,
+            generation_mode: None,
+            seed: 7,
+            last_hint: None,
+            director_reasoning: None,
+            writer_reasoning: None,
+            editor_reasoning: None,
+        };
+        store
+            .add_variant(&conv.id, &node_id, "带溯源的版本".into(), Some(provenance))
+            .unwrap();
+
+        // 重复 Editor → 拒绝
+        let duplicate = store.validate_partial_roll(
+            &conv.id,
+            &node_id,
+            &[PartialRollTarget::Editor, PartialRollTarget::Editor],
+        );
+        assert!(
+            matches!(duplicate, Err(ConversationError::PartialRollViolation(_))),
+            "{duplicate:?}"
+        );
+
+        // 未知 Subagent → 拒绝
+        let unknown = store.validate_partial_roll(
+            &conv.id,
+            &node_id,
+            &[PartialRollTarget::Subagent("missing".into())],
+        );
+        assert!(
+            matches!(unknown, Err(ConversationError::PartialRollViolation(_))),
+            "{unknown:?}"
+        );
+
+        // Plan 中的 Subagent → 通过
+        let known = store.validate_partial_roll(
+            &conv.id,
+            &node_id,
+            &[PartialRollTarget::Subagent("A".into())],
+        );
+        assert!(known.is_ok(), "{known:?}");
+
+        let _ = store.delete(&conv.id);
+    }
+
+    /// W-17：replace_active_variant 只能用于最后一条 AI 消息；中间节点必须拒绝。
+    #[test]
+    fn test_replace_active_variant_rejects_middle_node() {
+        let store = temp_store();
+        let conv = store.create(None, None);
+        let _user1 = store.append_user_message(&conv.id, "意图1".into()).unwrap();
+        let ai1 = store
+            .append_ai_draft(&conv.id, "成文1".into(), Some(dummy_provenance()))
+            .unwrap();
+        let _user2 = store.append_user_message(&conv.id, "意图2".into()).unwrap();
+        let ai2 = store
+            .append_ai_draft(&conv.id, "成文2".into(), Some(dummy_provenance()))
+            .unwrap();
+
+        // 中间节点 → 拒绝，且内容不变
+        let result = store.replace_active_variant(&conv.id, &ai1, "非法改写".into(), None);
+        assert!(
+            matches!(result, Err(ConversationError::PartialRollViolation(_))),
+            "{result:?}"
+        );
+        let unchanged = store.get(&conv.id).unwrap();
+        let node1 = unchanged.nodes.iter().find(|n| n.id == ai1).unwrap();
+        assert_eq!(node1.active_content(), "成文1");
+
+        // 末节点 → 允许
+        let ok = store.replace_active_variant(
+            &conv.id,
+            &ai2,
+            "重 roll 版".into(),
+            Some(dummy_provenance()),
+        );
+        assert!(ok.is_ok(), "{ok:?}");
 
         let _ = store.delete(&conv.id);
     }

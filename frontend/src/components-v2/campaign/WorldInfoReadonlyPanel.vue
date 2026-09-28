@@ -144,7 +144,7 @@ defineExpose({ refresh: load })
       description="导入后若卡内含 lorebook，会显示在这里。"
     />
     <template v-else>
-      <DataTable :columns="columns" :rows="filtered" empty-title="无匹配">
+      <DataTable :columns="columns" :rows="filtered" row-key="index" empty-title="无匹配">
         <template #cell-route="{ row }">
           <Badge :variant="routeVariant(row.route)" size="sm">{{ row.route }}</Badge>
         </template>

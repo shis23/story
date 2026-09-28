@@ -36,8 +36,28 @@ pub enum LeaseMode {
 /// Process-global held-lease bookkeeping for same-process reentrancy.
 #[derive(Debug, Default)]
 struct HeldLeaseBook {
-    /// Canonical path → (mode, refcount of real OS locks held for that path).
-    entries: HashMap<PathBuf, (LeaseMode, usize)>,
+    /// Canonical path → held lease record.
+    entries: HashMap<PathBuf, HeldLease>,
+}
+
+/// 单个路径的持有记录（S-11）。
+///
+/// **关键不变式**：真实 OS 锁句柄（fd / Windows share 句柄）的生命周期等于
+/// 「最后一个 holder 退出」，而不是「创建它的那个 guard 析构」。因此 fd 存放在
+/// 记账表里，由最后一个 holder 的 Drop 关闭——否则「真实 guard 先析构、重入
+/// guard 后析构」时 fd 提前关闭：OS 锁已释放，而同进程其它 guard 仍以为受保护。
+#[derive(Debug)]
+struct HeldLease {
+    mode: LeaseMode,
+    /// holder 数（1 = 仅真实持有者）。
+    holders: usize,
+    /// 真实 OS 锁句柄（由记账表持有到最后一个 holder 退出）。
+    ///
+    /// RAII 字段：**只被 Drop 消费、从不被读取**——保留它是为了把 fd / Windows
+    /// 共享句柄的生命周期延长到「最后一个 holder 退出」（见本结构体上方的关键
+    /// 不变式）。删除它会让 OS 锁提前释放，绝不能当成 dead code 清掉。
+    #[allow(dead_code)]
+    file: Option<File>,
 }
 
 fn held_book() -> &'static Mutex<HeldLeaseBook> {
@@ -104,7 +124,7 @@ impl AuthorityLeaseGuard {
             let mut book = held_book()
                 .lock()
                 .map_err(|_| SqliteError::Other("authority lease book poisoned".into()))?;
-            if let Some((held_mode, count)) = book.entries.get_mut(&key) {
+            if let Some(held) = book.entries.get_mut(&key) {
                 // 三审2：同进程重入的模式规则——
                 // - Shared→Shared、Exclusive→Shared（降级）、Exclusive→Exclusive：允许
                 //   no-op（原 OS 锁保留，更强或同等）。
@@ -112,16 +132,15 @@ impl AuthorityLeaseGuard {
                 //   Exclusive（flock/Windows 都不保证升级不阻塞或不会与其它 Shared
                 //   持有者死锁），伪装成功会让调用方误以为已独占。必须先释放 Shared
                 //   再获取 Exclusive。
-                if *held_mode == LeaseMode::Shared && mode == LeaseMode::Exclusive {
+                if held.mode == LeaseMode::Shared && mode == LeaseMode::Exclusive {
                     return Err(SqliteError::Other(format!(
                         "cannot upgrade shared lease to exclusive in-process at {}; \
                          release the shared lease first",
                         key.display()
                     )));
                 }
-                // 允许的重入：原 OS 锁保留；此 guard 是 no-op。
-                *count = count.saturating_add(1);
-                let _ = held_mode; // keep original mode as the OS lock mode
+                // 允许的重入：原 OS 锁保留（fd 在记账表里）；此 guard 是 no-op。
+                held.holders = held.holders.saturating_add(1);
                 return Ok(AuthorityLeaseGuard {
                     path: key,
                     reentrant: true,
@@ -134,13 +153,22 @@ impl AuthorityLeaseGuard {
             }
         }
 
-        let guard = acquire_os_lock(path, &key, mode)?;
+        let mut guard = acquire_os_lock(path, &key, mode)?;
 
         {
             let mut book = held_book()
                 .lock()
                 .map_err(|_| SqliteError::Other("authority lease book poisoned".into()))?;
-            book.entries.insert(key.clone(), (mode, 1));
+            // S-11：把真实 OS 句柄交给记账表托管（最后一个 holder 退出才关闭）。
+            let file = guard.take_file();
+            book.entries.insert(
+                key.clone(),
+                HeldLease {
+                    mode,
+                    holders: 1,
+                    file,
+                },
+            );
         }
 
         Ok(guard)
@@ -253,40 +281,58 @@ impl Drop for AuthorityLeaseGuard {
                     "authority lease book lock poisoned during Drop; path={}",
                     self.path.display()
                 );
+                // 记账表不可用：至少别把自己持有的 fd 泄漏到进程结束。
+                self.release_os_lock();
                 return;
             }
         };
-        if let Some((_, count)) = book.entries.get_mut(&self.path) {
-            if *count > 1 {
-                *count -= 1;
-                // Still held by another guard in this process; keep OS lock.
-                return;
-            }
-            book.entries.remove(&self.path);
+        if let Some(held) = book.entries.get_mut(&self.path)
+            && held.holders > 1
+        {
+            // S-11：仍有其它 holder（真实或重入）——只递减计数；真实 OS 句柄
+            // 由记账表持有，绝不在这里提前关闭。
+            held.holders -= 1;
+            return;
         }
+        // 最后一个 holder：移除记录 → 记录里的 fd 随之关闭 → OS 锁释放。
+        book.entries.remove(&self.path);
         drop(book);
 
-        if !self.reentrant {
-            self.release_os_lock();
-        }
+        // 兜底：正常情况下 fd 已托管给记账表（self.file == None）；若本 guard 仍
+        // 自持 fd（例如记账表已被清空），显式释放，避免进程内泄漏锁。
+        self.release_os_lock();
     }
 }
 
 impl AuthorityLeaseGuard {
+    /// 把真实 OS 句柄交给记账表托管（S-11）。
+    #[cfg(unix)]
+    fn take_file(&mut self) -> Option<File> {
+        self.file.take()
+    }
+
+    /// 把真实 OS 句柄交给记账表托管（S-11）。
+    #[cfg(not(unix))]
+    fn take_file(&mut self) -> Option<File> {
+        self._file.take()
+    }
+
     /// 释放 OS 层锁。Windows 关闭句柄即释放；unix 需要显式 flock LOCK_UN。
     #[cfg(unix)]
-    fn release_os_lock(&self) {
+    fn release_os_lock(&mut self) {
         use std::os::unix::io::AsRawFd;
-        if let Some(ref file) = self.file {
+        if let Some(file) = self.file.take() {
             unsafe {
                 libc::flock(file.as_raw_fd(), libc::LOCK_UN);
             }
+            drop(file);
         }
     }
 
     #[cfg(not(unix))]
-    fn release_os_lock(&self) {
+    fn release_os_lock(&mut self) {
         // 关闭句柄（drop _file）即释放 Windows 共享锁。
+        let _ = self._file.take();
     }
 }
 
@@ -357,6 +403,75 @@ mod tests {
         assert!(shared.is_reentrant());
         drop(shared);
         drop(excl);
+    }
+
+    #[test]
+    fn reentrant_guard_out_of_order_drop_keeps_os_lock_until_last_holder() {
+        // S-11：旧 Drop 在「还有其它持有者」时提前 return，但 Rust 仍会 drop
+        // guard 自己的字段 → 真实 fd 被关闭、**OS 锁提前释放**，而记账表仍记
+        // 「持有中」→ 跨进程互斥静默失效。这里用独立 fd 直接探测 OS 锁是否真的
+        // 还在（unix: flock(LOCK_EX|LOCK_NB)；Windows: share_mode(0) 打开）。
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(AUTHORITY_LEASE_FILENAME);
+
+        let owner = AuthorityLeaseGuard::acquire(&path, LeaseMode::Shared).unwrap();
+        assert!(!owner.is_reentrant());
+        let reentrant = AuthorityLeaseGuard::acquire(&path, LeaseMode::Shared).unwrap();
+        assert!(reentrant.is_reentrant());
+        assert!(
+            os_lock_held_by_another_handle(&path),
+            "两个持有者都在时 OS 锁必须被占据"
+        );
+
+        // 乱序 drop：先释放真实 owner，重入 guard 仍存活。
+        drop(owner);
+        assert!(
+            os_lock_held_by_another_handle(&path),
+            "S-11：重入持有者仍存活时 OS 锁不得被释放（真实 fd 由记账表托管）"
+        );
+
+        // 最后一个 holder 释放后锁必须真正释放，且记账表清空（下一次获取是真实锁）。
+        drop(reentrant);
+        assert!(
+            !os_lock_held_by_another_handle(&path),
+            "最后一个持有者释放后 OS 锁必须释放"
+        );
+        let excl = AuthorityLeaseGuard::acquire(&path, LeaseMode::Exclusive)
+            .expect("记账表清空后必须能重新独占获取");
+        assert!(!excl.is_reentrant(), "记账表不得残留伪造的重入状态");
+        drop(excl);
+    }
+
+    /// 用一个**独立 fd/fd 级**探测判断锁文件当前是否被其它句柄占用。
+    fn os_lock_held_by_another_handle(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .expect("open lease file");
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                unsafe {
+                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                }
+            }
+            rc != 0
+        }
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(false)
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(path)
+                .is_err()
+        }
     }
 
     #[test]

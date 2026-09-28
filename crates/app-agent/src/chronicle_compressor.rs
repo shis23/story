@@ -47,6 +47,10 @@ pub struct CompressRunOutcome {
     pub publish: CompressPublishResult,
     /// 可直接 insert 的 parent RoundSummary
     pub parent_summaries: Vec<RoundSummary>,
+    /// W-23：本次是否走了确定性降级文案（LLM 解析失败等），调用方可据此提示/审计
+    pub degraded: bool,
+    /// 降级原因（未降级为 None）
+    pub degraded_reason: Option<String>,
 }
 
 /// 从 uncovered 条目中按 level 过滤并规划组。
@@ -130,14 +134,37 @@ pub fn parse_compress_group_texts(
     Ok(out)
 }
 
+/// 提取首个配平的 JSON 数组（W-23：旧实现用 `rfind(']')`，会把
+/// `[...] 解释文字 [...]` 这类多数组文本切成一个非法大段）。
 fn extract_json_array(s: &str) -> Option<&str> {
     let start = s.find('[')?;
-    let end = s.rfind(']')?;
-    if end >= start {
-        Some(&s[start..=end])
-    } else {
-        None
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, ch) in s[start..].char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..start + offset + ch.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
     }
+    None
 }
 
 /// 无 LLM：用确定性拼接文案发布（测试 / fail-open 降级）。
@@ -222,6 +249,8 @@ fn finish_publish(
         groups: groups.to_vec(),
         publish,
         parent_summaries,
+        degraded: false,
+        degraded_reason: None,
     })
 }
 
@@ -277,7 +306,8 @@ pub async fn compress_groups_with_llm(
                 target: "chronicle_compressor",
                 "LLM JSON 解析失败，降级确定性文案: {e}"
             );
-            return publish_with_deterministic_texts(
+            // W-23：降级必须可观测（outcome 带标记），不能只有一条 warn 日志
+            let mut outcome = publish_with_deterministic_texts(
                 campaign_id,
                 lineage_id,
                 conversation_id,
@@ -286,7 +316,10 @@ pub async fn compress_groups_with_llm(
                 spans,
                 groups,
                 output_level,
-            );
+            )?;
+            outcome.degraded = true;
+            outcome.degraded_reason = Some(format!("LLM JSON 解析失败: {e}"));
+            return Ok(outcome);
         }
     };
     finish_publish(
@@ -410,6 +443,67 @@ mod tests {
         let t = parse_compress_group_texts(raw, 2).unwrap();
         assert_eq!(t[0].headline, "h1");
         assert_eq!(t[1].summary, "s2");
+    }
+
+    /// W-23：只取首个配平数组；`]` 之后的第二个数组/说明文字不得被并入。
+    #[test]
+    fn parse_compress_json_array_stops_at_first_balanced_bracket() {
+        let raw = r#"结果：[{"headline":"h1","summary":"s1"}] 备注：[{"headline":"忽略","summary":"忽略"}]"#;
+        let t = parse_compress_group_texts(raw, 1).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].headline, "h1");
+
+        // 字符串里的 `]` 不提前结束数组
+        let raw = r#"[{"headline":"含]括号","summary":"s"}]"#;
+        let t = parse_compress_group_texts(raw, 1).unwrap();
+        assert_eq!(t[0].headline, "含]括号");
+    }
+
+    /// W-23：LLM 解析失败走确定性文案时，outcome 必须带 degraded 标记（可观测降级）。
+    #[tokio::test]
+    async fn deterministic_fallback_is_marked_degraded() {
+        // 无脚本 mock → 返回通用文本，必然走降级
+        let client =
+            std::sync::Arc::new(MockLlmClient::new(vec![])) as std::sync::Arc<dyn LlmClient>;
+        let ctx = std::sync::Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let runtime = AgentRuntime::new(client, ctx);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let entries: Vec<_> = (1..=4).map(leaf).collect();
+
+        let outs = run_compress_if_needed(
+            &runtime,
+            &Id::from_str("c"),
+            &Id::from_str("lin"),
+            &Id::from_str("v"),
+            entries,
+            rx,
+            None,
+            Some(4),
+            Some(999),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].degraded, "解析失败必须标记 degraded");
+        assert!(
+            outs[0]
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("JSON")),
+            "降级原因应可读: {:?}",
+            outs[0].degraded_reason
+        );
     }
 
     #[test]

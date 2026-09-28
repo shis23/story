@@ -1,17 +1,35 @@
 <script setup>
+import { computed, ref } from 'vue'
 const props = defineProps({
   items: { type: Array, default: () => [] },
-  // 选中态:传一个 id 字段名,或用 activeItem 引用对比
+  // 行的业务主键字段名（默认 id），用于 v-for key 与 activeId 比对
   activeKey: { type: String, default: 'id' },
+  // 当前选中行的 activeKey 取值（F-05：此前没有这个 prop，isActive 恒 false）
+  activeId: { type: [String, Number], default: null },
   emptyTitle: { type: String, default: '暂无数据' },
   emptyDescription: { type: String, default: '' },
+  // 首屏最多渲染多少行（0 = 不限制）。大列表（角色卡库、日志）避免一次性全量渲染（F-34）
+  maxItems: { type: Number, default: 0 },
 })
 const emit = defineEmits(['select'])
 
+const showAll = ref(false)
+
 function isActive(item, index) {
-  if (props.activeKey && item && props.activeKey in item) return false
-  return false
+  if (props.activeId == null) return false
+  if (item == null) return false
+  const key = props.activeKey
+  if (key && typeof item === 'object' && key in item) return item[key] === props.activeId
+  return index === props.activeId
 }
+
+const renderedItems = computed(() => {
+  if (props.maxItems > 0 && !showAll.value) return props.items.slice(0, props.maxItems)
+  return props.items
+})
+const hiddenCount = computed(() =>
+  props.maxItems > 0 && !showAll.value ? Math.max(0, props.items.length - props.maxItems) : 0,
+)
 </script>
 
 <template>
@@ -25,8 +43,8 @@ function isActive(item, index) {
       <slot name="empty-action" />
     </div>
     <div
-      v-for="(item, index) in items"
-      :key="item[activeKey] ?? index"
+      v-for="(item, index) in renderedItems"
+      :key="item?.[activeKey] ?? index"
       class="px-3 py-2 cursor-pointer transition-colors duration-100 hover:bg-surface-2/60 border-l-2 border-transparent"
       :class="{ 'bg-accent-soft !border-accent': isActive(item, index) }"
       @click="emit('select', item, index)"
@@ -35,5 +53,11 @@ function isActive(item, index) {
         {{ typeof item === 'string' ? item : item.label || item.name || JSON.stringify(item) }}
       </slot>
     </div>
+    <button
+      v-if="hiddenCount > 0"
+      type="button"
+      class="w-full px-3 py-2 text-xs text-ink-soft hover:bg-surface-2/60 transition-colors"
+      @click="showAll = true"
+    >显示更多（还有 {{ hiddenCount }} 条）</button>
   </div>
 </template>

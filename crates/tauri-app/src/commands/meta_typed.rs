@@ -20,10 +20,21 @@ pub(crate) fn load_meta_snapshot_from_store(
     let campaign = store
         .get_campaign(campaign_id)
         .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+    // M-11：卡缺失时**不得**降级为空 definitions。空定义集会把每个带
+    // definition_id 的实例判成 orphan_instance，并生成「解绑 definition 转临时
+    // 角色」的破坏性修复提案（接受后 instance.is_temporary = true，角色定义/
+    // persona/schema 全部脱离）。SQLite 路径（meta_backend.rs）已显式 fail
+    // closed，这里与之对齐。
     let definitions = store
         .get_card(&campaign.card_id)
-        .map(|c| c.card.character_definitions)
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!(
+                "Campaign 的卡不存在: {}（拒绝按空 definitions 体检）",
+                campaign.card_id
+            ))
+        })?
+        .card
+        .character_definitions;
     let instances = store.list_instances(campaign_id);
     let knowledge = store.list_knowledge(campaign_id);
     let tasks = store.list_tasks(campaign_id);
@@ -185,9 +196,13 @@ pub(crate) fn canonical_typed_patch_actions_json(
     serde_json::to_value(canonical).ok()
 }
 
-/// 列出所有 Pending 状态的类型化 patch
+/// 列出所有 Pending 状态的类型化 patch。
+///
+/// M-03：可按 Campaign 过滤（前端传 `activeCampaign.id`）。不传时保持旧行为，
+/// 但 accept/preview 都会拒绝跨战役 patch，写边界不再依赖列表过滤。
 #[tauri::command]
 pub(crate) fn meta_list_typed_patches(
+    campaign_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let typed = state
@@ -197,6 +212,10 @@ pub(crate) fn meta_list_typed_patches(
     typed
         .iter()
         .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
+        .filter(|p| match campaign_id.as_deref() {
+            Some(cid) => p.campaign_id.as_deref() == Some(cid),
+            None => true,
+        })
         .map(|p| to_json_value(p, "typed patch"))
         .collect()
 }
@@ -222,6 +241,12 @@ pub(crate) fn meta_preview_typed_patch(
         &snapshot,
         state.inner().as_ref(),
     )
+}
+
+/// M-03：TypedPatch 必须与「提议时的 Campaign」绑定。
+/// `None` = 旧格式内存 patch（无绑定信息）→ 不满足（fail closed，需重新提案）。
+fn patch_campaign_binding_ok(patch: &storyforge_app_meta::TypedPatch, campaign_id: &str) -> bool {
+    patch.campaign_id.as_deref() == Some(campaign_id)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -253,6 +278,20 @@ pub(crate) fn meta_preview_typed_patch_with_snapshot(
         .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
 
     let input = build_preview_input(snapshot);
+
+    // M-03：patch 必须绑定到它被提议时的 Campaign。
+    // 旧实现只信入参 campaign_id，因此 A 战役的提案（`UpdateCampaignVariable`
+    // 无 target id）可以在 B 战役的 UI 上预览通过并被接受；`None` 表示旧格式
+    // 内存 patch（无绑定信息），同样 fail closed。
+    if !patch_campaign_binding_ok(patch, campaign_id) {
+        patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        let patch_json = to_json_value(&*patch, "typed patch preview")?;
+        return Ok(serde_json::json!({
+            "stale": true,
+            "reason": "campaign_mismatch",
+            "patch": patch_json,
+        }));
+    }
 
     // Preview 与 Accept 共用同一前置条件纯函数（Gate 2 Batch 2.4）：
     // target 缺失或 definition/schema 前置条件不满足时都标 Stale，确保 Preview 看到的
@@ -378,6 +417,16 @@ where
         }
         p.clone()
     };
+
+    // 1.5 M-03：Campaign 绑定校验（fail closed）。必须在写盘前，且与 preview
+    //     使用同一判据，避免「A 战役的提案写进 B 战役」。
+    if !patch_campaign_binding_ok(&patch, campaign_id) {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(TauriCommandError::validation(format!(
+            "Patch 未绑定当前 Campaign（patch.campaign_id={:?}, 目标={campaign_id}），已标记过期；请重新生成后再接受",
+            patch.campaign_id
+        )));
+    }
 
     // 2. revision 校验（Gate 4）：提案盖章的 revision 与当前不一致 = campaign
     //    已被推进，patch 视为过期，拒绝而非静默应用到新状态。
@@ -706,7 +755,11 @@ pub struct MvuTranslationSummaryDto {
     pub source_character_id: String,
     pub character_name: String,
     pub analyzed_at: String,
-    pub routing: String,
+    /// M-27d：必须是 `MvuRouting` 的 serde 形态（`{"kind":"native"|"hybrid",…}`），
+    /// 不是 Rust `Debug` 字符串。旧实现写 `format!("{:?}", …)`，而前端
+    /// `routingText()`（frontend/src/utils/campaignDisplay.js:29-34）按对象解析，
+    /// 于是恒返回「混合（）」。
+    pub routing: serde_json::Value,
     pub ui_binding_count: usize,
     pub fallback_count: usize,
     pub analysis_confidence: f64,
@@ -827,18 +880,23 @@ pub(crate) fn meta_list_mvu_translations(
         .storage()
         .list_mvu()
         .map_err(TauriCommandError::storage)?;
-    Ok(list
-        .iter()
-        .map(|m| MvuTranslationSummaryDto {
-            source_character_id: m.source_character_id.as_str().to_string(),
-            character_name: m.character_name.clone(),
-            analyzed_at: m.analyzed_at.clone(),
-            routing: format!("{:?}", m.translation.routing),
-            ui_binding_count: m.translation.ui_bindings.len(),
-            fallback_count: m.translation.fallback_fragments.len(),
-            analysis_confidence: m.translation.analysis_confidence,
+    list.iter()
+        .map(|m| -> Result<MvuTranslationSummaryDto, TauriCommandError> {
+            Ok(MvuTranslationSummaryDto {
+                source_character_id: m.source_character_id.as_str().to_string(),
+                character_name: m.character_name.clone(),
+                analyzed_at: m.analyzed_at.clone(),
+                // M-27d/e：走 serde 序列化（前端按 {kind} 对象解析），失败显式
+                // 传播而不是 `unwrap_or(Null)` 静默吞掉。
+                routing: serde_json::to_value(&m.translation.routing).map_err(|error| {
+                    TauriCommandError::internal(format!("MVU routing 序列化失败: {error}"))
+                })?,
+                ui_binding_count: m.translation.ui_bindings.len(),
+                fallback_count: m.translation.fallback_fragments.len(),
+                analysis_confidence: m.translation.analysis_confidence,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Tauri command: 查某角色卡的 MVU 翻译详情（前端渲染状态栏用）

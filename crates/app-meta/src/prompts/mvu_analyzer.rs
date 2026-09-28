@@ -226,6 +226,55 @@ fn entry_comment(entry: &storyforge_domain::world_info::WorldInfoEntry) -> Strin
         .to_string()
 }
 
+/// 判定为「变量树」所需的键值行下限（低于此值即使比例很高也不算——
+/// 短正文本来就不会触发截断，无需大额度）。
+const VARIABLE_TREE_MIN_KEY_LINES: usize = 6;
+/// 键值行占非空行的比例下限。
+const VARIABLE_TREE_KEY_LINE_RATIO: f64 = 0.6;
+
+/// 条目正文是否长得像变量树（M-17）：`key: value` 形态的行占绝对多数。
+///
+/// 旧实现按注释字符串含 `initvar` 给大额度，注释写成 `[变量初始化]`/`状态栏数据`
+/// 却承载整棵变量树的条目仍被 4K 截断（中段子树永远进不了 schema，与
+/// 2026-07-27 修复的是同一类缺口）。这里改为按正文形态判定，注释只用于
+/// [`build_worldbook_variable_section`] 的收录筛选。
+///
+/// 形态判据：缩进行 + `key:`（键为无空白的标识符，排除 `- `/`* ` 列表标记）；
+/// 尾部 `value` 非空，或该行只写 `key:` 作为子树开头。
+fn body_looks_like_variable_tree(body: &str) -> bool {
+    let mut non_empty = 0usize;
+    let mut key_lines = 0usize;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        non_empty += 1;
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("# ") {
+            continue;
+        }
+        let Some((raw_key, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = raw_key.trim_end();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let value = rest.trim();
+        // `key:`（空值 = 子树开头）或 `key: value`
+        if value.is_empty() || !value.starts_with("//") {
+            key_lines += 1;
+        }
+    }
+    if key_lines < VARIABLE_TREE_MIN_KEY_LINES || non_empty == 0 {
+        return false;
+    }
+    key_lines as f64 / non_empty as f64 >= VARIABLE_TREE_KEY_LINE_RATIO
+}
+
 /// 世界书里的变量条目（[InitVar] 初始值 / [mvu_update] 规则 / stat_data 引用）。
 /// 禁用条目也要收——MVU 卡的 [InitVar] 约定就是 enabled=false 当数据用。
 fn build_worldbook_variable_section(card: &Character) -> Option<String> {
@@ -250,8 +299,9 @@ fn build_worldbook_variable_section(card: &Character) -> Option<String> {
         if !is_var_entry || budget == 0 {
             continue;
         }
-        // [InitVar] 数据条目给大额度（整树不可截断），规则类条目维持小额度
-        let per_entry_cap = if c_lower.contains("initvar") {
+        // 变量树数据条目给大额度（整树不可截断），规则类条目维持小额度。
+        // 判据是正文形态（M-17），不是注释里是否写了 `initvar`。
+        let per_entry_cap = if body_looks_like_variable_tree(&entry.content) {
             24_000
         } else {
             4_000
@@ -673,5 +723,141 @@ mod tests {
             storyforge_domain::mvu_translation::CardComplexity::PureData,
             "启用 tavern_helper 脚本的卡不应判为 PureData"
         );
+    }
+
+    // ── M-17：大额度按正文形态判定，不再看注释里有没有 `initvar` ───────────
+
+    /// 造一棵超过旧 4K 单条额度的变量树（约 9K 字）
+    fn make_large_variable_tree_lines() -> Vec<String> {
+        let mut lines = vec!["变量树:".to_string()];
+        for i in 0..300 {
+            lines.push(format!("  角色{i:03}:\n    好感度: {i}\n    等级: 1"));
+        }
+        lines
+    }
+
+    fn card_with_entries(entries: serde_json::Value) -> Character {
+        use storyforge_domain::world_info::WorldInfoBook;
+        let st_book: storyforge_domain::character::StWorldInfoBook =
+            serde_json::from_value(serde_json::json!({ "entries": entries }))
+                .expect("st book json");
+        let mut card = make_card();
+        card.embedded_world_info = Some(WorldInfoBook::from_st(st_book));
+        card
+    }
+
+    #[test]
+    fn test_rule_like_entry_body_is_not_a_variable_tree() {
+        let mut lines =
+            vec!["变量更新规则（每轮按剧情输出 <UpdateVariable> JSONPatch）。".to_string()];
+        for i in 0..200 {
+            lines.push(format!(
+                "规则 {i}: 好感度变化参考剧情（https://example.com/doc 有说明）。"
+            ));
+        }
+        let body = lines.join("\n");
+        assert!(
+            !body_looks_like_variable_tree(&body),
+            "规则正文不得判为变量树"
+        );
+        // 变量树正文必须判为 true（同一启发式的正例）
+        assert!(body_looks_like_variable_tree(
+            &make_large_variable_tree_lines().join("\n")
+        ));
+    }
+
+    #[test]
+    fn test_variable_tree_entry_without_initvar_comment_gets_large_budget() {
+        // 回归（M-17）：注释写「变量初始化」（不含 `initvar`）、正文是整棵变量树——
+        // 旧实现按注释字符串含 `initvar` 判额度，会按 4K 截断，中段子树永远进不了
+        // schema。额度判据改为正文形态后必须给大额度。
+        //
+        // 注意：本测试的注释必须能通过 `build_worldbook_variable_section` 的收录筛选
+        // （`initvar`/`mvu`/`变量`/`UpdateVariable`/`stat_data+规则`）。像「状态栏数据」
+        // 这类既不含 `变量` 也不含 `initvar` 的注释根本进不了该区块（收录门与额度门
+        // 是两个独立判定），故不作为本测试的输入。
+        let mut tree_lines = make_large_variable_tree_lines();
+        tree_lines.insert(150, "  中段哨兵角色:\n    唯一标记: 42".into());
+        let tree_body = tree_lines.join("\n");
+        assert!(tree_body.chars().count() > 4_000, "样本必须超过旧单条额度");
+
+        // 对照：规则类条目（同一 budget 循环内），正文必须保持 4K 截断
+        let rule_body =
+            std::iter::once("变量更新规则：每轮按剧情输出 <UpdateVariable>。".to_string())
+                .chain((0..120).map(|i| {
+                    format!("规则 {i}: 好感度变化参考剧情（https://example.com/doc 有说明）。")
+                }))
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(
+            rule_body.chars().count() > 4_000,
+            "规则样本也必须超过 4K 才能验证截断"
+        );
+
+        let card = card_with_entries(serde_json::json!([
+            {
+                "id": 1, "keys": [], "content": tree_body,
+                "constant": false, "selective": true, "enabled": false,
+                "comment": "变量初始化"
+            },
+            {
+                "id": 2, "keys": [], "content": rule_body,
+                "constant": true, "selective": false, "enabled": true,
+                "comment": "变量更新规则"
+            }
+        ]));
+
+        let section = build_worldbook_variable_section(&card).expect("有变量条目");
+        assert!(
+            section.contains("--- 变量初始化"),
+            "变量树条目应被收录（注释不含 initvar 也必须进区块）"
+        );
+        assert!(
+            section.contains("中段哨兵角色"),
+            "变量树中段被截断，覆盖率缺口会复现（注释不含 initvar 也必须给大额度）"
+        );
+        assert!(section.contains("角色299"), "树尾也应保留");
+        // 规则类条目不得整段灌入：4K 截断生效（保留头 80% + 尾 20%，
+        // 故不能断言 `!contains("规则 119")`——尾段本来就会被保留）。
+        // 截断判据：出现省略标记，且规则行数明显少于正文的 120 行。
+        assert!(
+            section.contains("中间省略"),
+            "规则类条目应维持 4K 截断（正文出现省略标记）"
+        );
+        let rule_lines_kept = section.matches("规则 ").count();
+        assert!(
+            rule_lines_kept < 100,
+            "规则类条目不得按大额度整段保留（实际保留 {rule_lines_kept} 行）"
+        );
+    }
+
+    #[test]
+    fn test_initvar_comment_without_tree_body_gets_small_budget() {
+        // 反向回归：注释含 `initvar` 但正文是纯规则文本时不得给 24K
+        for comment in ["[initvar]变量更新规则", "变量更新规则"] {
+            let rule_body =
+                std::iter::once("变量更新规则：每轮按剧情输出 <UpdateVariable>。".to_string())
+                    .chain((0..120).map(|i| {
+                        format!("规则 {i}: 好感度变化参考剧情（https://example.com/doc 有说明）。")
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            let card = card_with_entries(serde_json::json!([{
+                "id": 1, "keys": [], "content": rule_body,
+                "constant": true, "selective": false, "enabled": true,
+                "comment": comment
+            }]));
+
+            let section = build_worldbook_variable_section(&card).expect("有变量条目");
+            assert!(
+                section.contains("中间省略"),
+                "注释 {comment:?} 的正文非变量树，应按 4K 截断（保留头+尾 + 省略标记）"
+            );
+            let rule_lines_kept = section.matches("规则 ").count();
+            assert!(
+                rule_lines_kept < 100,
+                "注释 {comment:?} 不得按大额度整段保留（实际保留 {rule_lines_kept} 行）"
+            );
+        }
     }
 }

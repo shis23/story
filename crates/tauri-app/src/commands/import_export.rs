@@ -432,43 +432,53 @@ pub(crate) fn export_st_card_png(
 /// 策略（用户已定）：每角色一张 PNG + 共享 lorebook。
 /// 共享知识/世界书转 ST lorebook 格式。
 #[tauri::command]
-pub fn export_campaign_st_cards(
+pub async fn export_campaign_st_cards(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignExportResult, TauriCommandError> {
-    let camp_id = Id::from_str(&campaign_id);
+    // 2026-09-13 域4 修复 T-12：本命令为每个角色实例生成一张 PNG（CPU/IO 密集，
+    // 工作量随实例数线性增长），而**非 async** 的 `#[tauri::command]` 由 Tauri 按
+    // `ExecutionContext::Blocking` 在 wry IPC handler 内联执行（无线程卸载），
+    // 会占住 IPC/事件线程。移到 blocking 池后 UI 事件循环不再被导出阻塞。
+    let storage = state.storage().clone();
+    tokio::task::spawn_blocking(move || export_campaign_st_cards_impl(&storage, &campaign_id))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("Campaign 卡导出任务失败: {e}")))?
+}
 
-    let campaign = state
-        .storage()
+/// 同步实现体（异步命令在 blocking 池里调用；测试可直接调用以保持同步）。
+pub(crate) fn export_campaign_st_cards_impl(
+    storage: &Arc<storage_backend::StorageFacade>,
+    campaign_id: &str,
+) -> Result<CampaignExportResult, TauriCommandError> {
+    let camp_id = Id::from_str(campaign_id);
+
+    let campaign = storage
         .get_campaign(&camp_id)
         .map_err(TauriCommandError::storage)?
         .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
     let campaign = campaign.campaign;
 
-    let stored_card = state
-        .storage()
+    let stored_card = storage
         .get_card(&campaign.card_id)
         .map_err(TauriCommandError::storage)?
         .ok_or_else(|| {
             TauriCommandError::not_found(format!("Campaign 关联的卡不存在: {}", campaign.card_id))
         })?;
 
-    let instances = state
-        .storage()
+    let instances = storage
         .list_instances(&camp_id)
         .map_err(TauriCommandError::storage)?;
     if instances.is_empty() {
         return Err("Campaign 无角色实例，无法导出".into());
     }
 
-    let campaign_book = state
-        .storage()
+    let campaign_book = storage
         .get_world_info(&camp_id)
         .map_err(TauriCommandError::storage)?;
 
     // Preserve the campaign book, including edits made after card import.
-    let shared_knowledge = state
-        .storage()
+    let shared_knowledge = storage
         .list_knowledge(&camp_id)
         .map_err(TauriCommandError::storage)?;
     let mut shared_lorebook = campaign_book.to_st_book();
@@ -492,8 +502,7 @@ pub fn export_campaign_st_cards(
         serde_json::to_string_pretty(&shared_lorebook).unwrap_or_else(|_| "{}".into());
 
     // 尝试从角色库获取原始 Character（用于 raw_card_json）
-    let original_character = state
-        .storage()
+    let original_character = storage
         .get_character(stored_card.card.source_character_id.as_str())
         .map_err(TauriCommandError::storage)?
         .map(|s| stored_info_to_character(&s));
@@ -556,12 +565,19 @@ pub fn export_campaign_st_cards(
 ///
 /// 包含 Campaign 元数据 + Instances + Definitions + Knowledge + Tasks + Summaries。
 #[tauri::command]
-pub(crate) fn export_campaign_bundle(
+pub(crate) async fn export_campaign_bundle(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<String, TauriCommandError> {
-    let camp_id = Id::from_str(&campaign_id);
-    state.storage().export_campaign_bundle(&camp_id)
+    // 2026-09-13 域4 修复 T-12：长 Campaign 的 bundle 序列化可达数十 MB，
+    // 非 async 命令会在 IPC 线程内联完成全部序列化 + 磁盘写；移到 blocking 池。
+    let storage = state.storage().clone();
+    tokio::task::spawn_blocking(move || {
+        let camp_id = Id::from_str(&campaign_id);
+        storage.export_campaign_bundle(&camp_id)
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("Bundle 导出任务失败: {e}")))?
 }
 
 pub(crate) fn export_campaign_bundle_from_store(
@@ -603,7 +619,7 @@ pub(crate) fn export_campaign_bundle_from_store(
 ///
 /// 导入始终生成全新 card/campaign/instance/knowledge/task/summary ID，避免覆盖现有数据。
 #[tauri::command]
-pub(crate) fn import_campaign_bundle(
+pub(crate) async fn import_campaign_bundle(
     bundle_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignImportResult, TauriCommandError> {
@@ -614,11 +630,18 @@ pub(crate) fn import_campaign_bundle(
         crate::error::MAX_BUNDLE_JSON_BYTES,
         "Campaign Bundle",
     )?;
-    let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
-        .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
-    state
-        .storage()
-        .import_campaign_bundle(bundle, state.conv_store.as_ref())
+    // 2026-09-13 域4 修复 T-12：≤16 MiB 的 JSON 解析与后续多表写入都是重 CPU/IO
+    // 工作，非 async 命令会在 IPC 线程内联执行；解析与落盘一起移到 blocking 池。
+    // 体积校验留在本线程（纯长度检查，让超大载荷快速失败、不进池）。
+    let app = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
+            .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
+        app.storage()
+            .import_campaign_bundle(bundle, app.conv_store.as_ref())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("Bundle 导入任务失败: {e}")))?
 }
 
 /// SQLite 分支：与 JSON 路径相同的校验/重写，但整包（含 conversation）在

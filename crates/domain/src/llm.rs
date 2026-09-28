@@ -8,6 +8,16 @@ use crate::Id;
 ///
 /// H-4：手写 Debug 打码 api_key。
 /// 展示给前端用 LlmConnectionSummary（已剥离 key）。
+///
+/// D-21 记录（api_key 序列化契约，判定非问题但显式写死约束）：
+/// - **必须**保留 `api_key` 的 Serialize/Deserialize：`ConnectionStore` 靠它把
+///   SecretRef 写入磁盘并读回（`secure_api_key` / `resolve_connection`），
+///   加 `#[serde(skip)]` 会导致密钥静默丢失。
+/// - 因此"不外泄"必须由**边界**保证，而不是靠 serde：
+///   落盘前必须已替换成 SecretRef（`ConnectionStore::save/update`），
+///   给前端的必须是 `LlmConnectionSummary`（含 `has_key` 布尔），
+///   `Debug` 必须在任何 tracing/dbg! 中打码（见下方手写实现）。
+/// - 新增返回 `LlmConnection` 的 Tauri 命令/日志前，先确认这条边界。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConnection {
     pub id: Id,
@@ -654,5 +664,61 @@ mod tests {
         let params = SamplingParams::default();
         assert_eq!(params.max_tokens, None);
         assert!(!params.max_tokens_explicit);
+    }
+
+    // ─── D-21：api_key 的 Debug/往返契约 ───────────────────────────────────
+
+    #[test]
+    fn llm_connection_debug_masks_api_key() {
+        let conn = LlmConnection {
+            id: Id::from_str("c1"),
+            name: "主连接".into(),
+            base_url: "https://api.example.com".into(),
+            api_key: "sk-super-secret".into(),
+            model: "m".into(),
+            protocol: LlmProtocol::OpenAi,
+            params: SamplingParams::default(),
+            tool_mode: ToolMode::default(),
+        };
+        let rendered = format!("{conn:?}");
+        assert!(
+            !rendered.contains("sk-super-secret"),
+            "Debug 不得泄漏 api_key（H-4）：{rendered}"
+        );
+        assert!(rendered.contains("***"));
+    }
+
+    #[test]
+    fn llm_connection_serde_round_trips_api_key_field() {
+        // D-21：api_key 必须能被序列化/反序列化（ConnectionStore 的 SecretRef 依赖它）
+        let conn = LlmConnection {
+            id: Id::from_str("c2"),
+            name: "存盘".into(),
+            base_url: "https://api.example.com".into(),
+            api_key: "secret-ref://conn-c2".into(),
+            model: "m".into(),
+            protocol: LlmProtocol::Anthropic,
+            params: SamplingParams::default(),
+            tool_mode: ToolMode::default(),
+        };
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(json.contains("secret-ref://conn-c2"));
+        let back: LlmConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.api_key, "secret-ref://conn-c2");
+        assert_eq!(back.protocol, LlmProtocol::Anthropic);
+    }
+
+    #[test]
+    fn llm_protocol_custom_shape_is_stable_for_current_frontend() {
+        // D-21：Custom(String) 的 wire 形状（{"Custom":"x"}）是当前前后端约定，
+        // 改动形状属于跨层破坏性变更，本任务不改；此测试钉住现状。
+        assert_eq!(
+            serde_json::to_string(&LlmProtocol::Custom("my-vendor".into())).unwrap(),
+            r#"{"Custom":"my-vendor"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<LlmProtocol>(r#"{"Custom":"my-vendor"}"#).unwrap(),
+            LlmProtocol::Custom("my-vendor".into())
+        );
     }
 }

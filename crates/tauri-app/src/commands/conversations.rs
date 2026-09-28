@@ -20,6 +20,10 @@ use crate::{
 };
 use storyforge_app_conversation::ConversationStore;
 
+// 保留 API：当前无前端入口（wrapper 于 2026-09-01 移除），保留原因见 docs/review-2026-09-13/fixes/04-tauri-fixes.md
+// （T-15：本命令被显式登记在 scripts/architecture/backend-baseline.mjs 的
+// RETAINED_NO_FRONTEND_CALLER 中；删除它需要连带删除 archive_conversation_impl，
+// 而后者是唯一实现体）。
 #[tauri::command]
 pub(crate) async fn archive_conversation(
     conversation_id: String,

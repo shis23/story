@@ -464,7 +464,8 @@ fn initialize_app_data_dir(framework_data_dir: Option<&Path>) -> Result<PathBuf,
 
     std::fs::create_dir_all(&data_dir)
         .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
-    migrate_from_exe_dir_if_needed(&data_dir, exe_parent.as_deref());
+    let migration = migrate_from_exe_dir_if_needed(&data_dir, exe_parent.as_deref());
+    report_migration_outcome(&migration);
     APP_DATA_DIR
         .set(data_dir.clone())
         .map_err(|_| "application data directory initialization raced".to_string())?;
@@ -472,18 +473,91 @@ fn initialize_app_data_dir(framework_data_dir: Option<&Path>) -> Result<PathBuf,
     Ok(data_dir)
 }
 
+/// 旧数据目录迁移的结果（S-06/R14）。
+///
+/// 旧实现返回 `()`：调用方除了日志没有任何判断依据，"迁了一半"和"迁完了"
+/// 在代码里不可区分，失败还会照常打印"数据迁移完成"。
+#[derive(Debug, PartialEq, Eq)]
+enum MigrationOutcome {
+    /// 无需迁移：无 `exe_parent`、旧目录不存在、或新旧同目录。
+    NotApplicable,
+    /// 新目录已有数据，且上次迁移没有留下失败标记 → 不覆盖用户数据。
+    SkippedPopulated,
+    /// 本次全部复制成功。
+    Completed { copied_files: usize, retried: bool },
+    /// 有复制失败。已留下 `.migration_incomplete` 标记：下次启动会重试。
+    Incomplete {
+        copied_files: usize,
+        failures: Vec<String>,
+        retried: bool,
+    },
+}
+
+/// 迁移未完成的标记文件名（写在新目录内）。
+///
+/// 作用是把"上次没搬完"持久化到下次启动。没有它时，一次部分失败（例如
+/// `campaigns/` 目录建好了但里面的文件没拷过来）会让下面的 `new_has_data`
+/// 判定成"新目录已有数据" → 永远跳过迁移，旧目录里的数据再也搬不过来。
+const MIGRATION_INCOMPLETE_MARKER: &str = ".migration_incomplete";
+
+/// 把迁移结果落到日志与健康面（S-06/R14）。
+///
+/// 启动路径与测试共用这**一个**入口：旧实现把"数据迁移完成"直接写在拷贝循环后面，
+/// 于是任何失败都伴随一句假成功日志，且没有任何可断言的返回值。
+fn report_migration_outcome(outcome: &MigrationOutcome) {
+    match outcome {
+        MigrationOutcome::Completed {
+            copied_files,
+            retried,
+        } => {
+            tracing::info!(copied_files, retried, "数据迁移完成");
+        }
+        MigrationOutcome::Incomplete {
+            copied_files,
+            failures,
+            retried,
+        } => {
+            let detail = failures.join("; ");
+            tracing::error!(
+                copied_files,
+                retried,
+                failure_count = failures.len(),
+                detail = %detail,
+                "数据迁移未完成：{} 项失败（旧目录未被修改，标记 {} 已留在新目录，下次启动重试）",
+                failures.len(),
+                MIGRATION_INCOMPLETE_MARKER
+            );
+            // 迁移是"尽力而为"的启动步骤，不阻断启动；但失败必须在健康面可见，
+            // 否则用户看到的是"启动正常 + 一部分旧数据不见了"。
+            // detail 只用相对条目名，不带用户绝对路径（健康报告会进前端）。
+            crate::storage_health::record_backend_incident(
+                "legacy_dir_migration_incomplete",
+                &format!(
+                    "从旧安装目录迁移数据未完成（{} 项失败）：{}；旧目录数据未改动，下次启动会重试",
+                    failures.len(),
+                    detail
+                ),
+            );
+        }
+        MigrationOutcome::NotApplicable | MigrationOutcome::SkippedPopulated => {}
+    }
+}
+
 /// 从旧的 exe_dir/data 迁移到新的 OS 标准目录（仅当新目录为空时）。
 ///
 /// `exe_parent` 显式传入（而非内部再 `current_exe()`），便于用临时目录测试
 /// 迁移逻辑而不依赖真实 exe 路径。
-fn migrate_from_exe_dir_if_needed(new_dir: &Path, exe_parent: Option<&Path>) {
+///
+/// S-06/R14：失败必须作为结果返回给调用方；旧实现在 `let _ =` 吞错之后
+/// 无条件 `tracing::info!("数据迁移完成")`，给出假成功信号。
+fn migrate_from_exe_dir_if_needed(new_dir: &Path, exe_parent: Option<&Path>) -> MigrationOutcome {
     let Some(exe_parent) = exe_parent else {
-        return;
+        return MigrationOutcome::NotApplicable;
     };
     let old_dir = exe_parent.join("data");
 
     if old_dir == new_dir || !old_dir.exists() {
-        return;
+        return MigrationOutcome::NotApplicable;
     }
 
     // 检查新目录是否为空（忽略已迁移的数据）
@@ -491,41 +565,124 @@ fn migrate_from_exe_dir_if_needed(new_dir: &Path, exe_parent: Option<&Path>) {
         || new_dir.join("connections.json").exists()
         || new_dir.join("campaigns").exists();
 
-    if new_has_data {
-        return; // 新目录已有数据，不需要迁移
+    let marker = new_dir.join(MIGRATION_INCOMPLETE_MARKER);
+    let retried = marker.exists();
+    if new_has_data && !retried {
+        return MigrationOutcome::SkippedPopulated; // 新目录已有数据，不需要迁移
     }
 
     tracing::info!(
-        "正在从旧数据目录迁移: {} → {}",
+        "正在从旧数据目录迁移: {} → {}{}",
         old_dir.display(),
-        new_dir.display()
+        new_dir.display(),
+        if retried {
+            "（上次迁移未完成，本次重试）"
+        } else {
+            ""
+        }
     );
-    if let Ok(entries) = std::fs::read_dir(&old_dir) {
-        for entry in entries.flatten() {
-            let dest = new_dir.join(entry.file_name());
-            if entry.path().is_dir() {
-                copy_dir_recursive(&entry.path(), &dest);
-            } else if let Err(e) = std::fs::copy(entry.path(), &dest) {
-                tracing::warn!("迁移文件失败 {}: {e}", entry.path().display());
+
+    let mut failures: Vec<String> = Vec::new();
+    // 先落标记再拷贝：中途崩溃/断电也必须让下次启动重试，而不是当成迁完了。
+    if let Err(e) = std::fs::write(&marker, "migration in progress\n") {
+        failures.push(format!("写入迁移标记失败: {e}"));
+    }
+
+    let mut copied_files = 0usize;
+    match std::fs::read_dir(&old_dir) {
+        Err(e) => failures.push(format!("读取旧数据目录失败: {e}")),
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        failures.push(format!("读取旧数据目录条目失败: {e}"));
+                        continue;
+                    }
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let dest = new_dir.join(entry.file_name());
+                if entry.path().is_dir() {
+                    copied_files += copy_dir_recursive(&entry.path(), &dest, &name, &mut failures);
+                } else {
+                    match std::fs::copy(entry.path(), &dest) {
+                        Ok(_) => copied_files += 1,
+                        Err(e) => failures.push(format!("{name}: {e}")),
+                    }
+                }
             }
         }
-        tracing::info!("数据迁移完成");
+    }
+
+    if failures.is_empty() {
+        // 只有全部成功才撤销标记。
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!("迁移完成后清理标记失败: {e}");
+        }
+        MigrationOutcome::Completed {
+            copied_files,
+            retried,
+        }
+    } else {
+        // 失败清单同时写进标记文件，排查时可直接读取。
+        if let Err(e) = std::fs::write(
+            &marker,
+            format!("migration incomplete\n{}\n", failures.join("; ")),
+        ) {
+            tracing::warn!("更新迁移标记失败: {e}");
+        }
+        MigrationOutcome::Incomplete {
+            copied_files,
+            failures,
+            retried,
+        }
     }
 }
 
-/// 递归复制目录
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
-    std::fs::create_dir_all(dst).ok();
-    if let Ok(entries) = std::fs::read_dir(src) {
-        for entry in entries.flatten() {
-            let dest = dst.join(entry.file_name());
-            if entry.path().is_dir() {
-                copy_dir_recursive(&entry.path(), &dest);
-            } else {
-                let _ = std::fs::copy(entry.path(), &dest);
+/// 递归复制目录；返回成功复制的文件数，失败逐条追加到 `failures`。
+///
+/// S-06/R14：旧实现对 `create_dir_all`、`read_dir`、每个文件的 `fs::copy`
+/// 全部静默吞错（`let _ =` / `if let Ok` / `entries.flatten()`），嵌套目录里
+/// 的拷贝失败连一行日志都没有。`failures` 里的条目用**相对路径**，避免把
+/// 用户绝对路径带进健康报告（会进前端）。
+fn copy_dir_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    rel: &str,
+    failures: &mut Vec<String>,
+) -> usize {
+    if let Err(e) = std::fs::create_dir_all(dst) {
+        failures.push(format!("{rel}: 建目录失败: {e}"));
+        return 0;
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            failures.push(format!("{rel}: 读目录失败: {e}"));
+            return 0;
+        }
+    };
+    let mut copied = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failures.push(format!("{rel}: 读条目失败: {e}"));
+                continue;
+            }
+        };
+        let child_rel = format!("{rel}/{}", entry.file_name().to_string_lossy());
+        let dest = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copied += copy_dir_recursive(&entry.path(), &dest, &child_rel, failures);
+        } else {
+            match std::fs::copy(entry.path(), &dest) {
+                Ok(_) => copied += 1,
+                Err(e) => failures.push(format!("{child_rel}: {e}")),
             }
         }
     }
+    copied
 }
 
 fn load_embed_config(data_dir: &Path) -> Option<storyforge_infra_llm::EmbedConfig> {
@@ -841,6 +998,11 @@ impl AppState {
         let vector_store = Arc::new(BruteForceStore::with_persistence(
             data_dir.join("vectors.json"),
         ));
+
+        // 域1 write_fence：把已冻结的存储路径（如向量库写入失败被隔离）并入既有
+        // 健康报告，否则"写入持续 PermissionDenied"在 UI/诊断上无声。
+        // 去重与 path 语义见 `storage_health::record_write_fence_state`。
+        crate::storage_health::record_write_fence_state();
 
         // 尝试从已持久化的连接恢复活跃 client（挂 LlmInterceptor 记录调用）
         let (active_llm, active_conn_id) = {

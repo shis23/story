@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 use crate::character_knowledge::CharacterKnowledgeUpdate;
-use crate::llm::{ChatMessage, ToolSpec};
+use crate::llm::ChatMessage;
 use crate::story_task::TaskUpdate;
 use crate::world_info::WorldInfoEntry;
 
@@ -38,8 +38,9 @@ pub enum AgentRole {
 //
 // 序列化：Director → "Director"；Subagent("*") → "Subagent:*"（':' 分隔，可 round-trip）
 // 反序列化：先按 ':' 切，前缀匹配变体名；无 ':' 的当 unit 变体。
-// 兼容旧格式：纯 "Subagent" 当 Subagent("")（理论上不会出现，旧数据是 "Subagent(\"*\")" 无法兼容，
-//   但 profiles.json 此前因本 bug 从未成功保存，无旧数据需迁移）。
+// 兼容旧格式：serde 默认对元组变体生成的 `Subagent("*")`（见下方手写解析）。
+// D-20：纯 "Subagent"（无 ':'、无 payload）不是合法数据，会返回 unknown variant
+//   错误，不会静默变成 Subagent("")。
 impl Serialize for AgentRole {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -114,20 +115,6 @@ impl std::fmt::Display for AgentRole {
             Self::PostProcessor => write!(f, "后处理"),
         }
     }
-}
-
-// ─── Agent 配置（对应设计 §5 AgentProfile，M1 简化版）───────────────────
-
-/// Agent 运行配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentProfile {
-    pub role: AgentRole,
-    /// 系统提示词（由 assemble_system_prompt 组装）
-    pub system_prompt: String,
-    pub max_tool_rounds: u32,
-    pub tools: Vec<ToolSpec>,
-    /// 该 Agent 要使用的模型名（从 LlmConnection 读取，允许 Agent 覆盖）
-    pub model_override: Option<String>,
 }
 
 // ─── 专属上下文包（对应设计 §3.3 ContextPackage）────────────────────────
@@ -690,8 +677,12 @@ impl RoundSummary {
             .unwrap_or(crate::chronicle::ChronicleLevel::A)
     }
 
+    /// 是否为叶子 A 级摘要。
+    ///
+    /// D-20：改为与 [`Self::chronicle_level`] 同源判定，避免 level 非法时
+    /// 两个访问器结论矛盾（此前 `level == 0` 与 `unwrap_or(A)` 不一致）。
     pub fn is_leaf_a(&self) -> bool {
-        self.level == 0
+        self.chronicle_level() == crate::chronicle::ChronicleLevel::A
     }
 
     /// 分配 leaf code（系统侧；Summarizer 不写 code）。
@@ -810,5 +801,39 @@ mod round_summary_chronicle_tests {
         assert_eq!(a.lineage_id.as_str(), "lin-1");
         assert_eq!(a.turn_start, 7);
         assert_eq!(a.summary, "长摘要正文");
+    }
+
+    // ─── D-20：两个等级访问器必须同源 ──────────────────────────────────────
+
+    #[test]
+    fn is_leaf_a_agrees_with_chronicle_level_for_valid_levels() {
+        for (raw, expected) in [
+            (0u8, ChronicleLevel::A),
+            (1u8, ChronicleLevel::B),
+            (2u8, ChronicleLevel::C),
+        ] {
+            let mut entry =
+                RoundSummary::new(Id::from_str("c"), Id::from_str("v"), 1, "摘要".into());
+            entry.level = raw;
+            assert_eq!(entry.chronicle_level(), expected);
+            assert_eq!(
+                entry.is_leaf_a(),
+                expected == ChronicleLevel::A,
+                "is_leaf_a 必须与 chronicle_level 同源（D-20）"
+            );
+        }
+    }
+
+    #[test]
+    fn is_leaf_a_is_false_for_invalid_level() {
+        // 非法 level：chronicle_level() 回退 A，因此 is_leaf_a() 也必须是 true
+        // （旧实现 `level == 0` 会返回 false，两个访问器互相矛盾）
+        let mut entry = RoundSummary::new(Id::from_str("c"), Id::from_str("v"), 1, "摘要".into());
+        entry.level = 99;
+        assert_eq!(entry.chronicle_level(), ChronicleLevel::A);
+        assert!(
+            entry.is_leaf_a(),
+            "非法 level 下两个访问器必须给出同一结论（D-20）"
+        );
     }
 }

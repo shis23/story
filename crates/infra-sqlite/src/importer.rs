@@ -32,6 +32,9 @@ pub struct ImportReport {
     /// Gate 7 发现 #3：被跳过的孤儿行总数（父对象在源数据中不存在，
     /// JSON 应用里本就不可达；SQLite FK 拒绝插入，导入时跳过并计数）。
     pub skipped_orphan_rows: usize,
+    /// S-01：按集合的跳过明细（kind, count）——非零跳过必须可审计，
+    /// 不能只活在 tracing 里（调用方据此记录健康事件 / 面向 UI 暴露）。
+    pub skipped_detail: Vec<(String, usize)>,
     pub skipped_as_duplicate: bool,
 }
 
@@ -75,7 +78,10 @@ impl<'a> JsonImporter<'a> {
         data_dir: &Path,
         after_precheck: impl FnOnce(),
     ) -> Result<ImportReport> {
-        if !data_dir.exists() {
+        // N-R1-04：`Path::exists()` 对 stat 错误也返回 false——「读不了」不等于
+        // 「不存在」；只认 NotFound，其余由 `path_presence` 报
+        // `ImportSourceUnreadable`（fail-closed）。
+        if crate::readiness::path_presence(data_dir)?.is_missing() {
             return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
         }
 
@@ -98,8 +104,10 @@ impl<'a> JsonImporter<'a> {
         match result {
             Ok(report) => Ok(report),
             Err(e) => {
-                // 尽力记录失败 run（独立自动提交语句；不影响已回滚的数据事务）
-                let _ = self.db.connection().execute(
+                // 尽力记录失败 run（独立自动提交语句；不影响已回滚的数据事务）。
+                // S-14：失败 run 的写入本身失败也不能静默——否则 import_runs 里
+                // 只有成功记录，排障时看不到「导入曾经失败过」。
+                if let Err(record_error) = self.db.connection().execute(
                     r#"
                     INSERT OR REPLACE INTO import_runs
                         (run_id, source_root, source_manifest_hash, status, started_at, finished_at, error)
@@ -113,7 +121,14 @@ impl<'a> JsonImporter<'a> {
                         chrono::Utc::now().to_rfc3339(),
                         e.to_string(),
                     ],
-                );
+                ) {
+                    tracing::error!(
+                        run_id = %run_id,
+                        error = %record_error,
+                        import_error = %e,
+                        "failed to persist failed import_runs row (diagnostics only)"
+                    );
+                }
                 Err(e)
             }
         }
@@ -230,6 +245,11 @@ impl<'a> JsonImporter<'a> {
             compress_jobs: snapshot.compress_jobs.len(),
             characters: snapshot.characters.len(),
             skipped_orphan_rows: snapshot.skipped_orphan_rows,
+            skipped_detail: snapshot
+                .skipped
+                .iter()
+                .map(|(kind, count)| ((*kind).to_string(), *count))
+                .collect(),
             skipped_as_duplicate: false,
         })
     }
@@ -253,6 +273,11 @@ fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
         compress_jobs: snapshot.compress_jobs.len(),
         characters: snapshot.characters.len(),
         skipped_orphan_rows: snapshot.skipped_orphan_rows,
+        skipped_detail: snapshot
+            .skipped
+            .iter()
+            .map(|(kind, count)| ((*kind).to_string(), *count))
+            .collect(),
         skipped_as_duplicate: true,
     }
 }
@@ -278,6 +303,8 @@ struct SourceSnapshot {
     characters: Vec<Value>,
     /// Gate 7 发现 #3：被跳过的孤儿行总数（父对象在源数据中不存在）。
     skipped_orphan_rows: usize,
+    /// S-01：按集合的跳过明细。
+    skipped: Vec<(&'static str, usize)>,
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
@@ -300,6 +327,7 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
         compress_jobs: snapshot.compress_jobs,
         characters: snapshot.characters,
         skipped_orphan_rows: snapshot.skipped_orphan_rows,
+        skipped: snapshot.skipped,
     })
 }
 
@@ -520,6 +548,9 @@ fn upsert_campaign(tx: &rusqlite::Transaction<'_>, campaign: &Value) -> Result<(
     let lineage_id = optional_str(campaign, "lineage_id");
     // Gate 4 story-clock authority：索引列取 variables["story_clock"] 权威值，
     // 仅在缺失时回退旧顶层字段——与运行时 `current_story_clock()` 同口径。
+    // 两个来源都缺失时**必须**落域侧唯一权威默认值（`DEFAULT_STORY_CLOCK`，
+    // 与 `Campaign` 的 serde default / 新建 Campaign 同值）；旧实现写死
+    // "Day 1" 会让迁移进来的老数据与新建数据出现两套默认值（域1 D-03 同类缺陷）。
     let story_clock = campaign
         .get("variables")
         .and_then(|v| v.as_array())
@@ -534,7 +565,7 @@ fn upsert_campaign(tx: &rusqlite::Transaction<'_>, campaign: &Value) -> Result<(
                 .map(str::to_string)
         })
         .or_else(|| optional_str(campaign, "story_clock"))
-        .unwrap_or_else(|| "Day 1".to_string());
+        .unwrap_or_else(|| storyforge_domain::variables::DEFAULT_STORY_CLOCK.to_string());
     let created_at = optional_str(campaign, "created_at").unwrap_or_default();
     let payload = stable_json(campaign);
     tx.execute(
@@ -1207,6 +1238,89 @@ mod tests {
         // migrate 可能已执行，但业务表应为空
         assert_eq!(table_count(&db, "campaigns").unwrap(), 0);
         assert_eq!(table_count(&db, "turns").unwrap(), 0);
+    }
+
+    #[test]
+    fn legacy_campaign_without_story_clock_uses_the_domain_default() {
+        // 跨域项（域1 D-03）：老数据里 `variables["story_clock"]` 与旧顶层字段
+        // 都缺失时，迁移写入的索引列必须是域侧唯一权威默认值
+        // （`DEFAULT_STORY_CLOCK`），不能再是历史写死的 "Day 1"——否则「迁移进来的
+        // 老数据」与「新建数据」会长期并存两套默认值。
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("cards.json"),
+            &json!([{
+                "id": "card-legacy", "name": "Hero", "source_character_id": "char-1",
+                "character_definitions": []
+            }]),
+        );
+        write_json(
+            &dir.path().join("campaigns.json"),
+            &json!([{
+                "id": "camp-legacy",
+                "card_id": "card-legacy",
+                "name": "Legacy",
+                "created_at": "2026-07-13T00:00:00Z",
+                // 无顶层 story_clock，variables 里也没有 story_clock。
+                "variables": []
+            }]),
+        );
+        for name in [
+            "instances.json",
+            "knowledge.json",
+            "tasks.json",
+            "round_summaries.json",
+            "turns.json",
+        ] {
+            write_json(&dir.path().join(name), &json!([]));
+        }
+        fs::create_dir_all(dir.path().join("conversations")).unwrap();
+
+        let mut db = Database::open_in_memory().unwrap();
+        let report = JsonImporter::new(&mut db)
+            .import_data_dir(dir.path())
+            .expect("legacy campaign must import");
+        assert_eq!(report.campaigns, 1);
+
+        let stored: String = db
+            .connection()
+            .query_row(
+                "SELECT story_clock FROM campaigns WHERE campaign_id = 'camp-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            storyforge_domain::variables::DEFAULT_STORY_CLOCK,
+            "迁移默认值必须与域侧唯一权威一致"
+        );
+        assert_ne!(stored, "Day 1", "不得回落到历史默认值 Day 1");
+
+        // 显式值仍以 record 为准（默认值只补缺失，不覆盖用户数据）。
+        write_json(
+            &dir.path().join("campaigns.json"),
+            &json!([{
+                "id": "camp-legacy",
+                "card_id": "card-legacy",
+                "name": "Legacy",
+                "created_at": "2026-07-13T00:00:00Z",
+                "story_clock": "Day 9",
+                "variables": []
+            }]),
+        );
+        JsonImporter::new(&mut db)
+            .import_data_dir(dir.path())
+            .expect("re-import with explicit story_clock");
+        let stored: String = db
+            .connection()
+            .query_row(
+                "SELECT story_clock FROM campaigns WHERE campaign_id = 'camp-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "Day 9", "显式值不得被默认值覆盖");
     }
 
     #[test]

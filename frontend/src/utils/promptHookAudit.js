@@ -23,6 +23,10 @@ const SAFE_STATUSES = new Set([
   'unloaded',
   'revoked',
   'budget_exceeded',
+  // M-21a / M-21b 新增的链内状态：非法 messages 变更被忽略、整链预算耗尽后
+  // 不再调用 host。不在这里登记会被 sanitizeStatus 折叠成 audit_error。
+  'invalid_mutation',
+  'chain_budget_exceeded',
 ])
 const SAFE_SUMMARY_TYPES = new Set([
   'array',

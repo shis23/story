@@ -454,7 +454,14 @@ impl ProfileStore {
         if !has_any {
             let (default_profile, _) =
                 storyforge_domain::prompt_module::builtins::default_profile();
-            let _ = self.save(default_profile);
+            // S-14：写入失败不能静默——默认 Profile 没落盘会让下一个进程看到
+            // 「一个 Profile 都没有」，且用户以为内置默认一直可用。
+            if let Err(error) = self.save(default_profile) {
+                tracing::error!(
+                    error = %error,
+                    "failed to persist builtin default prompt profile; the next start will retry"
+                );
+            }
         }
     }
 
@@ -717,7 +724,13 @@ impl AgentProfileConfigStore {
         if !has_builtin {
             configs.push(default_agent_profile_config());
             drop(configs);
-            let _ = self.persist_configs();
+            // S-14：同上——内置默认 Agent Profile 落盘失败必须可见。
+            if let Err(error) = self.persist_configs() {
+                tracing::error!(
+                    error = %error,
+                    "failed to persist builtin default agent profile config; the next start will retry"
+                );
+            }
         }
     }
 
