@@ -137,8 +137,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest ships a preinstalled Android SDK. The third-party
+      # android-actions/setup-android@v3 step broke on 2026-09-28 runners
+      # (sdkmanager: "Failed to find package 'tools'", exit 1 — dispatch run
+      # 36432958941); accept licenses on the preinstalled SDK instead.
+      - name: Accept Android SDK licenses (preinstalled SDK)
+        run: yes | sdkmanager --licenses > /dev/null || true
 
       - name: Install NDK ${{ env.NDK_VERSION }}
         run: |
