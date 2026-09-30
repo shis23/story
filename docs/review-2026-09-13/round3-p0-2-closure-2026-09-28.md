@@ -95,8 +95,7 @@ PoC 过程中发现应用自身的 MVU 运行时壳帧调用 `invoke` 会**挂�
 
 ## 6 诚实边界（未验证部分）
 
-1. **release 构建未复验**：守卫是无 cfg 差异的 JS 注入，debug/release 行为应当一致，但本轮 PoC
-   全部跑在 debug 构建；release 构建 CDP 工具链（devtools 特性）未验证。
+1. ~~release 构建未复验~~ **已于 2026-09-30 复验收口**：`cargo build --release` 产物（target/release/storyforge.exe，19 分钟全量优化构建）以同一 CDP 方法复验，结果与 §3 逐项一致（子帧 `frozen:true`/`invoke:undefined`/裸 ipc fetch `FETCH-BLOCKED`、主帧 `SUCCESS` 未冻结），证据 `artifacts/p02-poc/poc-evidence-after-fix-RELEASE.json`。另证：CDP 远程调试是 WebView2 运行时开关（`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`），在未开 tauri devtools 特性的 release 构建上同样可用。
 2. **macOS/Linux/Android 真机未跑**：macOS/Linux 不向子帧注入（守卫不运行、维持原状）；Android
    理论被 window.ipc 封死覆盖，未真机验证。
 3. **护栏强度**：本修复是脚本层（非 Rust 传输层）拒绝。绕过需要 (a) WebView2/Chromium 自身漏洞，
