@@ -1,0 +1,24 @@
+# StoryForge PoC 补丁层：启动时用 `--patch <本文件>` 叠加在 profile 之后。
+#
+# 1. 激活宿主插件（注册 provider `storyforge` 与 /api/storyforge/* 路由）。
+# 2. 新增 agent 预设 `storyforge`：只有 persona，不挂任何工具；附带 agent 作用域插件
+#    `dsh-plugin-storyforge/agent`，把该预设下每次模型请求钉到 storyforge/pipeline。
+- insert:
+    - id: storyforge
+      name: 'dsh-plugin-storyforge'
+    - id: preset-storyforge
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: storyforge
+        name: StoryForge
+        description: StoryForge 多 Agent 写作管线（PoC）
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are StoryForge, a multi-agent interactive fiction engine.
+              complete: true
+              includeRuntimeContext: false
+          - id: storyforge-agent
+            name: 'dsh-plugin-storyforge/agent'
