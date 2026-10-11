@@ -253,8 +253,14 @@ pub fn delete_card(
     }
     if !aggregate_result.unwrap() {
         // 卡不存在：聚合未改任何状态，但前置可能已删——用快照恢复前置原样。
-        if let Some(snap) = snapshot {
-            let _ = crate::backend_workflows::restore_delete_card_snapshot(snap);
+        if let Some(snap) = snapshot
+            && let Err(restore_err) = crate::backend_workflows::restore_delete_card_snapshot(snap)
+        {
+            // 2026-10-11 审计：旧实现 `let _ =` 吞掉恢复失败，用户只看到「不存在」，
+            // 前置已删的数据却没回来。
+            return Err(TauriCommandError::storage(format!(
+                "角色卡不存在: {id}; 恢复前置删除也失败，数据需要恢复: {restore_err}"
+            )));
         }
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
     }
@@ -281,6 +287,10 @@ pub fn delete_card(
     // SQLite 级联直接删除 conversations 行（不经 ConversationStore），缓存若
     // 不失效，后续 find_by_campaign 会命中已删会话（与 delete_character 同款）。
     state.conv_store.invalidate();
+    // 被删 Campaign 的远记忆向量（派生索引，失败只告警）。
+    for (campaign_id, _) in &per_campaign_conv_ids {
+        crate::vector_index::purge_campaign_vectors(state.inner(), campaign_id);
+    }
     // tool_ctx：被删活动若曾是当前注入源，重建世界书（无活跃活动时回退角色库）。
     super::characters::rebuild_world_info_in_tool_ctx(&state);
     Ok(())

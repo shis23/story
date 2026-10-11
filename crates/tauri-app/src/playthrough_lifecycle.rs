@@ -233,6 +233,7 @@ fn delete_campaign_playthrough_with_deleter<D: ConversationDeleter>(
         }
     }
 
+    crate::vector_index::purge_campaign_vectors(state, campaign_id);
     Ok(())
 }
 
@@ -329,6 +330,70 @@ mod tests {
         assert!(store.get_campaign(&campaign.id).is_none());
         assert!(conv_store.get(&conversation.id).is_none());
         assert_eq!(load_active_campaign(&state.data_dir), None);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn delete_playthrough_purges_only_that_campaigns_vectors() {
+        use storyforge_infra_vector::{VectorKind, VectorRecord, VectorStore};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-playthrough-vector-purge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CampaignStore::new(&dir);
+        let conv_store =
+            ConversationStore::with_persistence(Arc::new(FailingPersistence::default()));
+        let mut campaign = Campaign::new(Id::from_str("campaign-vector-purge"), "purge");
+        let conversation = conv_store
+            .create_persisted(None, Some(campaign.id.clone()))
+            .unwrap();
+        campaign.conversation_id = Some(conversation.id.clone());
+        store.save_campaign(campaign.clone()).unwrap();
+        let state = AppState::new_for_test();
+
+        let record = |id: &str, campaign_id: Option<&str>| {
+            let mut metadata = std::collections::HashMap::new();
+            if let Some(cid) = campaign_id {
+                metadata.insert("campaign_id".into(), serde_json::json!(cid));
+            }
+            VectorRecord {
+                id: Id::from_str(id),
+                content: id.into(),
+                vector: vec![],
+                keywords: vec![id.into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata,
+            }
+        };
+        let before = state.vector_store.count();
+        state
+            .vector_store
+            .upsert(record("purge-own", Some(campaign.id.as_str())))
+            .unwrap();
+        state
+            .vector_store
+            .upsert(record("purge-other", Some("campaign-untouched")))
+            .unwrap();
+        state
+            .vector_store
+            .upsert(record("purge-global", None))
+            .unwrap();
+
+        delete_campaign_playthrough_in_store(&store, &conv_store, &state, &campaign.id).unwrap();
+
+        assert_eq!(
+            state.vector_store.count(),
+            before + 2,
+            "只清理被删 Campaign 的向量，其它 Campaign 与全局记录保留"
+        );
+        let remaining = state
+            .vector_store
+            .search_by_keywords(&["purge".into()], 10)
+            .unwrap();
+        assert!(remaining.iter().all(|hit| hit.id.as_str() != "purge-own"));
 
         std::fs::remove_dir_all(dir).ok();
     }

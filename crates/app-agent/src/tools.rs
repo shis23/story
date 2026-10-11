@@ -115,6 +115,36 @@ impl ChronicleToolBudget {
     }
 }
 
+/// `search_vectors` 命中的作用域判定（纯函数，便于单测）。
+///
+/// - 带 `campaign_id` 标签的记录（远记忆/归档）只对同一 Campaign 可见；
+///   无活跃 Campaign 的旧路径看不到任何 Campaign 的记录。
+/// - 带 `owner_character_id` 标签的记录（角色私有知识）对绑定了其它实例的
+///   子 Agent 不可见；导演/编剧（未绑定实例）可见。
+/// - 无标签记录（角色库世界书等全局资料）始终可见。
+fn vector_hit_visible_in(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ctx: &ToolContext,
+) -> bool {
+    if let Some(tagged) = metadata.get("campaign_id") {
+        let active = ctx
+            .campaign_runtime
+            .as_ref()
+            .map(|runtime| runtime.campaign.id.to_string());
+        if tagged.as_str() != active.as_deref() {
+            return false;
+        }
+    }
+    if let (Some(owner), Some(current)) = (
+        metadata.get("owner_character_id"),
+        ctx.current_character_instance_id.as_ref(),
+    ) && owner.as_str() != Some(current.as_str())
+    {
+        return false;
+    }
+    true
+}
+
 /// 工具上下文（提供给工具函数的数据源）
 #[derive(Clone)]
 pub struct ToolContext {
@@ -541,19 +571,23 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .as_ref()
                     .ok_or_else(|| ToolError::Internal("向量存储未配置".into()))?;
 
-                // 关键词搜索（M2 阶段先用关键词，后续接嵌入向量搜索）
-                let keywords: Vec<String> = query
-                    .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-                    .filter(|w| w.len() >= 2)
-                    .map(String::from)
-                    .collect();
+                // 关键词搜索（M2 阶段先用关键词，后续接嵌入向量搜索）。
+                // 2026-10-11 审计：旧实现只按空白/ASCII 标点切词，无空格的中文查询
+                // 整句成为一个 token，几乎不可能被记录关键词「包含」——中文查询基本
+                // 零命中。改用与远记忆召回共用的切词（中文 2-gram）。
+                let keywords = storyforge_infra_vector::extract_query_tokens(query);
 
+                // 2026-10-11 审计：向量库是全局单例（所有 Campaign 的远记忆 +
+                // 角色库世界书）。先取全部命中再按作用域过滤、最后截断，避免
+                // 别的 Campaign 的剧情摘要串进本局（排序保持关键词命中数降序）。
                 let hits = store
-                    .search_by_keywords(&keywords, top_k)
+                    .search_by_keywords(&keywords, store.count().max(top_k))
                     .map_err(|e| ToolError::Internal(format!("向量搜索失败: {e}")))?;
 
                 let results: Vec<serde_json::Value> = hits
                     .into_iter()
+                    .filter(|h| vector_hit_visible_in(&h.metadata, &ctx))
+                    .take(top_k)
                     .map(|h| {
                         serde_json::json!({
                             "content": h.content,
@@ -1060,6 +1094,100 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    fn ctx_for_campaign(campaign_id: &str) -> ToolContext {
+        let mut campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-scope"), "scope");
+        campaign.id = Id::from_str(campaign_id);
+        let mut ctx = ToolContext::empty();
+        ctx.campaign_runtime = Some(Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        }));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn search_vectors_matches_chinese_queries_without_spaces() {
+        use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
+
+        let store = Arc::new(BruteForceStore::new());
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("wi-garden"),
+                content: "大观园设定".into(),
+                vector: vec![],
+                keywords: vec!["大观园".into()],
+                kind: VectorKind::WorldInfo,
+                metadata: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let mut ctx = ToolContext::empty();
+        ctx.vector_store = Some(store);
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let out = registry
+            .dispatch(
+                "search_vectors",
+                serde_json::json!({ "query": "林黛玉在大观园里做什么" }),
+                Arc::new(ctx),
+            )
+            .await
+            .expect("search_vectors");
+        assert_eq!(
+            out["results_count"], 1,
+            "无空格中文查询必须能命中关键词「大观园」，got {out}"
+        );
+    }
+
+    #[test]
+    fn search_vectors_scope_hides_other_campaigns_and_private_knowledge() {
+        let ctx_a = ctx_for_campaign("camp-a");
+        assert!(vector_hit_visible_in(
+            &tagged(&[("campaign_id", "camp-a")]),
+            &ctx_a
+        ));
+        assert!(
+            !vector_hit_visible_in(&tagged(&[("campaign_id", "camp-b")]), &ctx_a),
+            "别的 Campaign 的远记忆不得串进本局"
+        );
+        assert!(
+            vector_hit_visible_in(&tagged(&[]), &ctx_a),
+            "无标签的全局世界书始终可见"
+        );
+
+        let legacy = ToolContext::empty();
+        assert!(!vector_hit_visible_in(
+            &tagged(&[("campaign_id", "camp-a")]),
+            &legacy
+        ));
+        assert!(vector_hit_visible_in(&tagged(&[]), &legacy));
+
+        let mut sub = ctx_for_campaign("camp-a");
+        sub.current_character_instance_id = Some(Id::from_str("inst-1"));
+        let own = tagged(&[("campaign_id", "camp-a"), ("owner_character_id", "inst-1")]);
+        let other = tagged(&[("campaign_id", "camp-a"), ("owner_character_id", "inst-2")]);
+        assert!(vector_hit_visible_in(&own, &sub));
+        assert!(
+            !vector_hit_visible_in(&other, &sub),
+            "子 Agent 不得读到别的角色私有知识"
+        );
+        assert!(
+            vector_hit_visible_in(&other, &ctx_a),
+            "导演未绑定实例，可见"
+        );
+    }
     use storyforge_domain::Id;
     use storyforge_domain::campaign::{Campaign, CharacterInstance};
     use storyforge_domain::campaign_runtime::CampaignRuntimeContext;

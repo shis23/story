@@ -1212,12 +1212,17 @@ pub(crate) async fn start_writing(
         }
         Err(e) => {
             // Phase A: 写作失败 → TurnRecord 标 Failed（无副作用，安全失败）
-            if let Some(ref turn) = turn_record {
-                let _ = update_turn_record(app.storage(), &turn.turn_id, |record| {
+            if let Some(ref turn) = turn_record
+                && let Err(mark_err) = update_turn_record(app.storage(), &turn.turn_id, |record| {
                     record.status = storyforge_domain::turn::TurnStatus::Failed;
                     record.failure_reason = Some(format!("写作失败: {e}"));
                     record.touch();
-                });
+                })
+            {
+                tracing::warn!(
+                    "写作失败后标记 Turn {} 为 Failed 失败: {mark_err}",
+                    turn.turn_id
+                );
             }
             // Gate 8 复评：回滚本次 user 消息（is_last 守卫）——失败后重试不
             // 得留下重复输入节点。

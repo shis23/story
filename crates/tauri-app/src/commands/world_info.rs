@@ -31,6 +31,9 @@ pub struct CampaignWorldInfoEntryDto {
     pub route: String,
     /// card | merged_global | user
     pub source: String,
+    /// 卡模板条目是否全局共享（切到其它角色卡也生效）
+    #[serde(default)]
+    pub is_global: bool,
     /// 原文是否被截断
     #[serde(default)]
     pub content_truncated: bool,
@@ -142,6 +145,7 @@ pub(crate) fn world_info_entry_to_dto_preview(
         order: e.order,
         route: lore_route_to_str(&e.route),
         source: entry_source_label(e),
+        is_global: crate::commands::characters::entry_is_global(e),
         content_truncated: truncated,
         content_len,
     }
@@ -164,6 +168,7 @@ pub(crate) fn world_info_entry_to_dto_full(
         order: e.order,
         route: lore_route_to_str(&e.route),
         source: entry_source_label(e),
+        is_global: crate::commands::characters::entry_is_global(e),
         content_truncated: false,
         content_len: e.content.chars().count(),
     }
@@ -355,7 +360,8 @@ pub(crate) fn set_campaign_world_info_route(
     Ok(())
 }
 
-/// 卡模板世界书只读（供角色卡 UI，不可写路径）。
+/// 卡模板世界书（角色卡面板；编辑走 add/update/delete_world_info_entry 与
+/// update_world_info_route，条目下标与这里返回的 index 一致）。
 /// `character_id` 可为 CharacterStore.id 或 CharacterCard.source_character_id。
 #[tauri::command]
 pub(crate) fn get_character_world_info(

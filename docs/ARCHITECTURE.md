@@ -116,7 +116,7 @@ harness 调用同一后处理应用服务；`draft_hash` 同步、quality report
 - ContextEpoch 固定同一 epoch 的 anchor、overview、band 和 revision 视图。
 - Director 可使用 `search_chronicle` / `get_chronicle` 查询 Chronicle A/B/C。
 - ChronicleCompressor job/publication 基础支持 A→B→C、连续非重叠 covers、`covered_by`、revision 与幂等 replay。
-- MemoryArchiver 处理对话消息归档，与 Chronicle A/B/C 是不同水位和用途。
+- MemoryArchiver 处理对话消息归档，与 Chronicle A/B/C 是不同水位和用途。嵌入模型是可选项：不配置时远记忆（摘要与归档）只按关键词召回。
 
 权威规格：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`。
 

@@ -246,6 +246,55 @@ export async function listModels(baseUrl, apiKey) {
   return []
 }
 
+// ─── 嵌入模型（可选：不配置时远记忆按关键词召回）─────────────────────────────
+
+/** 当前嵌入配置（不含 key）：{ endpoint, model, dim, has_key }，未配置为 null */
+export async function getEmbedConfig() {
+  if (isTauri()) {
+    return await invoke('get_embed_config')
+  }
+  return null
+}
+
+/**
+ * 保存嵌入配置。后端会先调用一次接口：连不上不保存；dim 填 0 自动识别维度。
+ * keepExistingKey=true 且 apiKey 为空时沿用已保存的 key。
+ */
+export async function configureEmbedder({ endpoint, apiKey, model, dim, keepExistingKey }) {
+  if (isTauri()) {
+    return await invoke('configure_embedder', {
+      endpoint,
+      apiKey: apiKey || '',
+      model,
+      dim: Number(dim) || 0,
+      keepExistingKey: !!keepExistingKey,
+    })
+  }
+}
+
+/** 停用嵌入模型（远记忆退回纯关键词召回，已有向量保留） */
+export async function clearEmbedConfig() {
+  if (isTauri()) {
+    return await invoke('clear_embed_config')
+  }
+}
+
+/** 远记忆索引状态：{ embedder_configured, archived_records, missing_vectors, backfill_running } */
+export async function getMemoryIndexStatus() {
+  if (isTauri()) {
+    return await invoke('get_memory_index_status')
+  }
+  return { embedder_configured: false, archived_records: 0, missing_vectors: 0, backfill_running: false }
+}
+
+/** 为缺向量的远记忆补建向量，返回 { candidates, embedded, failed, error } */
+export async function rebuildMemoryEmbeddings() {
+  if (isTauri()) {
+    return await invoke('rebuild_memory_embeddings')
+  }
+  return { candidates: 0, embedded: 0, failed: 0, error: null }
+}
+
 // ─── LLM 连接管理 ──────────────────────────────────────────────────────────
 
 /** 列出内置连接模板 */
@@ -888,6 +937,16 @@ export async function deleteCard(id) {
 }
 
 /**
+ * 删除角色库里的源角色（世界书、MVU 翻译，及仍关联的卡与活动）。
+ * id 可为存储 id 或 source_character_id。
+ */
+export async function deleteCharacter(id) {
+  if (isTauri()) {
+    return await invoke('delete_character', { id })
+  }
+}
+
+/**
  * 开档：建 Campaign，实例化所有 Protagonist/Supporting 角色
  * @param {string} cardId - CharacterCard ID
  * @param {string} name - 档名
@@ -1037,6 +1096,62 @@ export async function getCharacterWorldInfoEntry(characterId, entryIndex) {
   return null
 }
 
+// 卡模板世界书编辑：entryIndex 与 getCharacterWorldInfo 返回的 index 一致。
+// 改的是角色卡模板（之后新开的活动从这里拷贝），不影响已开活动的本局世界书。
+
+/** 新增卡模板世界书条目，返回新条目的 index */
+export async function addCharacterWorldInfoEntry({ characterId, keys, content, constant, isGlobal }) {
+  if (isTauri()) {
+    return await invoke('add_world_info_entry', {
+      characterId,
+      keys,
+      content,
+      constant: !!constant,
+      isGlobal: !!isGlobal,
+    })
+  }
+  return 0
+}
+
+/** 更新卡模板世界书条目（keys / 正文 / 常驻 / 全局 / depth / order） */
+export async function updateCharacterWorldInfoEntry({
+  characterId,
+  entryIndex,
+  keys,
+  content,
+  constant,
+  isGlobal,
+  depth,
+  order,
+}) {
+  if (isTauri()) {
+    return await invoke('update_world_info_entry', {
+      characterId,
+      entryIndex,
+      keys,
+      content,
+      constant: !!constant,
+      isGlobal: !!isGlobal,
+      depth: Number(depth) || 0,
+      order: Number(order) || 0,
+    })
+  }
+}
+
+/** 改卡模板世界书条目路由（Disabled 即禁用该条目） */
+export async function setCharacterWorldInfoRoute(characterId, entryIndex, route) {
+  if (isTauri()) {
+    return await invoke('update_world_info_route', { characterId, entryIndex, route })
+  }
+}
+
+/** 删除卡模板世界书条目 */
+export async function deleteCharacterWorldInfoEntry(characterId, entryIndex) {
+  if (isTauri()) {
+    return await invoke('delete_world_info_entry', { characterId, entryIndex })
+  }
+}
+
 /** 本局世界书单条完整正文 */
 export async function getCampaignWorldInfoEntry(campaignId, entryIndex) {
   if (isTauri()) {
@@ -1126,14 +1241,6 @@ export async function listInstances(campaignId) {
     return await invoke('list_instances', { campaignId })
   }
   return []
-}
-
-/** 获取单个角色实例详情 */
-export async function getInstance(campaignId, instanceId) {
-  if (isTauri()) {
-    return await invoke('get_instance', { campaignId, instanceId })
-  }
-  return null
 }
 
 /** 向 Campaign 加入一个卡内角色，或创建一个临时角色 */

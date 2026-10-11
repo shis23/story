@@ -19,6 +19,7 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import EmbeddingConfigCard from './EmbeddingConfigCard.vue'
 import { errorText } from '../../utils/errorText.js'
 import {
   normalizeOptionalMaxTokens,
@@ -809,6 +810,11 @@ async function handleSetActive(id) {
             >{{ saveLabel }}</Button>
           </div>
         </div>
+
+        <div class="border-t border-line"></div>
+
+        <!-- 嵌入模型（可选，远记忆语义召回） -->
+        <EmbeddingConfigCard />
       </template>
     </div>
   </PanelHost>

@@ -673,7 +673,8 @@ pub(crate) fn last_user_intent_before(
 /// 按用户意图从向量库召回 ArchivedSummary（混合：关键词 + 可选嵌入，best-effort）。
 ///
 /// 失败只 warn，不阻断写作。无命中时 `far_memory_hits` 为空。
-/// 有 campaign 时优先过滤同 campaign 记录，兼容无标签的旧归档。
+/// 有 campaign 时只召回同 campaign 记录；无 campaign（legacy）时只召回本会话或
+/// 无会话标签的 legacy 归档（作用域语义见 app-memory `recall.rs` 的 `accepts_scope`）。
 /// 配置了 Embedder 时走向量+关键词合并；否则纯关键词。
 pub(crate) async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
     ctx.far_memory_hits.clear();
@@ -682,6 +683,7 @@ pub(crate) async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppSt
         return;
     }
     let campaign_filter = ctx.campaign_id.as_ref().map(|id| id.to_string());
+    let conversation_filter = ctx.conversation_id.to_string();
     let embedder = state
         .embed_config
         .read()
@@ -699,6 +701,7 @@ pub(crate) async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppSt
         intent,
         3,
         campaign_filter.as_deref(),
+        Some(conversation_filter.as_str()),
         embedder.as_ref(),
     )
     .await
@@ -746,10 +749,27 @@ pub(crate) fn index_round_summaries_to_vector_with_vectors(
     batch: &storyforge_domain::turn::MutationBatch,
     vectors: &[(Id, Vec<f32>)],
 ) {
-    for mutation in &batch.mutations {
-        let storyforge_domain::turn::Mutation::UpsertSummary(summary) = mutation else {
-            continue;
-        };
+    let summaries = batch
+        .mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            storyforge_domain::turn::Mutation::UpsertSummary(summary) => Some(summary.as_ref()),
+            _ => None,
+        });
+    index_summaries_with_vectors(vector_store, summaries, vectors);
+}
+
+/// 把 RoundSummary 写成远记忆向量记录（关键词必写，`vectors` 里有的同时带真实向量）。
+///
+/// 2026-10-11 审计：整批一次 `upsert_batch` 落盘——旧实现逐条 upsert，每条都重写
+/// 整个向量库文件；分支/导入重建几百条摘要时退化成几百次全量写盘。
+pub(crate) fn index_summaries_with_vectors<'a>(
+    vector_store: &dyn VectorStore,
+    summaries: impl IntoIterator<Item = &'a storyforge_domain::agent::RoundSummary>,
+    vectors: &[(Id, Vec<f32>)],
+) -> usize {
+    let mut records = Vec::new();
+    for summary in summaries {
         let content = summary.content.trim();
         if content.is_empty() {
             continue;
@@ -808,25 +828,34 @@ pub(crate) fn index_round_summaries_to_vector_with_vectors(
             .find(|(id, _)| id == &summary.id)
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        if let Err(e) = vector_store.upsert(VectorRecord {
+        records.push(VectorRecord {
             id: summary.id.clone(),
             content: content.to_string(),
             vector,
             keywords,
             kind: VectorKind::ArchivedSummary,
             metadata,
-        }) {
-            tracing::warn!(
-                target: "far_memory",
-                "RoundSummary {} 入向量库失败: {e}",
-                summary.id
-            );
-        } else {
+        });
+    }
+    if records.is_empty() {
+        return 0;
+    }
+    let count = records.len();
+    let ids: Vec<String> = records.iter().map(|r| r.id.to_string()).collect();
+    match vector_store.upsert_batch(records) {
+        Ok(()) => {
             tracing::debug!(
                 target: "far_memory",
-                "RoundSummary {} 已索引到远记忆向量库",
-                summary.id
+                "{count} 条 RoundSummary 已索引到远记忆向量库 ids={ids:?}"
             );
+            count
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "far_memory",
+                "{count} 条 RoundSummary 入向量库失败 ids={ids:?}: {e}"
+            );
+            0
         }
     }
 }
@@ -838,8 +867,24 @@ pub(crate) async fn index_round_summaries_async(
     state: Arc<AppState>,
     batch: storyforge_domain::turn::MutationBatch,
 ) {
+    let summaries: Vec<storyforge_domain::agent::RoundSummary> = batch
+        .mutations
+        .into_iter()
+        .filter_map(|mutation| match mutation {
+            storyforge_domain::turn::Mutation::UpsertSummary(summary) => Some(*summary),
+            _ => None,
+        })
+        .collect();
+    index_summaries_async(state, summaries).await;
+}
+
+/// 后台：关键词立即入库，再在配置了 Embedder 时逐条补齐真实向量（best-effort）。
+pub(crate) async fn index_summaries_async(
+    state: Arc<AppState>,
+    summaries: Vec<storyforge_domain::agent::RoundSummary>,
+) {
     // 1. 关键词立即入库
-    index_round_summaries_to_vector(state.vector_store.as_ref(), &batch);
+    index_summaries_with_vectors(state.vector_store.as_ref(), &summaries, &[]);
 
     // 2. 可选嵌入补齐
     let config = state
@@ -859,10 +904,7 @@ pub(crate) async fn index_round_summaries_async(
     };
 
     let mut vectors = Vec::new();
-    for mutation in &batch.mutations {
-        let storyforge_domain::turn::Mutation::UpsertSummary(summary) = mutation else {
-            continue;
-        };
+    for summary in &summaries {
         let content = summary.content.trim();
         if content.is_empty() {
             continue;
@@ -879,7 +921,11 @@ pub(crate) async fn index_round_summaries_async(
         }
     }
     if !vectors.is_empty() {
-        index_round_summaries_to_vector_with_vectors(state.vector_store.as_ref(), &batch, &vectors);
+        let embedded: Vec<&storyforge_domain::agent::RoundSummary> = summaries
+            .iter()
+            .filter(|s| vectors.iter().any(|(id, _)| id == &s.id))
+            .collect();
+        index_summaries_with_vectors(state.vector_store.as_ref(), embedded, &vectors);
         tracing::info!(
             target: "far_memory",
             "RoundSummary 嵌入补齐 {} 条",

@@ -1,13 +1,11 @@
-/// 记忆召回器（对应设计 §7.3）
+/// 远记忆召回（对应设计 §7.3）
 ///
-/// Agent 工具调用入口：query → 关键词生成 → 向量召回 → rerank → 结果。
-/// 借鉴 shujuku 的 keywordPromptGroup 工作流。
-use std::sync::Arc;
-
-use tracing::{debug, info};
+/// 写作开始时按用户意图检索 `ArchivedSummary`：关键词基线 + 可选向量召回合并。
+use tracing::debug;
 
 use storyforge_infra_llm::Embedder;
-use storyforge_infra_vector::{VectorHit, VectorStore};
+pub use storyforge_infra_vector::extract_query_tokens;
+use storyforge_infra_vector::{MetadataFilter, VectorHit, VectorStore};
 
 use crate::archiver::MemoryError;
 
@@ -39,140 +37,89 @@ impl From<VectorHit> for MemoryHit {
     }
 }
 
-// ─── 召回器 ────────────────────────────────────────────────────────────────
+/// 向量命中的最低余弦相似度（设计 §7.3 默认值）。
+const MIN_VECTOR_SCORE: f32 = 0.45;
 
-/// 记忆召回器
-pub struct MemoryRecaller {
-    embedder: Arc<Embedder>,
-    vector_store: Arc<dyn VectorStore>,
-    /// 最低相似度阈值
-    min_score: f32,
-}
-
-impl MemoryRecaller {
-    pub fn new(embedder: Arc<Embedder>, vector_store: Arc<dyn VectorStore>) -> Self {
-        Self {
-            embedder,
-            vector_store,
-            min_score: 0.45, // 设计 §7.3 默认值
-        }
-    }
-
-    /// 设置最低相似度阈值
-    pub fn with_min_score(mut self, min_score: f32) -> Self {
-        self.min_score = min_score;
-        self
-    }
-
-    /// Agent 工具调用入口（替代 shujuku 的自动注入）
-    ///
-    /// 流程：
-    /// 1. LLM 生成检索关键词
-    /// 2. 向量相似度召回
-    /// 3. minScore 过滤
-    pub async fn recall(&self, query: &str, top_k: usize) -> Result<Vec<MemoryHit>, MemoryError> {
-        info!(target: "app-memory", "召回请求: query={query}, top_k={top_k}");
-
-        // Step 1: 向量相似度召回
-        let query_vec = self.embedder.embed(query).await.map_err(MemoryError::Llm)?;
-        let hits = self.vector_store.search_by_vector(&query_vec, top_k)?;
-
-        // Step 2: minScore 过滤
-        let filtered: Vec<MemoryHit> = hits
-            .into_iter()
-            .filter(|h| h.score >= self.min_score)
-            .map(MemoryHit::from)
-            .collect();
-
-        debug!(target: "app-memory", "召回 {} 条结果（阈值 {}）", filtered.len(), self.min_score);
-        Ok(filtered)
-    }
-
-    /// 关键词召回（不用向量，直接关键词匹配）
-    pub fn recall_by_keywords(
-        &self,
-        keywords: &[String],
-        limit: usize,
-    ) -> Result<Vec<MemoryHit>, MemoryError> {
-        let hits = self.vector_store.search_by_keywords(keywords, limit)?;
-        Ok(hits.into_iter().map(MemoryHit::from).collect())
-    }
-}
-
-/// 从自然语言查询抽取检索 token（中英混合）。
-///
-/// - 英文/数字：按空白与标点切词，长度 ≥ 2
-/// - 中文等非 ASCII：抽 2-gram，覆盖无空格连续文本
-pub fn extract_query_tokens(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for w in query.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
-        let w = w.trim();
-        if w.chars().count() >= 2 {
-            tokens.push(w.to_string());
-        }
-    }
-    let chars: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
-        .collect();
-    for window in chars.windows(2) {
-        if window.iter().any(|c| !c.is_ascii()) {
-            tokens.push(window.iter().collect());
-        }
-    }
-    // 去重保序
-    let mut seen = std::collections::HashSet::new();
-    tokens.retain(|t| seen.insert(t.clone()));
-    tokens
-}
-
-/// 纯关键词远记忆召回（不依赖 Embedder），**不做 campaign 过滤**。
+/// 纯关键词远记忆召回（不依赖 Embedder），legacy 作用域（无 campaign 参数）。
 ///
 /// 用于 ContextCompiler 最小版：写作开始时按用户意图检索 `ArchivedSummary`，
 /// 注入 Director volatile tail。无命中 / 无 token 时返回空。
 ///
-/// N-R7-01/R2 更正：本入口无 campaign 参数，因此**接受任意 campaign 标签的记录**
-/// （等价于 `recall_archived_by_query_filtered(_, _, _, None)`）。需要按 campaign
-/// 隔离时必须走 `recall_archived_by_query_filtered(..., Some(cid))`——其语义是
-/// fail closed：无 `campaign_id` 标签的记录**会被丢弃**（见 `accepts_campaign`），
-/// 不存在的"兼容旧记录"回退不要把本函数读成 fail closed。
+/// 本入口无作用域参数，等价于 `recall_archived_by_query_filtered(_, _, _, None, None)`：
+/// 2026-10-11 审计起只返回**未带 `campaign_id` 标签**的记录（legacy 会话归档），
+/// 任何 Campaign 的远记忆都不会出现（见 `accepts_scope`）。需要某个 Campaign
+/// 的记录必须走 `recall_archived_by_query_filtered(..., Some(cid), _)`。
 pub fn recall_archived_by_query(
     store: &dyn VectorStore,
     query: &str,
     limit: usize,
 ) -> Result<Vec<MemoryHit>, MemoryError> {
-    recall_archived_by_query_filtered(store, query, limit, None)
+    recall_archived_by_query_filtered(store, query, limit, None, None)
 }
 
-/// 带可选 campaign 过滤的远记忆关键词召回。
+/// 带作用域过滤的远记忆关键词召回（作用域语义见 `accepts_scope`）。
 pub fn recall_archived_by_query_filtered(
     store: &dyn VectorStore,
     query: &str,
     limit: usize,
     campaign_id: Option<&str>,
+    conversation_id: Option<&str>,
 ) -> Result<Vec<MemoryHit>, MemoryError> {
     let tokens = extract_query_tokens(query);
     if tokens.is_empty() || limit == 0 {
         return Ok(vec![]);
     }
-    // 多取一些再按 kind / campaign 过滤，避免被 WorldInfo 占满
-    let fetch = limit.saturating_mul(8).max(limit);
-    let hits = store.search_by_keywords(&tokens, fetch)?;
-    Ok(filter_archived_hits(hits, limit, campaign_id, None))
+    let hits = match campaign_id {
+        // 2026-10-11 审计：campaign 过滤必须在截断**之前**做。旧实现先取全局前
+        // `limit*8` 条再过滤，别的 Campaign 记录一多就把本局命中整批挤掉。
+        Some(cid) => store.search_by_keywords_filtered(
+            &tokens,
+            store.count().max(limit),
+            &MetadataFilter::new().for_campaign(&storyforge_domain::Id::from_str(cid)),
+        )?,
+        // 无 campaign：「无标签」无法用等值过滤表达，取全部命中后再过滤。
+        None => store.search_by_keywords(&tokens, store.count().max(limit))?,
+    };
+    Ok(filter_archived_hits(
+        hits,
+        limit,
+        campaign_id,
+        conversation_id,
+        None,
+    ))
 }
 
-/// 判断 ArchivedSummary 命中是否属于目标 campaign。
+/// 判断 ArchivedSummary 命中是否属于当前写作作用域。
 ///
-/// - 无过滤条件：全部接受
-/// - 有 campaign 过滤：必须带 `campaign_id` 标签且匹配（fail closed）
+/// - 无 campaign（legacy 写作路径）：只接受**未带** `campaign_id` 标签的记录；
+///   给了 `conversation_id` 时还必须带同一个 `conversation_id` 标签。2026-10-11
+///   审计：旧实现在这里全部接受，非 Campaign 的角色对话会召回到所有 Campaign 和
+///   其它 legacy 会话的剧情摘要；随后（W-14 收尾）完全无标签的更早数据也不再
+///   接受——它无法归属到任何会话，放行就会出现在每一条 legacy 会话里。
+/// - 有 campaign 过滤：必须带 `campaign_id` 标签且匹配（fail closed）；
+///   `conversation_id` 不参与（一个 Campaign 一条会话，fork 另立 Campaign）
 ///
 /// W-14：旧实现把"无标签"当作匹配，legacy 会话归档会泄漏进任意 campaign 的远记忆。
 /// 生产归档唯一入口（`commands/conversations.rs` 的水位归档）对 campaign 会话始终
 /// 写入 `campaign_id`，因此无标签记录只可能来自无 campaign 的 legacy 会话或更早的
 /// 未标记数据；收紧后它们在 campaign 召回中不再出现，未过滤召回不受影响。
-fn accepts_campaign(hit: &VectorHit, campaign_id: Option<&str>) -> bool {
+fn accepts_scope(
+    hit: &VectorHit,
+    campaign_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> bool {
     let Some(cid) = campaign_id else {
-        return true;
+        if hit.metadata.contains_key("campaign_id") {
+            return false;
+        }
+        return match (
+            conversation_id,
+            hit.metadata.get("conversation_id").and_then(|v| v.as_str()),
+        ) {
+            (Some(current), Some(tagged)) => current == tagged,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
     };
     match hit.metadata.get("campaign_id").and_then(|v| v.as_str()) {
         Some(hit_cid) => hit_cid == cid,
@@ -193,6 +140,7 @@ fn filter_archived_hits(
     hits: Vec<VectorHit>,
     limit: usize,
     campaign_id: Option<&str>,
+    conversation_id: Option<&str>,
     min_score: Option<f32>,
 ) -> Vec<MemoryHit> {
     let mut out = Vec::new();
@@ -201,7 +149,7 @@ fn filter_archived_hits(
         if hit.kind != storyforge_infra_vector::VectorKind::ArchivedSummary {
             continue;
         }
-        if !accepts_campaign(&hit, campaign_id) {
+        if !accepts_scope(&hit, campaign_id, conversation_id) {
             continue;
         }
         if let Some(min) = min_score
@@ -259,13 +207,15 @@ pub async fn recall_archived_hybrid(
     query: &str,
     limit: usize,
     campaign_id: Option<&str>,
+    conversation_id: Option<&str>,
     embedder: Option<&Embedder>,
 ) -> Result<Vec<MemoryHit>, MemoryError> {
     if limit == 0 || query.trim().is_empty() {
         return Ok(vec![]);
     }
 
-    let keyword_hits = recall_archived_by_query_filtered(store, query, limit, campaign_id)?;
+    let keyword_hits =
+        recall_archived_by_query_filtered(store, query, limit, campaign_id, conversation_id)?;
 
     let Some(embedder) = embedder else {
         return Ok(keyword_hits);
@@ -279,16 +229,59 @@ pub async fn recall_archived_hybrid(
         }
     };
 
-    // 多取再过滤 kind/campaign；空向量记录会被 cosine 跳过
+    Ok(merge_vector_stage(
+        store,
+        &query_vec,
+        keyword_hits,
+        limit,
+        campaign_id,
+        conversation_id,
+    ))
+}
+
+/// 混合召回的向量阶段：向量命中优先、关键词补齐。
+///
+/// 向量检索失败（例如库里有维度与当前 Embedder 不一致的旧记录）时回退为关键词
+/// 结果——与嵌入失败同语义。此前用 `?` 直接上抛，已经算好的关键词命中会被一起
+/// 丢掉，调用方只能"整次召回失败（跳过）"。空向量的关键词专用记录由向量库自身跳过。
+fn merge_vector_stage(
+    store: &dyn VectorStore,
+    query_vec: &[f32],
+    keyword_hits: Vec<MemoryHit>,
+    limit: usize,
+    campaign_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> Vec<MemoryHit> {
+    // 多取再过滤 kind/min_score；campaign 过滤在向量库内、截断之前完成（同关键词路径）。
     let fetch = limit.saturating_mul(8).max(limit);
-    let vector_raw = store.search_by_vector(&query_vec, fetch)?;
-    let vector_hits = filter_archived_hits(vector_raw, limit, campaign_id, Some(0.45));
+    let searched = match campaign_id {
+        Some(cid) => store.search_by_vector_filtered(
+            query_vec,
+            fetch,
+            &MetadataFilter::new().for_campaign(&storyforge_domain::Id::from_str(cid)),
+        ),
+        None => store.search_by_vector(query_vec, store.count().max(fetch)),
+    };
+    let vector_raw = match searched {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(target: "far_memory", "远记忆向量检索失败，回退关键词: {e}");
+            return keyword_hits;
+        }
+    };
+    let vector_hits = filter_archived_hits(
+        vector_raw,
+        limit,
+        campaign_id,
+        conversation_id,
+        Some(MIN_VECTOR_SCORE),
+    );
 
     if vector_hits.is_empty() {
-        return Ok(keyword_hits);
+        return keyword_hits;
     }
 
-    Ok(merge_memory_hits(vector_hits, keyword_hits, limit))
+    merge_memory_hits(vector_hits, keyword_hits, limit)
 }
 
 #[cfg(test)]
@@ -395,17 +388,101 @@ mod tests {
             })
             .unwrap();
 
-        let hits = recall_archived_by_query_filtered(&store, "诊所", 5, Some("camp-a")).unwrap();
+        let hits =
+            recall_archived_by_query_filtered(&store, "诊所", 5, Some("camp-a"), None).unwrap();
         // W-14：campaign 过滤下只接受带匹配标签的记录；无标签的 legacy 归档不再泄漏进来
         assert_eq!(hits.len(), 1);
         assert!(hits.iter().any(|h| h.content.contains("A 营")));
         assert!(!hits.iter().any(|h| h.content.contains("旧归档")));
         assert!(!hits.iter().any(|h| h.content.contains("B 营")));
 
-        // 未过滤召回仍可见 legacy 归档（legacy 用户的既有行为不变）
-        let unscoped = recall_archived_by_query_filtered(&store, "诊所", 5, None).unwrap();
-        assert_eq!(unscoped.len(), 3);
+        // 未过滤召回（legacy 写作路径）仍可见 legacy 归档，但 2026-10-11 审计起
+        // 不再包含任何 Campaign 的记录（旧实现返回 3 条，A/B 两局剧情都串进来）。
+        let unscoped = recall_archived_by_query_filtered(&store, "诊所", 5, None, None).unwrap();
+        assert_eq!(unscoped.len(), 1);
         assert!(unscoped.iter().any(|h| h.content.contains("旧归档")));
+        assert!(!unscoped.iter().any(|h| h.content.contains("营")));
+    }
+
+    #[test]
+    fn campaign_recall_is_not_starved_by_other_campaigns() {
+        // 2026-10-11 审计：旧实现先取全局前 `limit*8` 条再按 campaign 过滤，
+        // 别的 Campaign 有足够多同关键词记录时，本局命中被整批挤出窗口。
+        let store = BruteForceStore::new();
+        let tagged = |cid: &str| {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("campaign_id".into(), serde_json::Value::String(cid.into()));
+            meta
+        };
+        // id 以 "a-" 开头的噪声记录在同分排序（id 升序）里排在本局记录之前。
+        for i in 0..40 {
+            store
+                .upsert(VectorRecord {
+                    id: Id::from_str(format!("a-noise-{i:02}")),
+                    content: format!("别的活动：诊所 {i}"),
+                    vector: vec![],
+                    keywords: vec!["诊所".into()],
+                    kind: VectorKind::ArchivedSummary,
+                    metadata: tagged("camp-noise"),
+                })
+                .unwrap();
+        }
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("z-mine"),
+                content: "本局：诊所的地下室".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: tagged("camp-mine"),
+            })
+            .unwrap();
+
+        let hits =
+            recall_archived_by_query_filtered(&store, "诊所", 3, Some("camp-mine"), None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "本局记录不得被其它 Campaign 的同关键词记录挤掉"
+        );
+        assert!(hits[0].content.contains("本局"));
+    }
+
+    #[test]
+    fn legacy_recall_is_scoped_to_its_own_conversation() {
+        // 2026-10-11 审计：legacy 归档只带 conversation_id 标签；旧实现在无
+        // campaign 时全部接受，角色 A 的对话会召回角色 B 对话的剧情摘要。
+        let store = BruteForceStore::new();
+        let record = |id: &str, conv: Option<&str>| {
+            let mut meta = std::collections::HashMap::new();
+            if let Some(conv) = conv {
+                meta.insert(
+                    "conversation_id".into(),
+                    serde_json::Value::String(conv.into()),
+                );
+            }
+            VectorRecord {
+                id: Id::from_str(id),
+                content: format!("{id}：诊所"),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: meta,
+            }
+        };
+        store.upsert(record("mine", Some("conv-a"))).unwrap();
+        store.upsert(record("other", Some("conv-b"))).unwrap();
+        store.upsert(record("untagged", None)).unwrap();
+
+        let hits =
+            recall_archived_by_query_filtered(&store, "诊所", 5, None, Some("conv-a")).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"mine"));
+        assert!(
+            !ids.contains(&"untagged"),
+            "W-14：无法归属会话的旧归档不得出现在任意 legacy 会话里"
+        );
+        assert!(!ids.contains(&"other"), "不得召回其它 legacy 会话的归档");
     }
 
     #[test]
@@ -452,11 +529,63 @@ mod tests {
                 metadata: Default::default(),
             })
             .unwrap();
-        let hybrid = recall_archived_hybrid(&store, "诊所", 3, None, None)
+        let hybrid = recall_archived_hybrid(&store, "诊所", 3, None, None, None)
             .await
             .unwrap();
-        let keyword = recall_archived_by_query_filtered(&store, "诊所", 3, None).unwrap();
+        let keyword = recall_archived_by_query_filtered(&store, "诊所", 3, None, None).unwrap();
         assert_eq!(hybrid.len(), keyword.len());
         assert_eq!(hybrid[0].content, keyword[0].content);
+    }
+
+    fn archived(id: &str, content: &str, vector: Vec<f32>) -> VectorRecord {
+        VectorRecord {
+            id: Id::from_str(id),
+            content: content.into(),
+            vector,
+            keywords: vec!["诊所".into()],
+            kind: VectorKind::ArchivedSummary,
+            metadata: Default::default(),
+        }
+    }
+
+    /// 2026-10-11 审计：库里有关键词专用（空向量）的世界书条目时，向量阶段仍要
+    /// 产出向量命中，而不是让整次混合召回失败。
+    #[test]
+    fn vector_stage_tolerates_keyword_only_records() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(archived("embedded", "已嵌入的归档", vec![1.0, 0.0]))
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                kind: VectorKind::WorldInfo,
+                ..archived("wi", "绿灯世界书", vec![])
+            })
+            .unwrap();
+        store
+            .upsert(archived("kw-only", "仅关键词的归档", vec![]))
+            .unwrap();
+
+        let keyword_hits =
+            recall_archived_by_query_filtered(&store, "诊所", 3, None, None).unwrap();
+        let merged = merge_vector_stage(&store, &[1.0, 0.0], keyword_hits, 3, None, None);
+        let ids: Vec<&str> = merged.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["embedded", "kw-only"], "向量命中在前、关键词补齐");
+    }
+
+    /// 向量检索出错（维度与当前 Embedder 不一致的旧记录）时回退关键词结果，
+    /// 不丢掉已算好的关键词命中。
+    #[test]
+    fn vector_stage_falls_back_to_keyword_hits_on_search_error() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(archived("old-dim", "旧维度归档", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        let keyword_hits =
+            recall_archived_by_query_filtered(&store, "诊所", 3, None, None).unwrap();
+        assert_eq!(keyword_hits.len(), 1);
+        let merged = merge_vector_stage(&store, &[1.0, 0.0], keyword_hits, 3, None, None);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "old-dim");
     }
 }

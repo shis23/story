@@ -653,12 +653,15 @@ pub(crate) fn soft_delete_variant(
             .find_attempt_by_variant(&nid)
             .map(|a| a.attempt_id.clone());
         if let Some(att_id) = attempt_id {
-            let _ = update_turn_record(state.storage(), &turn.turn_id, |record| {
+            // 2026-10-11 审计：标记失败必须在软删变体之前中止。旧实现 `let _ =`
+            // 吞掉错误后照常软删，留下「变体已删、Attempt 仍是 Draft」的不一致态。
+            update_turn_record(state.storage(), &turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&att_id) {
                     att.status = storyforge_domain::turn::AttemptStatus::Discarded;
                 }
                 record.touch();
-            });
+            })
+            .map_err(|e| TauriCommandError::storage(format!("标记 Attempt 丢弃失败: {e}")))?;
         }
     }
 
@@ -818,12 +821,18 @@ pub(crate) fn switch_variant(
         let turn_id = turn.turn_id.clone();
         if let Some(att) = turn.find_attempt_by_variant(&nid) {
             let attempt_id = att.attempt_id.clone();
-            let _ = update_turn_record(state.storage(), &turn_id, |record| {
+            // 变体切换已落盘，这里不再回报 Err（否则前端会误以为切换失败）；
+            // 但 Stale 标记失败必须留痕，不得静默。
+            if let Err(e) = update_turn_record(state.storage(), &turn_id, |record| {
                 if let Some(a) = record.find_attempt_mut(&attempt_id) {
                     a.status = storyforge_domain::turn::AttemptStatus::Stale;
                 }
                 record.touch();
-            });
+            }) {
+                tracing::warn!(
+                    "切换变体后标记 Attempt {attempt_id} 为 Stale 失败（turn={turn_id}）: {e}"
+                );
+            }
         }
     }
 

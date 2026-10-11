@@ -1178,31 +1178,35 @@ impl StorageFacade {
         }
     }
 
-    /// Update a character world-info entry route (world_info_entries[i].route).
+    /// Run a card world-info transform on either backend (same pure function,
+    /// same count refresh).
+    fn mutate_character_info<T>(
+        &self,
+        id_or_source: &str,
+        operation: &str,
+        f: impl FnOnce(&mut CharacterInfo) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.is_sqlite() {
+            sqlite_runtime::mutate_character(id_or_source, f)
+        } else {
+            self.json_character_store(BackendCapability::CharacterCommands, operation)?
+                .mutate(id_or_source, f)
+        }
+    }
+
+    /// Update a card world-info entry route (index into the full embedded book).
     pub fn update_character_world_info_route(
         &self,
         id_or_source: &str,
         entry_index: usize,
         new_route: &str,
     ) -> Result<(), String> {
-        if self.is_sqlite() {
-            sqlite_runtime::mutate_character(id_or_source, |info| {
-                crate::commands::characters::apply_world_info_route_update(
-                    info,
-                    entry_index,
-                    new_route,
-                )
-            })
-        } else {
-            self.json_character_store(
-                BackendCapability::CharacterCommands,
-                "update character world info route",
-            )?
-            .update_world_info_route(id_or_source, entry_index, new_route)
-        }
+        self.mutate_character_info(id_or_source, "update character world info route", |info| {
+            crate::commands::characters::apply_world_info_route_update(info, entry_index, new_route)
+        })
     }
 
-    /// Update a character world-info entry's keys/content/constant/is_global/depth/order.
+    /// Update a card world-info entry's keys/content/constant/is_global/depth/order.
     #[allow(clippy::too_many_arguments)]
     pub fn update_character_world_info_entry(
         &self,
@@ -1215,26 +1219,9 @@ impl StorageFacade {
         depth: i32,
         order: i32,
     ) -> Result<(), String> {
-        if self.is_sqlite() {
-            sqlite_runtime::mutate_character(id_or_source, |info| {
-                crate::commands::characters::apply_world_info_entry_update(
-                    info,
-                    entry_index,
-                    keys,
-                    content,
-                    constant,
-                    is_global,
-                    depth,
-                    order,
-                )
-            })
-        } else {
-            self.json_character_store(
-                BackendCapability::CharacterCommands,
-                "update character world info entry",
-            )?
-            .update_world_info_entry(
-                id_or_source,
+        self.mutate_character_info(id_or_source, "update character world info entry", |info| {
+            crate::commands::characters::apply_world_info_entry_update(
+                info,
                 entry_index,
                 keys,
                 content,
@@ -1243,10 +1230,10 @@ impl StorageFacade {
                 depth,
                 order,
             )
-        }
+        })
     }
 
-    /// Append a character world-info entry, returning its new index.
+    /// Append a card world-info entry, returning its index in the full book.
     pub fn add_character_world_info_entry(
         &self,
         id_or_source: &str,
@@ -1255,57 +1242,22 @@ impl StorageFacade {
         constant: bool,
         is_global: bool,
     ) -> Result<usize, String> {
-        if self.is_sqlite() {
-            sqlite_runtime::mutate_character(id_or_source, |info| {
-                crate::commands::characters::apply_add_world_info_entry(
-                    info, keys, content, constant, is_global,
-                )
-            })
-        } else {
-            self.json_character_store(
-                BackendCapability::CharacterCommands,
-                "add character world info entry",
-            )?
-            .add_world_info_entry(id_or_source, keys, content, constant, is_global)
-        }
+        self.mutate_character_info(id_or_source, "add character world info entry", |info| {
+            crate::commands::characters::apply_add_world_info_entry(
+                info, keys, content, constant, is_global,
+            )
+        })
     }
 
-    /// Remove a character world-info entry.
+    /// Remove a card world-info entry.
     pub fn delete_character_world_info_entry(
         &self,
         id_or_source: &str,
         entry_index: usize,
     ) -> Result<(), String> {
-        if self.is_sqlite() {
-            sqlite_runtime::mutate_character(id_or_source, |info| {
-                crate::commands::characters::apply_delete_world_info_entry(info, entry_index)
-            })
-        } else {
-            self.json_character_store(
-                BackendCapability::CharacterCommands,
-                "delete character world info entry",
-            )?
-            .delete_world_info_entry(id_or_source, entry_index)
-        }
-    }
-
-    /// Replace a character's whole world-info entry list (bulk patch).
-    pub fn update_character_world_info_entries_bulk(
-        &self,
-        id_or_source: &str,
-        entries: Vec<crate::WorldInfoEntryInfo>,
-    ) -> Result<(), String> {
-        if self.is_sqlite() {
-            sqlite_runtime::mutate_character(id_or_source, |info| {
-                crate::commands::characters::apply_update_world_info_entries_bulk(info, entries)
-            })
-        } else {
-            self.json_character_store(
-                BackendCapability::CharacterCommands,
-                "replace character world info entries",
-            )?
-            .update_world_info_entries_bulk(id_or_source, entries)
-        }
+        self.mutate_character_info(id_or_source, "delete character world info entry", |info| {
+            crate::commands::characters::apply_delete_world_info_entry(info, entry_index)
+        })
     }
 
     /// 原子批量替换多个角色的 world_info_entries（Gate 4 七审 P1）。
@@ -1507,13 +1459,23 @@ impl StorageFacade {
     /// Export the full Campaign bundle JSON. Both backends produce the exact
     /// same versioned `CampaignBundle` structure.
     pub fn export_campaign_bundle(&self, camp_id: &Id) -> Result<String, TauriCommandError> {
+        self.export_campaign_bundle_with(camp_id, |_| {})
+    }
+
+    /// 同 `export_campaign_bundle`，序列化前让调用方补上存储层之外的数据
+    /// （消息归档在向量库里，存储门面拿不到）。
+    pub fn export_campaign_bundle_with(
+        &self,
+        camp_id: &Id,
+        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
+    ) -> Result<String, TauriCommandError> {
         if self.is_sqlite() {
-            return self.export_campaign_bundle_from_sqlite(camp_id);
+            return self.export_campaign_bundle_from_sqlite(camp_id, enrich);
         }
         self.json_turn_store("export snapshot")
             .map_err(TauriCommandError::storage)?
             .with_idle_turn_snapshot(camp_id, |turns| {
-                self.export_campaign_bundle_from_json(camp_id, turns)
+                self.export_campaign_bundle_from_json(camp_id, turns, enrich)
                     .map_err(|e| e.to_string())
             })
             .map_err(TauriCommandError::storage)
@@ -1523,6 +1485,7 @@ impl StorageFacade {
         &self,
         camp_id: &Id,
         turns: Vec<storyforge_domain::turn::TurnRecord>,
+        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
     ) -> Result<String, TauriCommandError> {
         let store =
             self.json_campaign_store(BackendCapability::ImportExport, "export campaign bundle")?;
@@ -1558,6 +1521,7 @@ impl StorageFacade {
                 world_info: self
                     .get_world_info(camp_id)
                     .map_err(TauriCommandError::storage)?,
+                message_archives: Vec::new(),
             });
             bundle.format_version = 3;
             crate::commands::bundle_runtime::validate_runtime(&bundle)?;
@@ -1574,6 +1538,7 @@ impl StorageFacade {
             &bundle.campaign,
             &bundle.summaries,
         )?;
+        enrich(&mut bundle);
         serde_json::to_string_pretty(&bundle)
             .map_err(|e| TauriCommandError::internal(e.to_string()))
     }
@@ -1656,9 +1621,11 @@ impl StorageFacade {
     fn export_campaign_bundle_from_sqlite(
         &self,
         camp_id: &Id,
+        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
     ) -> Result<String, TauriCommandError> {
-        let bundle = sqlite_runtime::export_campaign_snapshot(camp_id)
+        let mut bundle = sqlite_runtime::export_campaign_snapshot(camp_id)
             .map_err(TauriCommandError::storage)?;
+        enrich(&mut bundle);
         serde_json::to_string_pretty(&bundle)
             .map_err(|e| TauriCommandError::internal(format!("Bundle 序列化失败: {e}")))
     }
@@ -2096,12 +2063,6 @@ fn resolve_backend_inner(data_dir: &Path) -> Result<BackendResolution, BackendWi
 pub fn check_marker_status(data_dir: &Path) -> MarkerStatus {
     let plan = CutoverPlan::new(data_dir, data_dir.join(SQLITE_DB_FILENAME));
     inspect_marker(&plan)
-}
-
-/// The SQLite database path for the given data directory, regardless of
-/// whether SQLite is currently selected.
-pub fn sqlite_db_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(SQLITE_DB_FILENAME)
 }
 
 fn current_version_sqlite(db_path: &Path) -> Option<i64> {

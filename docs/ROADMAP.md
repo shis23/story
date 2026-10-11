@@ -201,7 +201,7 @@
 - ~~建 24 个基础 UI 组件（19 手写 + 5 Headless UI 承载），补组件挂载测试层。~~ ✅ 阶段 2
 - ~~把 App.vue 内联业务逻辑抽成 8 个 composable + 3 个纯 util。~~ ✅ 阶段 3
 - ~~搭 shell 应用框架（AppShell/TopBar/PrimarySidebar/InspectorDrawer/PanelHost）。~~ ✅ 阶段 4
-- ~~重写写作工作台（ChatMessage 保留 8 emit 契约）+ AppV2 首次组装。~~ ✅ 阶段 5（**2026-09-13 更正**：8 emit 契约的真实载体是 `frontend/src/design/writing/MessageItem.vue`（8 个 emit 全部接线）；旧的 `components-v2/writing/ChatMessage.vue` 零引用，属阶段 8 遗留、未接线）
+- ~~重写写作工作台（ChatMessage 保留 8 emit 契约）+ AppV2 首次组装。~~ ✅ 阶段 5（**2026-09-13 更正**：8 emit 契约的真实载体是 `frontend/src/design/writing/MessageItem.vue`（8 个 emit 全部接线）；旧的 `components-v2/writing/ChatMessage.vue` 零引用，属阶段 8 遗留、未接线，2026-10-11 已随整个目录删除）
 - ~~重写 Campaign 面板（CampaignPanel 保留 refreshActiveDetailTab 契约）+ 4 个 tab。~~ ✅ 阶段 6
 - ~~重写 meta/st/config/debug 面板（MetaPanel 保留 mvu-applied 契约）。~~ ✅ 阶段 7
 - ~~main.js 切换到 AppV2 + Pinia，旧 App.vue 保留可回退。~~ ✅ 阶段 8
@@ -211,7 +211,7 @@
 
 - ✅ 双轨测试（**2026-07-08 时点数据**）：node --test 212 pass + vitest 21 pass，不破坏既有护城河（含 16 个半脆弱测试）。**当前计数（2026-09-13）：node:test 67 文件 / 532 通过（域5 单进程直跑）；vitest 侧 `frontend/tests/components-v2/` 31 个文件，通过数待 Lead 收口门禁确认后回填**。
 - ✅ 构建产物 422KB（2026-07-08 时点），仅存已知 Vite dynamic import warning。最新构建产物大小与告警以 `docs/RELEASE-STATUS.md` 为准。
-- ✅ 契约红线保留（2026-07-08 时点）：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`。**2026-09-13 更新**：`tauri-api.js` 已删除 20 个零引用 wrapper（`cardstudioListStages` 等保留入口已接线），因此"`tauri-api.js` 签名零改动"只对 2026-07-08 时点成立；后端 175 条命令一条未删，其中 23 条为"无前端入口的声明的保留 API"（`scripts/architecture/backend-baseline.mjs` 的 `RETAINED_NO_FRONTEND_CALLER`）。
+- ✅ 契约红线保留（2026-07-08 时点）：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`。**2026-09-13 更新**：`tauri-api.js` 已删除 20 个零引用 wrapper（`cardstudioListStages` 等保留入口已接线），因此"`tauri-api.js` 签名零改动"只对 2026-07-08 时点成立；后端 175 条命令一条未删，其中 24 条为"无前端入口的声明的保留 API"（2026-10-11：`getInstance` wrapper 删除后 `get_instance` 入表）（`scripts/architecture/backend-baseline.mjs` 的 `RETAINED_NO_FRONTEND_CALLER`）。**2026-10-11 续**：嵌入模型设置新增 3 条命令（175→178），卡模板世界书编辑 / 嵌入配置 / `delete_character` 共 7 条重新接线，零入口保留 API 24→17。
 
 详细计划见 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。
 

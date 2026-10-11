@@ -13,6 +13,24 @@ pub(crate) struct BundleRuntime {
     pub character: StoredCharacter,
     pub world_info: WorldInfoBook,
     pub turns: Vec<TurnRecord>,
+    /// 会话的消息归档（远记忆）。存储层导出时为空，由导出命令从向量库补齐；
+    /// 旧包没有这个字段。导入时写成关键词记录并据此恢复归档水位。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_archives: Vec<BundleMessageArchive>,
+}
+
+/// 包内的一条消息归档。向量与嵌入模型绑定、不可移植，所以不进包：导入后先按
+/// 关键词召回，配置了嵌入模型再补建向量。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BundleMessageArchive {
+    pub content: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// 覆盖的消息区间（归档消息列表上的绝对下标，含两端）；旧记录没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_end: Option<usize>,
 }
 
 pub(crate) fn validate_runtime(bundle: &CampaignBundle) -> Result<(), TauriCommandError> {
@@ -190,7 +208,13 @@ pub(crate) fn rewrite_runtime(
         .map_err(|e| TauriCommandError::validation(e.to_string()))?;
     runtime.turns = serde_json::from_value(history["turns"].take())
         .map_err(|e| TauriCommandError::validation(e.to_string()))?;
-    runtime.conversation.archived_upto = 0; // Vector indexes are rebuilt, not transferred.
+    // Vectors are not transferred: summaries are re-indexed after import
+    // (`vector_index::index_campaign_summaries`). The archive watermark starts at
+    // 0 here and is advanced again only after the bundled message archives have
+    // been written for the new conversation (`vector_index::import_message_archives`);
+    // fork copies the source archives the same way (`copy_message_archives`).
+    // A bundle without archives keeps 0, so auto-archive rebuilds them.
+    runtime.conversation.archived_upto = 0;
     runtime.character.id = Id::new().to_string();
     runtime.character.info.source_character_id = Some(source_character_id.to_string());
     runtime.conversation.character_id = Some(runtime.character.id.clone());

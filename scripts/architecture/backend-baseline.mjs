@@ -175,46 +175,14 @@ export const RETAINED_NO_FRONTEND_CALLER = [
   // 背书。是否彻底删除这 20 个命令需 Lead 裁定；若裁定删除，按本表上方注释的连删清单
   // 执行（命令 fn + `lib.rs` 注册条目 + `--write-snapshot` + 本表条目 + 文档命令计数）。
   // 反过来若某命令重新接线，删掉本表条目即可——`staleRetainedDeclarations` 会立刻提示。
-  {
-    command: 'add_world_info_entry',
-    file: 'commands/characters.rs',
-    reason: '角色卡世界书条目新增（Campaign 维度另有 add_campaign_world_info_entry）',
-  },
-  {
-    command: 'update_world_info_entry',
-    file: 'commands/characters.rs',
-    reason: '角色卡世界书条目更新（Campaign 维度另有 update_campaign_world_info_entry）',
-  },
-  {
-    command: 'delete_world_info_entry',
-    file: 'commands/characters.rs',
-    reason: '角色卡世界书条目删除（Campaign 维度另有 delete_campaign_world_info_entry）',
-  },
-  {
-    command: 'update_world_info_route',
-    file: 'commands/characters.rs',
-    reason: '世界书触发路由更新（Campaign 维度另有 set_campaign_world_info_route）',
-  },
+  //
+  // 2026-10-11：卡模板世界书编辑（add/update/delete_world_info_entry、
+  // update_world_info_route）、嵌入模型设置（configure_embedder、get_embed_config）
+  // 与角色库删除（delete_character）已接上前端，移出本表。
   {
     command: 'card_shell_allow_host',
     file: 'commands/card_shell.rs',
     reason: 'T-09 提权白名单入口：保留，重新接线时必须走用户确认（不可静默放行）',
-  },
-  {
-    command: 'configure_embedder',
-    file: 'commands/connections.rs',
-    reason: '嵌入模型配置写入；能力已实现、UI 未接（域5 独立核对：非"被取代"，属零引用）',
-  },
-  {
-    command: 'get_embed_config',
-    file: 'commands/connections.rs',
-    reason: '嵌入模型配置读取；能力已实现、UI 未接（域5 独立核对：非"被取代"，属零引用）',
-  },
-  {
-    command: 'delete_character',
-    file: 'commands/characters.rs',
-    reason:
-      'CLAUDE.md 文档化的级联删除语义（对 StoredCharacter.id / source_character_id / 同会话 tool_ctx 域 id 做 Campaign/MVU/向量清理）——属文档化保留 API，不是随手遗留（域5 建议保留）',
   },
   {
     command: 'export_st_card_png',
@@ -275,6 +243,12 @@ export const RETAINED_NO_FRONTEND_CALLER = [
     command: 'meta_get_conversation',
     file: 'commands/meta.rs',
     reason: 'Meta 会话读取',
+  },
+  // ─── 2026-10-11 全量审计删除零引用 wrapper `getInstance` 后新增 ──────────────
+  {
+    command: 'get_instance',
+    file: 'commands/campaigns.rs',
+    reason: '单个角色实例读取（前端经 list_instances 整表读取，单条读取暂无入口）',
   },
 ]
 

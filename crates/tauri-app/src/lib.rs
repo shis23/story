@@ -28,6 +28,7 @@ pub mod storage_health;
 pub mod turn_coordinator;
 pub mod turn_lifecycle;
 pub mod turn_store;
+mod vector_index;
 
 use commands::{
     campaigns::*, card_shell::*, cards::*, characters::*, connections::*, conversations::*,
@@ -723,6 +724,29 @@ fn load_embed_config_with_secret_store(
     } else {
         None
     }
+}
+
+/// 停用嵌入模型：删除 `embed.json`（含 `.tmp` 备份）与系统凭据库里的 key。
+pub(crate) fn clear_embed_config_files(
+    data_dir: &Path,
+    secret_store: &dyn SecretStore,
+) -> Result<(), String> {
+    let secret_ref = make_secret_ref(EMBED_SECRET_KIND, EMBED_SECRET_ID);
+    if let Err(e) = secret_store.delete_secret(&secret_ref) {
+        tracing::warn!("删除嵌入 API SecretRef 失败: {e}");
+    }
+    let path = data_dir.join("embed.json");
+    for file in [
+        path.clone(),
+        PathBuf::from(format!("{}.tmp", path.display())),
+    ] {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("删除嵌入配置失败 {}: {e}", file.display())),
+        }
+    }
+    Ok(())
 }
 
 fn persist_embed_config_secret_ref(
@@ -1452,6 +1476,13 @@ pub fn run() {
             // terminal 活动 Turn + 补挂 preaccept 恢复 + 重放 ChronicleCompressor）。
             startup_recovery::run_startup_recovery(&app_state);
 
+            // 派生向量索引对账（世界书按角色库重建、清已删局残留、补齐远记忆缺口）。
+            // 只读写本地索引、不调嵌入 API；放后台线程，不拖慢窗口出现。
+            {
+                let app_state = app_state.clone();
+                std::thread::spawn(move || vector_index::reconcile_on_startup(&app_state));
+            }
+
             // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
             let mvu_rt =
                 WebViewMvuRuntime::with_shared_pending(app.handle().clone(), mvu_pending.clone());
@@ -1568,6 +1599,9 @@ pub fn run() {
             log_append_frontend,
             configure_embedder,
             get_embed_config,
+            clear_embed_config,
+            get_memory_index_status,
+            rebuild_memory_embeddings,
             archive_conversation,
             // P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量
             extract_characters,

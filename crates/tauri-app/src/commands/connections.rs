@@ -2,15 +2,97 @@ use super::super::*;
 
 // ─── LLM 连接管理命令 ──────────────────────────────────────────────────────
 
+/// 保存嵌入模型配置（可选项：不配置时远记忆只用关键词召回）。
+///
+/// 保存前先调用一次接口：连不上不保存；`dim = 0` 时采用接口实际返回的维度，
+/// 填了维度但与接口不一致时报错。`keep_existing_key = true` 且 `api_key` 为空时
+/// 沿用已保存的 key（编辑其它字段时不必重新输入）。
 #[tauri::command]
 pub(crate) async fn configure_embedder(
     endpoint: String,
     api_key: String,
     model: String,
     dim: usize,
+    keep_existing_key: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    configure_embedder_impl(endpoint, api_key, model, dim, state).await
+    configure_embedder_impl(endpoint, api_key, model, dim, keep_existing_key, state).await
+}
+
+/// 停用嵌入模型：删除配置与凭据。已有向量保留（重新启用同一模型可继续使用），
+/// 远记忆召回退回纯关键词。
+#[tauri::command]
+pub(crate) async fn clear_embed_config(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::clear_embed_config_files(&data_dir, &SystemSecretStore::default())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("清除嵌入配置任务失败: {e}")))?
+    .map_err(TauriCommandError::storage)?;
+    *state
+        .embed_config
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    Ok(())
+}
+
+/// 远记忆索引状态（嵌入模型设置面板用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryIndexStatusDto {
+    pub embedder_configured: bool,
+    /// 远记忆记录总数（剧情摘要 + 消息归档）
+    pub archived_records: usize,
+    /// 其中还没有（或维度不符的）向量的条数；未配置嵌入模型时为无向量的条数
+    pub missing_vectors: usize,
+    pub backfill_running: bool,
+}
+
+#[tauri::command]
+pub(crate) fn get_memory_index_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> MemoryIndexStatusDto {
+    let dim = state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|c| c.dim);
+    let (archived_records, missing_vectors) =
+        crate::vector_index::archive_embedding_counts(state.vector_store.as_ref(), dim);
+    MemoryIndexStatusDto {
+        embedder_configured: dim.is_some(),
+        archived_records,
+        missing_vectors,
+        backfill_running: crate::vector_index::EmbeddingBackfillGuard::is_running(),
+    }
+}
+
+/// 为缺向量（或维度不符）的远记忆记录补建向量。嵌入接口出错时停在出错处，
+/// 已完成的部分保留，可再次执行续上。
+#[tauri::command]
+pub(crate) async fn rebuild_memory_embeddings(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<crate::vector_index::MemoryEmbeddingReport, TauriCommandError> {
+    if state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_none()
+    {
+        return Err(TauriCommandError::validation(
+            "未配置嵌入模型：远记忆目前按关键词召回，配置嵌入模型后才能补建向量",
+        ));
+    }
+    match crate::vector_index::run_embedding_backfill(state.inner(), None).await {
+        Some(Ok(report)) => Ok(report),
+        Some(Err(e)) => Err(TauriCommandError::internal(e)),
+        None => Err(TauriCommandError::validation(
+            "已有向量补建任务在进行，请稍候",
+        )),
+    }
 }
 
 #[tauri::command]
@@ -25,14 +107,44 @@ pub(crate) async fn configure_embedder_impl(
     api_key: String,
     model: String,
     dim: usize,
+    keep_existing_key: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let config = storyforge_infra_llm::EmbedConfig {
+    let endpoint = endpoint.trim().to_string();
+    let model = model.trim().to_string();
+    if endpoint.is_empty() || model.is_empty() {
+        return Err(TauriCommandError::validation(
+            "嵌入接口地址和模型名不能为空",
+        ));
+    }
+    let api_key = if keep_existing_key.unwrap_or(false) && api_key.trim().is_empty() {
+        state
+            .embed_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|c| c.api_key.clone())
+            .unwrap_or_default()
+    } else {
+        api_key.trim().to_string()
+    };
+    let mut config = storyforge_infra_llm::EmbedConfig {
         endpoint,
         api_key,
         model,
         dim,
     };
+    let actual_dim = storyforge_infra_llm::Embedder::new(config.clone())
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?
+        .probe_dim()
+        .await
+        .map_err(|e| TauriCommandError::validation(format!("嵌入接口测试失败: {e}")))?;
+    if dim != 0 && dim != actual_dim {
+        return Err(TauriCommandError::validation(format!(
+            "向量维度不一致：填写的是 {dim}，接口实际返回 {actual_dim}（留空可自动识别）"
+        )));
+    }
+    config.dim = actual_dim;
     configure_embedder_async(state.inner().clone(), config).await
 }
 

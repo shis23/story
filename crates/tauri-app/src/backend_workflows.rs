@@ -215,11 +215,13 @@ impl TurnWorkflow {
                     provisional_variant_id
                 );
             }
-            let _ = self.storage.update_turn_record(request.turn_id, |record| {
+            if let Err(mark_err) = self.storage.update_turn_record(request.turn_id, |record| {
                 record.status = TurnStatus::Failed;
                 record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
                 record.touch();
-            });
+            }) {
+                tracing::warn!("标记 Turn {} 为 Failed 失败: {mark_err}", request.turn_id);
+            }
             return Err(format!(
                 "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
             ));

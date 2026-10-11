@@ -2117,3 +2117,73 @@ fn gate_guard_recognizes_unsupported_capability_guards() {
         violations[0]
     );
 }
+
+/// 2026-10-11 审计：生产 `create_campaign_for_backend` 的会话落盘失败必须中止
+/// 建档。旧实现用无 Result 的 `ConversationStore::create`——外部持久化失败时它
+/// 只记日志并返回未落库的会话，Campaign 随后照常落库，留下指向不存在会话的
+/// `conversation_id`（无开场白时补偿分支也不会触发）。
+#[test]
+fn create_campaign_for_backend_fails_closed_when_conversation_cannot_persist() {
+    use storyforge_app_conversation::{ConversationError, ConversationPersistence};
+    use storyforge_domain::conversation::Conversation;
+    use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
+
+    struct RejectingSave;
+    impl ConversationPersistence for RejectingSave {
+        fn load_all(&self) -> Result<Vec<Conversation>, ConversationError> {
+            Ok(Vec::new())
+        }
+        fn save(&self, _conversation: &Conversation) -> Result<(), ConversationError> {
+            Err(ConversationError::ExternalStorage(
+                "injected conversation save failure".into(),
+            ))
+        }
+        fn delete(&self, _id: &Id) -> Result<(), ConversationError> {
+            Ok(())
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "storyforge_test_create_campaign_conv_fail_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = storage_backend::StorageFacade::new(
+        dir.clone(),
+        PinnedBackend::new(StorageBackend::Json, BackendSource::Default),
+    );
+    let conv_store = ConversationStore::with_persistence(std::sync::Arc::new(RejectingSave));
+
+    let character = make_test_character("Conv Fail Source");
+    let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+    card.character_definitions
+        .push(make_test_character_definition(
+            &card.id,
+            "conv-fail-def",
+            "Hero",
+        ));
+    let card_id = card.id.as_str().to_string();
+    storage.save_card(card).unwrap();
+
+    let err = crate::commands::campaigns::create_campaign_for_backend(
+        &storage,
+        &conv_store,
+        card_id,
+        "conv persist blocked".into(),
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("injected conversation save failure"),
+        "expected conversation persistence failure, got {err}"
+    );
+    assert!(
+        storage.list_campaigns(None).unwrap().is_empty(),
+        "会话落盘失败时不得留下指向悬空 conversation_id 的 Campaign"
+    );
+    assert!(conv_store.list().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

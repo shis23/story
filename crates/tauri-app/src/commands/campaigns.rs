@@ -248,20 +248,6 @@ pub(crate) fn save_character_card_to_store(
 
 /// 测试用 JSON 直连覆盖保存（等价 `CampaignStore::save_card_if_no_campaigns`）。
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) async fn save_character_card_force_rerun_async(
-    store: Arc<campaign_store::CampaignStore>,
-    card: storyforge_domain::character::CharacterCard,
-) -> Result<campaign_store::StoredCard, TauriCommandError> {
-    tokio::task::spawn_blocking(move || {
-        save_character_card_force_rerun_to_store(store.as_ref(), card)
-    })
-    .await
-    .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
-}
-
-/// 测试用 JSON 直连覆盖保存（等价 `CampaignStore::save_card_if_no_campaigns`）。
-#[cfg(test)]
 pub(crate) fn save_character_card_force_rerun_to_store(
     store: &campaign_store::CampaignStore,
     card: storyforge_domain::character::CharacterCard,
@@ -352,8 +338,13 @@ pub(crate) fn create_campaign_for_backend(
     );
     let campaign_id = campaign.id.clone();
 
-    // 自动建对话并绑定到 Campaign
-    let conv = conv_store.create(Some(card_id.clone()), Some(campaign_id.clone()));
+    // 自动建对话并绑定到 Campaign。
+    // 2026-10-11 审计：必须用 `create_persisted`——旧的无 Result `create` 在 SQLite
+    // 落盘失败时只记日志、返回一个既未落库也未入缓存的会话，随后 Campaign 照常
+    // 落库并指向不存在的 conversation_id（无开场白时补偿分支也不会触发）。
+    let conv = conv_store
+        .create_persisted(Some(card_id.clone()), Some(campaign_id.clone()))
+        .map_err(|e| TauriCommandError::storage(format!("创建 Campaign 会话失败: {e}")))?;
     campaign.conversation_id = Some(conv.id.clone());
 
     // 三.6 补偿：bundle 任一步失败 → 删除会话 + Campaign（不留孤儿）。
@@ -849,13 +840,38 @@ pub fn fork_campaign(
         ));
     }
 
-    fork_campaign_for_backend(
+    let source_conversation_id = state
+        .storage()
+        .get_campaign(&source_cid)
+        .ok()
+        .flatten()
+        .and_then(|record| record.campaign.conversation_id);
+    let forked = fork_campaign_for_backend(
         state.storage(),
         state.conv_store.as_ref(),
-        source_cid,
+        source_cid.clone(),
         Id::from_str(&fork_node_id),
         name,
-    )
+    )?;
+    let forked_campaign_id = Id::from_str(&forked.id);
+    // 分支的摘要换了新 id：复用来源局已有向量补建远记忆索引（不重新嵌入）。
+    crate::vector_index::index_campaign_summaries(
+        state.inner(),
+        &forked_campaign_id,
+        Some(&source_cid),
+    );
+    // 会话级远记忆（消息归档）连同归档水位一起带给分支。
+    if let (Some(source_conversation), Some(forked_conversation)) =
+        (source_conversation_id, forked.conversation_id.as_deref())
+    {
+        crate::vector_index::copy_message_archives(
+            state.inner(),
+            &source_conversation,
+            &forked_campaign_id,
+            &Id::from_str(forked_conversation),
+        );
+    }
+    Ok(forked)
 }
 
 /// Fork only a committed head through the complete snapshot import boundary.

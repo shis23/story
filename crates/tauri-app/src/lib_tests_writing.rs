@@ -2483,6 +2483,7 @@ fn test_index_round_summary_to_far_memory() {
         "诊所",
         5,
         Some("camp-fm"),
+        None,
     )
     .unwrap();
     assert_eq!(hits.len(), 1);

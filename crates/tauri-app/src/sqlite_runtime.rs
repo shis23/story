@@ -270,6 +270,7 @@ pub(crate) fn export_campaign_snapshot(
                 character,
                 world_info,
                 turns,
+                message_archives: Vec::new(),
             })
         } else {
             None
@@ -1715,8 +1716,7 @@ pub fn mutate_character<T>(
             serde_json::from_str(&info_json).map_err(|e| format!("解析角色卡失败: {e}"))?;
         let result = f(&mut info)?;
         // 同步更新计数（对齐 JSON CharacterStore 编辑路径）。
-        info.world_info_count = info.world_info_entries.len();
-        info.has_world_info = !info.world_info_entries.is_empty();
+        crate::commands::characters::refresh_world_info_counts(&mut info);
         let new_json =
             serde_json::to_string(&info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
         db.connection()
@@ -1773,8 +1773,6 @@ pub fn update_world_info_entries_bulk_multi(
                 new_entries.clone(),
             )
             .map_err(|e| e.to_string())?;
-            info.world_info_count = info.world_info_entries.len();
-            info.has_world_info = !info.world_info_entries.is_empty();
             let new_json =
                 serde_json::to_string(&info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
             tx.execute(

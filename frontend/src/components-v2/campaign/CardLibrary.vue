@@ -16,7 +16,7 @@ import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
-import WorldInfoReadonlyPanel from './WorldInfoReadonlyPanel.vue'
+import CardWorldInfoEditor from './CardWorldInfoEditor.vue'
 import { errorText } from '../../utils/errorText.js'
 
 const emit = defineEmits(['open-campaigns', 'open-studio', 'revise-card'])
@@ -190,9 +190,9 @@ function roleVariant(roleType) {
               <div class="text-ink-soft line-clamp-2">{{ def.persona_prompt }}</div>
             </div>
 
-            <!-- 卡模板世界书（只读） -->
+            <!-- 卡模板世界书（可编辑；新开的活动从这里拷贝） -->
             <div class="pt-2 border-t border-line">
-              <WorldInfoReadonlyPanel :character-id="sourceCharacterId(card) || cardDetail.source_character_id" />
+              <CardWorldInfoEditor :character-id="sourceCharacterId(card) || cardDetail.source_character_id" />
             </div>
 
             <!-- 操作 -->

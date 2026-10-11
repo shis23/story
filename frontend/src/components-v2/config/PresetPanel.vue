@@ -6,6 +6,7 @@ import {
   listPresets,
   getPreset,
   deletePreset,
+  importPreset,
   updatePresetPrompt,
   updatePresetRegex,
   importPresetAsModules,
@@ -43,6 +44,7 @@ const editingPrompt = ref(null) // 正在编辑的 prompt index
 const editContent = ref('')
 const saving = ref(false)
 const importingGlobalRegex = ref(false)
+const importingPreset = ref(false)
 const importingModules = ref(false)
 // F-45：加载失败此前无 catch → 浮动 rejection + 空态假象（"还没有预设"）
 const loadError = ref(null)
@@ -181,6 +183,33 @@ async function toggleRegexDisabled(index) {
   }
 }
 
+// 2026-10-11 审计：空态文案一直写「请先导入」，但面板没有任何导入入口
+//（importPreset wrapper 自初版起零调用）——用户无法导入 ST 预设。
+async function importPresetFromFile() {
+  importingPreset.value = true
+  saving.value = true
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await open({
+      multiple: false,
+      filters: [{ name: 'ST 预设 JSON', extensions: ['json'] }],
+    })
+    if (!filePath) return
+
+    // readFile 而非 readTextFile：capability 只授权 fs:allow-read-file。
+    const { readFile } = await import('@tauri-apps/plugin-fs')
+    const rawData = await readFile(filePath)
+    const message = await importPreset(rawData)
+    await refresh()
+    await alertDialog(message)
+  } catch (e) {
+    await alertDialog('导入预设失败: ' + errorText(e))
+  } finally {
+    importingPreset.value = false
+    saving.value = false
+  }
+}
+
 async function importGlobalRegexFromSettings() {
   importingGlobalRegex.value = true
   saving.value = true
@@ -299,6 +328,17 @@ function placementBadgeVariant(regex) {
       <Tabs v-model="activeTopTab" :tabs="topTabs">
         <!-- ═══ Tab: 预设 ═══ -->
         <div v-if="activeTopTab === 'presets'" class="space-y-3 pb-4">
+          <div class="flex items-center justify-end gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              :loading="importingPreset"
+              :disabled="saving"
+              title="导入 SillyTavern 预设 JSON"
+              @click="importPresetFromFile"
+            >{{ importingPreset ? '导入中' : '导入预设' }}</Button>
+          </div>
+
           <LoadingState v-if="loading" />
 
           <div v-else-if="loadError" class="rounded-xl border border-err/40 bg-err/10 px-3 py-3 text-center space-y-2">
@@ -309,7 +349,7 @@ function placementBadgeVariant(regex) {
           <EmptyState
             v-else-if="presets.length === 0"
             title="还没有预设"
-            description="请先导入"
+            description="点击右上角「导入预设」选择 SillyTavern 预设 JSON"
           />
 
           <div

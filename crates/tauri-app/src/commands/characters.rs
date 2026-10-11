@@ -179,37 +179,12 @@ pub(crate) fn import_character(
         let world_info = character.embedded_world_info.clone();
         ctx.characters.push(Arc::new(character));
         if let Some(wi) = world_info {
-            // 先清理该角色之前导入的绿灯世界书条目（防重复累积）
-            {
-                let all_keywords: Vec<String> = wi
-                    .entries
-                    .iter()
-                    .flat_map(|e| e.keys.iter().cloned())
-                    .collect();
-                if !all_keywords.is_empty()
-                    && let Ok(hits) = state.vector_store.search_by_keywords(&all_keywords, 1000)
-                {
-                    for hit in hits.into_iter().filter(|h| h.kind == VectorKind::WorldInfo) {
-                        let _ = state.vector_store.delete(&hit.id);
-                    }
-                }
-            }
-            // 把绿灯世界书条目入库到向量存储（search_vectors 工具关键词搜索用）
-            for entry in &wi.entries {
-                if !entry.disabled && !entry.constant && !entry.keys.is_empty() {
-                    let _ = state.vector_store.upsert(VectorRecord {
-                        id: Id::new(),
-                        content: entry.content.clone(),
-                        vector: vec![], // 关键词路径不需要真实向量，后续接嵌入 API 时补充
-                        keywords: entry.keys.clone(),
-                        kind: VectorKind::WorldInfo,
-                        metadata: std::collections::HashMap::new(),
-                    });
-                }
-            }
             ctx.world_info = Some(Arc::new(wi));
         }
     }
+    // 绿灯世界书条目入向量库（search_vectors 用）：按角色库全量重建，取代旧的
+    // 「按关键词删旧条目 + 逐条 upsert」（见 vector_index::sync_world_info_vectors）。
+    crate::vector_index::sync_world_info_vectors(state.inner());
 
     Ok(CharacterSummary {
         id: stored.id,
@@ -367,9 +342,15 @@ pub fn delete_character(
         .into_iter()
         .flatten()
         .collect();
+    // JSON 角色库只按存储 id 删除：调用方传的是源 Character.id（角色卡面板只知道
+    // source_character_id）时，先换成解析到的存储 id，否则级联删了卡、主记录却没删。
+    let target_id = stored
+        .as_ref()
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| id.clone());
     let removed = state
         .storage()
-        .delete_character_full_cascade(&id, &source_ids)
+        .delete_character_full_cascade(&target_id, &source_ids)
         .map_err(|e| TauriCommandError::storage(format!("删除失败（已整体回滚）: {e}")))?;
     if !removed {
         return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
@@ -401,6 +382,10 @@ pub fn delete_character(
             tracing::warn!("删除角色后清理会话失败 conv={conv_id}: {e}");
         }
     }
+    // 级联删掉的 Campaign 的远记忆向量同样要清（派生索引，失败只告警）。
+    for campaign_id in &affected_campaign_ids {
+        crate::vector_index::purge_campaign_vectors(state.inner(), campaign_id);
+    }
     // 同步从 tool_ctx 移除
     if let Some(name) = name {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -411,9 +396,9 @@ pub fn delete_character(
             ctx.world_info = None;
         }
     }
-    // 内存态世界书重建（角色库已删除，t_ctx 内世界书条目需要清理）
-    // 注意：旧实现引用的 vector_store.delete_by_character 不存在（无效调用），
-    // 现改为显式不执行 + 记录。SQLite 角色库删除已含全量持久化级联。
+    // 内存态世界书重建（角色库已删除，t_ctx 内世界书条目需要清理）。
+    // `VectorStore::delete_by_character` 按 `owner_character_id`（角色私有知识）
+    // 删除，与角色库世界书向量无关，这里不调用。
     rebuild_world_info_in_tool_ctx(&state);
     Ok(())
 }
@@ -439,20 +424,10 @@ pub(crate) fn update_world_info_route(
         &route_canonical,
     )?;
 
-    // 同步更新 tool_ctx 中的世界书路由
-    if let Ok(Some(stored)) = state.storage().get_character(&character_id)
-        && stored.info.world_info_entries.get(entry_index).is_some()
-    {
-        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(ref world_info) = ctx.world_info {
-            let mut new_book = (**world_info).clone();
-            if let Some(entry) = new_book.entries.get_mut(entry_index) {
-                entry.route = parsed_route;
-            }
-            ctx.world_info = Some(Arc::new(new_book));
-        }
-    }
-
+    // 同步 tool_ctx（含全局条目 merge）+ 检索池向量重建。旧实现按 entry_index 直接
+    // 改 tool_ctx 里的合并书——那本书混着多张卡与全局条目，下标对不上；检索池也
+    // 不跟着变（改成 Constant / Disabled 的条目仍能被 search_vectors 搜到）。
+    rebuild_world_info_in_tool_ctx(&state);
     Ok(())
 }
 
@@ -506,19 +481,8 @@ pub(crate) fn add_world_info_entry(
         is_global.unwrap_or(false),
     )?;
 
-    // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目入向量库
+    // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目向量重建
     rebuild_world_info_in_tool_ctx(&state);
-    // 新增的绿灯条目入向量库
-    if !constant && !keys.is_empty() {
-        let _ = state.vector_store.upsert(VectorRecord {
-            id: Id::new(),
-            content,
-            vector: vec![],
-            keywords: keys,
-            kind: VectorKind::WorldInfo,
-            metadata: std::collections::HashMap::new(),
-        });
-    }
     Ok(new_index)
 }
 
@@ -549,6 +513,9 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
     if require_character_commands(state.inner().as_ref(), "rebuild character world info").is_err() {
         return;
     }
+    // 角色库世界书变了（增删改条目、改路由、删卡/删角色）：检索池向量跟着重建，
+    // 必须放在下面「活跃活动早退」之前——向量池与本局注入源无关。
+    crate::vector_index::sync_world_info_vectors(state.inner());
     use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
     // 有活跃活动时以本局世界书为唯一注入源（卡库写路径 rebuild 不应覆盖）。
@@ -647,26 +614,153 @@ pub(crate) fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppSta
     }
 }
 
-// ─── 世界书编辑纯变换（SQLite 路径经 facade 复用；JSON 路径走 CharacterStore）──
+// ─── 卡模板世界书编辑（两个后端共用的纯变换）──────────────────────────────
 //
-// 这些纯函数与 `CharacterStore` 的内联变换保持字节级相同的语义与错误消息
-// （索引越界 / 新增条目默认路由 / 计数刷新由 `mutate_character` 统一完成）。
+// 卡模板世界书的权威是完整的 `embedded_world_info`（含禁用条目、次级关键词、
+// 注释等 ST 字段）：角色卡面板、新开局的种子、导出都读它。`world_info_entries`
+// 只是它的投影（去掉禁用条目，供非 Campaign 写作路径与检索池使用），每次编辑后
+// 重新生成。2026-10-11 审计前编辑命令只改投影：面板看不到、新开局也拿不到修改。
+//
+// 条目下标 = 完整世界书里的下标（与 `get_character_world_info` 返回的 index 一致）。
+// 「全局共享」标记存在条目扩展 `sf_global` 上，投影时还原为 `is_global`。
 
-/// 更新世界书条目路由（entry.route）。
+const GLOBAL_FLAG: &str = "sf_global";
+
+pub(crate) fn entry_is_global(entry: &storyforge_domain::world_info::WorldInfoEntry) -> bool {
+    entry
+        .extensions
+        .get(GLOBAL_FLAG)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn set_entry_extension(
+    entry: &mut storyforge_domain::world_info::WorldInfoEntry,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if !entry.extensions.is_object() {
+        entry.extensions = serde_json::json!({});
+    }
+    if let Some(map) = entry.extensions.as_object_mut() {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn set_entry_global(entry: &mut storyforge_domain::world_info::WorldInfoEntry, is_global: bool) {
+    if is_global || entry_is_global(entry) {
+        set_entry_extension(entry, GLOBAL_FLAG, serde_json::Value::Bool(is_global));
+    }
+}
+
+fn route_name(route: &storyforge_domain::world_info::LoreRoute) -> String {
+    format!("{route:?}")
+}
+
+fn projected_entry(entry: &storyforge_domain::world_info::WorldInfoEntry) -> WorldInfoEntryInfo {
+    WorldInfoEntryInfo {
+        keys: entry.keys.clone(),
+        content: entry.content.clone(),
+        constant: entry.constant,
+        route: route_name(&entry.route),
+        is_global: entry_is_global(entry),
+        depth: entry.depth,
+        order: entry.order,
+    }
+}
+
+fn user_entry_from_info(
+    info: &WorldInfoEntryInfo,
+) -> storyforge_domain::world_info::WorldInfoEntry {
+    let mut entry = world_info_entry_from_info(info);
+    set_entry_extension(&mut entry, "sf_source", serde_json::json!("user"));
+    set_entry_global(&mut entry, info.is_global);
+    entry
+}
+
+/// 刷新世界书计数（两个后端的写路径在变换后统一调用）。
+pub(crate) fn refresh_world_info_counts(info: &mut CharacterInfo) {
+    info.world_info_count = info
+        .embedded_world_info
+        .as_ref()
+        .map(|book| book.entries.len())
+        .unwrap_or(info.world_info_entries.len());
+    info.has_world_info = info.world_info_count > 0;
+}
+
+/// 取可编辑的完整世界书。旧数据里投影可能与完整书分叉（只改了投影的旧编辑路径、
+/// 没有内嵌书的旧卡）：投影里有、书里没有的条目并回书里，全局标记同步到书上，
+/// 绝不因为这次编辑丢掉内容。对未分叉的数据是空操作。
+fn card_book_mut(info: &mut CharacterInfo) -> &mut storyforge_domain::world_info::WorldInfoBook {
+    let projection = std::mem::take(&mut info.world_info_entries);
+    let book = info.embedded_world_info.get_or_insert_with(|| {
+        storyforge_domain::world_info::WorldInfoBook {
+            entries: Vec::new(),
+            source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
+        }
+    });
+    let mut matched = vec![false; book.entries.len()];
+    for projected in &projection {
+        let found = book.entries.iter().enumerate().position(|(i, entry)| {
+            !matched[i] && entry.keys == projected.keys && entry.content == projected.content
+        });
+        match found {
+            Some(i) => {
+                matched[i] = true;
+                set_entry_global(&mut book.entries[i], projected.is_global);
+            }
+            None => book.entries.push(user_entry_from_info(projected)),
+        }
+    }
+    info.world_info_entries = projection;
+    info.embedded_world_info
+        .as_mut()
+        .expect("book materialized above")
+}
+
+/// 从完整世界书重新生成投影（去掉禁用条目）。
+pub(crate) fn reproject_world_info(info: &mut CharacterInfo) {
+    info.world_info_entries = info
+        .embedded_world_info
+        .as_ref()
+        .map(|book| {
+            book.entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .map(projected_entry)
+                .collect()
+        })
+        .unwrap_or_default();
+    refresh_world_info_counts(info);
+}
+
+fn book_entry_mut(
+    book: &mut storyforge_domain::world_info::WorldInfoBook,
+    entry_index: usize,
+) -> Result<&mut storyforge_domain::world_info::WorldInfoEntry, String> {
+    book.entries
+        .get_mut(entry_index)
+        .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))
+}
+
+/// 更新世界书条目路由。路由为 Disabled 时条目同时标记禁用，其它路由解除禁用。
 pub(crate) fn apply_world_info_route_update(
     info: &mut CharacterInfo,
     entry_index: usize,
     new_route: &str,
 ) -> Result<(), String> {
-    let entry = info
-        .world_info_entries
-        .get_mut(entry_index)
-        .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
-    entry.route = new_route.to_string();
+    let route =
+        crate::commands::world_info::parse_lore_route(new_route).map_err(|e| e.to_string())?;
+    let entry = book_entry_mut(card_book_mut(info), entry_index)?;
+    entry.disabled = matches!(route, storyforge_domain::world_info::LoreRoute::Disabled);
+    entry.route = route;
+    reproject_world_info(info);
     Ok(())
 }
 
-/// 更新世界书条目的 keys / content / constant / is_global / depth / order。
+/// 更新世界书条目的 keys / content / constant / is_global / depth / order
+/// （其余 ST 字段——次级关键词、注释、位置等——原样保留）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_world_info_entry_update(
     info: &mut CharacterInfo,
@@ -678,20 +772,19 @@ pub(crate) fn apply_world_info_entry_update(
     depth: i32,
     order: i32,
 ) -> Result<(), String> {
-    let entry = info
-        .world_info_entries
-        .get_mut(entry_index)
-        .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
+    let entry = book_entry_mut(card_book_mut(info), entry_index)?;
     entry.keys = keys;
     entry.content = content;
     entry.constant = constant;
-    entry.is_global = is_global;
+    entry.selective = !constant;
     entry.depth = depth;
     entry.order = order;
+    set_entry_global(entry, is_global);
+    reproject_world_info(info);
     Ok(())
 }
 
-/// 新增世界书条目，返回新条目的索引。默认路由：蓝灯→Constant，绿灯→Selective。
+/// 新增世界书条目，返回新条目在完整世界书里的下标。默认路由：蓝灯→Constant，绿灯→Selective。
 pub(crate) fn apply_add_world_info_entry(
     info: &mut CharacterInfo,
     keys: Vec<String>,
@@ -700,17 +793,20 @@ pub(crate) fn apply_add_world_info_entry(
     is_global: bool,
 ) -> Result<usize, String> {
     let route = if constant { "Constant" } else { "Selective" }.to_string();
-    let entry = WorldInfoEntryInfo {
+    let entry = user_entry_from_info(&WorldInfoEntryInfo {
         keys,
         content,
         constant,
         route,
         is_global,
-        depth: 2,
-        order: 100,
-    };
-    info.world_info_entries.push(entry);
-    Ok(info.world_info_entries.len() - 1)
+        depth: default_depth(),
+        order: default_order(),
+    });
+    let book = card_book_mut(info);
+    book.entries.push(entry);
+    let index = book.entries.len() - 1;
+    reproject_world_info(info);
+    Ok(index)
 }
 
 /// 删除世界书条目。
@@ -718,40 +814,114 @@ pub(crate) fn apply_delete_world_info_entry(
     info: &mut CharacterInfo,
     entry_index: usize,
 ) -> Result<(), String> {
-    if entry_index >= info.world_info_entries.len() {
+    let book = card_book_mut(info);
+    if entry_index >= book.entries.len() {
         return Err(format!("世界书条目索引越界: {entry_index}"));
     }
-    info.world_info_entries.remove(entry_index);
+    book.entries.remove(entry_index);
+    reproject_world_info(info);
     Ok(())
 }
 
-/// 批量替换世界书条目（meta_accept_patch 持久化用）。
+/// 批量替换世界书投影（meta_accept_patch 持久化用），并让完整世界书跟上：
+/// 与新投影条目（keys + 正文）相同的旧条目原样复用（保留 ST 字段），只更新路由 /
+/// 层级 / 全局标记；新条目追加；不在新投影里的启用条目删除；禁用条目原样保留。
 pub(crate) fn apply_update_world_info_entries_bulk(
     info: &mut CharacterInfo,
     entries: Vec<WorldInfoEntryInfo>,
 ) -> Result<(), String> {
+    let old_entries = info
+        .embedded_world_info
+        .as_ref()
+        .map(|book| book.entries.clone())
+        .unwrap_or_default();
+    let mut used = vec![false; old_entries.len()];
+    let mut next = Vec::with_capacity(entries.len());
+    for projected in &entries {
+        let found = old_entries.iter().enumerate().position(|(i, entry)| {
+            !used[i]
+                && !entry.disabled
+                && entry.keys == projected.keys
+                && entry.content == projected.content
+        });
+        let entry = match found {
+            Some(i) => {
+                used[i] = true;
+                let mut entry = old_entries[i].clone();
+                let fresh = world_info_entry_from_info(projected);
+                entry.constant = fresh.constant;
+                entry.selective = fresh.selective;
+                entry.route = fresh.route;
+                entry.depth = fresh.depth;
+                entry.order = fresh.order;
+                set_entry_global(&mut entry, projected.is_global);
+                entry
+            }
+            None => user_entry_from_info(projected),
+        };
+        next.push(entry);
+    }
+    next.extend(
+        old_entries
+            .into_iter()
+            .zip(used)
+            .filter(|(entry, used)| !used && entry.disabled)
+            .map(|(entry, _)| entry),
+    );
+    let book = info.embedded_world_info.get_or_insert_with(|| {
+        storyforge_domain::world_info::WorldInfoBook {
+            entries: Vec::new(),
+            source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
+        }
+    });
+    book.entries = next;
     info.world_info_entries = entries;
+    refresh_world_info_counts(info);
     Ok(())
 }
 
 #[cfg(test)]
 mod world_info_transform_tests {
     use super::*;
+    use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
-    fn info_with_entries(count: usize) -> CharacterInfo {
+    fn book_entry(i: usize, disabled: bool) -> WorldInfoEntry {
+        let mut entry = world_info_entry_from_info(&WorldInfoEntryInfo {
+            keys: vec![format!("key{i}")],
+            content: format!("content{i}"),
+            constant: false,
+            route: "Selective".into(),
+            is_global: false,
+            depth: 2,
+            order: 100,
+        });
+        entry.secondary_keys = vec![format!("secondary{i}")];
+        entry.disabled = disabled;
+        if disabled {
+            entry.route = LoreRoute::Disabled;
+        }
+        entry
+    }
+
+    /// 导入后的样子：完整书（第 1 条禁用）+ 去掉禁用条目的投影。
+    fn imported_info() -> CharacterInfo {
         let mut info = sample_info("Transform Hero");
-        info.world_info_entries = (0..count)
-            .map(|i| WorldInfoEntryInfo {
-                keys: vec![format!("key{i}")],
-                content: format!("content{i}"),
-                constant: false,
-                route: "Selective".into(),
-                is_global: false,
-                depth: 2,
-                order: 100,
-            })
-            .collect();
+        info.embedded_world_info = Some(WorldInfoBook {
+            entries: vec![
+                book_entry(0, false),
+                book_entry(1, true),
+                book_entry(2, false),
+            ],
+            source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
+        });
+        reproject_world_info(&mut info);
         info
+    }
+
+    fn book(info: &CharacterInfo) -> &WorldInfoBook {
+        info.embedded_world_info.as_ref().unwrap()
     }
 
     fn sample_info(name: &str) -> CharacterInfo {
@@ -782,20 +952,15 @@ mod world_info_transform_tests {
     }
 
     #[test]
-    fn route_update_mutates_only_route() {
-        let mut info = info_with_entries(1);
-        apply_world_info_route_update(&mut info, 0, "Constant").unwrap();
-        assert_eq!(info.world_info_entries[0].route, "Constant");
-        assert_eq!(info.world_info_entries[0].keys, vec!["key0"]);
-        assert!(apply_world_info_route_update(&mut info, 3, "Constant").is_err());
-    }
+    fn edits_land_in_the_full_book_and_the_projection_follows() {
+        let mut info = imported_info();
+        assert_eq!(info.world_info_entries.len(), 2, "投影不含禁用条目");
+        assert_eq!(info.world_info_count, 3);
 
-    #[test]
-    fn entry_update_replaces_fields() {
-        let mut info = info_with_entries(1);
+        // 下标是完整书里的下标：2 = 第三条（投影里的第二条）
         apply_world_info_entry_update(
             &mut info,
-            0,
+            2,
             vec!["new".into()],
             "new content".into(),
             true,
@@ -804,11 +969,18 @@ mod world_info_transform_tests {
             9,
         )
         .unwrap();
-        let entry = &info.world_info_entries[0];
-        assert_eq!(entry.keys, vec!["new"]);
-        assert_eq!(entry.content, "new content");
-        assert!(entry.constant && entry.is_global);
-        assert_eq!((entry.depth, entry.order), (5, 9));
+        let edited = &book(&info).entries[2];
+        assert_eq!(edited.keys, vec!["new"]);
+        assert_eq!(
+            edited.secondary_keys,
+            vec!["secondary2"],
+            "其余 ST 字段保留"
+        );
+        assert!(edited.constant && entry_is_global(edited));
+        let projected = &info.world_info_entries[1];
+        assert_eq!(projected.content, "new content");
+        assert!(projected.is_global);
+        assert_eq!((projected.depth, projected.order), (5, 9));
         assert!(
             apply_world_info_entry_update(&mut info, 7, vec![], String::new(), false, false, 0, 0)
                 .is_err()
@@ -816,35 +988,110 @@ mod world_info_transform_tests {
     }
 
     #[test]
-    fn add_entry_defaults_route_depth_and_order() {
-        let mut info = info_with_entries(0);
-        let idx = apply_add_world_info_entry(&mut info, vec!["k".into()], "c".into(), true, true)
-            .unwrap();
-        assert_eq!(idx, 0);
-        let entry = &info.world_info_entries[0];
-        assert_eq!(entry.route, "Constant");
-        assert_eq!((entry.depth, entry.order), (2, 100));
-        assert!(entry.is_global);
-        let idx =
-            apply_add_world_info_entry(&mut info, vec!["k2".into()], "c2".into(), false, false)
-                .unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(info.world_info_entries[1].route, "Selective");
+    fn route_update_toggles_disabled_with_the_route() {
+        let mut info = imported_info();
+        apply_world_info_route_update(&mut info, 1, "Constant").unwrap();
+        assert!(
+            !book(&info).entries[1].disabled,
+            "改成非 Disabled 路由即启用"
+        );
+        assert_eq!(info.world_info_entries.len(), 3);
+        apply_world_info_route_update(&mut info, 0, "Disabled").unwrap();
+        assert!(book(&info).entries[0].disabled);
+        assert_eq!(info.world_info_entries.len(), 2);
+        assert!(apply_world_info_route_update(&mut info, 9, "Constant").is_err());
+        assert!(apply_world_info_route_update(&mut info, 0, "nonsense").is_err());
     }
 
     #[test]
-    fn delete_entry_removes_and_rejects_out_of_range() {
-        let mut info = info_with_entries(2);
+    fn add_and_delete_use_full_book_indexes() {
+        let mut info = imported_info();
+        let idx = apply_add_world_info_entry(&mut info, vec!["k".into()], "c".into(), true, true)
+            .unwrap();
+        assert_eq!(idx, 3);
+        let added = &book(&info).entries[3];
+        assert_eq!(added.route, LoreRoute::Constant);
+        assert_eq!((added.depth, added.order), (2, 100));
+        assert!(entry_is_global(added));
+        assert_eq!(added.extensions["sf_source"], "user");
+        assert_eq!(info.world_info_entries.len(), 3);
+
         apply_delete_world_info_entry(&mut info, 0).unwrap();
-        assert_eq!(info.world_info_entries.len(), 1);
-        assert_eq!(info.world_info_entries[0].keys, vec!["key1"]);
+        assert_eq!(book(&info).entries.len(), 3);
+        assert_eq!(book(&info).entries[0].keys, vec!["key1"]);
         assert!(apply_delete_world_info_entry(&mut info, 5).is_err());
     }
 
+    /// 没有内嵌书的旧卡：第一次编辑时用投影建出完整书。
     #[test]
-    fn bulk_replace_swaps_the_whole_list() {
-        let mut info = info_with_entries(2);
+    fn legacy_card_without_book_is_materialized_from_its_projection() {
+        let mut info = sample_info("Legacy");
+        info.world_info_entries = vec![WorldInfoEntryInfo {
+            keys: vec!["old".into()],
+            content: "legacy".into(),
+            constant: true,
+            route: "Constant".into(),
+            is_global: true,
+            depth: 2,
+            order: 100,
+        }];
+        apply_world_info_route_update(&mut info, 0, "Both").unwrap();
+        assert_eq!(book(&info).entries.len(), 1);
+        assert_eq!(book(&info).entries[0].route, LoreRoute::Both);
+        assert!(info.world_info_entries[0].is_global, "全局标记不丢");
+    }
+
+    /// 旧编辑路径只改了投影（书与投影分叉）：编辑时投影独有的条目并回书里。
+    #[test]
+    fn diverged_projection_entries_are_kept() {
+        let mut info = imported_info();
+        info.world_info_entries.push(WorldInfoEntryInfo {
+            keys: vec!["meta".into()],
+            content: "只在投影里的条目".into(),
+            constant: false,
+            route: "Selective".into(),
+            is_global: false,
+            depth: 2,
+            order: 100,
+        });
+        apply_world_info_route_update(&mut info, 0, "Constant").unwrap();
+        assert!(
+            book(&info)
+                .entries
+                .iter()
+                .any(|e| e.content == "只在投影里的条目")
+        );
+        assert_eq!(info.world_info_entries.len(), 3);
+    }
+
+    #[test]
+    fn bulk_replace_keeps_book_fields_and_disabled_entries() {
+        let mut info = imported_info();
+        let mut kept = info.world_info_entries[1].clone(); // 完整书第 2 条
+        kept.route = "Constant".into();
+        kept.constant = true;
+        kept.is_global = true;
+        let added = WorldInfoEntryInfo {
+            keys: vec!["patched".into()],
+            content: "patched".into(),
+            constant: false,
+            route: "Selective".into(),
+            is_global: false,
+            depth: 2,
+            order: 100,
+        };
+        apply_update_world_info_entries_bulk(&mut info, vec![kept, added]).unwrap();
+        let entries = &book(&info).entries;
+        assert_eq!(entries.len(), 3, "删掉第 0 条，新增一条，禁用条目保留");
+        assert_eq!(entries[0].secondary_keys, vec!["secondary2"]);
+        assert_eq!(entries[0].route, LoreRoute::Constant);
+        assert!(entry_is_global(&entries[0]));
+        assert_eq!(entries[1].content, "patched");
+        assert!(entries[2].disabled);
+        assert_eq!(info.world_info_entries.len(), 2);
+
         apply_update_world_info_entries_bulk(&mut info, vec![]).unwrap();
         assert!(info.world_info_entries.is_empty());
+        assert_eq!(book(&info).entries.len(), 1, "只剩禁用条目");
     }
 }

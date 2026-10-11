@@ -571,10 +571,19 @@ pub(crate) async fn export_campaign_bundle(
 ) -> Result<String, TauriCommandError> {
     // 2026-09-13 域4 修复 T-12：长 Campaign 的 bundle 序列化可达数十 MB，
     // 非 async 命令会在 IPC 线程内联完成全部序列化 + 磁盘写；移到 blocking 池。
-    let storage = state.storage().clone();
+    let app = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let camp_id = Id::from_str(&campaign_id);
-        storage.export_campaign_bundle(&camp_id)
+        // 消息归档（会话级远记忆）在向量库里，随快照一起导出（不含向量）。
+        app.storage()
+            .export_campaign_bundle_with(&camp_id, |bundle| {
+                if let Some(runtime) = bundle.runtime.as_mut() {
+                    runtime.message_archives = crate::vector_index::export_message_archives(
+                        &app,
+                        &runtime.conversation.id,
+                    );
+                }
+            })
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("Bundle 导出任务失败: {e}")))?
@@ -635,10 +644,34 @@ pub(crate) async fn import_campaign_bundle(
     // 体积校验留在本线程（纯长度检查，让超大载荷快速失败、不进池）。
     let app = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let bundle: CampaignBundle = serde_json::from_str(&bundle_json)
+        let mut bundle: CampaignBundle = serde_json::from_str(&bundle_json)
             .map_err(|e| TauriCommandError::validation(format!("Bundle JSON 解析失败: {e}")))?;
-        app.storage()
-            .import_campaign_bundle(bundle, app.conv_store.as_ref())
+        // 消息归档不进存储层：先取出来，导入成功后写进向量库并恢复归档水位。
+        let (archives, archived_upto) = bundle
+            .runtime
+            .as_mut()
+            .map(|runtime| {
+                (
+                    std::mem::take(&mut runtime.message_archives),
+                    runtime.conversation.archived_upto,
+                )
+            })
+            .unwrap_or_default();
+        let result = app
+            .storage()
+            .import_campaign_bundle(bundle, app.conv_store.as_ref())?;
+        let campaign_id = Id::from_str(&result.campaign_id);
+        // 兑现导入提示里的「向量索引将重建」：为新 id 的摘要建远记忆索引
+        // （关键词立即可召回；配置了 Embedder 时后台补嵌入）。
+        crate::vector_index::index_campaign_summaries(&app, &campaign_id, None);
+        crate::vector_index::import_message_archives(
+            &app,
+            archives,
+            archived_upto,
+            &campaign_id,
+            &Id::from_str(&result.conversation_id),
+        );
+        Ok(result)
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("Bundle 导入任务失败: {e}")))?

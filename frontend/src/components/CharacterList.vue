@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { listCards, getCard, deleteCard } from '../tauri-api.js'
+import { listCards, getCard, deleteCard, deleteCharacter } from '../tauri-api.js'
 import { confirmDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
 import {
@@ -57,10 +57,23 @@ async function handleSelect(card) {
 }
 
 async function handleDelete(card) {
-  const ok = await confirmDialog(`确定删除角色卡「${card.name}」？`, { title: '删除确认' })
+  const ok = await confirmDialog(
+    `确定删除角色卡「${card.name}」？
+它的活动、世界书与 MVU 翻译会一并删除。`,
+    { title: '删除确认' },
+  )
   if (!ok) return
   try {
     await deleteCard(card.id)
+    // 角色库里的源角色也要删：只删卡时它的世界书仍在检索池里，还能被搜到、
+    // 被非活动写作路径注入。源角色可能已不存在（旧数据），不算失败。
+    if (card.source_character_id) {
+      try {
+        await deleteCharacter(card.source_character_id)
+      } catch (e) {
+        if (e?.type !== 'not_found') throw e
+      }
+    }
     await refresh()
     if (props.activeId === card.id || props.activeId === card.source_character_id) {
       emit('select', null)

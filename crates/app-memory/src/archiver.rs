@@ -1,7 +1,10 @@
 /// 记忆归档器（对应设计 §7.2）
 ///
-/// 当 Recent Window 溢出时触发归档：批量取出 → LLM 压缩 → 嵌入 → 入向量库。
+/// 当 Recent Window 溢出时触发归档：批量取出 → LLM 压缩 → （可选）嵌入 → 入向量库。
 /// 借鉴 shujuku 的 summaryPromptGroup 工作流。
+///
+/// 嵌入模型是可选项：没配 Embedder（或嵌入调用失败）时总结照样以关键词记录入库，
+/// 远记忆走关键词召回；之后配置了嵌入模型可以为这些记录补建向量。
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -52,7 +55,7 @@ pub struct ArchivedSummary {
     /// 归档自哪些消息的索引范围
     pub source_range: (usize, usize),
     pub created_at: DateTime<Utc>,
-    /// 嵌入向量
+    /// 嵌入向量（`None` = 仅关键词记录：未配置嵌入模型或本次嵌入失败）
     pub vector: Option<Vec<f32>>,
     /// 关键词索引
     pub keywords: Vec<String>,
@@ -63,7 +66,7 @@ pub struct ArchivedSummary {
 /// 记忆归档器
 pub struct MemoryArchiver {
     llm: Arc<dyn LlmClient>,
-    embedder: Arc<Embedder>,
+    embedder: Option<Arc<Embedder>>,
     vector_store: Arc<dyn VectorStore>,
     config: ArchiveConfig,
     /// Model name used for LLM summarization during archive.
@@ -73,7 +76,7 @@ pub struct MemoryArchiver {
 impl MemoryArchiver {
     pub fn new(
         llm: Arc<dyn LlmClient>,
-        embedder: Arc<Embedder>,
+        embedder: Option<Arc<Embedder>>,
         vector_store: Arc<dyn VectorStore>,
         config: ArchiveConfig,
         model: String,
@@ -208,20 +211,23 @@ impl MemoryArchiver {
             }
         }
 
-        // W-06：嵌入/入库失败同样构成缺口——截断到失败点之前，绝不"失败了还推进水位"。
-        let mut embedded_upto = summaries.len();
+        // W-06：入库失败构成缺口——截断到失败点之前，绝不"失败了还推进水位"。
+        // 嵌入失败不再是缺口：总结先以关键词记录入库（远记忆不丢），向量之后补建。
+        let mut stored_upto = summaries.len();
         for (index, summary) in summaries.iter_mut().enumerate() {
-            let vector = match self.embedder.embed(&summary.content).await {
-                Ok(vector) => vector,
-                Err(e) => {
-                    warn!(
-                        target: "app-memory",
-                        "总结 {} 嵌入失败（水位不得越过该缺口）: {e}",
-                        summary.id
-                    );
-                    embedded_upto = index;
-                    break;
-                }
+            let vector = match &self.embedder {
+                Some(embedder) => match embedder.embed(&summary.content).await {
+                    Ok(vector) => Some(vector),
+                    Err(e) => {
+                        warn!(
+                            target: "app-memory",
+                            "总结 {} 嵌入失败，先以关键词记录入库（可稍后补建向量）: {e}",
+                            summary.id
+                        );
+                        None
+                    }
+                },
+                None => None,
             };
             let mut metadata = std::collections::HashMap::new();
             if let Some(m) = meta {
@@ -238,11 +244,21 @@ impl MemoryArchiver {
                     "source".into(),
                     serde_json::Value::String("message_archive".into()),
                 );
+                // 覆盖的消息区间（归档消息列表上的绝对下标，含两端）：分支 / 导出
+                // 搬运归档时据此判断哪些记录仍落在新会话的消息范围内。
+                metadata.insert(
+                    "message_start".into(),
+                    (m.message_offset + summary.source_range.0).into(),
+                );
+                metadata.insert(
+                    "message_end".into(),
+                    (m.message_offset + summary.source_range.1).into(),
+                );
             }
             if let Err(e) = self.vector_store.upsert(VectorRecord {
                 id: summary.id.clone(),
                 content: summary.content.clone(),
-                vector: vector.clone(),
+                vector: vector.clone().unwrap_or_default(),
                 keywords: summary.keywords.clone(),
                 kind: VectorKind::ArchivedSummary,
                 metadata,
@@ -252,14 +268,19 @@ impl MemoryArchiver {
                     "总结 {} 入向量库失败（水位不得越过该缺口）: {e}",
                     summary.id
                 );
-                embedded_upto = index;
+                stored_upto = index;
                 break;
             }
             // 仅入库成功后才标记 vector（旧实现失败也置 Some，导致召回永远看不到）
-            summary.vector = Some(vector);
-            info!(target: "app-memory", "总结 {} 已嵌入并入库", summary.id);
+            info!(
+                target: "app-memory",
+                "总结 {} 已入库（{}）",
+                summary.id,
+                if vector.is_some() { "含向量" } else { "仅关键词" }
+            );
+            summary.vector = vector;
         }
-        summaries.truncate(embedded_upto);
+        summaries.truncate(stored_upto);
 
         info!(target: "app-memory", "归档完成：{} 条总结", summaries.len());
         Ok(summaries)
@@ -271,6 +292,9 @@ impl MemoryArchiver {
 pub struct ArchiveMeta {
     pub campaign_id: Option<String>,
     pub conversation_id: Option<String>,
+    /// 传入切片第一条消息在归档消息列表上的绝对下标（即调用时的 `archived_upto`），
+    /// 用来把 `source_range` 换算成绝对区间写进 metadata。
+    pub message_offset: usize,
 }
 
 // ─── 辅助函数 ──────────────────────────────────────────────────────────────
@@ -311,10 +335,26 @@ async fn archive_batch(
 
     let resp = llm.chat(&req).await.map_err(MemoryError::Llm)?;
 
-    // 提取关键词（简单实现：从总结中提取高频词）
-    let keywords = extract_keywords(&resp.content);
+    // 2026-10-11 审计：空回复（推理模型把 max_tokens 耗在思考上、或 relay 返回空
+    // content）此前被当成功——入库一条空总结并推进归档水位，这批消息的远记忆
+    // 永久丢失。按失败处理，水位停在缺口前，下次重试。
+    let content = resp.content.trim();
+    if content.is_empty() {
+        return Err(MemoryError::Llm(
+            storyforge_domain::llm::LlmError::Internal("归档总结为空（LLM 未返回正文）".into()),
+        ));
+    }
 
-    Ok((resp.content, keywords))
+    // 关键词：高频词 + 查询侧分词（与 RoundSummary 索引同一策略）。没有嵌入模型时
+    // 远记忆完全靠关键词召回，只取高频词会漏掉只出现一次的人名 / 地名。
+    let mut keywords = extract_keywords(content);
+    for token in crate::recall::extract_query_tokens(content) {
+        if !keywords.contains(&token) {
+            keywords.push(token);
+        }
+    }
+
+    Ok((content.to_string(), keywords))
 }
 
 /// 简单关键词提取（从文本中提取出现频率较高的词）
@@ -481,6 +521,53 @@ mod tests {
         );
     }
 
+    struct BlankLlm;
+
+    #[async_trait]
+    impl LlmClient for BlankLlm {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            Ok(ChatResponse {
+                content: "  \n ".into(),
+                reasoning_content: Some("thought about it but ran out of tokens".into()),
+                tool_calls: vec![],
+                finish_reason: Some("length".into()),
+                usage: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            _tx: mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            self.chat(req).await
+        }
+    }
+
+    /// 2026-10-11 审计：空总结不得当成功（否则入库空记录并推进水位，远记忆永久丢失）。
+    #[tokio::test]
+    async fn blank_summary_is_a_gap_not_a_success() {
+        assert!(
+            archive_batch(&BlankLlm, &["older message"], 512, "m")
+                .await
+                .is_err()
+        );
+        let archiver = archiver_with(
+            Arc::new(BlankLlm),
+            ArchiveConfig {
+                archive_batch_size: 1,
+                archive_trigger_count: 2,
+                ..Default::default()
+            },
+        );
+        let summaries = archiver
+            .archive_prefix(&["a".to_string(), "b".to_string()], None)
+            .await
+            .unwrap();
+        assert!(summaries.is_empty(), "空总结批次构成缺口，水位不得推进");
+    }
+
     /// 第 N 次调用返回错误的 LLM（测试批次缺口）。
     struct FailingLlm {
         calls: std::sync::atomic::AtomicUsize,
@@ -529,7 +616,7 @@ mod tests {
     fn archiver_with(llm: Arc<dyn LlmClient>, config: ArchiveConfig) -> MemoryArchiver {
         MemoryArchiver::new(
             llm,
-            unreachable_embedder(),
+            Some(unreachable_embedder()),
             Arc::new(storyforge_infra_vector::BruteForceStore::new()),
             config,
             "archive-model".into(),
@@ -560,9 +647,9 @@ mod tests {
         );
     }
 
-    /// W-06：嵌入失败时不得返回 summary（否则水位推进会丢掉这段记忆）。
+    /// 嵌入失败不再丢记忆：总结以关键词记录入库，水位照常推进，向量之后补建。
     #[tokio::test]
-    async fn archive_prefix_drops_summaries_when_embed_fails() {
+    async fn archive_prefix_keeps_keyword_record_when_embed_fails() {
         let config = ArchiveConfig {
             archive_batch_size: 2,
             archive_trigger_count: 1,
@@ -573,14 +660,65 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             fail_on_call: usize::MAX, // 全部成功
         });
-        let archiver = archiver_with(llm, config);
+        let store = Arc::new(storyforge_infra_vector::BruteForceStore::new());
+        let archiver = MemoryArchiver::new(
+            llm,
+            Some(unreachable_embedder()),
+            store.clone(),
+            config,
+            "archive-model".into(),
+        );
         let messages = vec!["m0".to_string(), "m1".to_string()];
 
         let summaries = archiver.archive_prefix(&messages, None).await.unwrap();
-        assert!(
-            summaries.is_empty(),
-            "嵌入失败时不得返回 summary（水位不得越过）: {summaries:?}"
-        );
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].vector.is_none());
+        assert_eq!(store.count(), 1, "关键词记录必须入库");
+    }
+
+    /// 嵌入模型是可选项：不配 Embedder 也能归档，记录带绝对消息区间与会话标签。
+    #[tokio::test]
+    async fn archive_prefix_without_embedder_writes_keyword_records() {
+        let config = ArchiveConfig {
+            archive_batch_size: 2,
+            archive_trigger_count: 2,
+            max_concurrency: 1,
+            ..Default::default()
+        };
+        let llm: Arc<dyn LlmClient> = Arc::new(FailingLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_on_call: usize::MAX,
+        });
+        let store = Arc::new(storyforge_infra_vector::BruteForceStore::new());
+        let archiver = MemoryArchiver::new(llm, None, store.clone(), config, "m".into());
+        let meta = ArchiveMeta {
+            campaign_id: None,
+            conversation_id: Some("conv-x".into()),
+            message_offset: 10,
+        };
+        let messages: Vec<String> = (0..4).map(|i| format!("m{i}")).collect();
+
+        let summaries = archiver
+            .archive_prefix(&messages, Some(&meta))
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 2);
+        let records = store.records_matching(&storyforge_infra_vector::MetadataFilter::new());
+        assert_eq!(records.len(), 2);
+        let mut ranges: Vec<(u64, u64)> = records
+            .iter()
+            .map(|r| {
+                assert!(r.vector.is_empty(), "未配置嵌入模型时只写关键词记录");
+                assert!(!r.keywords.is_empty());
+                assert_eq!(r.metadata["conversation_id"], "conv-x");
+                (
+                    r.metadata["message_start"].as_u64().unwrap(),
+                    r.metadata["message_end"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        ranges.sort();
+        assert_eq!(ranges, vec![(10, 11), (12, 13)]);
     }
 
     /// W-15：max_concurrency=0 必须被钳制（否则 buffer_unordered(0) 让 collect 永挂）。
@@ -604,7 +742,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "max_concurrency=0 不得让归档永久挂起");
-        // embed 不可达 → 返回空（但调用本身完成）
-        assert!(result.unwrap().unwrap().is_empty());
+        // embed 不可达 → 关键词记录照常入库
+        assert_eq!(result.unwrap().unwrap().len(), 1);
     }
 }

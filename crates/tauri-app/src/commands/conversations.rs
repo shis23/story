@@ -37,34 +37,44 @@ pub(crate) async fn archive_conversation_impl(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
-    let config = state
-        .embed_config
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .ok_or("未配置嵌入 API，请先在设置中配置")?;
     let llm = state.require_active_llm()?;
-    let vector_store = state.vector_store.clone();
-    let embedder = Arc::new(
-        storyforge_infra_llm::Embedder::new(config)
-            .map_err(|e| TauriCommandError::internal(e.to_string()))?,
-    );
-    let model = get_conn_store()
-        .active_connection()
-        .map(|c| c.model)
-        .unwrap_or_else(|| "deepseek-chat".into());
-    let archiver = storyforge_app_memory::MemoryArchiver::new(
-        llm,
-        embedder,
-        vector_store,
-        storyforge_app_memory::ArchiveConfig::default(),
-        model,
-    );
+    let archiver = build_archiver(&state, llm);
 
     let count = run_archive_with_watermark(&state, &conv_id, &archiver, true)
         .await
         .map_err(TauriCommandError::internal)?;
     Ok(count)
+}
+
+/// 构造归档器。嵌入模型是可选项：没配置（或配置无效）时归档只写关键词记录，
+/// 远记忆照样可以按关键词召回；配置嵌入模型后再补建向量。
+fn build_archiver(
+    state: &AppState,
+    llm: Arc<dyn storyforge_infra_llm::LlmClient>,
+) -> storyforge_app_memory::MemoryArchiver {
+    let embedder = state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .and_then(|config| match storyforge_infra_llm::Embedder::new(config) {
+            Ok(embedder) => Some(Arc::new(embedder)),
+            Err(e) => {
+                tracing::warn!("构建 Embedder 失败，本次归档只写关键词记录: {e}");
+                None
+            }
+        });
+    let model = get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "deepseek-chat".into());
+    storyforge_app_memory::MemoryArchiver::new(
+        llm,
+        embedder,
+        state.vector_store.clone(),
+        storyforge_app_memory::ArchiveConfig::default(),
+        model,
+    )
 }
 
 fn archivable_messages_from_conversation(conv: &Conversation) -> Vec<String> {
@@ -110,16 +120,52 @@ pub(crate) async fn load_archive_snapshot(
     .map_err(|e| TauriCommandError::internal(format!("读取归档消息任务失败: {e}")))?
 }
 
+/// 每个对话同一时刻最多一个归档任务。
+///
+/// 2026-10-11 审计：自动归档在每次 accept 后后台触发，一次归档要跑多批 LLM
+/// 总结 + 嵌入（数十秒级）。水位只在任务结束时推进，期间再 accept 一轮会读到
+/// 同一个未归档前缀并并发归档同一批消息——向量库里出现重复远记忆。
+static ARCHIVE_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Id>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// 持有期间占住该对话的归档槽位；drop 时释放（含 panic / 提前返回）。
+pub(crate) struct ArchiveFlightGuard(Id);
+
+impl ArchiveFlightGuard {
+    pub(crate) fn try_acquire(conv_id: &Id) -> Option<Self> {
+        let mut in_flight = ARCHIVE_IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        in_flight
+            .insert(conv_id.clone())
+            .then(|| Self(conv_id.clone()))
+    }
+}
+
+impl Drop for ArchiveFlightGuard {
+    fn drop(&mut self) {
+        ARCHIVE_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// 水位驱动归档：只处理 `archived_upto..` 前缀，成功后推进水位。
 ///
 /// `require_threshold`：true 时与 ArchiveConfig.threshold 对齐（自动归档）；
-/// 手动命令也传 true，避免短对话误触发 LLM。
+/// 手动命令也传 true，避免短对话误触发 LLM。同一对话已有归档在跑时直接返回 0。
 async fn run_archive_with_watermark(
     state: &Arc<AppState>,
     conv_id: &Id,
     archiver: &storyforge_app_memory::MemoryArchiver,
     require_threshold: bool,
 ) -> Result<usize, String> {
+    let Some(_flight) = ArchiveFlightGuard::try_acquire(conv_id) else {
+        tracing::debug!(
+            target: "far_memory",
+            "对话 {conv_id} 已有归档任务在进行，跳过本次触发"
+        );
+        return Ok(0);
+    };
     let snap = load_archive_snapshot(state.conv_store.clone(), conv_id.clone())
         .await
         .map_err(|e| e.to_string())?;
@@ -142,6 +188,7 @@ async fn run_archive_with_watermark(
     let meta = storyforge_app_memory::ArchiveMeta {
         campaign_id: snap.campaign_id,
         conversation_id: Some(snap.conversation_id),
+        message_offset: upto,
     };
 
     // 水位路径已确认 pending 需要归档：跳过 maybe_archive 的二次 threshold，
@@ -192,21 +239,9 @@ async fn run_archive_with_watermark(
 /// 检查对话未归档消息是否超过阈值，超过则在后台触发归档。
 ///
 /// 阈值：50 条未归档消息（与 ArchiveConfig.default().threshold 一致）。
-/// 归档失败只 warn，不影响用户操作。
+/// 归档失败只 warn，不影响用户操作。只需要写作用的 LLM 连接；嵌入模型是可选项
+/// （此前没配嵌入模型就整段跳过，远记忆从来不会产生）。
 pub(crate) async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
-    let config = match state
-        .embed_config
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-    {
-        Some(c) => c,
-        None => {
-            tracing::debug!("未配置嵌入 API，跳过自动归档");
-            return;
-        }
-    };
-
     // 快速水位检查：未归档不足阈值则跳过（避免无意义构造 archiver）
     match load_archive_snapshot(state.conv_store.clone(), conv_id.clone()).await {
         Ok(snap) => {
@@ -234,25 +269,7 @@ pub(crate) async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) 
             return;
         }
     };
-    let vector_store = state.vector_store.clone();
-    let embedder = match storyforge_infra_llm::Embedder::new(config) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
-            tracing::warn!("构建 Embedder 失败，跳过自动归档: {e}");
-            return;
-        }
-    };
-    let model = get_conn_store()
-        .active_connection()
-        .map(|c| c.model)
-        .unwrap_or_else(|| "deepseek-chat".into());
-    let archiver = storyforge_app_memory::MemoryArchiver::new(
-        llm,
-        embedder,
-        vector_store,
-        storyforge_app_memory::ArchiveConfig::default(),
-        model,
-    );
+    let archiver = build_archiver(state, llm);
 
     match run_archive_with_watermark(state, conv_id, &archiver, true).await {
         Ok(n) if n > 0 => {
@@ -766,5 +783,24 @@ mod tests {
         let new_variant = &dto.nodes[2].variants[0];
         assert_eq!(old_variant.display_content, "<status>old</status>");
         assert_eq!(new_variant.display_content, "[new]");
+    }
+
+    /// 2026-10-11 审计：同一对话的归档槽位互斥，释放后可再次获取；不同对话互不影响。
+    #[test]
+    fn archive_flight_guard_is_exclusive_per_conversation() {
+        let a = Id::from_str("conv-archive-guard-a");
+        let b = Id::from_str("conv-archive-guard-b");
+        let first = ArchiveFlightGuard::try_acquire(&a).expect("first acquire");
+        assert!(
+            ArchiveFlightGuard::try_acquire(&a).is_none(),
+            "同一对话在归档进行中时不得再启动第二个归档"
+        );
+        let other = ArchiveFlightGuard::try_acquire(&b).expect("其它对话不受影响");
+        drop(first);
+        assert!(
+            ArchiveFlightGuard::try_acquire(&a).is_some(),
+            "释放后可再次归档"
+        );
+        drop(other);
     }
 }
