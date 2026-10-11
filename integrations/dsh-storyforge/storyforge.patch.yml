@@ -1,6 +1,8 @@
 # StoryForge PoC 补丁层：启动时用 `--patch <本文件>` 叠加在 profile 之后。
 #
-# 1. 激活宿主插件（注册 provider `storyforge` 与 /api/storyforge/* 路由）。
+# 1. 激活宿主插件（注册 provider `storyforge` 与 /api/storyforge/* 路由）。每轮写作交给
+#    Rust sidecar（先 `cargo build -p storyforge-dsh-bridge`），模型调用用 StoryForge 首页
+#    选的底层模型；可选配置见 README。
 #    debugEcho：额外注册仅调试用的本地回显 provider `sf-debug-echo`，在无凭据的临时
 #    实例里模拟普通会话，不发任何外部请求。正式使用时去掉。
 # 2. 新增 agent 预设 `storyforge`：只有 persona，不挂任何工具；附带 agent 作用域插件

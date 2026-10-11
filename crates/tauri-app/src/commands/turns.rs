@@ -524,7 +524,8 @@ pub(crate) async fn accept_variant(
     .await
 }
 
-pub(crate) async fn accept_variant_async(
+/// `accept_variant` 的命令本体；也是非 Tauri 宿主（DSH sidecar）的接受入口。
+pub async fn accept_variant_async(
     state: Arc<AppState>,
     conv_id: Id,
     node_id: Id,

@@ -879,11 +879,7 @@ pub(crate) async fn start_writing(
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let app = state.inner().clone();
-    app.require_active_llm()?;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
-
-    // Phase A 屏障：存在非 terminal Turn → 拒绝启动（在追加 user 消息之前）
-    check_turn_barrier(&app)?;
 
     // 前端事件转发任务
     let on_event_clone = on_event.clone();
@@ -893,6 +889,55 @@ pub(crate) async fn start_writing(
             let _ = on_event_clone.send(writing_event);
         }
     });
+
+    let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
+    start_writing_for_host(
+        app,
+        StartWritingRequest {
+            intent,
+            character_id,
+            conversation_id,
+            opening_message,
+            generation_mode,
+        },
+        event_tx,
+        Some(prompt_hook),
+    )
+    .await
+}
+
+/// `start_writing` 的入参（命令形参原样搬入，供非 Tauri 宿主复用）。
+#[derive(Debug, Clone, Default)]
+pub struct StartWritingRequest {
+    pub intent: String,
+    pub character_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub opening_message: Option<String>,
+    pub generation_mode: Option<storyforge_domain::generation::GenerationMode>,
+}
+
+/// `start_writing` 的命令本体（非 Tauri 宿主入口，DSH sidecar 用）。
+///
+/// 事件经 `event_tx` 推送；成文后后台后处理仍持有它的克隆，所有克隆释放
+/// （接收端读到 `None`）即表示本轮包括后处理在内全部结束。`prompt_hook`
+/// 为 None 时不发 `PromptHookRequest`（Tauri 命令传前端钩子）。
+pub async fn start_writing_for_host(
+    app: Arc<AppState>,
+    request: StartWritingRequest,
+    event_tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    prompt_hook: Option<PromptHook>,
+) -> Result<serde_json::Value, TauriCommandError> {
+    let StartWritingRequest {
+        intent,
+        character_id,
+        conversation_id,
+        opening_message,
+        generation_mode,
+    } = request;
+    app.require_active_llm()?;
+
+    // Phase A 屏障：存在非 terminal Turn → 拒绝启动（在追加 user 消息之前）
+    check_turn_barrier(&app)?;
 
     // 构造写作上下文（从 tool_ctx 快照读取，导入的角色卡/世界书自动可见）
     let tool_snapshot = app.snapshot_tool_ctx();
@@ -1010,9 +1055,8 @@ pub(crate) async fn start_writing(
     let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
-    let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
-        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook))?;
+        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, prompt_hook)?;
     let result = pipeline
         .start_writing_with_mode(
             intent,

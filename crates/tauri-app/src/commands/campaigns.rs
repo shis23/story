@@ -84,6 +84,15 @@ pub async fn extract_characters(
     force: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardSummaryDto, TauriCommandError> {
+    extract_characters_for_host(state.inner(), source_character_id, force).await
+}
+
+/// `extract_characters` 的命令本体（非 Tauri 宿主入口，DSH sidecar 用）。
+pub async fn extract_characters_for_host(
+    state: &Arc<AppState>,
+    source_character_id: String,
+    force: Option<bool>,
+) -> Result<CardSummaryDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
     use storyforge_domain::character::CharacterExtractionStatus;
     use storyforge_domain::variables::{
@@ -316,7 +325,7 @@ pub fn create_campaign(
 /// world-info 全部成功或全部清理。任一后续步骤失败都删除会话与 Campaign，
 /// 不留孤儿（无「campaign 缺会话」、无「会话缺 campaign」）；开场白与世界书
 /// 的持久化错误**传播**（旧实现 `tracing::warn!` 吞掉，留下半成品 bundle）。
-pub(crate) fn create_campaign_for_backend(
+pub fn create_campaign_for_backend(
     storage: &crate::storage_backend::StorageFacade,
     conv_store: &ConversationStore,
     card_id: String,
@@ -826,6 +835,16 @@ pub fn fork_campaign(
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
+    fork_campaign_for_host(state.inner(), source_campaign_id, fork_node_id, name)
+}
+
+/// `fork_campaign` 的命令本体（非 Tauri 宿主入口，DSH sidecar 用）。
+pub fn fork_campaign_for_host(
+    state: &Arc<AppState>,
+    source_campaign_id: String,
+    fork_node_id: String,
+    name: String,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
     let source_cid = Id::from_str(&source_campaign_id);
 
     // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
@@ -855,17 +874,13 @@ pub fn fork_campaign(
     )?;
     let forked_campaign_id = Id::from_str(&forked.id);
     // 分支的摘要换了新 id：复用来源局已有向量补建远记忆索引（不重新嵌入）。
-    crate::vector_index::index_campaign_summaries(
-        state.inner(),
-        &forked_campaign_id,
-        Some(&source_cid),
-    );
+    crate::vector_index::index_campaign_summaries(state, &forked_campaign_id, Some(&source_cid));
     // 会话级远记忆（消息归档）连同归档水位一起带给分支。
     if let (Some(source_conversation), Some(forked_conversation)) =
         (source_conversation_id, forked.conversation_id.as_deref())
     {
         crate::vector_index::copy_message_archives(
-            state.inner(),
+            state,
             &source_conversation,
             &forked_campaign_id,
             &Id::from_str(forked_conversation),
@@ -943,6 +958,14 @@ pub fn delete_campaign(
 pub fn set_active_campaign(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    set_active_campaign_for_host(state.inner(), id)
+}
+
+/// `set_active_campaign` 的命令本体（非 Tauri 宿主入口，DSH sidecar 用）。
+pub fn set_active_campaign_for_host(
+    state: &Arc<AppState>,
+    id: String,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
 
@@ -1024,7 +1047,7 @@ pub fn set_active_campaign(
     // 作为 after_commit 钩子在锁内执行（Gate 4 六审 P1：与指针提交原子，
     // 删除线程无法在指针提交后、世界书写入前插入清指针）。
     set_active_campaign_in_state(
-        state.inner().as_ref(),
+        state.as_ref(),
         campaign_id.clone(),
         || {
             if !state

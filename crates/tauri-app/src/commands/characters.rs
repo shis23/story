@@ -161,7 +161,15 @@ pub(crate) fn import_character(
     data: Vec<u8>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterSummary, TauriCommandError> {
-    require_character_commands(state.inner().as_ref(), "import character")?;
+    import_character_for_host(state.inner(), data)
+}
+
+/// `import_character` 的命令本体（非 Tauri 宿主入口，DSH sidecar 用）。
+pub fn import_character_for_host(
+    state: &Arc<AppState>,
+    data: Vec<u8>,
+) -> Result<CharacterSummary, TauriCommandError> {
+    require_character_commands(state.as_ref(), "import character")?;
     let character =
         storyforge_infra_import::import_character(&data).map_err(TauriCommandError::from)?;
     let info = CharacterInfo::from(&character);
@@ -184,7 +192,7 @@ pub(crate) fn import_character(
     }
     // 绿灯世界书条目入向量库（search_vectors 用）：按角色库全量重建，取代旧的
     // 「按关键词删旧条目 + 逐条 upsert」（见 vector_index::sync_world_info_vectors）。
-    crate::vector_index::sync_world_info_vectors(state.inner());
+    crate::vector_index::sync_world_info_vectors(state);
 
     Ok(CharacterSummary {
         id: stored.id,

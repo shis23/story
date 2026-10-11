@@ -17,6 +17,7 @@ members = [
     "crates/app-meta",
     "crates/tauri-app",
     "crates/harness-real-llm",
+    "crates/dsh-bridge",
 ]
 
 [workspace.package]

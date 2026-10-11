@@ -42,6 +42,17 @@ pub use commands::meta_typed::MetaSnapshot;
 pub use commands::writing::{
     is_postprocess_instance_present, normalize_knowledge_update_for_postprocess,
 };
+// 非 Tauri 宿主（DSH sidecar，`crates/dsh-bridge`）：命令签名不变，这里只暴露
+// 命令本体（`*_for_host` / `accept_variant_async`）与它们的 DTO，让 sidecar 跑
+// 与 Tauri 命令同一份生产代码。
+pub use commands::campaigns::{
+    CampaignSummaryDto, create_campaign_for_backend, extract_characters_for_host,
+    fork_campaign_for_host, set_active_campaign_for_host,
+};
+pub use commands::cards::CardSummaryDto;
+pub use commands::characters::{CharacterSummary, import_character_for_host};
+pub use commands::turns::accept_variant_async;
+pub use commands::writing::{StartWritingRequest, start_writing_for_host};
 // Gate 4 五审 P2：独立 SQLite 命令测试二进制（tests/sqlite_command_lifecycle.rs）
 // 需要以真实 SQLite AppState 驱动真实命令。命令函数本体已提升为 `pub`（签名不变），
 // 这里仅向 crate 外暴露这两个命令名——无任何 backend 分派逻辑（gate3 源码级测试
@@ -319,6 +330,31 @@ static MVU_RUNTIME: OnceLock<Arc<WebViewMvuRuntime>> = OnceLock::new();
 /// Android 的真实私有目录依赖运行中的 Activity，不能在 Builder 构造前猜测；
 /// setup 完成后，所有延迟初始化的 store 都通过这里取得同一目录。
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// 非 Tauri 宿主（DSH sidecar）在构造任何存储之前钉住应用数据目录。
+///
+/// 桌面端 `get_app_data_dir()` 默认解析到用户真实的 `%APPDATA%/StoryForge`
+/// 一类位置；sidecar 必须先钉到自己的隔离目录，否则全局连接 / 预设 / 正则
+/// 存储会读写真实数据。不做旧目录迁移。同一路径重复调用幂等，不同路径报错。
+pub fn pin_app_data_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
+    let data_dir = data_dir.to_path_buf();
+    if let Some(existing) = APP_DATA_DIR.get() {
+        if existing != &data_dir {
+            return Err(format!(
+                "application data directory already initialized as {}, refusing {}",
+                existing.display(),
+                data_dir.display()
+            ));
+        }
+        return Ok(existing.clone());
+    }
+    APP_DATA_DIR
+        .set(data_dir.clone())
+        .map_err(|_| "application data directory initialization raced".to_string())?;
+    Ok(data_dir)
+}
 
 /// 应用数据目录纯解析逻辑的目标平台标识。抽取为参数是为了让纯函数
 /// `resolve_app_data_dir` 可在单元测试中按平台断言，不触碰真实环境变量或文件系统。
@@ -1190,6 +1226,17 @@ impl AppState {
     pub fn active_llm(&self) -> Option<Arc<dyn LlmClient>> {
         let guard = self.active_llm.lock().unwrap_or_else(|p| p.into_inner());
         guard.clone()
+    }
+
+    /// 非 Tauri 宿主（DSH sidecar）注入 LLM client：不经连接存储、不改活跃连接 id。
+    /// 包装（重试 / 调用日志）由调用方负责。
+    pub fn install_llm_client(&self, client: Arc<dyn LlmClient>) {
+        *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = Some(client);
+    }
+
+    /// 派生向量索引的启动对账（与 Tauri setup 同一入口；非 Tauri 宿主自行调用）。
+    pub fn reconcile_vector_indexes_on_startup(&self) {
+        vector_index::reconcile_on_startup(self);
     }
 
     /// 获取真实活跃连接；所有需要 LLM 的生产入口统一 fail closed。
