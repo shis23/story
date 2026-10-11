@@ -155,6 +155,12 @@ impl SseEventAccumulator {
         let chunk: openai_types::StreamDelta = serde_json::from_str(&text)
             .map_err(|e| LlmError::StreamParse(format!("JSON 解析失败: {e}; data={text}")))?;
 
+        // 2026-10-11 审计：流内错误事件此前因 `choices` 缺省为空而被当成空 chunk
+        // 静默跳过，流随后正常结束——半截（甚至空）正文被当作完整回复交给流水线。
+        if let Some(error) = chunk.error.as_ref().filter(|e| !e.is_null()) {
+            return Err(classify_stream_error_event(error));
+        }
+
         let delta = chunk.choices.first().map(|c| &c.delta);
 
         let delta_content = delta.and_then(|d| d.content.clone());
@@ -245,6 +251,32 @@ impl SseEventAccumulator {
     }
 }
 
+/// 把流内 `{"error": ...}` 事件映射为 `LlmError`。
+///
+/// 429 / rate limit 类 → `RateLimited`，其余 → `ServerError`（都属可重试类；
+/// `RetryingClient` 只在本次尝试尚未向下游推送任何 chunk 时才会重试）。
+fn classify_stream_error_event(error: &serde_json::Value) -> LlmError {
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .or_else(|| error.as_str().map(str::to_string))
+        .unwrap_or_else(|| error.to_string());
+    let code = error.get("code");
+    let kind = error.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let rate_limited = code.and_then(|c| c.as_u64()) == Some(429)
+        || code
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c == "429" || c.contains("rate_limit"))
+        || kind.contains("rate_limit");
+    let detail = format!("流内错误事件: {message}");
+    if rate_limited {
+        LlmError::RateLimited(detail)
+    } else {
+        LlmError::ServerError(detail)
+    }
+}
+
 impl Default for SseEventAccumulator {
     fn default() -> Self {
         Self::new()
@@ -267,6 +299,10 @@ pub(crate) mod openai_types {
         /// 由 `usage_parse::parse_provider_usage` 归一化（与非流式同一路径）。
         #[serde(default)]
         pub usage: Option<serde_json::Value>,
+        /// 流内错误事件（HTTP 200 已发出后，OpenRouter/DeepSeek/OpenAI 等会以
+        /// `data: {"error": {...}}` 报告过载、内容过滤、上游断开）。
+        #[serde(default)]
+        pub error: Option<serde_json::Value>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -558,5 +594,47 @@ mod tests {
         assert_eq!(usage.cached_tokens, 300);
         assert_eq!(usage.cache_creation_tokens, 50);
         assert_eq!(usage.total_tokens, 520);
+    }
+
+    /// 2026-10-11 审计：流内错误事件必须中止流并报错，不得当空 chunk 跳过。
+    #[test]
+    fn sse_error_event_mid_stream_fails_the_stream() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        let ok = r#"{"choices":[{"delta":{"content":"半截"},"finish_reason":null}]}"#;
+        acc.on_line(format!("data: {ok}").as_bytes(), &tx).unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        let err = r#"{"error":{"message":"upstream overloaded","code":502}}"#;
+        acc.on_line(format!("data: {err}").as_bytes(), &tx).unwrap();
+        let e = acc.on_line(b"", &tx).expect_err("错误事件必须让流失败");
+        assert!(
+            matches!(&e, LlmError::ServerError(m) if m.contains("upstream overloaded")),
+            "got {e:?}"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().delta_content.as_deref(),
+            Some("半截")
+        );
+        assert!(rx.try_recv().is_err(), "错误事件本身不产出 chunk");
+    }
+
+    #[test]
+    fn sse_error_event_rate_limit_and_null_error() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        let err = r#"{"error":{"message":"slow down","code":429}}"#;
+        acc.on_line(format!("data: {err}").as_bytes(), &tx).unwrap();
+        assert!(matches!(
+            acc.on_line(b"", &tx),
+            Err(LlmError::RateLimited(_))
+        ));
+
+        let mut acc = SseEventAccumulator::new();
+        let fine =
+            r#"{"error":null,"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        acc.on_line(format!("data: {fine}").as_bytes(), &tx)
+            .unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        assert_eq!(acc.full_content, "ok", "error:null 不是错误");
     }
 }

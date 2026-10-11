@@ -214,7 +214,7 @@ impl Preset {
     pub fn input_regex_scripts(&self) -> Vec<&RegexScript> {
         self.regex_scripts
             .iter()
-            .filter(|r| !r.disabled && regex_script_applies_to_placement(r, RegexPlacement::Input))
+            .filter(|r| !r.disabled && r.applies_to_placement(&RegexPlacement::Input))
             .collect()
     }
 
@@ -222,32 +222,29 @@ impl Preset {
     pub fn output_regex_scripts(&self) -> Vec<&RegexScript> {
         self.regex_scripts
             .iter()
-            .filter(|r| !r.disabled && regex_script_applies_to_placement(r, RegexPlacement::Output))
+            .filter(|r| !r.disabled && r.applies_to_placement(&RegexPlacement::Output))
             .collect()
     }
 }
 
-fn regex_script_applies_to_placement(script: &RegexScript, placement: RegexPlacement) -> bool {
-    if script.placement_codes.is_empty() {
-        return script.placement == placement;
-    }
+impl RegexScript {
+    /// 脚本是否作用于给定 placement（唯一实现；infra-regex 执行器同样调用它）。
+    ///
+    /// 有 ST 原始 `placement_codes` 时以它为准（一个脚本可同时作用于多个钩子），
+    /// 否则退回单值 `placement`。
+    pub fn applies_to_placement(&self, placement: &RegexPlacement) -> bool {
+        if self.placement_codes.is_empty() {
+            return self.placement == *placement;
+        }
 
-    match placement {
-        RegexPlacement::Input => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_USER_INPUT),
-        RegexPlacement::Output => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_AI_OUTPUT),
-        RegexPlacement::SlashCommand => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_SLASH_COMMAND),
-        RegexPlacement::WorldInfo => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_WORLD_INFO),
-        RegexPlacement::Reasoning => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_REASONING),
+        let code = match placement {
+            RegexPlacement::Input => ST_REGEX_PLACEMENT_USER_INPUT,
+            RegexPlacement::Output => ST_REGEX_PLACEMENT_AI_OUTPUT,
+            RegexPlacement::SlashCommand => ST_REGEX_PLACEMENT_SLASH_COMMAND,
+            RegexPlacement::WorldInfo => ST_REGEX_PLACEMENT_WORLD_INFO,
+            RegexPlacement::Reasoning => ST_REGEX_PLACEMENT_REASONING,
+        };
+        self.placement_codes.contains(&code)
     }
 }
 

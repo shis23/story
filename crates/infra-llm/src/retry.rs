@@ -152,9 +152,22 @@ impl LlmClient for RetryingClient {
 
             // 每次重试都需要新的 cancel receiver（clone）
             let cancel_clone = cancel.clone();
-            match self.inner.chat_stream(req, tx.clone(), cancel_clone).await {
+            let (result, forwarded_any) =
+                Self::stream_attempt(self.inner.as_ref(), req, &tx, cancel_clone).await;
+            match result {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
+                    // 模块契约：已向下游推送过 chunk 就不再重试——否则消费者会先收到
+                    // 半截正文、再收到第二次请求的完整正文，拼接成重复内容。
+                    if forwarded_any {
+                        if e.is_retryable() {
+                            warn!(
+                                target: "infra-llm",
+                                "chat_stream 已推送部分内容后失败，不重试: {e}"
+                            );
+                        }
+                        return Err(e);
+                    }
                     if !e.is_retryable() || attempt == self.config.max_retries {
                         return Err(e);
                     }
@@ -164,6 +177,37 @@ impl LlmClient for RetryingClient {
         }
 
         Err(last_error.unwrap())
+    }
+}
+
+impl RetryingClient {
+    /// 执行一次流式尝试，经代理 channel 转发 chunk，并报告是否已向下游推送过内容。
+    async fn stream_attempt(
+        inner: &dyn LlmClient,
+        req: &ChatRequest,
+        tx: &mpsc::UnboundedSender<StreamChunk>,
+        cancel: watch::Receiver<bool>,
+    ) -> (Result<ChatResponse, LlmError>, bool) {
+        let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut forwarded_any = false;
+        let attempt = inner.chat_stream(req, proxy_tx, cancel);
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                biased;
+                Some(chunk) = proxy_rx.recv() => {
+                    forwarded_any = true;
+                    let _ = tx.send(chunk);
+                }
+                result = &mut attempt => break result,
+            }
+        };
+        // 内层返回后 proxy_tx 已随 future 释放；排空缓冲中尚未转发的 chunk。
+        while let Ok(chunk) = proxy_rx.try_recv() {
+            forwarded_any = true;
+            let _ = tx.send(chunk);
+        }
+        (result, forwarded_any)
     }
 }
 
@@ -436,6 +480,91 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "cancel should interrupt backoff promptly, took {elapsed:?}"
+        );
+    }
+
+    /// 先推送一段 chunk 再以可重试错误失败的流（模拟流内错误事件）。
+    struct PartialThenFailClient {
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LlmClient for PartialThenFailClient {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            unreachable!("only chat_stream is exercised")
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            tx: mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(StreamChunk {
+                delta_content: Some("半截".into()),
+                delta_reasoning_content: None,
+                delta_tool_calls: None,
+                finish_reason: None,
+            });
+            Err(LlmError::ServerError("流内错误事件: overloaded".into()))
+        }
+    }
+
+    /// 2026-10-11 审计：模块契约"已开始推送 chunk 后不重试"此前没有实现——
+    /// 可重试错误会重发请求，下游收到半截 + 完整两份正文。
+    #[tokio::test]
+    async fn chat_stream_does_not_retry_after_forwarding_chunks() {
+        let inner = Arc::new(PartialThenFailClient {
+            calls: AtomicU32::new(0),
+        });
+        let client = RetryingClient::new(
+            inner.clone(),
+            RetryConfig {
+                max_retries: 3,
+                base_backoff_ms: 1,
+            },
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let err = client
+            .chat_stream(&make_request(), tx, cancel_rx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::ServerError(_)));
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            1,
+            "推送过内容后不得重试"
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().delta_content.as_deref(),
+            Some("半截")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// 建连阶段（尚未推送任何 chunk）的可重试错误仍然重试，且成功尝试的 chunk 照常转发。
+    #[tokio::test]
+    async fn chat_stream_still_retries_before_any_chunk() {
+        let inner = Arc::new(FailNTimesClient::new(1, LlmError::Timeout));
+        let client = RetryingClient::new(
+            inner,
+            RetryConfig {
+                max_retries: 2,
+                base_backoff_ms: 1,
+            },
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let resp = client
+            .chat_stream(&make_request(), tx, cancel_rx)
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "ok");
+        assert_eq!(
+            rx.recv().await.unwrap().delta_content.as_deref(),
+            Some("ok")
         );
     }
 }

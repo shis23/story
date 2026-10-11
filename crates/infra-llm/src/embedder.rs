@@ -67,6 +67,22 @@ impl Embedder {
 
     /// 批量获取嵌入向量
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
+        let json = self.request(texts).await?;
+        parse_embedding_response(&json, Some(self.config.dim))
+    }
+
+    /// 测试接口并返回它实际产出的向量维度（不校验配置里的 `dim`）。
+    pub async fn probe_dim(&self) -> Result<usize, LlmError> {
+        let json = self.request(&["维度探测 dimension probe"]).await?;
+        parse_embedding_response(&json, None)?
+            .into_iter()
+            .next()
+            .map(|v| v.len())
+            .filter(|dim| *dim > 0)
+            .ok_or_else(|| LlmError::Internal("嵌入 API 返回空结果".into()))
+    }
+
+    async fn request(&self, texts: &[&str]) -> Result<serde_json::Value, LlmError> {
         let body = serde_json::json!({
             "model": self.config.model,
             "input": texts,
@@ -88,19 +104,16 @@ impl Embedder {
             return Err(LlmError::Http(format!("嵌入 API 错误 {status}: {text}")));
         }
 
-        let json: serde_json::Value = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| LlmError::Internal(format!("嵌入响应解析失败: {e}")))?;
-
-        parse_embedding_response(&json, self.config.dim)
+            .map_err(|e| LlmError::Internal(format!("嵌入响应解析失败: {e}")))
     }
 }
 
-/// 解析 OpenAI 兼容的嵌入响应
+/// 解析 OpenAI 兼容的嵌入响应（`expected_dim = None` 时不校验维度）
 fn parse_embedding_response(
     json: &serde_json::Value,
-    expected_dim: usize,
+    expected_dim: Option<usize>,
 ) -> Result<Vec<Vec<f32>>, LlmError> {
     let data = json
         .get("data")
@@ -126,7 +139,9 @@ fn parse_embedding_response(
             })
             .collect::<Result<Vec<_>, LlmError>>()?;
 
-        if vec.len() != expected_dim {
+        if let Some(expected_dim) = expected_dim
+            && vec.len() != expected_dim
+        {
             return Err(LlmError::Internal(format!(
                 "嵌入维度不匹配：期望 {expected_dim}，实际 {}",
                 vec.len()
@@ -162,7 +177,7 @@ mod tests {
             ]
         });
 
-        let result = parse_embedding_response(&json, 3).unwrap();
+        let result = parse_embedding_response(&json, Some(3)).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], vec![0.1, 0.2, 0.3]);
         assert_eq!(result[1], vec![0.4, 0.5, 0.6]);
@@ -176,8 +191,11 @@ mod tests {
             ]
         });
 
-        let result = parse_embedding_response(&json, 3);
+        let result = parse_embedding_response(&json, Some(3));
         assert!(result.is_err());
+        // 维度探测不校验，按接口实际返回的长度为准
+        let probed = parse_embedding_response(&json, None).unwrap();
+        assert_eq!(probed[0].len(), 2);
     }
 
     #[test]
@@ -195,7 +213,7 @@ mod tests {
             ]
         });
 
-        let result = parse_embedding_response(&json, 3);
+        let result = parse_embedding_response(&json, Some(3));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("不是有效数值"));

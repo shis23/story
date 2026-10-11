@@ -5,14 +5,10 @@
 /// - Input: applied before the director agent
 /// - Output: applied after the writer finalizes
 /// - sub-agents do not run regex
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use storyforge_domain::preset::{
-    RegexPlacement, RegexScript, ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING,
-    ST_REGEX_PLACEMENT_SLASH_COMMAND, ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
-};
+use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
 // --- regex executor --------------------------------------------------------
 
@@ -112,7 +108,7 @@ pub fn apply_regex_scripts_for_target_at_depth(
         if script.disabled {
             continue;
         }
-        if !script_applies_to_placement(script, &placement) {
+        if !script.applies_to_placement(&placement) {
             continue;
         }
         if !script_applies_to_target(script, target) {
@@ -187,7 +183,8 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
     let text_owned = text.to_string();
     let pattern_owned = regex_spec.pattern.clone();
     let flags_owned = regex_spec.flags.clone();
-    let replace_owned = script.replace_string.clone();
+    let replace_owned = replace_match_macro(&script.replace_string);
+    let trim_owned = script.trim_strings.clone();
     let is_global = regex_spec.flags.contains('g');
 
     let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, RegexError>>();
@@ -197,12 +194,15 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
                 .map_err(|e| {
                     RegexError::Compile(format!("正则 '{}' 编译失败: {}", script_name, e))
                 })?;
-            let result = if is_global {
-                re.replace_all(&text_owned, &replace_owned)
-            } else {
-                re.replace(&text_owned, &replace_owned)
+            let expand = |m: &regress::Match| {
+                expand_st_replacement(&replace_owned, m, &text_owned, &trim_owned)
             };
-            Ok(result.to_string())
+            let result = if is_global {
+                re.replace_all_with(&text_owned, expand)
+            } else {
+                re.replace_with(&text_owned, expand)
+            };
+            Ok(result)
         })();
         // Ignore send error: parent timed out and dropped the receiver.
         let _ = result_tx.send(outcome);
@@ -236,6 +236,60 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
             thread_name
         ))),
     }
+}
+
+/// ST `runRegexScript` 的替换串语义：`{{match}}`（不分大小写）等价于 `$0`。
+///
+/// 2026-10-11 审计：此前直接把替换串交给 regress，`{{match}}` 原样留在输出里——
+/// 大量 ST 美化/状态栏脚本（例如把匹配包进 HTML 容器）因此渲染出字面量占位符。
+fn replace_match_macro(replace_string: &str) -> String {
+    const MACRO: &str = "{{match}}";
+    let lower = replace_string.to_ascii_lowercase();
+    let mut out = String::with_capacity(replace_string.len());
+    let mut cursor = 0;
+    while let Some(found) = lower[cursor..].find(MACRO) {
+        let start = cursor + found;
+        out.push_str(&replace_string[cursor..start]);
+        out.push_str("$0");
+        cursor = start + MACRO.len();
+    }
+    out.push_str(&replace_string[cursor..]);
+    out
+}
+
+/// 按 ST 语义展开一次匹配的替换串：只识别 `$<数字>`（贪婪，`$0` 为整个匹配），
+/// 引用的分组先去掉 `trimStrings` 中的每个子串；不存在/未参与匹配的分组展开为空。
+/// 其余字符（含 `$$`、`${name}`）按字面输出——与 ST 回调式 `String.replace` 一致。
+fn expand_st_replacement(
+    replacement: &str,
+    m: &regress::Match,
+    text: &str,
+    trim_strings: &[String],
+) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '$' || !chars.peek().is_some_and(|(_, c)| c.is_ascii_digit()) {
+            out.push(ch);
+            continue;
+        }
+        let mut group: usize = 0;
+        while let Some(&(_, digit)) = chars.peek() {
+            let Some(value) = digit.to_digit(10) else {
+                break;
+            };
+            group = group.saturating_mul(10).saturating_add(value as usize);
+            chars.next();
+        }
+        if let Some(range) = m.group(group) {
+            let mut captured = text[range].to_string();
+            for trim in trim_strings.iter().filter(|t| !t.is_empty()) {
+                captured = captured.replace(trim.as_str(), "");
+            }
+            out.push_str(&captured);
+        }
+    }
+    out
 }
 
 fn apply_regex_to_tagged_blocks(
@@ -359,30 +413,6 @@ fn merge_flags(inline_flags: &str, field_flags: &str) -> String {
     merged
 }
 
-fn script_applies_to_placement(script: &RegexScript, placement: &RegexPlacement) -> bool {
-    if script.placement_codes.is_empty() {
-        return script.placement == *placement;
-    }
-
-    match placement {
-        RegexPlacement::Input => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_USER_INPUT),
-        RegexPlacement::Output => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_AI_OUTPUT),
-        RegexPlacement::SlashCommand => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_SLASH_COMMAND),
-        RegexPlacement::WorldInfo => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_WORLD_INFO),
-        RegexPlacement::Reasoning => script
-            .placement_codes
-            .contains(&ST_REGEX_PLACEMENT_REASONING),
-    }
-}
-
 fn script_applies_to_target(script: &RegexScript, target: RegexExecutionTarget) -> bool {
     if script.prompt_only.unwrap_or(false) {
         return target == RegexExecutionTarget::Prompt;
@@ -417,53 +447,14 @@ fn script_applies_to_depth(script: &RegexScript, depth: usize) -> bool {
     true
 }
 
-// --- input/output regex split ----------------------------------------------
-
-/// Split ST regex_scripts into input/output scripts
-pub fn split_by_placement(scripts: &[RegexScript]) -> (Vec<&RegexScript>, Vec<&RegexScript>) {
-    let mut input = Vec::new();
-    let mut output = Vec::new();
-
-    for script in scripts {
-        if script.disabled {
-            continue;
-        }
-        if script_applies_to_placement(script, &RegexPlacement::Input) {
-            input.push(script);
-        }
-        if script_applies_to_placement(script, &RegexPlacement::Output) {
-            output.push(script);
-        }
-    }
-
-    (input, output)
-}
-
-/// Build a script summary for frontend display
-pub fn script_summary(script: &RegexScript) -> ScriptSummary {
-    ScriptSummary {
-        id: script.id.clone(),
-        name: script.script_name.clone(),
-        placement: format!("{:?}", script.placement),
-        disabled: script.disabled,
-        find_regex: script.find_regex.clone(),
-        replace_string: script.replace_string.clone(),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptSummary {
-    pub id: String,
-    pub name: String,
-    pub placement: String,
-    pub disabled: bool,
-    pub find_regex: String,
-    pub replace_string: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storyforge_domain::preset::{
+        ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING,
+        ST_REGEX_PLACEMENT_SLASH_COMMAND, ST_REGEX_PLACEMENT_USER_INPUT,
+        ST_REGEX_PLACEMENT_WORLD_INFO,
+    };
 
     fn make_script(
         name: &str,
@@ -874,22 +865,6 @@ mod tests {
     }
 
     #[test]
-    fn test_split_by_placement() {
-        let mut both = make_script("both", r"x", "y", RegexPlacement::Input);
-        both.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_AI_OUTPUT];
-        let scripts = vec![
-            make_script("输入1", r"a", "b", RegexPlacement::Input),
-            make_script("输出1", r"c", "d", RegexPlacement::Output),
-            make_script("输入2", r"e", "f", RegexPlacement::Input),
-            both,
-        ];
-
-        let (input, output) = split_by_placement(&scripts);
-        assert_eq!(input.len(), 3);
-        assert_eq!(output.len(), 2);
-    }
-
-    #[test]
     fn test_invalid_regex() {
         let scripts = vec![make_script(
             "坏正则",
@@ -964,6 +939,54 @@ mod tests {
         assert!(
             elapsed.as_secs() < REGEX_TIMEOUT_SECS + 5,
             "timeout returned too slowly: {elapsed:?}"
+        );
+    }
+
+    fn apply_output(text: &str, script: &RegexScript) -> String {
+        apply_regex_scripts(text, std::slice::from_ref(script), RegexPlacement::Output).unwrap()
+    }
+
+    /// 2026-10-11 审计：ST `{{match}}`（不分大小写）等价于 `$0`。
+    #[test]
+    fn st_match_macro_expands_to_whole_match() {
+        let script = make_script(
+            "wrap",
+            r"/<bar>[\s\S]*?<\/bar>/g",
+            "<div>{{match}}</div>|{{MATCH}}",
+            RegexPlacement::Output,
+        );
+        assert_eq!(
+            apply_output("x<bar>1</bar>y", &script),
+            "x<div><bar>1</bar></div>|<bar>1</bar>y"
+        );
+    }
+
+    /// trimStrings 从被引用的分组中删除；不影响替换串本身的字面文本。
+    #[test]
+    fn st_trim_strings_apply_to_referenced_groups() {
+        let mut script = make_script(
+            "trim",
+            r"/<s>(.*?)<\/s>/g",
+            "[$1]-[{{match}}]",
+            RegexPlacement::Output,
+        );
+        script.trim_strings = vec!["**".into(), String::new()];
+        assert_eq!(apply_output("<s>**粗**</s>", &script), "[粗]-[<s>粗</s>]");
+    }
+
+    /// ST 只识别 `$<数字>`：`${...}`（卡内注入 HTML 的 JS 模板字面量）与 `$$` 按字面保留，
+    /// 不存在的分组展开为空。此前 regress 把 `${x}` 当命名分组展开为空，毁掉注入脚本。
+    #[test]
+    fn st_replacement_keeps_js_template_literals_and_dollar_pairs() {
+        let script = make_script(
+            "js",
+            r"/<v>(\d+)<\/v>/",
+            "<script>const t = `${count}`; let s = '$$'; /*$9*/ v=$1</script>",
+            RegexPlacement::Output,
+        );
+        assert_eq!(
+            apply_output("<v>42</v>", &script),
+            "<script>const t = `${count}`; let s = '$$'; /**/ v=42</script>"
         );
     }
 }

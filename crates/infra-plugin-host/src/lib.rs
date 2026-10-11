@@ -186,20 +186,25 @@ impl PluginRegistry {
             enabled: true,
         };
 
-        plugins.insert(plugin.manifest.id.clone(), plugin);
-        drop(plugins);
-        self.persist();
+        let id = plugin.manifest.id.clone();
+        plugins.insert(id.clone(), plugin);
+        if let Err(e) = self.persist(&plugins) {
+            plugins.remove(&id);
+            return Err(e);
+        }
         Ok(())
     }
 
     /// 卸载插件
     pub fn uninstall(&self, id: &str) -> Result<(), PluginError> {
         let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
-        plugins
+        let removed = plugins
             .remove(id)
             .ok_or_else(|| PluginError::NotFound(id.into()))?;
-        drop(plugins);
-        self.persist();
+        if let Err(e) = self.persist(&plugins) {
+            plugins.insert(id.to_string(), removed);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -209,9 +214,13 @@ impl PluginRegistry {
         let plugin = plugins
             .get_mut(id)
             .ok_or_else(|| PluginError::NotFound(id.into()))?;
-        plugin.enabled = enabled;
-        drop(plugins);
-        self.persist();
+        let previous = std::mem::replace(&mut plugin.enabled, enabled);
+        if let Err(e) = self.persist(&plugins) {
+            if let Some(plugin) = plugins.get_mut(id) {
+                plugin.enabled = previous;
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -230,17 +239,6 @@ impl PluginRegistry {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .cloned()
-            .collect()
-    }
-
-    /// 列出已启用的插件
-    pub fn list_enabled(&self) -> Vec<InstalledPlugin> {
-        self.plugins
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|p| p.enabled)
             .cloned()
             .collect()
     }
@@ -270,24 +268,18 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// 获取在指定 UI 挂载点的插件列表
-    pub fn plugins_for_slot(&self, slot: &UiSlot) -> Vec<InstalledPlugin> {
-        self.plugins
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|p| p.enabled && p.manifest.ui_slots.contains(slot))
-            .cloned()
-            .collect()
-    }
-
-    fn persist(&self) {
+    /// 在持有写锁时落盘；失败由调用方回滚内存并把错误返回给命令层。
+    ///
+    /// 2026-10-11 审计：此前只 `error!` 后返回 Ok——安装/卸载/启停对用户报告成功，
+    /// 重启后却丢失（其它 store 均已传播落盘错误，插件注册表是唯一例外）。
+    fn persist(&self, plugins: &HashMap<String, InstalledPlugin>) -> Result<(), PluginError> {
         if let Some(path) = &self.persist_path {
-            let plugins = self.plugins.read().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = storyforge_infra_util::atomic_write_json(path, &*plugins) {
-                tracing::error!("持久化插件数据失败（历史 bug：静默吞错误会导致重启丢数据）: {e}");
-            }
+            storyforge_infra_util::atomic_write_json(path, plugins).map_err(|e| {
+                tracing::error!("持久化插件数据失败: {e}");
+                PluginError::Io(e)
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -519,21 +511,39 @@ mod tests {
         );
     }
 
+    /// 2026-10-11 审计：落盘失败必须返回错误并回滚内存（此前吞错后报告成功，
+    /// 重启即丢失安装/卸载/启停）。
     #[test]
-    fn test_plugins_for_slot() {
-        let registry = PluginRegistry::new();
+    fn persist_failure_is_reported_and_rolled_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "sf_plugins_persist_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let path = dir.join("plugins.json");
+        let registry = PluginRegistry::with_persistence(path.clone());
+        registry.install(make_manifest("kept", vec![])).unwrap();
 
-        let mut manifest1 = make_manifest("p1", vec![]);
-        manifest1.ui_slots = vec![UiSlot::SidebarPanel];
-        registry.install(manifest1).unwrap();
+        storyforge_infra_util::write_fence::freeze(&path);
+        assert!(matches!(
+            registry.install(make_manifest("new", vec![])),
+            Err(PluginError::Io(_))
+        ));
+        assert!(registry.get("new").is_none(), "安装失败不得残留在内存");
+        assert!(registry.set_enabled("kept", false).is_err());
+        assert!(
+            registry.get("kept").unwrap().enabled,
+            "启停失败必须恢复原状态"
+        );
+        assert!(registry.uninstall("kept").is_err());
+        assert!(registry.get("kept").is_some(), "卸载失败必须放回插件");
+        storyforge_infra_util::write_fence::unfreeze(&path);
 
-        let mut manifest2 = make_manifest("p2", vec![]);
-        manifest2.ui_slots = vec![UiSlot::MessageDecorator];
-        registry.install(manifest2).unwrap();
-
-        let sidebar_plugins = registry.plugins_for_slot(&UiSlot::SidebarPanel);
-        assert_eq!(sidebar_plugins.len(), 1);
-        assert_eq!(sidebar_plugins[0].manifest.id, "p1");
+        registry.set_enabled("kept", false).unwrap();
+        let reopened = PluginRegistry::with_persistence(path.clone());
+        assert!(!reopened.get("kept").unwrap().enabled);
+        assert!(reopened.get("new").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

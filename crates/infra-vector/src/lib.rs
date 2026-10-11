@@ -146,6 +146,23 @@ pub trait VectorStore: Send + Sync {
     /// 按 character 删除所有记录（删卡时级联清理，M-2）
     fn delete_by_character(&self, character_id: &Id) -> Result<usize, VectorError>;
 
+    /// 批量插入或更新：一次落盘，任一步失败整体回滚（内存不留半批）。
+    fn upsert_batch(&self, records: Vec<VectorRecord>) -> Result<(), VectorError>;
+
+    /// 列出满足标签过滤的全部记录（派生索引对账 / 分支复制向量用）。
+    fn records_matching(&self, filter: &MetadataFilter) -> Vec<VectorRecord>;
+
+    /// 是否已有该 id 的记录（对账补索引用，不克隆记录）。
+    fn contains(&self, id: &Id) -> bool;
+
+    /// 用 `records` 整体替换某一类记录（派生索引全量重建）：一次落盘，失败回滚。
+    /// 返回被移除的旧记录数。
+    fn replace_kind(
+        &self,
+        kind: VectorKind,
+        records: Vec<VectorRecord>,
+    ) -> Result<usize, VectorError>;
+
     /// 记录总数
     fn count(&self) -> usize;
 }
@@ -257,6 +274,72 @@ impl BruteForceStore {
         }
         Ok(())
     }
+
+    /// 批量删除满足谓词的记录；落盘失败时把删掉的记录放回内存再返回错误。
+    fn delete_where(&self, matches: impl Fn(&VectorRecord) -> bool) -> Result<usize, VectorError> {
+        self.apply_changes(matches, Vec::new())
+    }
+
+    /// 单次落盘的批量变更：先删掉满足 `remove` 的记录，再写入 `insert`。
+    ///
+    /// 配额只拦**净增长**超限（与单条 upsert 一致：覆盖已存在 id 不算增长）；
+    /// 落盘失败时把内存恢复到变更前，避免内存与磁盘分叉。返回删除的记录数。
+    fn apply_changes(
+        &self,
+        remove: impl Fn(&VectorRecord) -> bool,
+        insert: Vec<VectorRecord>,
+    ) -> Result<usize, VectorError> {
+        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
+        let doomed: Vec<Id> = records
+            .values()
+            .filter(|r| remove(r))
+            .map(|r| r.id.clone())
+            .collect();
+        if doomed.is_empty() && insert.is_empty() {
+            return Ok(0);
+        }
+        let before = records.len();
+        let mut final_ids: std::collections::HashSet<&Id> = records.keys().collect();
+        for id in &doomed {
+            final_ids.remove(id);
+        }
+        for record in &insert {
+            final_ids.insert(&record.id);
+        }
+        let after = final_ids.len();
+        if after > self.max_records && after > before {
+            return Err(VectorError::QuotaExceeded {
+                current: before,
+                limit: self.max_records,
+            });
+        }
+
+        let mut undo: HashMap<Id, Option<VectorRecord>> = HashMap::new();
+        let removed = doomed.len();
+        for id in doomed {
+            let old = records.remove(&id);
+            undo.entry(id).or_insert(old);
+        }
+        for record in insert {
+            let id = record.id.clone();
+            let old = records.insert(id.clone(), record);
+            undo.entry(id).or_insert(old);
+        }
+        if let Err(e) = self.persist_records(&records) {
+            for (id, old) in undo {
+                match old {
+                    Some(old) => {
+                        records.insert(id, old);
+                    }
+                    None => {
+                        records.remove(&id);
+                    }
+                }
+            }
+            return Err(e);
+        }
+        Ok(removed)
+    }
 }
 
 impl Default for BruteForceStore {
@@ -274,10 +357,9 @@ impl Default for BruteForceStore {
 ///    否则下一次 `upsert` 会把内存里的空集写回主文件，把"可抢救的损坏文件"
 ///    变成"干净的空文件"。
 ///
-/// 上层（tauri-app `storage_health`）应登记事件并提供解除入口；
-/// 域1 通过 `write_fence::storage_health_report()` 把"哪份文件被隔离、为什么、
-/// 怎么办"暴露出去（域4/域2 消费后前端可见），但应用内一键解除属产品决策
-/// （Lead N-03，本轮不做）。
+/// 上层登记与解除：tauri-app `storage_health::record_write_fence_state()` 启动时把
+/// `write_fence::frozen_entries()` 登记为阻断事件，用户在 `StorageHealthGate` 确认后
+/// 经 `storage_health_acknowledge` → `write_fence::unfreeze` 解除。
 fn quarantine_unrecoverable_corruption(
     path: &std::path::Path,
     err: &str,
@@ -319,8 +401,22 @@ impl VectorStore for BruteForceStore {
                 limit: self.max_records,
             });
         }
-        records.insert(record.id.clone(), record);
-        self.persist_records(&records)?;
+        let id = record.id.clone();
+        let previous = records.insert(id.clone(), record);
+        // 落盘失败时回滚内存（2026-10-11 审计）：否则调用方收到 Err 而内存里已有
+        // 该记录，内存与磁盘分叉——归档器据 Err 不推进水位、下次换新 id 重归档，
+        // 进程内就会出现重复远记忆。
+        if let Err(e) = self.persist_records(&records) {
+            match previous {
+                Some(old) => {
+                    records.insert(id, old);
+                }
+                None => {
+                    records.remove(&id);
+                }
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -339,8 +435,17 @@ impl VectorStore for BruteForceStore {
         // 污染检索且无法排查）。第一条不匹配即短路返回，调用方可定位并修复损坏记录。
         // 只收集 (score, id) 再取 top-k：全量克隆每条记录（content/keywords/metadata）
         // 在配额上限（50k × ~4KB）下是 ~200MB 级瞬态分配（2026-09-01 全量审查修复）。
+        //
+        // 2026-10-11 审计：空向量记录是**设计内**的关键词专用记录（绿灯世界书条目、
+        // 嵌入完成前的 RoundSummary），不是损坏数据——向量路径必须跳过它们。此前它们
+        // 也被判 DimensionMismatch，导致只要库里有一条世界书条目，配置了 Embedder 的
+        // 远记忆混合召回就整体失败（连关键词命中一起丢）。全零向量同样没有方向、
+        // 无法定义余弦分数，按"无向量"跳过而不是误报维度错误。
         let mut scored: Vec<(f32, Id)> = Vec::with_capacity(records.len());
         for r in records.values().filter(|r| filter.accepts(r)) {
+            if r.vector.is_empty() || r.vector.iter().all(|x| *x == 0.0) {
+                continue;
+            }
             let score = cosine_similarity(query, &r.vector).ok_or_else(|| {
                 warn!(
                     "向量维度不匹配，查询 {} 维 vs 记录 id={} {} 维",
@@ -442,34 +547,97 @@ impl VectorStore for BruteForceStore {
 
     fn delete(&self, id: &Id) -> Result<(), VectorError> {
         let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
-        records.remove(id);
-        self.persist_records(&records)?;
+        let Some(removed) = records.remove(id) else {
+            return Ok(());
+        };
+        if let Err(e) = self.persist_records(&records) {
+            records.insert(id.clone(), removed);
+            return Err(e);
+        }
         Ok(())
     }
 
     fn delete_by_campaign(&self, campaign_id: &Id) -> Result<usize, VectorError> {
-        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         let target = serde_json::Value::String(campaign_id.to_string());
-        let before = records.len();
-        records.retain(|_, r| r.metadata.get("campaign_id") != Some(&target));
-        let removed = before - records.len();
-        self.persist_records(&records)?;
-        Ok(removed)
+        self.delete_where(|r| r.metadata.get("campaign_id") == Some(&target))
     }
 
     fn delete_by_character(&self, character_id: &Id) -> Result<usize, VectorError> {
-        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         let target = serde_json::Value::String(character_id.to_string());
-        let before = records.len();
-        records.retain(|_, r| r.metadata.get("owner_character_id") != Some(&target));
-        let removed = before - records.len();
-        self.persist_records(&records)?;
-        Ok(removed)
+        self.delete_where(|r| r.metadata.get("owner_character_id") == Some(&target))
+    }
+
+    fn upsert_batch(&self, records: Vec<VectorRecord>) -> Result<(), VectorError> {
+        self.apply_changes(|_| false, records).map(|_| ())
+    }
+
+    fn contains(&self, id: &Id) -> bool {
+        self.records
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
+    fn records_matching(&self, filter: &MetadataFilter) -> Vec<VectorRecord> {
+        let records = self.records.read().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<VectorRecord> = records
+            .values()
+            .filter(|r| filter.accepts(r))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
+    }
+
+    fn replace_kind(
+        &self,
+        kind: VectorKind,
+        records: Vec<VectorRecord>,
+    ) -> Result<usize, VectorError> {
+        if let Some(stray) = records.iter().find(|r| r.kind != kind) {
+            return Err(VectorError::Index(format!(
+                "replace_kind({kind:?}) 收到其它类型的记录 {}（{:?}）",
+                stray.id, stray.kind
+            )));
+        }
+        self.apply_changes(|r| r.kind == kind, records)
     }
 
     fn count(&self) -> usize {
         self.records.read().unwrap_or_else(|p| p.into_inner()).len()
     }
+}
+
+// ─── 查询切词 ──────────────────────────────────────────────────────────────
+
+/// 从自然语言查询抽取检索 token（中英混合）。
+///
+/// - 英文/数字：按空白与标点切词，长度 ≥ 2
+/// - 中文等非 ASCII：抽 2-gram，覆盖无空格连续文本
+///
+/// 与 `search_by_keywords*` 的「记录关键词包含查询 token」匹配语义配套；远记忆
+/// 召回（app-memory）与 Agent `search_vectors` 工具共用，避免两套切词漂移。
+pub fn extract_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for w in query.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
+        let w = w.trim();
+        if w.chars().count() >= 2 {
+            tokens.push(w.to_string());
+        }
+    }
+    let chars: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect();
+    for window in chars.windows(2) {
+        if window.iter().any(|c| !c.is_ascii()) {
+            tokens.push(window.iter().collect());
+        }
+    }
+    // 去重保序
+    let mut seen = std::collections::HashSet::new();
+    tokens.retain(|t| seen.insert(t.clone()));
+    tokens
 }
 
 // ─── 余弦相似度 ────────────────────────────────────────────────────────────
@@ -1070,5 +1238,197 @@ mod tests {
             vec!["r0", "r1"],
             "同分必须按 id 升序决定 top-k（D-05）"
         );
+    }
+
+    /// 2026-10-11 审计：关键词专用记录（空向量）与全零向量不是损坏数据，向量路径
+    /// 必须跳过而不是让整次检索 DimensionMismatch。
+    #[test]
+    fn vector_search_skips_keyword_only_and_zero_vectors() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(make_record("embedded", "已嵌入", vec!["诊所"]))
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("wi-keyword-only"),
+                content: "绿灯世界书条目".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::WorldInfo,
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("zero"),
+                content: "全零向量".into(),
+                vector: vec![0.0, 0.0, 0.0],
+                keywords: vec![],
+                kind: VectorKind::ArchivedSummary,
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+
+        let hits = store
+            .search_by_vector(&[1.0, 0.0, 0.0], 10)
+            .expect("关键词专用记录不得让向量检索失败");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["embedded"]);
+
+        // 非空且维度不同的记录仍是真正的维度错误（H-7 语义保持）。
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("bad-dim"),
+                content: "二维".into(),
+                vector: vec![1.0, 0.0],
+                keywords: vec![],
+                kind: VectorKind::ArchivedSummary,
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store.search_by_vector(&[1.0, 0.0, 0.0], 10),
+            Err(VectorError::DimensionMismatch { actual: 2, .. })
+        ));
+    }
+
+    /// 2026-10-11 审计：落盘失败必须回滚内存，否则 Err 返回后内存与磁盘分叉。
+    #[test]
+    fn persist_failure_rolls_back_in_memory_mutations() {
+        let path = temp_store_path("rollback");
+        let store = BruteForceStore::with_persistence(path.clone());
+        let mut tagged = make_record("kept", "已落盘", vec!["k"]);
+        tagged.metadata.insert(
+            "campaign_id".into(),
+            serde_json::Value::String("camp-1".into()),
+        );
+        store.upsert(tagged).unwrap();
+
+        storyforge_infra_util::write_fence::freeze(&path);
+        assert!(store.upsert(make_record("new", "新增", vec![])).is_err());
+        assert_eq!(store.count(), 1, "新增失败不得残留在内存");
+        assert!(
+            store
+                .upsert(make_record("kept", "覆盖", vec!["k"]))
+                .is_err()
+        );
+        let kept = store.search_by_keywords(&["k".into()], 10).unwrap();
+        assert_eq!(kept[0].content, "已落盘", "覆盖失败必须恢复旧值");
+        assert!(store.delete(&Id::from_str("kept")).is_err());
+        assert_eq!(store.count(), 1, "删除失败必须放回记录");
+        assert!(store.delete_by_campaign(&Id::from_str("camp-1")).is_err());
+        assert_eq!(store.count(), 1, "批量删除失败必须放回记录");
+        storyforge_infra_util::write_fence::unfreeze(&path);
+
+        assert_eq!(
+            store.delete_by_campaign(&Id::from_str("camp-1")).unwrap(),
+            1
+        );
+        assert_eq!(store.count(), 0);
+        let reopened = BruteForceStore::with_persistence(path.clone());
+        assert_eq!(reopened.count(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn world_info(id: &str, content: &str) -> VectorRecord {
+        VectorRecord {
+            kind: VectorKind::WorldInfo,
+            ..make_record(id, content, vec!["wi"])
+        }
+    }
+
+    #[test]
+    fn upsert_batch_persists_once_and_rolls_back_as_a_whole() {
+        let path = temp_store_path("batch");
+        let store = BruteForceStore::with_persistence(path.clone());
+        store
+            .upsert_batch(vec![
+                make_record("a", "甲", vec!["k"]),
+                make_record("b", "乙", vec!["k"]),
+            ])
+            .unwrap();
+        assert_eq!(BruteForceStore::with_persistence(path.clone()).count(), 2);
+
+        storyforge_infra_util::write_fence::freeze(&path);
+        let err = store.upsert_batch(vec![
+            make_record("a", "甲-改", vec!["k"]),
+            make_record("c", "丙", vec!["k"]),
+        ]);
+        storyforge_infra_util::write_fence::unfreeze(&path);
+        assert!(err.is_err());
+        assert_eq!(store.count(), 2, "失败的批次不得留下新记录");
+        let a = store
+            .records_matching(&MetadataFilter::new())
+            .into_iter()
+            .find(|r| r.id.as_str() == "a")
+            .unwrap();
+        assert_eq!(a.content, "甲", "失败的批次必须恢复被覆盖的旧值");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn upsert_batch_enforces_quota_on_net_growth_only() {
+        let store = BruteForceStore::with_max_records(2);
+        store
+            .upsert_batch(vec![
+                make_record("a", "1", vec![]),
+                make_record("b", "2", vec![]),
+            ])
+            .unwrap();
+        assert!(matches!(
+            store.upsert_batch(vec![make_record("c", "3", vec![])]),
+            Err(VectorError::QuotaExceeded { .. })
+        ));
+        // 覆盖已有 id 不算增长。
+        store
+            .upsert_batch(vec![make_record("a", "1'", vec![])])
+            .unwrap();
+        assert_eq!(store.count(), 2);
+    }
+
+    #[test]
+    fn replace_kind_swaps_only_that_kind() {
+        let store = BruteForceStore::new();
+        store.upsert(world_info("old-wi", "旧条目")).unwrap();
+        store
+            .upsert(make_record("summary", "摘要", vec!["k"]))
+            .unwrap();
+
+        let removed = store
+            .replace_kind(VectorKind::WorldInfo, vec![world_info("new-wi", "新条目")])
+            .unwrap();
+        assert_eq!(removed, 1);
+        let ids: Vec<String> = store
+            .records_matching(&MetadataFilter::new())
+            .into_iter()
+            .map(|r| r.id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["new-wi".to_string(), "summary".to_string()]);
+
+        assert!(
+            store
+                .replace_kind(
+                    VectorKind::WorldInfo,
+                    vec![make_record("x", "类型不符", vec![])]
+                )
+                .is_err(),
+            "混入其它类型的记录必须拒绝，避免误删"
+        );
+        assert_eq!(store.count(), 2);
+    }
+
+    #[test]
+    fn records_matching_filters_by_metadata() {
+        let store = BruteForceStore::new();
+        let mut tagged = make_record("t", "带标签", vec![]);
+        tagged
+            .metadata
+            .insert("campaign_id".into(), serde_json::json!("camp-1"));
+        store.upsert(tagged).unwrap();
+        store.upsert(make_record("u", "无标签", vec![])).unwrap();
+        let hits =
+            store.records_matching(&MetadataFilter::new().for_campaign(&Id::from_str("camp-1")));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), "t");
     }
 }

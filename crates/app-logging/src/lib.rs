@@ -259,6 +259,7 @@ impl LogStore {
     pub fn new(log_dir: PathBuf) -> Self {
         // 确保目录存在
         std::fs::create_dir_all(&log_dir).ok();
+        cleanup_old_files(&log_dir, LOG_RETENTION_DAYS);
         let mut buffer = LogBuffer::new();
         // P1-2 修复：启动时回填历史日志。原实现只建空内存缓冲，跨会话历史全丢，
         // 调试面板看不到之前的日志。这里读取 log_dir/*.jsonl 按行反序列化后 push，
@@ -321,25 +322,44 @@ impl LogStore {
             }
         }
     }
+}
 
-    /// 清理过期日志文件（保留最近 N 天）
-    pub fn cleanup_old_files(&self, keep_days: u32) {
-        let cutoff = Utc::now() - chrono::Duration::days(keep_days as i64);
-        let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+/// 落盘日志保留天数。
+///
+/// 2026-10-11 审计：此前清理函数从未被调用，`logs/YYYY-MM-DD.jsonl`（含完整
+/// LLM 请求/回复正文）无限增长，且每次启动的回填都要逐行反序列化全部历史文件。
+pub const LOG_RETENTION_DAYS: u32 = 30;
 
-        if let Ok(entries) = std::fs::read_dir(&self.log_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    // 文件名格式：YYYY-MM-DD.jsonl
-                    if let Some(date_part) = name.strip_suffix(".jsonl")
-                        && date_part < cutoff_str.as_str()
-                    {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
+/// 删除 `log_dir` 下早于 `keep_days` 天的 `YYYY-MM-DD.jsonl` 文件，返回删除数。
+///
+/// 只认合法日期文件名，其它 `.jsonl`（例如用户手放的导出）不动。删除失败只告警。
+fn cleanup_old_files(log_dir: &std::path::Path, keep_days: u32) -> usize {
+    let cutoff = (Utc::now() - chrono::Duration::days(keep_days as i64)).date_naive();
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(date) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        else {
+            continue;
+        };
+        if date >= cutoff {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!(
+                "Failed to remove expired log {}: {e}",
+                entry.path().display()
+            ),
         }
     }
+    removed
 }
 
 /// 启动时回填历史日志（P1-2）。
@@ -778,6 +798,49 @@ mod tests {
         let all = store.query(&LogFilter::default());
         let count = all.iter().filter(|e| e.message == "good-line").count();
         assert_eq!(count, 2, "损坏行应被跳过,两条有效行应回填");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-11 审计：启动时按保留期清理过期日志文件，且过期条目不再回填；
+    /// 非日期命名的 jsonl 不动。
+    #[test]
+    fn test_log_store_prunes_expired_files_on_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_log_retention_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |msg: &str| {
+            let mut s =
+                serde_json::to_string(&make_entry(LogKind::LlmCall, LogLevel::Info, msg)).unwrap();
+            s.push('\n');
+            s
+        };
+        let expired_day = (Utc::now() - chrono::Duration::days(LOG_RETENTION_DAYS as i64 + 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let recent_day = (Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let expired = dir.join(format!("{expired_day}.jsonl"));
+        let recent = dir.join(format!("{recent_day}.jsonl"));
+        let foreign = dir.join("1.jsonl");
+        std::fs::write(&expired, line("expired-entry")).unwrap();
+        std::fs::write(&recent, line("recent-entry")).unwrap();
+        std::fs::write(&foreign, "not a dated log\n").unwrap();
+
+        let store = LogStore::new(dir.clone());
+        assert!(!expired.exists(), "超过保留期的日志文件应被删除");
+        assert!(recent.exists());
+        assert!(foreign.exists(), "非 YYYY-MM-DD 命名的文件不得被删除");
+        let messages: HashSet<String> = store
+            .query(&LogFilter::default())
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert!(messages.contains("recent-entry"));
+        assert!(!messages.contains("expired-entry"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
