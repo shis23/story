@@ -107,10 +107,10 @@ export function usePipeline(handlers = {}) {
           detail: '合并 · 润色 · 成文',
           output: '',
         }
-        // Editor 逐字流式由 StreamingMessage 读 pipeline.editor.output 渲染，不再插占位消息
+        // Editor 逐字流式由写作面（useWritingScreenAdapter → StreamingBody）读 pipeline.editor.output 渲染，不再插占位消息
         break
       case 'editor_progress':
-        // 累积编剧流式输出到 pipeline(StreamingMessage 实时渲染)
+        // 累积编剧流式输出到 pipeline(StreamingBody 实时渲染)
         if (writing.pipeline.editor.status === 'done') break
         if (writing.pipeline.editor.status !== 'running') {
           writing.pipeline.editor = { role: 'editor', status: 'running', detail: '生成中', output: '' }
@@ -128,7 +128,7 @@ export function usePipeline(handlers = {}) {
           output: event.data?.text || writing.pipeline.editor.output || '',
         }
         writing.pipeline.stateLabel = '已产出'
-        // 成文由 applyConversation 推入正式消息;StreamingMessage 随 showPipeline=false 消失
+        // 成文由 applyConversation 推入正式消息;流式块随 showPipeline=false 消失
         break
       case 'quality_checked': {
         // B3：warn-only 质量门禁结果，不阻断 accept/postprocess

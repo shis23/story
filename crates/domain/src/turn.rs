@@ -111,21 +111,6 @@ impl AttemptStatus {
 
 // ─── 状态推导结果 ───────────────────────────────────────────────────────────
 
-/// postprocess 的推导结果（独立于用户是否 accept）。
-///
-/// 区分"配置主动关闭"与"实际推导失败"：
-/// - `SkippedByPolicy` → 正常 Committed（空 diff）。
-/// - `Failed` → 允许 Degraded（用户显式接受不完整状态）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DerivationOutcome {
-    /// 推导成功，产出候选 diff
-    Succeeded,
-    /// 被配置关闭（enable_postprocess=false / enable_summarizer=false）
-    SkippedByPolicy,
-    /// 推导尝试了但失败（LLM 超时、解析失败等）
-    Failed(String),
-}
-
 /// 单个推导组件（summary / state）的状态，分别追踪。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -420,13 +405,6 @@ impl TurnRecord {
         self.attempts
             .iter_mut()
             .find(|a| &a.attempt_id == attempt_id)
-    }
-
-    /// 按 variant_id 查找（可变）——只返回活动（非 terminal）Attempt（同 P0-1 修复）
-    pub fn find_attempt_by_variant_mut(&mut self, variant_id: &Id) -> Option<&mut TurnAttempt> {
-        self.attempts
-            .iter_mut()
-            .find(|a| &a.variant_id == variant_id && a.status.is_active())
     }
 
     /// 更新 updated_at 时间戳

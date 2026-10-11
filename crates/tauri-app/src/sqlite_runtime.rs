@@ -21,8 +21,8 @@ use storyforge_domain::turn::{AttemptStatus, TurnRecord, TurnStatus};
 use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::preaccept::{
     AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyOutcome,
-    PostprocessApplyRequest, PreacceptOutboxRow, PreacceptRecoverySnapshot,
-    RegenerateAttemptRequest, SqlitePreacceptRepository,
+    PostprocessApplyRequest, PreacceptOutboxRow, RegenerateAttemptRequest,
+    SqlitePreacceptRepository,
 };
 use storyforge_infra_sqlite::production::{
     AcceptOutcome as SqliteAcceptOutcome, AcceptTurnRequest, SqliteProductionRepository,
@@ -1071,14 +1071,6 @@ pub fn ensure_world_info_from_book(
     Ok(book)
 }
 
-/// Delete the campaign world info row (campaign teardown).
-pub fn delete_world_info(campaign_id: &Id) -> Result<bool, String> {
-    with_db_mut(|db| {
-        SqliteProductionRepository::delete_world_info_payload(db, campaign_id)
-            .map_err(|e| e.to_string())
-    })
-}
-
 fn reconfirm_accept_replay(
     attempt: &storyforge_domain::turn::TurnAttempt,
     outcome: crate::turn_lifecycle::AcceptOutcome,
@@ -1396,14 +1388,6 @@ pub fn mark_stale_after_edit(
 pub fn list_preaccept_outbox_for_turn(turn_id: &Id) -> Result<Vec<PreacceptOutboxRow>, String> {
     with_db(|db| {
         SqlitePreacceptRepository::list_outbox_for_turn(db, turn_id).map_err(|e| e.to_string())
-    })
-}
-
-pub fn recover_active_preaccept_state(
-    campaign_id: &Id,
-) -> Result<PreacceptRecoverySnapshot, String> {
-    with_db(|db| {
-        SqlitePreacceptRepository::recover_active_state(db, campaign_id).map_err(|e| e.to_string())
     })
 }
 

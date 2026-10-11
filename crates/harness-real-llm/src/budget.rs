@@ -494,14 +494,6 @@ impl BudgetedLlmClient {
         self.samples.lock().expect("samples lock").clone()
     }
 
-    pub fn total_prompt_tokens(&self) -> u32 {
-        self.samples().iter().map(|s| s.prompt_tokens).sum()
-    }
-
-    pub fn total_completion_tokens(&self) -> u32 {
-        self.samples().iter().map(|s| s.completion_tokens).sum()
-    }
-
     fn reserve_call(&self, req: &ChatRequest, streaming: bool) -> Result<ReservedCall, LlmError> {
         let gate = self
             .reservation_gate

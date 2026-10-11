@@ -183,7 +183,7 @@ export function useMessageVariants(options = {}) {
 
       writingStore.pipeline.state = 'done'
       writingStore.pipeline.stateLabel = '重 roll 完成'
-      writingStore.showPipeline = false // 收起 StreamingMessage
+      writingStore.showPipeline = false // 收起写作面流式块
       loadInstanceNameMap()
       // result 含最终成文，但 UI 已由 refreshed 驱动，无需单独消费
       void result
@@ -413,7 +413,7 @@ export function useMessageVariants(options = {}) {
       writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
       writingStore.pipeline.state = 'done'
       writingStore.pipeline.stateLabel = '重 roll 完成'
-      writingStore.showPipeline = false // 收起 StreamingMessage
+      writingStore.showPipeline = false // 收起写作面流式块
       loadInstanceNameMap()
       scrollToBottom()
     } catch (err) {

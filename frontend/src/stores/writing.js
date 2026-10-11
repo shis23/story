@@ -32,7 +32,7 @@ export const useWritingStore = defineStore('writing', () => {
     // localStorage may be unavailable in tests/private contexts; in-memory scoping still works.
   }
 
-  // pipeline 状态机(App.vue:285-292)— 结构冻结,StreamingMessage 直接消费
+  // pipeline 状态机(App.vue:285-292)— 结构冻结,useWritingScreenAdapter 直接消费
   const pipeline = reactive({
     state: 'idle',
     stateLabel: '',

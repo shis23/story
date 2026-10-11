@@ -57,16 +57,6 @@ pub struct WorldInfoConflict {
     pub reason: String,
 }
 
-/// 预设诊断报告
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresetReport {
-    pub name: String,
-    pub prompt_count: usize,
-    pub enabled_count: usize,
-    pub regex_count: usize,
-    pub issues: Vec<String>,
-}
-
 /// 角色卡诊断报告
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardReport {

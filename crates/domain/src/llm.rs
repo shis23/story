@@ -306,13 +306,6 @@ pub struct FunctionCall {
     pub arguments: String, // JSON 字符串
 }
 
-impl FunctionCall {
-    /// 解析 arguments JSON 为具体类型
-    pub fn parse_args<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_str(&self.arguments)
-    }
-}
-
 // ─── Agent 工具定义（发给 LLM 的 tools 数组）─────────────────────────────
 
 /// Agent 可用的工具定义（对应 OpenAI function calling 的 tools 格式）

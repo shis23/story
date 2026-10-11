@@ -152,13 +152,6 @@ pub struct MvuExecuteResponse {
     pub error: Option<String>,
 }
 
-/// 前端 load ack 响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MvuLoadAck {
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
 /// Tauri event 名称常量
 pub const EVENT_MVU_LOAD_CARD_ASSETS: &str = "mvu:load_card_assets";
 pub const EVENT_MVU_UNLOAD_CARD: &str = "mvu:unload_card";

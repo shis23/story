@@ -65,7 +65,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::backend::StorageBackend;
 use crate::connection::{Database, STORYFORGE_APPLICATION_ID};
@@ -2229,14 +2228,6 @@ impl Drop for CutoverLockGuard {
         // On Windows the handle close releases the lock.
         let _ = &self.path;
     }
-}
-
-/// Compute a SHA-256 hex of the database file for verification.
-pub fn database_file_hash(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(hex_encode(hasher.finalize()))
 }
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {

@@ -631,17 +631,6 @@ impl<'a> ProductionPostprocessService<'a> {
         self.sink.sync_autofix(identity, final_text, report)
     }
 
-    pub fn sync_autofix_attempt_with_provenance(
-        &self,
-        identity: &PostprocessIdentity,
-        final_text: &str,
-        report: QualityReport,
-        provenance: Option<Provenance>,
-    ) -> Result<(), ProductionPostprocessError> {
-        self.sink
-            .sync_autofix_with_provenance(identity, final_text, report, provenance)
-    }
-
     /// Map runner output into DerivationComponents (summary/state tracked separately).
     pub fn derive_components(outcome: &Option<PostProcessOutcome>) -> DerivationComponents {
         match outcome {

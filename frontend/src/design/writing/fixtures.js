@@ -82,8 +82,6 @@ export const fxGreetings = [
   { label: '开场三 · 墓园', content: '他每年只来两次。清明，和她的生日。墓碑上的照片已经有些褪色，但那双眼睛看人时微微偏头的样子，和巷子里那个声音一模一样。' },
 ]
 
-export const fxUserMessageOnly = [fxMessagesWritten[0]]
-
 /** 页题/元信息（接线：Campaign 名 / 会话派生） */
 export const fxPageTitle = '第一章 · 雨巷'
 export const fxDuration = '用时 8 分钟'

@@ -219,34 +219,7 @@ fn parse_string_list_value(value: Option<&serde_json::Value>) -> Vec<String> {
     }
 }
 
-/// 角色卡元数据（列表展示用，不含大字段）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CharacterMeta {
-    pub id: Id,
-    pub name: String,
-    pub description: String,
-    pub tags: Vec<String>,
-    pub creator: String,
-    pub source: Source,
-    pub has_world_info: bool,
-    pub has_renderable_assets: bool,
-}
-
 impl Character {
-    /// 提取元数据（列表展示用）
-    pub fn to_meta(&self) -> CharacterMeta {
-        CharacterMeta {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            description: self.description.clone(),
-            tags: self.tags.clone(),
-            creator: self.creator.clone(),
-            source: self.source.clone(),
-            has_world_info: self.embedded_world_info.is_some(),
-            has_renderable_assets: self.renderable_assets.is_some(),
-        }
-    }
-
     /// 检查是否有可渲染的前端资产（HTML/JS/CSS）
     pub fn has_renderable_assets(&self) -> bool {
         self.renderable_assets.is_some()
@@ -731,11 +704,6 @@ impl CharacterDefinition {
             role_type: RoleType::Protagonist,
             variable_schema: merged_schema,
         }
-    }
-
-    /// 把卡级 MVU schema 合并进 definition 的 variable_schema（导入后处理用）
-    pub fn merge_variable_schema(&mut self, mvu_schema: &[VariableField]) {
-        self.variable_schema = merge_schema(&self.variable_schema, mvu_schema);
     }
 }
 

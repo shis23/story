@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storyforge_domain::character::{Character, StCharacterData};
+use storyforge_domain::character::Character;
 use storyforge_domain::preset::RegexScript;
 use storyforge_domain::variables::extract_mvu_schema_from_extensions;
 use storyforge_domain::world_info::WorldInfoBook;
@@ -1303,11 +1303,6 @@ fn compare_value(
             });
         }
     }
-}
-
-/// Serialize StCharacterData for semantic comparison helpers.
-pub fn st_data_to_value(data: &StCharacterData) -> Value {
-    serde_json::to_value(data).unwrap_or(Value::Null)
 }
 
 /// Deterministic pseudo-random for bounded property tests (xorshift64*).

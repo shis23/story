@@ -162,13 +162,6 @@ impl CampaignStore {
         }
     }
 
-    /// Permanently close this process-local JSON handle after an opt-in
-    /// backend has become authoritative. This only protects against an
-    /// accidental lazy initialization before backend resolution.
-    pub fn disable_json_access(&self) {
-        self.json_access_disabled.store(true, Ordering::Release);
-    }
-
     fn json_access_disabled(&self) -> bool {
         self.json_access_disabled.load(Ordering::Acquire)
     }

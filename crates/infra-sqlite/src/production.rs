@@ -736,19 +736,6 @@ impl SqliteProductionRepository {
         )
     }
 
-    /// Delete the campaign world info row (campaign teardown / re-import).
-    pub fn delete_world_info_payload(db: &mut Database, campaign_id: &Id) -> Result<bool> {
-        migrations::migrate(db)?;
-        let uow = UnitOfWork::begin(db.connection_mut())?;
-        let tx = uow.transaction()?;
-        let removed = tx.execute(
-            "DELETE FROM campaign_world_info WHERE campaign_id = ?1",
-            [campaign_id.as_str()],
-        )?;
-        uow.commit()?;
-        Ok(removed > 0)
-    }
-
     // ─── MVU 翻译缓存（V005；payload 为上层 StoredMvuTranslation 全量 JSON）───
 
     /// Upsert 一条 MVU 翻译（按 source_character_id 去重，同 JSON 店语义）。

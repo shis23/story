@@ -504,12 +504,6 @@ impl CampaignMutationCoordinator {
     pub fn current_revision(store: &CampaignStore, campaign_id: &Id) -> Option<u64> {
         store.get_campaign(campaign_id).map(|c| c.revision)
     }
-
-    /// 检查 Campaign 是否有活动 Turn（屏障检查用）。
-    /// 实际检查由 TurnStore.get_active_turn 完成，这里只是转发。
-    pub fn has_active_turn(turn_store: &crate::turn_store::TurnStore, campaign_id: &Id) -> bool {
-        turn_store.get_active_turn(campaign_id).is_some()
-    }
 }
 
 #[cfg(test)]

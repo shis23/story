@@ -610,18 +610,6 @@ impl RealLlmRunBudget {
             max_tokens,
         }
     }
-
-    pub fn assert_enabled_or_skip(reason: &str) {
-        let budget = Self::from_env();
-        if !budget.enabled {
-            eprintln!(
-                "skip real LLM eval: STORYFORGE_EVAL_REAL_LLM not enabled ({reason}); \
-                 set STORYFORGE_EVAL_REAL_LLM=1 plus LLM_BASE_URL/API_KEY/MODEL to run"
-            );
-            // panic with ignore-friendly message when used inside #[ignore] tests via require
-            panic!("STORYFORGE_EVAL_REAL_LLM disabled: {reason}");
-        }
-    }
 }
 
 fn parse_u32_env(name: &str, default: u32) -> u32 {

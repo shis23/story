@@ -1,6 +1,6 @@
 # 会话历史 · 接线契约卡（design/history → AppV2）
 
-> 纯展示。替换 `components-v2/writing/ConversationHistoryList.vue`。
+> 纯展示。替换旧 `components-v2/writing/ConversationHistoryList.vue`（2026-10-11 已删除）。
 
 ## Props
 

@@ -52,7 +52,7 @@
 3. 重 roll 三级菜单在 MessageItem 内联实现。
 4. `scrollToBottom` 由 WritingScreen expose，AppV2 转发。
 5. Composer 已并入 WritingScreen；AppShell `#composer` 槽可空。
-6. 旧 `components-v2/writing/*` **仅作存档参考**，生产主路径不再引用 Viewport/Composer；**不承诺"可回退"**（零引用、未接线，2026-09-13 复核确认 `frontend/src` 内没有指向该目录的相对导入，见 `docs/review-2026-09-13/fixes/05-frontend-fixes.md` F-46）。
+6. 旧 `components-v2/writing/*`（上表"替换"列里的旧组件）已于 2026-10-11 全量审计删除（此前零引用、未接线，见 `docs/review-2026-09-13/fixes/05-frontend-fixes.md` F-46）；上表"替换"列仅作历史对照，**不存在回退路径**。
 7. 保存不是 Vue emit 事件，只有 `saveVariant` 回调明确返回 `true` 才退出编辑；返回 `false` 或拒绝时保留输入。
 8. `add-variant` 必须传 `{ nodeId }`；分支只在已采纳末尾显示，后端独立验证并拒绝活动轮次和历史节点。
 

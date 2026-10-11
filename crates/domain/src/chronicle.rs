@@ -225,22 +225,9 @@ impl ChronicleEntry {
             && &self.lineage_id == lineage_id
             && self.invalidated_at.is_none()
     }
-
-    pub fn is_uncovered(&self) -> bool {
-        self.covered_by.is_none()
-    }
-
-    pub fn is_leaf(&self) -> bool {
-        self.level == ChronicleLevel::A
-    }
 }
 
 // ─── lineage ───────────────────────────────────────────────────────────────
-
-/// 新建写作线时分配 lineage_id。
-pub fn new_lineage_id() -> Id {
-    Id::new()
-}
 
 /// 条目是否适用于当前分支（规格 §3.3）。
 pub fn entry_applies_to_lineage(entry: &ChronicleEntry, campaign_id: &Id, lineage_id: &Id) -> bool {

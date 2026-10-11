@@ -19,10 +19,6 @@ impl<'conn> UnitOfWork<'conn> {
         self.tx.as_ref().ok_or(SqliteError::UnitOfWorkFinished)
     }
 
-    pub fn transaction_mut(&mut self) -> Result<&mut rusqlite::Transaction<'conn>> {
-        self.tx.as_mut().ok_or(SqliteError::UnitOfWorkFinished)
-    }
-
     pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
         let n = self.transaction()?.execute(sql, params)?;
         Ok(n)
