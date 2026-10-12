@@ -685,6 +685,9 @@ pub fn last_user_intent_before(
 /// 有 campaign 时只召回同 campaign 记录；无 campaign（legacy）时只召回本会话或
 /// 无会话标签的 legacy 归档（作用域语义见 app-memory `recall.rs` 的 `accepts_scope`）。
 /// 配置了 Embedder 时走向量+关键词合并；否则纯关键词。
+///
+/// 向向量库要 `FAR_MEMORY_RECALL_CANDIDATES` 条候选，注入时再剔除与近期摘要重复的
+/// 并截到 `FAR_MEMORY_INJECT_LIMIT` 条。
 pub async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
     ctx.far_memory_hits.clear();
     let intent = intent.trim();
@@ -708,7 +711,7 @@ pub async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, in
     match storyforge_app_memory::recall_archived_hybrid(
         state.vector_store.as_ref(),
         intent,
-        3,
+        FAR_MEMORY_RECALL_CANDIDATES,
         campaign_filter.as_deref(),
         Some(conversation_filter.as_str()),
         embedder.as_ref(),
@@ -961,6 +964,12 @@ pub struct CampaignContextSnapshot {
 /// ContextCompiler load-side：写入 WritingContext 的近期摘要条数上限。
 /// turn 计数仍用全量 list_summaries.len()；注入侧再取 last 5。
 const RECENT_SUMMARIES_LOAD_LIMIT: usize = 12;
+/// 远记忆召回向向量库要的候选数。每轮的 A 摘要也在向量库里，注入时与近期摘要重复的
+/// 命中会被剔除（`render_far_memory_for_injection_excluding`）；只要注入上限那么多候选
+/// 时，最近几轮的摘要常占掉大半名额，更早的远记忆反而进不来。多留近期摘要条数的余量，
+/// 剔除后仍能凑满注入上限。
+const FAR_MEMORY_RECALL_CANDIDATES: usize =
+    storyforge_app_pipeline::FAR_MEMORY_INJECT_LIMIT + RECENT_SUMMARIES_LOAD_LIMIT;
 /// 按 turn 升序后只保留最近 `limit` 条，避免长战役全量摘要进内存/工具上下文。
 pub fn take_recent_summaries_for_context(
     mut summaries: Vec<storyforge_domain::agent::RoundSummary>,
@@ -2647,5 +2656,65 @@ mod tests {
             }
             other => panic!("expected PostProcessSkipped, got {other:?}"),
         }
+    }
+
+    /// 近期摘要与查询更贴合、排在前面；注入时它们被剔除后，更早的远记忆仍要能凑满注入上限。
+    #[tokio::test]
+    async fn far_memory_recall_leaves_room_after_recent_summaries_are_excluded() {
+        use storyforge_app_pipeline::{
+            FAR_MEMORY_INJECT_LIMIT, render_far_memory_for_injection_excluding,
+        };
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::turn::{Mutation, MutationBatch};
+
+        let state = AppState::new_for_test();
+        let camp = Id::new();
+        let conv = Id::new();
+        let older: Vec<RoundSummary> = (1..=4)
+            .map(|turn| {
+                RoundSummary::new(
+                    camp.clone(),
+                    conv.clone(),
+                    turn,
+                    format!("第{turn}轮：她收下了那把铜钥匙，第{turn}次沉默。"),
+                )
+            })
+            .collect();
+        let recent: Vec<RoundSummary> = (5..=(4 + RECENT_SUMMARIES_LOAD_LIMIT as u32))
+            .map(|turn| {
+                RoundSummary::new(
+                    camp.clone(),
+                    conv.clone(),
+                    turn,
+                    format!("第{turn}轮：铜钥匙与土龙村老屋的旧事，第{turn}次提起。"),
+                )
+            })
+            .collect();
+        let mut batch = MutationBatch::new(Id::new(), 0);
+        for summary in older.iter().chain(&recent) {
+            batch
+                .mutations
+                .push(Mutation::UpsertSummary(Box::new(summary.clone())));
+        }
+        index_round_summaries_to_vector(state.vector_store.as_ref(), &batch);
+
+        let mut ctx = WritingContext::legacy(vec![], None, conv);
+        ctx.campaign_id = Some(camp);
+        ctx.recent_summaries = recent.clone();
+        fill_far_memory_hits(&mut ctx, &state, "铜钥匙 土龙村").await;
+
+        let recent_texts: Vec<String> = recent.iter().map(|s| s.content.clone()).collect();
+        let block = render_far_memory_for_injection_excluding(
+            &ctx.far_memory_hits,
+            FAR_MEMORY_INJECT_LIMIT,
+            &recent_texts,
+        )
+        .expect("更早的摘要应当留下");
+        let injected: Vec<&str> = block.lines().skip(1).collect();
+        assert_eq!(injected.len(), FAR_MEMORY_INJECT_LIMIT, "{block}");
+        assert!(
+            injected.iter().all(|line| line.contains("沉默")),
+            "注入的应是更早的摘要：{block}"
+        );
     }
 }
