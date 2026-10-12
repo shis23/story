@@ -324,6 +324,57 @@ pub fn replace_template_vars(text: &str, char_name: &str, user_name: &str) -> St
     replace_template_vars_with_context(text, &ctx)
 }
 
+/// 没有用户人设设置时 `{{user}}` 渲染成的名字（提示词、开场白、对话历史一致）。
+pub const DEFAULT_USER_NAME: &str = "玩家";
+
+/// 只替换身份宏：`{{user}}` / `<user>` 一类换成用户名，`{{char}}` / `<bot>` 一类换成角色名，
+/// 其它宏原样保留。
+///
+/// 结果确定、无副作用，用于落库的开场白与送给模型的对话历史。完整渲染器
+/// [`replace_template_vars_with_context`] 里的 `{{random}}` / `{{time}}` 每次结果不同、
+/// `{{setvar}}` 有副作用，套在历史上会让历史前缀逐轮变化，所以这里不碰。
+/// `char_name` 为 `None`（多角色局面，角色宏指代不明）时角色宏原样保留。
+pub fn replace_identity_macros(text: &str, char_name: Option<&str>, user_name: &str) -> String {
+    if !text.contains("{{") && !text.contains('<') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let body = &after[..end];
+        let value = match body.trim().to_ascii_lowercase().as_str() {
+            "user" | "username" | "user_name" => Some(user_name),
+            "char" | "charname" | "char_name" | "character" | "bot" | "charifnotuser"
+            | "char_if_not_user" => char_name,
+            _ => None,
+        };
+        match value {
+            Some(value) => out.push_str(value),
+            None => {
+                out.push_str("{{");
+                out.push_str(body);
+                out.push_str("}}");
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    let aliases = TemplateVarContext {
+        char_name: char_name.unwrap_or_default().to_string(),
+        user_name: user_name.to_string(),
+        render_character_macros: char_name.is_some(),
+        ..Default::default()
+    };
+    replace_angle_aliases(&out, &aliases)
+}
+
 pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarContext) -> String {
     let mut state = TemplateRenderState {
         variables: context.variables.clone(),
@@ -1217,6 +1268,41 @@ pub mod builtins {
         fn test_replace_template_vars_preserves_unknown_macros() {
             let result = replace_template_vars("{{unknown::macro}} {{char}}", "Seraphina", "玩家");
             assert_eq!(result, "{{unknown::macro}} Seraphina");
+        }
+
+        #[test]
+        fn identity_macros_render_user_and_char_only() {
+            let text = "{{User}} 推门进来，{{ char }} 抬头：<USER>，<bot> 等你很久了。{{random::a::b}} {{time}} {{setvar::k::v}}";
+            let result = replace_identity_macros(text, Some("Seraphina"), DEFAULT_USER_NAME);
+            assert_eq!(
+                result,
+                "玩家 推门进来，Seraphina 抬头：玩家，Seraphina 等你很久了。{{random::a::b}} {{time}} {{setvar::k::v}}"
+            );
+            // 确定性：同一输入两次结果一致（历史前缀逐轮稳定）。
+            assert_eq!(
+                result,
+                replace_identity_macros(text, Some("Seraphina"), DEFAULT_USER_NAME)
+            );
+        }
+
+        #[test]
+        fn identity_macros_keep_character_macros_without_a_single_character() {
+            let result =
+                replace_identity_macros("{{char}} 看着 {{user}}，<bot> 不语", None, "玩家");
+            assert_eq!(result, "{{char}} 看着 玩家，<bot> 不语");
+        }
+
+        #[test]
+        fn identity_macros_leave_plain_and_unterminated_text_alone() {
+            assert_eq!(
+                replace_identity_macros("普通正文", Some("A"), "玩家"),
+                "普通正文"
+            );
+            assert_eq!(
+                replace_identity_macros("半截 {{user", Some("A"), "玩家"),
+                "半截 {{user"
+            );
+            assert_eq!(replace_identity_macros("{{user}}{{user}}", None, "U"), "UU");
         }
 
         #[test]

@@ -414,6 +414,35 @@ fn resolve_legacy_opening_message_accepts_only_card_greetings() {
 }
 
 #[test]
+fn opening_messages_are_saved_with_identity_macros_expanded() {
+    // 选择仍按卡片原文匹配，落库的是展开后的成文。
+    let mut character = make_test_character("Greeter");
+    character.first_mes = "{{user}} 推门进来，{{char}} 抬起头。".into();
+    character.alternate_greetings = vec!["<USER> 又来了，<BOT> 笑了。".into()];
+    let character = Arc::new(character);
+    assert_eq!(
+        resolve_legacy_opening_message(Some(&character), None),
+        Some("玩家 推门进来，Greeter 抬起头。".into())
+    );
+    assert_eq!(
+        resolve_legacy_opening_message(
+            Some(&character),
+            Some("<USER> 又来了，<BOT> 笑了。".into())
+        ),
+        Some("玩家 又来了，Greeter 笑了。".into())
+    );
+    // 取不到卡名时只展开用户宏。
+    assert_eq!(
+        crate::runtime_support::render_opening_message("{{user}} 与 {{char}}", None),
+        "玩家 与 {{char}}"
+    );
+    assert_eq!(
+        crate::runtime_support::render_opening_message("{{user}} 与 {{char}}", Some("  ")),
+        "玩家 与 {{char}}"
+    );
+}
+
+#[test]
 fn resolve_opening_message_from_parts_supports_campaign_greetings() {
     let alternates = vec!["alternate one".to_string(), "alternate two".to_string()];
 
@@ -1205,6 +1234,20 @@ fn test_apply_campaign_opening_rewrites_first_assistant_message() {
     let conv = conv_store.get(&conv_id).unwrap();
     assert_eq!(conv.nodes.len(), 1);
     assert_eq!(conv.nodes[0].active_content(), "scene-2");
+
+    // 开场壳选中的开场来自卡片原文：落库前展开身份宏，{{char}} 取卡名。
+    apply_campaign_opening_in_store(
+        &store,
+        &conv_store,
+        &campaign_id,
+        "{{user}} 见到了 {{char}}。".into(),
+    )
+    .unwrap();
+    assert_eq!(
+        conv_store.get(&conv_id).unwrap().nodes[0].active_content(),
+        "玩家 见到了 Opening Source。"
+    );
+    apply_campaign_opening_in_store(&store, &conv_store, &campaign_id, "scene-2".into()).unwrap();
 
     // \u{91cd}\u{8f7d}\u{540e}\u{4ecd}\u{662f}\u{6539}\u{5199}\u{503c}\u{ff1a}\u{786e}\u{8ba4}\u{771f}\u{6b63}\u{843d}\u{76d8}\u{800c}\u{975e}\u{4ec5}\u{7f13}\u{5b58}
     let reloaded = ConversationStore::new(dir.join("conversations"));

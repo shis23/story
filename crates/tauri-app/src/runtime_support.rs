@@ -361,6 +361,17 @@ pub(crate) fn is_current_attempt_ready_for_postprocess(
     turn_lifecycle::is_current_attempt_ready_for_postprocess(record, attempt_id)
 }
 
+/// 开场白落库前展开身份宏（`{{user}}` / `{{char}}` / `<user>` 等）：会话里显示的、
+/// 之后作为历史送给模型的都是成文，模型不会把占位符照抄进正文。`{{char}}` 取卡名
+/// （与 ST 一致）；取不到名字时角色宏原样保留。
+pub(crate) fn render_opening_message(message: &str, char_name: Option<&str>) -> String {
+    storyforge_domain::prompt_module::replace_identity_macros(
+        message,
+        char_name.map(str::trim).filter(|name| !name.is_empty()),
+        storyforge_domain::prompt_module::DEFAULT_USER_NAME,
+    )
+}
+
 pub(crate) fn resolve_legacy_opening_message(
     character: Option<&Arc<storyforge_domain::character::Character>>,
     requested: Option<String>,
@@ -372,6 +383,7 @@ pub(crate) fn resolve_legacy_opening_message(
         requested,
         "legacy",
     )
+    .map(|opening| render_opening_message(&opening, Some(&character.name)))
 }
 
 #[cfg(test)]

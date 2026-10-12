@@ -377,7 +377,10 @@ pub(crate) fn create_campaign_for_backend(
         storage,
         &stored.card.source_character_id,
         opening_message,
-    ) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
+    )
+    .map(|opening| {
+        crate::runtime_support::render_opening_message(&opening, Some(&stored.card.name))
+    }) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         return Err(cleanup_after_failure(format!("追加开场白失败: {e}")));
     }
@@ -451,7 +454,10 @@ pub(crate) fn create_campaign_in_store(
         character_store,
         &stored.card.source_character_id,
         opening_message,
-    ) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
+    )
+    .map(|opening| {
+        crate::runtime_support::render_opening_message(&opening, Some(&stored.card.name))
+    }) && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         return Err(cleanup_after_failure(format!("追加开场白失败: {e}")));
     }
@@ -529,6 +535,10 @@ pub(crate) fn apply_campaign_opening_in_store(
         ));
     }
     let node_id = node.id.clone();
+    let char_name = store
+        .get_card(&campaign.card_id)
+        .map(|stored| stored.card.name);
+    let content = crate::runtime_support::render_opening_message(&content, char_name.as_deref());
     conv_store
         .edit_variant(&conv_id, &node_id, content)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
@@ -578,6 +588,12 @@ pub(crate) fn apply_campaign_opening_for_backend(
         ));
     }
     let node_id = node.id.clone();
+    // 壳选择的开场来自卡片原文，落库前同样展开身份宏（与开档一致）。
+    let char_name = storage
+        .get_card(&campaign.card_id)
+        .map_err(TauriCommandError::storage)?
+        .map(|stored| stored.card.name);
+    let content = crate::runtime_support::render_opening_message(&content, char_name.as_deref());
     conv_store
         .edit_variant(&conv_id, &node_id, content)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
