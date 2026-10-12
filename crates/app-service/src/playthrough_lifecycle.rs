@@ -23,7 +23,7 @@ impl ConversationDeleter for ConversationStoreDeleter<'_> {
 /// Gate 5：Campaign 删除源的 backend-neutral 端口——JSON `CampaignStore` 与
 /// `StorageFacade`（SQLite 单事务级联）都实现它，删除一局活动的编排逻辑只依赖
 /// 该端口，不再直连 JSON store。
-pub(crate) trait CampaignDeleter {
+pub trait CampaignDeleter {
     fn get_campaign(&self, id: &Id) -> Result<Option<Campaign>, String>;
     fn delete_campaign(&self, id: &Id) -> Result<bool, String>;
 }
@@ -49,7 +49,7 @@ impl CampaignDeleter for crate::storage_backend::StorageFacade {
 
 /// 删除一局活动的全部权威数据：Campaign 聚合、绑定会话和活跃指针。
 /// `source` 是 backend-neutral 端口（JSON store 或 StorageFacade）。
-pub(crate) fn delete_campaign_playthrough_in_store(
+pub fn delete_campaign_playthrough_in_store(
     source: &dyn CampaignDeleter,
     conv_store: &ConversationStore,
     state: &AppState,
@@ -245,8 +245,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::commands::campaigns::set_active_campaign_in_state;
     use crate::load_active_campaign;
+    use crate::services::campaigns::set_active_campaign_in_state;
     use storyforge_app_conversation::{ConversationError, ConversationPersistence};
     use storyforge_domain::campaign::Campaign;
     use storyforge_domain::conversation::Conversation;

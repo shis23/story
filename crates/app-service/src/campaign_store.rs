@@ -968,7 +968,7 @@ impl CampaignStore {
 
     /// 持锁读取-修改-写入 Campaign。仅当 Campaign 存在时调用 `f`；
     /// `f` 失败不写盘、内存不变；persist 失败内存回滚（三.9 同款）。
-    pub(crate) fn mutate_campaign_candidate<F>(
+    pub fn mutate_campaign_candidate<F>(
         &self,
         campaign_id: &Id,
         f: F,
@@ -990,7 +990,7 @@ impl CampaignStore {
     }
 
     /// 持锁读取-修改-写入角色实例（仅当实例存在时调用 `f`）。
-    pub(crate) fn mutate_instance_candidate<F>(
+    pub fn mutate_instance_candidate<F>(
         &self,
         campaign_id: &Id,
         instance_id: &Id,
@@ -1021,7 +1021,7 @@ impl CampaignStore {
     ///
     /// 调用方（facade）负责先取 TurnStore 活动 Turn 守卫（turns 锁在外层，
     /// 锁序 turns → campaigns → instances，与 `with_idle_turn_guard` 一致）。
-    pub(crate) fn add_instance_guarded(
+    pub fn add_instance_guarded(
         &self,
         campaign_id: &Id,
         instance: &CharacterInstance,
@@ -1594,7 +1594,7 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     )
 }
 
-pub(crate) fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
+pub fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
     storyforge_infra_util::atomic_write_json(path, data).map_err(|e| {
         let msg = format!("持久化失败 {}: {e}", path.display());
         tracing::error!("{msg}");

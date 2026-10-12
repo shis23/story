@@ -1,6 +1,6 @@
 # StoryForge 架构说明
 
-> 更新日期：2026-09-13（「插件与导入边界」「发布边界」「当前主要技术债」按 2026-09-06 的闭合结果回写；其余部分仍为 2026-09-05 代码快照）。
+> 更新日期：2026-10-12（「Workspace 边界」：宿主无关的应用服务抽成 `crates/app-service`）；2026-09-13（「插件与导入边界」「发布边界」「当前主要技术债」按 2026-09-06 的闭合结果回写；其余部分仍为 2026-09-05 代码快照）。
 > 本文描述当前源码的代码边界；当前候选的验收状态以 `RELEASE-STATUS.md` 为准，功能存在不等于门禁通过。
 
 ## 架构原则
@@ -20,9 +20,13 @@ frontend
   -> Tauri commands / events
 
 crates/tauri-app
-  -> composition root
-  -> command DTO / local app services
-  -> JSON stores / SQLite runtime selector
+  -> composition root (run / setup)
+  -> #[tauri::command] shells / card shell protocol / WebView MVU runtime
+
+crates/app-service
+  -> AppState / StorageFacade / JSON stores / SQLite runtime selector
+  -> Turn / Attempt / postprocess workflows / derived vector index
+  -> command DTO and helpers (services/*)
 
 crates/app-pipeline
   -> Director / Subagent / Editor orchestration
@@ -49,7 +53,9 @@ crates/harness-real-llm
   -> deterministic gates / real-model probes / M5 evidence
 ```
 
-当前 workspace 共 16 个 crate。`domain` 不依赖内部应用层；`app-*` 不依赖 `tauri-app`；Tauri 负责把 store 组装为应用层使用的快照和服务。
+当前 workspace 共 17 个 crate。`domain` 不依赖内部应用层；`app-*` 不依赖 `tauri-app`；`app-service` 不依赖 tauri，桌面端与非 Tauri 宿主共用它，进程级单例（数据目录、连接 / 预设存储、MVU runtime、后台运行时）由宿主在启动时钉住或安装。
+
+`crates/tauri-app/src/commands/<x>.rs` 只保留 `#[tauri::command]` 外壳（命令签名不变），DTO 与辅助函数在 `crates/app-service/src/services/<x>.rs`，外壳以 `pub use` 引入；tauri-app 根模块 `pub use storyforge_app_service::*`，原有 `crate::` 路径与 harness / 集成测试的 `storyforge_lib::` 路径不变。源码级门禁（`scripts/architecture/backend-baseline.mjs`、`lib_tests_backend.rs` gate3、命令层 JSON 直连扫描）同时扫描两个 crate 的 `src/`。
 
 ## 写作与 Turn 生命周期
 

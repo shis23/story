@@ -1,7 +1,7 @@
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn load_json_with_tmp_backup_or_default<T>(
+pub fn load_json_with_tmp_backup_or_default<T>(
     path: &Path,
     on_parse_error: impl FnOnce(&serde_json::Error),
     on_recovery_failed: impl FnOnce(&Path, &serde_json::Error),

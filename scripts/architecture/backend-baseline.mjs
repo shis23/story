@@ -356,16 +356,42 @@ export function extractSqliteReferences(source) {
   }
 }
 
+/**
+ * 后端应用层源码所在的 crate。2026-10-12 起宿主无关的应用服务（AppState、
+ * 存储门面、工作流、命令的非 Tauri 部分 `services/`）抽到
+ * `crates/app-service`，tauri-app 只留 Tauri 外壳；两个 `src/` 都要扫，
+ * 否则门禁会对搬走的代码静默失明。
+ */
+export const BACKEND_SOURCE_CRATES = ['tauri-app', 'app-service']
+
+/** `commands/`（Tauri 外壳）或 `services/`（宿主无关的另一半）即命令层。 */
+function isCommandLayerSource({ crate, relative }) {
+  return (
+    (crate === 'tauri-app' && relative.startsWith('commands/')) ||
+    (crate === 'app-service' && relative.startsWith('services/'))
+  )
+}
+
 export function collectBaseline(repoRoot = REPO_ROOT) {
   const libPath = path.join(repoRoot, 'crates', 'tauri-app', 'src', 'lib.rs')
-  const backendSourceRoot = path.join(repoRoot, 'crates', 'tauri-app', 'src')
   const apiPath = path.join(repoRoot, 'frontend', 'src', 'tauri-api.js')
   const cargoPath = path.join(repoRoot, 'Cargo.toml')
   const libSource = readUtf8(libPath)
-  const backendSources = listRustSources(backendSourceRoot).map((filePath) => ({
-    filePath,
-    source: readUtf8(filePath),
-  }))
+  // relative：相对所在 crate 的 src/；qualified：`<crate>/<relative>`，白名单与
+  // 按文件统计一律用 qualified，同名文件跨 crate 不会互相顶替。
+  const backendSources = BACKEND_SOURCE_CRATES.flatMap((crate) => {
+    const root = path.join(repoRoot, 'crates', crate, 'src')
+    return listRustSources(root).map((filePath) => {
+      const relative = path.relative(root, filePath).replaceAll('\\', '/')
+      return {
+        filePath,
+        crate,
+        relative,
+        qualified: `${crate}/${relative}`,
+        source: readUtf8(filePath),
+      }
+    })
+  })
   const backendSource = backendSources.map(({ source }) => source).join('\n')
   const productionBackendSources = backendSources.filter(
     ({ filePath }) => !path.basename(filePath).startsWith('lib_tests'),
@@ -395,10 +421,9 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   sqlite.applicationFlagReferences =
     sqlite.activeFlagReferences - sqlite.facadeFlagReferences
   sqlite.ambientCharacterStoreReferences = productionBackendSources
-    .filter(({ filePath }) => {
-      const relative = path.relative(backendSourceRoot, filePath)
-      return relative.startsWith(`commands${path.sep}`) || path.basename(filePath) === 'runtime_support.rs'
-    })
+    .filter(
+      (entry) => isCommandLayerSource(entry) || path.basename(entry.filePath) === 'runtime_support.rs',
+    )
     .reduce((count, { source }) => count + (source.match(/\bget_store\(\)/g) ?? []).length, 0)
   const selectedWriterConstructorPattern =
     /\b(?:CampaignStore|CharacterStore|TurnStore|CompressJobStore)::new\(/g
@@ -409,31 +434,32 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
       0,
     )
   sqlite.applicationSelectedWriterConstructors = productionBackendSources
-    .filter(({ filePath }) => {
-      const relative = path.relative(backendSourceRoot, filePath)
-      return relative.startsWith(`commands${path.sep}`) || path.basename(filePath) === 'runtime_support.rs'
-    })
+    .filter(
+      (entry) => isCommandLayerSource(entry) || path.basename(entry.filePath) === 'runtime_support.rs',
+    )
     .reduce(
       (count, { source }) => count + (source.match(selectedWriterConstructorPattern) ?? []).length,
       0,
     )
   // Gate 3: `.is_sqlite()` / `.is_json()` method calls are only allowed in the
-  // bootstrap file, the facade, the SQLite runtime and the named backend
-  // adapter. Every other production source must be zero.
+  // AppState bootstrap, the facade, the SQLite runtime and the named backend
+  // adapter. Every other production source must be zero. Entries are
+  // crate-qualified (mirrors the Rust static whitelist test); the Tauri shell
+  // has no entry since AppState moved to app-service.
   const backendFlagPattern = /\.is_sqlite\(\)|\.is_json\(\)/g
   const methodFlagFiles = new Map()
-  for (const { filePath, source } of productionBackendSources) {
+  for (const { qualified, source } of productionBackendSources) {
     const count = (source.match(backendFlagPattern) ?? []).length
-    if (count > 0) methodFlagFiles.set(path.relative(backendSourceRoot, filePath).replaceAll('\\', '/'), count)
+    if (count > 0) methodFlagFiles.set(qualified, count)
   }
   const methodFlagWhitelist = [
-    'lib.rs',
-    'storage_backend.rs',
-    'sqlite_runtime.rs',
-    'backend_workflows.rs',
+    'app-service/lib.rs',
+    'app-service/storage_backend.rs',
+    'app-service/sqlite_runtime.rs',
+    'app-service/backend_workflows.rs',
     // 三审9：启动恢复协调模块（按 is_sqlite 分派 + JSON 路径 facade stores），
     // 与 backend_workflows 同性质——原 lib.rs:243 包装器抽取而来。
-    'startup_recovery.rs',
+    'app-service/startup_recovery.rs',
   ]
   sqlite.applicationMethodFlagReferences = [...methodFlagFiles.entries()]
     .filter(([name]) => !methodFlagWhitelist.includes(name))
@@ -454,13 +480,9 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   const legacyStoreAccessorPattern =
     /\.json_(?:character|campaign|turn|compress_job)_store\b/g
   const legacyAccessorFiles = new Map()
-  for (const { filePath, source } of productionBackendSources) {
+  for (const { qualified, source } of productionBackendSources) {
     const count = (source.match(legacyStoreAccessorPattern) ?? []).length
-    if (count > 0)
-      legacyAccessorFiles.set(
-        path.relative(backendSourceRoot, filePath).replaceAll('\\', '/'),
-        count,
-      )
+    if (count > 0) legacyAccessorFiles.set(qualified, count)
   }
   const legacyAccessorAllowed = (name) => methodFlagWhitelist.includes(name)
   sqlite.applicationLegacyStoreAccessorReferences = [...legacyAccessorFiles.entries()]
@@ -472,9 +494,11 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   )
 
   // 2026-09-13 域4 T-13/T-16：命令位置基线（详见 COMMAND_LOCATION_ALLOWLIST）。
+  // tauri-app 内仍按 src/ 相对路径（`commands/x.rs`、`card_studio_api.rs`）定位；
+  // app-service 里出现命令属性一律带 crate 前缀，必然落在白名单外被拦下。
   const commandLocations = extractCommandLocations(
-    productionBackendSources.map(({ filePath, source }) => ({
-      relativePath: path.relative(backendSourceRoot, filePath).replaceAll('\\', '/'),
+    productionBackendSources.map(({ crate, relative, qualified, source }) => ({
+      relativePath: crate === 'tauri-app' ? relative : qualified,
       source,
     })),
   )
@@ -501,7 +525,7 @@ export function collectBaseline(repoRoot = REPO_ROOT) {
   return {
     generatedAt: new Date().toISOString(),
     files: {
-      backend: 'crates/tauri-app/src/**/*.rs',
+      backend: BACKEND_SOURCE_CRATES.map((crate) => `crates/${crate}/src/**/*.rs`),
       frontendApi: 'frontend/src/tauri-api.js',
     },
     backend: {

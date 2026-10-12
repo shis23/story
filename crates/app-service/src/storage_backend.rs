@@ -45,10 +45,10 @@ use storyforge_domain::story_task::StoryTask;
 
 /// Gate 4 P1-4: the character library DTO re-exported through the facade so
 /// both backends expose one application-level character contract.
-pub use crate::commands::characters::CharacterInfo;
+pub use crate::services::characters::CharacterInfo;
 /// Gate 4 七审 P1: world-info entry DTO (multi-role atomic write-back tests
 /// construct per-role `world_info_entries` values).
-pub use crate::commands::characters::WorldInfoEntryInfo;
+pub use crate::services::characters::WorldInfoEntryInfo;
 /// Gate 4 P1-4: the stored-character DTO shared by the JSON and SQLite
 /// character libraries.
 pub use crate::storage::StoredCharacter;
@@ -341,7 +341,7 @@ impl StorageFacade {
         })
     }
 
-    pub(crate) fn json_campaign_store_owned(
+    pub fn json_campaign_store_owned(
         &self,
         capability: BackendCapability,
         operation: &str,
@@ -369,7 +369,7 @@ impl StorageFacade {
         })
     }
 
-    pub(crate) fn json_character_store_owned(
+    pub fn json_character_store_owned(
         &self,
         capability: BackendCapability,
         operation: &str,
@@ -392,7 +392,7 @@ impl StorageFacade {
         })
     }
 
-    pub(crate) fn json_compress_job_store(
+    pub fn json_compress_job_store(
         &self,
         operation: &str,
     ) -> Result<Arc<CompressJobStore>, String> {
@@ -690,7 +690,7 @@ impl StorageFacade {
 
     /// 活动 Turn 屏障 + Campaign 存在性校验 + 实例写入（同一原子单元）。
     /// `validate` 在写盘前对既有实例列表做重复检查（同名 / 同 definition）。
-    pub(crate) fn add_idle_instance(
+    pub fn add_idle_instance(
         &self,
         campaign_id: &Id,
         instance: &CharacterInstance,
@@ -754,10 +754,7 @@ impl StorageFacade {
     ///
     /// SQLite：`delete_card_payload` 的单事务级联已含 chronicle_compress_jobs，
     /// 此处返回 0（no-op）；JSON：CompressJobStore 候选 → 持久化 → 换入删除。
-    pub(crate) fn delete_compress_jobs_for_campaign(
-        &self,
-        campaign_id: &Id,
-    ) -> Result<usize, String> {
+    pub fn delete_compress_jobs_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
         if self.is_sqlite() {
             Ok(0)
         } else {
@@ -1202,7 +1199,7 @@ impl StorageFacade {
         new_route: &str,
     ) -> Result<(), String> {
         self.mutate_character_info(id_or_source, "update character world info route", |info| {
-            crate::commands::characters::apply_world_info_route_update(info, entry_index, new_route)
+            crate::services::characters::apply_world_info_route_update(info, entry_index, new_route)
         })
     }
 
@@ -1220,7 +1217,7 @@ impl StorageFacade {
         order: i32,
     ) -> Result<(), String> {
         self.mutate_character_info(id_or_source, "update character world info entry", |info| {
-            crate::commands::characters::apply_world_info_entry_update(
+            crate::services::characters::apply_world_info_entry_update(
                 info,
                 entry_index,
                 keys,
@@ -1243,7 +1240,7 @@ impl StorageFacade {
         is_global: bool,
     ) -> Result<usize, String> {
         self.mutate_character_info(id_or_source, "add character world info entry", |info| {
-            crate::commands::characters::apply_add_world_info_entry(
+            crate::services::characters::apply_add_world_info_entry(
                 info, keys, content, constant, is_global,
             )
         })
@@ -1256,7 +1253,7 @@ impl StorageFacade {
         entry_index: usize,
     ) -> Result<(), String> {
         self.mutate_character_info(id_or_source, "delete character world info entry", |info| {
-            crate::commands::characters::apply_delete_world_info_entry(info, entry_index)
+            crate::services::characters::apply_delete_world_info_entry(info, entry_index)
         })
     }
 
@@ -1326,7 +1323,7 @@ impl StorageFacade {
             };
             let info = stored.info;
             if let Some(book) = info.embedded_world_info.clone() {
-                return crate::commands::campaigns::merge_global_entries_into_book_facade(
+                return crate::services::campaigns::merge_global_entries_into_book_facade(
                     self, book, &info.name,
                 )
                 .map(Some);
@@ -1334,7 +1331,7 @@ impl StorageFacade {
             if let Some(book) =
                 crate::startup_support::world_info_book_from_entries(&info.world_info_entries)
             {
-                return crate::commands::campaigns::merge_global_entries_into_book_facade(
+                return crate::services::campaigns::merge_global_entries_into_book_facade(
                     self, book, &info.name,
                 )
                 .map(Some);
@@ -1353,7 +1350,7 @@ impl StorageFacade {
             let info = stored.info;
             if let Some(book) = info.embedded_world_info.clone() {
                 return Ok(Some(
-                    crate::commands::campaigns::merge_global_entries_into_book(
+                    crate::services::campaigns::merge_global_entries_into_book(
                         store, book, &info.name,
                     ),
                 ));
@@ -1362,7 +1359,7 @@ impl StorageFacade {
                 crate::startup_support::world_info_book_from_entries(&info.world_info_entries)
             {
                 return Ok(Some(
-                    crate::commands::campaigns::merge_global_entries_into_book(
+                    crate::services::campaigns::merge_global_entries_into_book(
                         store, book, &info.name,
                     ),
                 ));
@@ -1467,7 +1464,7 @@ impl StorageFacade {
     pub fn export_campaign_bundle_with(
         &self,
         camp_id: &Id,
-        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
+        enrich: impl FnOnce(&mut crate::services::import_export::CampaignBundle),
     ) -> Result<String, TauriCommandError> {
         if self.is_sqlite() {
             return self.export_campaign_bundle_from_sqlite(camp_id, enrich);
@@ -1485,15 +1482,15 @@ impl StorageFacade {
         &self,
         camp_id: &Id,
         turns: Vec<storyforge_domain::turn::TurnRecord>,
-        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
+        enrich: impl FnOnce(&mut crate::services::import_export::CampaignBundle),
     ) -> Result<String, TauriCommandError> {
         let store =
             self.json_campaign_store(BackendCapability::ImportExport, "export campaign bundle")?;
-        let json = crate::commands::import_export::export_campaign_bundle_from_store(
+        let json = crate::services::import_export::export_campaign_bundle_from_store(
             store,
             camp_id.clone(),
         )?;
-        let mut bundle: crate::commands::import_export::CampaignBundle =
+        let mut bundle: crate::services::import_export::CampaignBundle =
             serde_json::from_str(&json).map_err(|e| TauriCommandError::internal(e.to_string()))?;
         if bundle.campaign.pending_compress_publication.is_some() {
             return Err(TauriCommandError::validation(
@@ -1514,7 +1511,7 @@ impl StorageFacade {
                 .get_character(card.source_character_id.as_str())
                 .map_err(TauriCommandError::storage)?
                 .ok_or_else(|| TauriCommandError::storage("源角色卡缺失，拒绝生成不完整快照"))?;
-            bundle.runtime = Some(crate::commands::bundle_runtime::BundleRuntime {
+            bundle.runtime = Some(crate::services::bundle_runtime::BundleRuntime {
                 conversation,
                 character,
                 turns,
@@ -1524,7 +1521,7 @@ impl StorageFacade {
                 message_archives: Vec::new(),
             });
             bundle.format_version = 3;
-            crate::commands::bundle_runtime::validate_runtime(&bundle)?;
+            crate::services::bundle_runtime::validate_runtime(&bundle)?;
         }
         let after = self
             .get_campaign(camp_id)
@@ -1534,7 +1531,7 @@ impl StorageFacade {
         {
             return Err(TauriCommandError::validation("导出期间故事已变化，请重试"));
         }
-        crate::commands::import_export::validate_bundle_summary_graph(
+        crate::services::import_export::validate_bundle_summary_graph(
             &bundle.campaign,
             &bundle.summaries,
         )?;
@@ -1547,16 +1544,16 @@ impl StorageFacade {
     /// rollback; SQLite path lands everything in one transaction.
     pub fn import_campaign_bundle(
         &self,
-        bundle: crate::commands::import_export::CampaignBundle,
+        bundle: crate::services::import_export::CampaignBundle,
         conv_store: &ConversationStore,
-    ) -> Result<crate::commands::import_export::CampaignImportResult, TauriCommandError> {
+    ) -> Result<crate::services::import_export::CampaignImportResult, TauriCommandError> {
         if self.is_sqlite() {
-            crate::commands::import_export::import_campaign_bundle_into_sqlite(conv_store, bundle)
+            crate::services::import_export::import_campaign_bundle_into_sqlite(conv_store, bundle)
         } else {
             let store = self
                 .json_campaign_store(BackendCapability::ImportExport, "import campaign bundle")
                 .map_err(TauriCommandError::validation)?;
-            crate::commands::import_export::import_campaign_bundle_into_store_with_runtime(
+            crate::services::import_export::import_campaign_bundle_into_store_with_runtime(
                 store,
                 conv_store,
                 bundle,
@@ -1571,14 +1568,14 @@ impl StorageFacade {
         }
     }
 
-    pub(crate) fn fork_campaign_snapshot(
+    pub fn fork_campaign_snapshot(
         &self,
         conv_store: &ConversationStore,
         source_id: &Id,
         node_id: &Id,
         name: &str,
-    ) -> Result<crate::commands::campaigns::CampaignSummaryDto, TauriCommandError> {
-        use crate::commands::import_export::*;
+    ) -> Result<crate::services::campaigns::CampaignSummaryDto, TauriCommandError> {
+        use crate::services::import_export::*;
         let bundle: CampaignBundle = serde_json::from_str(&self.export_campaign_bundle(source_id)?)
             .map_err(|e| TauriCommandError::internal(e.to_string()))?;
         let runtime = bundle
@@ -1613,7 +1610,7 @@ impl StorageFacade {
             .get_campaign(&Id::from_str(&imported.campaign_id))
             .map_err(TauriCommandError::storage)?
             .ok_or_else(|| TauriCommandError::storage("分支写入后不可见"))?;
-        let mut dto = crate::commands::campaigns::CampaignSummaryDto::from(&record.campaign);
+        let mut dto = crate::services::campaigns::CampaignSummaryDto::from(&record.campaign);
         dto.instance_count = record.instance_count;
         Ok(dto)
     }
@@ -1621,7 +1618,7 @@ impl StorageFacade {
     fn export_campaign_bundle_from_sqlite(
         &self,
         camp_id: &Id,
-        enrich: impl FnOnce(&mut crate::commands::import_export::CampaignBundle),
+        enrich: impl FnOnce(&mut crate::services::import_export::CampaignBundle),
     ) -> Result<String, TauriCommandError> {
         let mut bundle = sqlite_runtime::export_campaign_snapshot(camp_id)
             .map_err(TauriCommandError::storage)?;

@@ -349,7 +349,7 @@ impl CompressJobStore {
     ///
     /// 候选 → 持久化 → 换入：写盘失败时内存保持原值（与其它 mutator 同款，
     /// 三.9 原子性约定）。返回删除条数；无任务时不写盘（幂等 no-op）。
-    pub(crate) fn delete_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
+    pub fn delete_for_campaign(&self, campaign_id: &Id) -> Result<usize, String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
         let before = jobs.len();
         let mut candidate = jobs.clone();

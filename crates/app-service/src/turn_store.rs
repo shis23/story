@@ -286,7 +286,7 @@ impl TurnStore {
     ///
     /// 锁序约定：turns → CampaignStore 内部集合锁（campaigns/instances/…）。
     /// CampaignStore 的任何方法都不会反向取 turns 锁，因此不会死锁。
-    pub(crate) fn with_idle_turn_guard<R>(
+    pub fn with_idle_turn_guard<R>(
         &self,
         campaign_id: &Id,
         f: impl FnOnce() -> Result<R, String>,
@@ -304,7 +304,7 @@ impl TurnStore {
         f()
     }
 
-    pub(crate) fn with_idle_turn_snapshot<R>(
+    pub fn with_idle_turn_snapshot<R>(
         &self,
         campaign_id: &Id,
         f: impl FnOnce(Vec<TurnRecord>) -> Result<R, String>,

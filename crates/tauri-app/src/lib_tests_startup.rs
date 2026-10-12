@@ -505,7 +505,7 @@ pub(super) fn command_prompt_hook_channel(
 
 pub(super) fn state_with_recording_llm(llm: Arc<RecordingMockLlm>) -> Arc<AppState> {
     let state = AppState::new_for_test();
-    *state.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = Some(llm as Arc<dyn LlmClient>);
+    state.install_llm_client(llm as Arc<dyn LlmClient>);
     let state = Arc::new(state);
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());

@@ -2,7 +2,7 @@
 //! CampaignStore 预置摘要，不计入 backend-baseline 的生产源扫描）。
 
 use super::*;
-use crate::commands::characters::{CharacterInfo, WorldInfoEntryInfo};
+use crate::services::characters::{CharacterInfo, WorldInfoEntryInfo};
 
 fn entry(keys: &[&str], content: &str, route: &str) -> WorldInfoEntryInfo {
     WorldInfoEntryInfo {

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn stored_info_to_character(
+pub fn stored_info_to_character(
     stored: &storage::StoredCharacter,
 ) -> storyforge_domain::character::Character {
     let embedded_world_info = stored
@@ -38,7 +38,7 @@ pub(crate) fn stored_info_to_character(
     }
 }
 
-pub(crate) fn world_info_entry_from_info(
+pub fn world_info_entry_from_info(
     e: &WorldInfoEntryInfo,
 ) -> storyforge_domain::world_info::WorldInfoEntry {
     use storyforge_domain::world_info::{LoreRoute, WorldInfoEntry};
@@ -69,7 +69,7 @@ pub(crate) fn world_info_entry_from_info(
     }
 }
 
-pub(crate) fn world_info_book_from_entries(
+pub fn world_info_book_from_entries(
     entries: &[WorldInfoEntryInfo],
 ) -> Option<storyforge_domain::world_info::WorldInfoBook> {
     if entries.is_empty() {
@@ -87,7 +87,7 @@ pub(crate) fn world_info_book_from_entries(
 ///
 /// `active_name` = 当前激活的角色卡名（来自 tool_ctx.characters 的最后一个）。
 /// 返回的 WorldInfoBook 包含所有应生效的条目（含全局共享的）。
-pub(crate) fn collect_world_info_for_active(
+pub fn collect_world_info_for_active(
     all_chars: &[storage::StoredCharacter],
     active_name: &str,
 ) -> storyforge_domain::world_info::WorldInfoBook {

@@ -2,11 +2,16 @@ use super::*;
 
 #[test]
 fn gate3_character_commands_do_not_probe_the_sqlite_runtime() {
-    let source = include_str!("commands/characters.rs");
-    assert!(
-        !source.contains("sqlite_runtime::is_sqlite_active()"),
-        "character commands must select storage through AppState::storage()"
-    );
+    // 命令外壳（tauri-app）与其宿主无关的另一半（app-service/services）都要查。
+    for source in [
+        include_str!("commands/characters.rs"),
+        include_str!("../../app-service/src/services/characters.rs"),
+    ] {
+        assert!(
+            !source.contains("sqlite_runtime::is_sqlite_active()"),
+            "character commands must select storage through AppState::storage()"
+        );
+    }
 }
 
 #[test]
@@ -1559,7 +1564,7 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
 
 #[test]
 fn runtime_support_routes_backend_selection_through_the_injected_facade() {
-    let source = include_str!("runtime_support.rs");
+    let source = include_str!("../../app-service/src/runtime_support.rs");
     assert!(
         !source.contains("is_sqlite_active("),
         "runtime_support must not read the process-global SQLite flag"
@@ -1870,9 +1875,34 @@ fn delete_character_command_clears_active_pointer_and_conversation_cache() {
 /// `_owned`）的 `json_character_store` 调用，其所在函数体必须存在
 /// `require_supported(..., CharacterCommands, ...)` 守卫——即该路径在 SQLite
 /// 下 fail-closed 而非静默读 JSON。
+///
+/// 命令的宿主无关部分抽到 `storyforge-app-service` 后，扫描范围是
+/// `tauri-app/src/commands/` 与 `app-service/src/services/` 两棵树；两边都必须
+/// 扫到文件，防止路径漂移让门禁静默失效。
 fn collect_command_rust_files() -> Vec<(String, String)> {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+    for base in [
+        crates_dir.join("tauri-app").join("src").join("commands"),
+        crates_dir.join("app-service").join("src").join("services"),
+    ] {
+        let before = files.len();
+        collect_rust_files_under(&crates_dir, base.clone(), &mut files);
+        assert!(
+            files.len() > before,
+            "command sources must exist under {}",
+            base.display()
+        );
+    }
+    files.sort();
+    files
+}
+
+fn collect_rust_files_under(
+    crates_dir: &std::path::Path,
+    base: std::path::PathBuf,
+    files: &mut Vec<(String, String)>,
+) {
     let mut stack = vec![base];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -1882,7 +1912,7 @@ fn collect_command_rust_files() -> Vec<(String, String)> {
                     stack.push(path);
                 } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                     let name = path
-                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .strip_prefix(crates_dir)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .replace('\\', "/");
@@ -1892,8 +1922,6 @@ fn collect_command_rust_files() -> Vec<(String, String)> {
             }
         }
     }
-    files.sort();
-    files
 }
 
 /// Unsupported 能力集合：SQLite 下 `require_supported` 对这些能力 fail-closed，

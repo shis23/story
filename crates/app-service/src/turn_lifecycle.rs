@@ -342,7 +342,7 @@ pub struct AcceptDecisionInput<'a> {
 
 /// Validate the request-owned identifiers before an adapter reads any
 /// request-selected campaign or conversation state.
-pub(crate) fn ensure_accept_scope(
+pub fn ensure_accept_scope(
     campaign_id: &Id,
     conversation_id: &Id,
     turn: &TurnRecord,
@@ -364,7 +364,7 @@ pub(crate) fn ensure_accept_scope(
 
 /// Return the shared terminal replay decision before adapters perform reads
 /// that are unnecessary for an already committed attempt.
-pub(crate) fn evaluate_accept_replay(
+pub fn evaluate_accept_replay(
     turn: &TurnRecord,
     attempt: &TurnAttempt,
 ) -> Result<Option<AcceptOutcome>, AcceptError> {
