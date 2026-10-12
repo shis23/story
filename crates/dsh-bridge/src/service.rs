@@ -12,13 +12,16 @@
 //! - 与 DSH 历史对齐：调用方可带上 DSH 历史里已完成的轮数，与存档里已采纳的
 //!   轮数不一致时拒绝执行（已采纳的轮次不能重写，DSH 的重新生成 / 编辑历史会
 //!   造成两边错位）。分叉只支持从最新一轮（与生产 `fork_campaign` 的约束一致）。
+//! - 取消只作用于前台：还在排队等锁的写作请求直接放弃（不执行），正在成文的一轮
+//!   中止。收尾不受 DSH 停止按钮影响——正文已经显示在 DSH 里，半途停下后处理会让
+//!   这一轮无法接受，会话与存档从此错位。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, mpsc};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use storyforge_app_service::error::TauriCommandError;
@@ -142,6 +145,30 @@ pub struct BridgeService {
     turn_lock: Arc<tokio::sync::Mutex<()>>,
     last_settle: Arc<Mutex<Option<SettleReport>>>,
     settling: Mutex<Option<JoinHandle<()>>>,
+    foreground: Arc<Mutex<Foreground>>,
+}
+
+/// 可被取消的前台写作：排队等锁的请求与正在成文的一轮。
+#[derive(Default)]
+struct Foreground {
+    next_ticket: u64,
+    /// 排队中的写作请求：(票号, 存档, 放弃信号)。
+    waiting: Vec<(u64, String, oneshot::Sender<()>)>,
+    /// 正在成文的一轮所属存档；收尾阶段为 None。
+    writing: Option<String>,
+}
+
+/// 成文阶段结束（或提前返回）时清掉前台标记。
+struct WritingPhase(Arc<Mutex<Foreground>>);
+
+impl Drop for WritingPhase {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).writing = None;
+    }
+}
+
+fn targets(scope: Option<&str>, campaign_id: &str) -> bool {
+    scope.is_none_or(|scope| scope == campaign_id)
 }
 
 impl BridgeService {
@@ -153,6 +180,7 @@ impl BridgeService {
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_settle: Arc::new(Mutex::new(None)),
             settling: Mutex::new(None),
+            foreground: Arc::new(Mutex::new(Foreground::default())),
         }
     }
 
@@ -195,8 +223,37 @@ impl BridgeService {
             .clone()
     }
 
-    /// 取消正在跑的写作或后处理（没有在跑的返回 false）。
-    pub fn cancel(&self) -> bool {
+    /// 取消前台写作（DSH 停止按钮）：`campaign_id` 所属的排队请求直接放弃，
+    /// 正在成文的那一轮中止；收尾不受影响。`campaign_id` 为 None 时不区分存档。
+    /// 返回是否取消了什么。
+    pub fn cancel(&self, campaign_id: Option<&str>) -> bool {
+        let mut foreground = self.foreground.lock().unwrap_or_else(|p| p.into_inner());
+        let (abandoned, kept): (Vec<_>, Vec<_>) = foreground
+            .waiting
+            .drain(..)
+            .partition(|(_, campaign, _)| targets(campaign_id, campaign));
+        foreground.waiting = kept;
+        let mut cancelled = false;
+        for (_, _, abandon) in abandoned {
+            cancelled |= abandon.send(()).is_ok();
+        }
+        if foreground
+            .writing
+            .as_deref()
+            .is_some_and(|campaign| targets(campaign_id, campaign))
+        {
+            cancelled |= self.cancel_current();
+        }
+        cancelled
+    }
+
+    /// 退出时用：连同收尾一起中止。
+    pub fn cancel_all(&self) -> bool {
+        let abandoned = self.cancel(None);
+        self.cancel_current() || abandoned
+    }
+
+    fn cancel_current(&self) -> bool {
         let slot = self
             .app
             .current_cancel
@@ -206,6 +263,39 @@ impl BridgeService {
             Some(handle) => handle.cancel_tx.send(true).is_ok(),
             None => false,
         }
+    }
+
+    /// 写作请求排队等锁；排队期间被取消则放弃，不执行。拿到锁后标记为前台成文。
+    async fn acquire_turn(
+        &self,
+        campaign_id: &str,
+    ) -> Result<(OwnedMutexGuard<()>, WritingPhase), BridgeError> {
+        let (abandon_tx, mut abandon_rx) = oneshot::channel();
+        let ticket = {
+            let mut foreground = self.foreground.lock().unwrap_or_else(|p| p.into_inner());
+            foreground.next_ticket += 1;
+            let ticket = foreground.next_ticket;
+            foreground
+                .waiting
+                .push((ticket, campaign_id.to_string(), abandon_tx));
+            ticket
+        };
+        let abandoned = || BridgeError::new("cancelled", "已取消：这一轮还在排队，没有执行");
+        let guard = tokio::select! {
+            guard = self.acquire() => guard,
+            _ = &mut abandon_rx => return Err(abandoned()),
+        };
+        let mut foreground = self.foreground.lock().unwrap_or_else(|p| p.into_inner());
+        foreground
+            .waiting
+            .retain(|(waiting, _, _)| *waiting != ticket);
+        // 拿锁与取消同时发生：以取消为准。
+        if abandon_rx.try_recv().is_ok() {
+            return Err(abandoned());
+        }
+        foreground.writing = Some(campaign_id.to_string());
+        drop(foreground);
+        Ok((guard, WritingPhase(self.foreground.clone())))
     }
 
     /// 等上一轮收尾结束后拿到串行锁。
@@ -369,7 +459,7 @@ impl BridgeService {
         history_turns: Option<usize>,
         observer: Arc<dyn TurnObserver>,
     ) -> Result<TurnOutput, BridgeError> {
-        let guard = self.acquire().await;
+        let (guard, writing_phase) = self.acquire_turn(campaign_id).await?;
         let usage_before = self.llm.usage();
         if intent.trim().is_empty() {
             return Err(BridgeError::new("validation", "本轮输入为空"));
@@ -420,6 +510,8 @@ impl BridgeService {
             None,
         )
         .await;
+        // 成文结束：之后的收尾不再响应取消。
+        drop(writing_phase);
         let value = match result {
             Ok(value) => value,
             Err(error) => {

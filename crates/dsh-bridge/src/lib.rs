@@ -15,7 +15,8 @@
 //! - `turn.run {campaign_id, intent, generation_mode?, history_turns?}` → `TurnOutput`
 //!   （成文即返回；`generation_mode` 取 `continuation` / `duet` / `big_scene` /
 //!   `sequential_crew`，省略走自动路由；`history_turns` 与存档不一致时报 `out_of_sync`）
-//! - `turn.cancel {}` → `{cancelled}`
+//! - `turn.cancel {campaign_id?}` → `{cancelled}`（只取消前台：排队中的写作请求放弃，
+//!   正在成文的一轮中止；收尾照常完成。省略 `campaign_id` 时不区分存档）
 //! - `bridge.shutdown {}` → `{}` 后退出
 //!
 //! sidecar → 插件：
@@ -197,7 +198,10 @@ pub async fn handle_request(
                 .map_err(to_rpc)?;
             encode(serde_json::to_value(output))
         }
-        "turn.cancel" => Ok(json!({ "cancelled": service.cancel() })),
+        "turn.cancel" => {
+            let campaign_id = params.get("campaign_id").and_then(Value::as_str);
+            Ok(json!({ "cancelled": service.cancel(campaign_id) }))
+        }
         other => Err(RpcError::new("unknown_method", format!("未知方法 {other}"))),
     }
 }
@@ -277,7 +281,7 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
 
     // 插件断开或要求退出：中止在跑的写作，挂起的模型调用一律失败。
     tracing::info!("bridge shutting down");
-    service.cancel();
+    service.cancel_all();
     peer.fail_all();
     drop(observer);
     drop(service);

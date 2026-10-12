@@ -308,18 +308,37 @@ impl FakePlugin {
     }
 
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, Value> {
+        let id = self.send_request(method, params).await;
+        self.response(&id).await
+    }
+
+    /// 只发请求不等响应，返回请求 id（配合 [`Self::response`]）。
+    pub async fn send_request(&mut self, method: &str, params: Value) -> String {
         let id = format!("p-{}", self.next_id);
         self.next_id += 1;
         self.send(json!({ "id": id, "method": method, "params": params }))
             .await;
+        id
+    }
+
+    /// 一直读到指定请求的响应（期间照常应答模型调用、记录事件）。
+    pub async fn response(&mut self, id: &str) -> Result<Value, Value> {
         loop {
             let message = self.pump().await;
-            if message["id"] == id.as_str() && message.get("method").is_none() {
+            if message["id"] == id && message.get("method").is_none() {
                 return match message.get("error") {
                     Some(error) => Err(error.clone()),
                     None => Ok(message["result"].clone()),
                 };
             }
+        }
+    }
+
+    /// 应答所有被扣下的模型调用，之后的调用照常即时应答。
+    pub async fn release_held(&mut self) {
+        self.hold_llm = false;
+        for request in std::mem::take(&mut self.held) {
+            self.answer_llm(&request).await;
         }
     }
 
