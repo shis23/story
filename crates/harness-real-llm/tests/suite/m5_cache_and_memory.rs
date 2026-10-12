@@ -5,7 +5,7 @@
 //!
 //! 运行：
 //! ```text
-//! cargo test -p harness-real-llm --test m5_cache_and_memory -- --ignored --nocapture
+//! cargo test -p harness-real-llm --test suite m5_cache_and_memory:: -- --ignored --nocapture
 //! # 或
 //! powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite m5
 //! ```

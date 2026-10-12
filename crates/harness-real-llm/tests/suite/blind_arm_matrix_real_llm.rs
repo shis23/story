@@ -6,7 +6,7 @@
 //! $env:LLM_API_KEY='<process-only secret>'
 //! $env:LLM_MODEL='glm-5.2'
 //! $env:STORYFORGE_LLM_TIMEOUT_SECS='600'
-//! cargo test -p harness-real-llm --test blind_arm_matrix_real_llm -- --ignored --nocapture
+//! cargo test -p harness-real-llm --test suite blind_arm_matrix_real_llm:: -- --ignored --nocapture
 //! ```
 //!
 //! The tracked evidence is privacy-safe: scores, arm identities, latency, usage,
