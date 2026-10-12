@@ -49,7 +49,7 @@
 | history | `DEFAULT_HISTORY_WINDOW_SIZE=20` 消息条 + epoch 整块前移；可有确定性 `【历史纪要】checkpoint` |
 | RoundSummary / Chronicle A 字段 | **Summarizer** 产出 content；`build_mutation_batch` 分配 `code`（A####）+ `headline` 截断；兼容字段 `lineage_id`/`covered_by`；`to_chronicle_a()` 纯转换；**Accept 后**落盘 |
 | MemoryArchiver | **已有**：对话**消息正文**过长时批压 → `ArchivedSummary` 入向量库（水位 `archived_upto`） |
-| 远记忆召回 | RoundSummary 索引向量库（metadata 含 `source_kind=chronicle_a` / `code` / `lineage_id`）；`intent → hybrid → top≈3` 进 tail |
+| 远记忆召回 | RoundSummary 索引向量库（metadata 含 `source_kind=chronicle_a` / `code` / `lineage_id`）；`intent → hybrid → top≈3` 进 tail（向量库先取 3 + 近期摘要条数 12 个候选，剔除与近期摘要重复的再取前 3，免得最近几轮的摘要占掉名额） |
 | M0 公式与类型 | **`crates/domain/src/chronicle.rs`**：身份、lineage、revision 规则、epoch 成员、`ContextEpochSnapshot`、`compile_history_blocks`、compress 分组/`covers` 校验、overview 选择；单测覆盖 |
 | epoch 快照接线 / 概览进 history | **已接线**：`Campaign.context_epoch` 持久化；`fill_campaign`/`start_writing`/`regenerate` 编译入口 `refresh_context_epoch`（满 E rollover + chronicle_revision bump）；Director history 前缀 + tail 硬去重 |
 | `search_chronicle` / `get_chronicle` | **已完成（可独立部分）**（Director；A/B/C 目录 + 每轮预算；数据源=RoundSummary 兼容视图） |
