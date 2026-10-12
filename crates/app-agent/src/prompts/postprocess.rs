@@ -320,7 +320,22 @@ pub fn register_postprocess_tools(registry: &mut ToolRegistry) {
                                     "properties": {
                                         "title": {"type": "string"},
                                         "description": {"type": "string"},
-                                        "triggers": {"type": "array"},
+                                        "triggers": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "kind": {
+                                                        "type": "string",
+                                                        "enum": ["event", "turn_reminder", "story_time", "manual"]
+                                                    },
+                                                    "description": {"type": "string"},
+                                                    "at_turn": {"type": "integer"},
+                                                    "target": {"type": "string"}
+                                                },
+                                                "required": ["kind"]
+                                            }
+                                        },
                                         "related_characters": {"type": "array", "items": {"type": "string"}}
                                     }
                                 }
