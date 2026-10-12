@@ -1599,6 +1599,55 @@ pub fn count_uncovered_chronicle_levels_for_backend(
     }
 }
 
+pub const COMPRESS_A_THRESHOLD_ENV: &str = "STORYFORGE_COMPRESS_A_THRESHOLD";
+pub const COMPRESS_B_THRESHOLD_ENV: &str = "STORYFORGE_COMPRESS_B_THRESHOLD";
+
+/// A→B / B→C 批压阈值（未覆盖条目数），进程内只解析一次。
+///
+/// 默认 `DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD` / `DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD`
+/// （200 / 200）。环境变量 `STORYFORGE_COMPRESS_A_THRESHOLD` /
+/// `STORYFORGE_COMPRESS_B_THRESHOLD`（正整数）可调低，供验收在十几轮内触发两级压缩；
+/// 入队判定与后台 worker 用同一组值。
+pub fn chronicle_compress_thresholds() -> (usize, usize) {
+    static THRESHOLDS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *THRESHOLDS.get_or_init(|| {
+        let a = parse_compress_threshold(
+            COMPRESS_A_THRESHOLD_ENV,
+            std::env::var(COMPRESS_A_THRESHOLD_ENV).ok().as_deref(),
+            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
+        );
+        let b = parse_compress_threshold(
+            COMPRESS_B_THRESHOLD_ENV,
+            std::env::var(COMPRESS_B_THRESHOLD_ENV).ok().as_deref(),
+            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
+        );
+        tracing::info!(
+            target: "chronicle_compressor",
+            a_threshold = a,
+            b_threshold = b,
+            "chronicle compress thresholds"
+        );
+        (a, b)
+    })
+}
+
+/// 未设置 → 默认值；正整数 → 该值；其它（0、负数、非数字）告警后用默认值。
+fn parse_compress_threshold(name: &str, raw: Option<&str>, default: usize) -> usize {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                target: "chronicle_compressor",
+                "{name}={raw:?} 不是正整数，沿用默认值 {default}"
+            );
+            default
+        }
+    }
+}
+
 /// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
 /// SQLite 走 V006 `chronicle_compress_jobs` 表；JSON 走 CompressJobStore。
 pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: Id) {
@@ -1615,14 +1664,9 @@ pub fn maybe_spawn_chronicle_compress(state: Arc<crate::AppState>, campaign_id: 
                 return;
             }
         };
-    let need_a = storyforge_domain::chronicle::should_enqueue_compress(
-        uncovered_a,
-        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
-    );
-    let need_b = storyforge_domain::chronicle::should_enqueue_compress(
-        uncovered_b,
-        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
-    );
+    let (a_threshold, b_threshold) = chronicle_compress_thresholds();
+    let need_a = storyforge_domain::chronicle::should_enqueue_compress(uncovered_a, a_threshold);
+    let need_b = storyforge_domain::chronicle::should_enqueue_compress(uncovered_b, b_threshold);
     if !need_a && !need_b {
         return;
     }
@@ -1784,6 +1828,7 @@ fn production_compress(
         };
         let tool_snapshot = state.snapshot_tool_ctx();
         let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
+        let (a_threshold, b_threshold) = chronicle_compress_thresholds();
         storyforge_app_agent::run_compress_if_needed(
             &runtime,
             &campaign_id,
@@ -1792,8 +1837,8 @@ fn production_compress(
             entries,
             cancel,
             None,
-            None,
-            None,
+            Some(a_threshold),
+            Some(b_threshold),
         )
         .await
     })
@@ -2275,6 +2320,21 @@ mod tests {
         let conv_store = Arc::new(ConversationStore::new(dir.join("conversations")));
         let workflow = TurnWorkflow::new(storage.clone(), conv_store.clone());
         (storage, conv_store, workflow)
+    }
+
+    #[test]
+    fn compress_threshold_env_accepts_only_positive_integers() {
+        let name = COMPRESS_A_THRESHOLD_ENV;
+        assert_eq!(parse_compress_threshold(name, None, 200), 200);
+        assert_eq!(parse_compress_threshold(name, Some("8"), 200), 8);
+        assert_eq!(parse_compress_threshold(name, Some(" 12 "), 200), 12);
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                parse_compress_threshold(name, Some(bad), 200),
+                200,
+                "{bad:?}"
+            );
+        }
     }
 
     /// 三.8 判别测试：Attempt 更新（update_turn_record）失败时，conversation

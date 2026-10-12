@@ -204,7 +204,7 @@ User Intent
 职责：
 
 - 阈值触发时，由**系统**按时间将未覆盖 A（或 B）切成连续不重叠组；**LLM 只写**每组 headline/summary；**系统**填 `covers`/`covered_by` 并校验「恰好覆盖一次」。
-- 实验默认：active A 达 200、组大小 4 → 约 50 条 B；B 同理 → C（参数可测后调整）。
+- 实验默认：active A 达 200、组大小 4 → 约 50 条 B；B 同理 → C（参数可测后调整）。验收时可用环境变量 `STORYFORGE_COMPRESS_A_THRESHOLD` / `STORYFORGE_COMPRESS_B_THRESHOLD`（正整数，进程启动时读一次）调低阈值，十几轮内触发两级压缩；入队判定与后台 worker 用同一组值。
 - 后台异步，失败可重试；发布时递增 `chronicle_revision`；**不**进入每轮成文热路径，**不**随意 bump `campaign_revision`。
 
 不负责：本轮成文摘要、消息归档、状态写回。可与 Summarizer 共用模型档，但 **独立入口/角色**。

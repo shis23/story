@@ -437,7 +437,7 @@ impl CampaignMutationCoordinator {
                             .count();
                         if storyforge_domain::chronicle::should_enqueue_compress(
                             uncovered_a,
-                            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
+                            crate::backend_workflows::chronicle_compress_thresholds().0,
                         ) {
                             tracing::info!(
                                 target: "chronicle_compressor",
