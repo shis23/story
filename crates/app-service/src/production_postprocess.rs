@@ -198,18 +198,14 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
         original_provenance,
     } = request;
     let original_text = final_text.clone();
-    let contract = pipeline
-        .session()
-        .and_then(|session| session.plan.as_ref())
-        .map(|plan| {
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                plan,
-                writing_ctx.campaign_runtime.as_deref(),
-            )
-        });
+    let contract = pipeline.narrative_contract(
+        pipeline.session().and_then(|session| session.plan.as_ref()),
+        writing_ctx.campaign_runtime.as_deref(),
+        conversation_id,
+    );
     let mut quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
         &final_text,
-        contract.as_ref(),
+        Some(&contract),
     );
     emit_quality_checked(event_tx, &quality_report);
 
@@ -238,19 +234,10 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
             .await
         {
             Ok((fixed_text, fixed_provenance)) => {
-                let contract = pipeline
-                    .session()
-                    .and_then(|session| session.plan.as_ref())
-                    .map(|plan| {
-                        storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                            plan,
-                            writing_ctx.campaign_runtime.as_deref(),
-                        )
-                    });
                 let fixed_report =
                     storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
                         &fixed_text,
-                        contract.as_ref(),
+                        Some(&contract),
                     );
                 emit_quality_checked(event_tx, &fixed_report);
                 if !autofix_result_can_replace_original(&fixed_report) {
@@ -269,7 +256,7 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
                     quality_report =
                         storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
                             &final_text,
-                            contract.as_ref(),
+                            Some(&contract),
                         );
                     emit_quality_checked(event_tx, &quality_report);
                 } else {
@@ -3078,6 +3065,80 @@ mod tests {
                 return Err("injected mark_failed storage failure".into());
             }
             self.inner.mark_failed_if_current(identity, reason)
+        }
+    }
+
+    // ── 卡开场白确立的格式：状态栏 HTML 不触发 auto-fix ──────────────────────
+
+    /// 第一人称 + 状态栏开场的卡：同结构状态栏留在正文里，质量门放行、不跑
+    /// Editor auto-fix（mock 修订稿不会替换原稿）；没有这段开场白时照旧 auto-fix。
+    #[tokio::test]
+    async fn card_status_bar_from_opening_skips_editor_autofix() {
+        use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
+        use storyforge_domain::conversation::Role;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conv_store = Arc::new(ConversationStore::new(dir.path().to_path_buf()));
+        let draft = "我在她对面坐下。她把笔记本合上，看了我一眼，又转头望向窗外的操场。\
+            午后的阳光落在桌角，粉笔灰在光里慢慢浮动。我数着她睫毛投下的影子，等她先开口。\n\
+            <details><summary>状态栏</summary><div><ul><li>时间：中午</li></ul></div></details>";
+
+        for (opening, expect_autofix) in [
+            (
+                Some(
+                    "我推开门，她抬头看了我一眼。我没说话，我只是把信放在桌上。\n\
+                     <details><summary>状态栏</summary><div><ul><li>时间：上午</li></ul></div></details>",
+                ),
+                false,
+            ),
+            (None, true),
+        ] {
+            let conversation_id = conv_store.create(None, None).id;
+            if let Some(opening) = opening {
+                conv_store
+                    .append_final_message(&conversation_id, Role::Assistant, opening.into())
+                    .unwrap();
+            }
+            let draft_node_id = conv_store
+                .append_ai_draft(&conversation_id, draft.into(), None)
+                .unwrap();
+            let mut pipeline = PipelineOrchestrator::new(
+                Arc::new(storyforge_infra_llm::mock_client::MockLlmClient::new(
+                    vec![],
+                )),
+                conv_store.clone(),
+                Arc::new(storyforge_app_agent::tools::ToolContext::empty()),
+                None,
+            );
+            let writing_ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+
+            let (text, report, _) = run_quality_gate_with_optional_editor_autofix(
+                draft.to_string(),
+                QualityAutofixRequest {
+                    pipeline: &mut pipeline,
+                    draft_node_id: &draft_node_id,
+                    conversation_id: &conversation_id,
+                    writing_ctx: &writing_ctx,
+                    event_tx: &event_tx,
+                    cancel,
+                    log_prefix: "test",
+                    original_provenance: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            if expect_autofix {
+                assert_ne!(
+                    text, draft,
+                    "无开场白时 <div> 仍是格式泄漏，应走 auto-fix: {report:?}"
+                );
+            } else {
+                assert_eq!(text, draft);
+                assert!(report.passed(), "{:?}", report.warnings);
+            }
         }
     }
 }

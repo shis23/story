@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import {
   formatContent,
   shouldRenderHtmlDisplay,
+  splitRawHtmlBlocks,
 } from '../src/utils/formatContent.js'
 
 test('formats markdown text while escaping raw html', () => {
@@ -44,4 +45,26 @@ test('keeps derived plain-text display content on the text formatter path', () =
 
 test('ignores unknown custom tags in derived content', () => {
   assert.equal(shouldRenderHtmlDisplay('<status>HP 5</status>', '<data_block>hp=5</data_block>'), false)
+})
+
+test('splits a card status bar block out of raw message text', () => {
+  const statusBar = '<details style="border:1px solid #ccc"><summary>状态栏</summary>'
+    + '<div><ul><li><b>时间:</b> 上午</li></ul><div>嵌套</div></div></details>'
+  const text = `我推开门。\r\n\r\n${statusBar}\r\n<StatusPlaceHolderImpl/>`
+  assert.deepEqual(splitRawHtmlBlocks(text), [
+    { type: 'text', content: '我推开门。' },
+    { type: 'html', content: statusBar },
+    { type: 'text', content: '<StatusPlaceHolderImpl/>' },
+  ])
+})
+
+test('leaves plain text, data tags and unclosed blocks byte-identical', () => {
+  for (const text of [
+    '普通正文\n第二行',
+    '<data_block>hp=5</data_block>',
+    '正文 <div class="bar">流式中还没闭合',
+    '<span>行内</span>不算块',
+  ]) {
+    assert.deepEqual(splitRawHtmlBlocks(text), [{ type: 'text', content: text }])
+  }
 })
