@@ -43,7 +43,8 @@ export function classifyCall(messages) {
 
   const actor = system.indexOf(ACTOR)
   if (actor >= 0) {
-    // 名字取最后一处「你是角色 X。」：子 Agent 基础模板开头还有一句没替换的 `{name}`。
+    // 名字取最后一处「你是角色 X。」：79326ea 之前的 sidecar，子 Agent 基础模板开头还有
+    // 一句没替换的 `{name}`，旧版本和旧调用日志里仍会出现。
     const start = system.lastIndexOf(ACTOR) + ACTOR.length
     const end = system.indexOf('。', start)
     const name = end > start ? system.slice(start, end).trim() : ''

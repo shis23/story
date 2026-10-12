@@ -377,7 +377,8 @@ fn system_text(request: &Value) -> String {
 }
 
 /// 子 Agent 请求的角色显示名（系统提示词里的「你是角色 X。」）；不是子 Agent 返回 None。
-/// 取最后一处：子 Agent 基础模板开头还有一句未替换的「你是角色 {name}。」。
+/// 取最后一处：79326ea 之前子 Agent 基础模板开头还有一句未替换的「你是角色 {name}。」，
+/// 现在模板已不带身份句，只剩运行时追加的这一处。
 fn subagent_name(request: &Value) -> Option<String> {
     let text = system_text(request);
     let start = text.rfind("你是角色 ")? + "你是角色 ".len();
