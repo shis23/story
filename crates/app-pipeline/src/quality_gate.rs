@@ -28,13 +28,17 @@ pub fn run_quality_gate_with_contract(
     text: &str,
     contract: Option<&NarrativeContract>,
 ) -> QualityReport {
+    // 复读 / 字数只看正文：卡自带状态栏的标签与内联样式是模板，每轮照抄不算复读。
+    let prose = contract.map_or(std::borrow::Cow::Borrowed(text), |c| {
+        c.strip_card_markup(text)
+    });
     let mut warnings: Vec<QualityWarning> = vec![
-        check_ngram_repetition(text),
+        check_ngram_repetition(&prose),
         check_meta_description(text),
-        check_too_short(text),
+        check_too_short(&prose),
         check_perspective_leak(text),
         check_format_leak(text, contract),
-        check_consecutive_repeat(text),
+        check_consecutive_repeat(&prose),
         check_em_dash(text, contract),
         check_negation_then_affirmation(text, contract),
     ]
@@ -986,6 +990,51 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 真实卡的状态栏：每个 `<li>` 带同样的内联样式，开场白还用破折号。
+    /// 带开场白契约时既不算复读也不算破折号违规，整份报告通过（不触发 auto-fix）；
+    /// 无契约时两项照旧报出。
+    #[test]
+    fn card_status_bar_styles_and_opening_em_dash_pass_with_opening_contract() {
+        use storyforge_domain::narrative_contract::OpeningStyle;
+
+        let items: String = [("时间", "周一上午"), ("地点", "高二A班"), ("事件", "初次重逢"), ("状态", "强装镇定"), ("破绽", "指节发白")]
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "<li style=\"padding: 2px 0; border-bottom: 1px dashed #d3c9b3\"><b>{k}:</b> {v}</li>"
+                )
+            })
+            .collect();
+        let bar = format!(
+            "<details style=\"padding: 12px\"><summary>状态栏</summary><div><ul>{items}</ul></div></details>"
+        );
+        let opening = format!("我瞥见——她握笔的手指在发抖。\n{bar}");
+        let contract =
+            NarrativeContract::default().with_opening_style(&OpeningStyle::from_opening(&opening));
+        let draft = format!(
+            "我在她身边站定——她没有抬头。窗外的蝉鸣忽远忽近，粉笔灰落在课桌一角。\
+             我想开口——又咽了回去。她的笔尖停在半空——像在等什么。\n{bar}"
+        );
+
+        let with_card = run_quality_gate_with_contract(&draft, Some(&contract));
+        assert!(with_card.passed(), "{:?}", with_card.warnings);
+
+        let without = run_quality_gate(&draft);
+        let codes: Vec<_> = without.warnings.iter().map(|w| &w.code).collect();
+        assert!(
+            codes
+                .iter()
+                .any(|c| matches!(c, QualityWarningCode::NgramRepetition { .. })),
+            "{codes:?}"
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|c| matches!(c, QualityWarningCode::EmDashDensity { .. })),
+            "{codes:?}"
+        );
     }
 
     /// 卡开场白自带的状态栏 HTML 是卡的既定格式：不算格式泄漏、不触发 auto-fix；

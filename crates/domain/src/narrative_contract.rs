@@ -25,16 +25,19 @@ pub enum NarrativePov {
 
 /// 开场白确立的叙事风格。
 ///
-/// 对话首条开场白（卡的 first_mes / 所选 greeting）决定两件事：
+/// 对话首条开场白（卡的 first_mes / 所选 greeting）决定：
 /// - 叙述人称：第一/第二人称开场的卡，正文沿用同一人称；
 /// - 卡自带标记：开场白里出现的 HTML 标签（状态栏等）与代码围栏是卡的既定格式，
-///   质量门不把它们当格式泄漏。`<think>` 永远不算卡的格式。
+///   质量门不把它们当格式泄漏，也不拿标签和内联样式算复读。`<think>` 永远不算卡的格式；
+/// - 破折号：开场白自己用破折号时，正文照用不算违规（默认文风禁破折号）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpeningStyle {
     /// 推断出的人称；None = 判断不出（沿用默认限知第三人称）
     pub pov: Option<NarrativePov>,
     /// 小写 HTML 标签名，代码围栏记为 "```"；去重排序
     pub card_markup: Vec<String>,
+    /// 开场白用了破折号（—）
+    pub uses_em_dash: bool,
 }
 
 /// 人称判定的最低出现次数（叙述部分）
@@ -45,8 +48,29 @@ impl OpeningStyle {
         Self {
             pov: infer_opening_pov(text),
             card_markup: collect_card_markup(text),
+            uses_em_dash: text.contains('—'),
         }
     }
+}
+
+/// `s` 以 `<` 开头时解析一个 HTML 标签：返回 (小写标签名, 标签名之后的字节偏移)。
+/// 名字后必须紧跟 `>` `/` 或空白，`<!--`、`<3`、`< ` 之类都不算。
+fn html_tag_name(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut j = 1;
+    if bytes.get(j) == Some(&b'/') {
+        j += 1;
+    }
+    let start = j;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+        j += 1;
+    }
+    let terminated = matches!(
+        bytes.get(j),
+        Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
+    );
+    (j > start && bytes[start].is_ascii_alphabetic() && terminated)
+        .then(|| (s[start..j].to_ascii_lowercase(), j))
 }
 
 fn collect_card_markup(text: &str) -> Vec<String> {
@@ -54,30 +78,12 @@ fn collect_card_markup(text: &str) -> Vec<String> {
     if text.contains("```") {
         tags.insert("```".to_string());
     }
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
+    for (i, _) in text.match_indices('<') {
+        if let Some((name, _)) = html_tag_name(&text[i..])
+            && name != "think"
+        {
+            tags.insert(name);
         }
-        let mut j = i + 1;
-        if j < bytes.len() && bytes[j] == b'/' {
-            j += 1;
-        }
-        let start = j;
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
-            j += 1;
-        }
-        let terminated =
-            j < bytes.len() && matches!(bytes[j], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n');
-        if j > start && bytes[start].is_ascii_alphabetic() && terminated {
-            let name = text[start..j].to_ascii_lowercase();
-            if name != "think" {
-                tags.insert(name);
-            }
-        }
-        i = j.max(i + 1);
     }
     tags.into_iter().collect()
 }
@@ -300,7 +306,48 @@ impl NarrativeContract {
             self.pov_from_opening = true;
         }
         self.card_markup = style.card_markup.clone();
+        if style.uses_em_dash {
+            self.style_constraints.ban_em_dash = false;
+        }
         self
+    }
+
+    /// 去掉卡自带的标记（`card_markup` 里的 HTML 标签与 HTML 注释），只留其中文字；
+    /// 去掉的标签处断行，免得相邻条目粘成一串。给复读 / 字数这类正文检查用：
+    /// 状态栏的标签与内联样式是模板，不是复读。
+    pub fn strip_card_markup<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.card_markup.iter().any(|m| m != "```") {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(lt) = rest.find('<') {
+            out.push_str(&rest[..lt]);
+            let tail = &rest[lt..];
+            if tail.starts_with("<!--") {
+                rest = tail.find("-->").map_or("", |end| &tail[end + 3..]);
+                continue;
+            }
+            let card_tag = html_tag_name(tail)
+                .filter(|(name, _)| self.allows_card_markup(name))
+                .and_then(|(_, after_name)| {
+                    tail[after_name..].find('>').map(|gt| after_name + gt + 1)
+                });
+            match card_tag {
+                Some(end) => {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    rest = &tail[end..];
+                }
+                None => {
+                    out.push('<');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        std::borrow::Cow::Owned(out)
     }
 
     /// 卡开场白是否用过该标记（小写标签名，或 "```"）
@@ -706,6 +753,37 @@ mod tests {
         assert_eq!(plain, NarrativeContract::default());
         assert!(!plain.render_for_prompt().contains("沿用开场白"));
         assert!(plain.card_markup_instruction().is_none());
+    }
+
+    #[test]
+    fn strip_card_markup_keeps_text_and_foreign_tags() {
+        let contract = NarrativeContract::default()
+            .with_opening_style(&OpeningStyle::from_opening(FIRST_PERSON_OPENING));
+        let draft = "我坐下。a < b\n<!-- 注释 -->\
+            <details><summary style=\"padding: 4px\">状态栏</summary>\
+            <div style=\"line-height:1.6\"><ul><li><b>时间:</b> 中午</li></ul></div></details>\
+            <span>外来</span>";
+        assert_eq!(
+            contract.strip_card_markup(draft),
+            "我坐下。a < b\n状态栏\n时间:\n 中午\n<span>外来</span>"
+        );
+        // 没有卡标记：原样借用，不分配
+        let plain = NarrativeContract::default();
+        assert!(matches!(
+            plain.strip_card_markup(draft),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn opening_with_em_dash_lifts_the_em_dash_ban() {
+        let with_dash = NarrativeContract::default()
+            .with_opening_style(&OpeningStyle::from_opening("我瞥见——她的手指在发抖。"));
+        assert!(!with_dash.style_constraints.ban_em_dash);
+        assert!(with_dash.style_constraints.ban_negation_affirmation);
+        let without = NarrativeContract::default()
+            .with_opening_style(&OpeningStyle::from_opening("我看见她的手指在发抖。"));
+        assert!(without.style_constraints.ban_em_dash);
     }
 
     #[test]
