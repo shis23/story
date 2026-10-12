@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url'
 import { BridgeRpcError, createBridge } from './bridge.js'
 import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
 import { classifyCall } from './roles.js'
-import { fitSessionTitle, friendlyError, llmHint, openingText } from './text.js'
+import { fitSessionTitle, friendlyError, llmHint, readableText } from './text.js'
 
 import {
   API_BASE,
@@ -611,7 +611,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
 
     const turn = currentTurn(options.messages)
     if (turn.opening) {
-      const opening = openingText(session?.opening) || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
+      const opening = readableText(session?.opening) || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
       yield* streamBlock(0, 'text', opening, signal, 64, 0)
       yield* finishStop(opening.length)
       return
@@ -688,7 +688,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
       reasoning += summary
       yield { type: 'reasoning-delta', index: 0, text: summary }
       yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: reasoning } }
-      const text = result?.text ?? ''
+      const text = readableText(result?.text)
       yield* streamBlock(1, 'text', text, signal, 64, 0)
       yield* result?.usage ? finishWithUsage(toDshUsage(result.usage)) : finishStop(text.length)
     } finally {

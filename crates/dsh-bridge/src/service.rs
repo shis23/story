@@ -99,7 +99,12 @@ pub struct SettleReport {
 pub struct BridgeStatus {
     pub data_dir: String,
     pub active_campaign: Option<String>,
+    /// 写作锁被占用（前台成文或后台收尾）。
     pub busy: bool,
+    /// 正在前台成文的存档；收尾阶段为 None。
+    pub writing: Option<String>,
+    /// 排队等写作锁的存档（按到达顺序，可重复）。
+    pub queued: Vec<String>,
     pub last_settle: Option<SettleReport>,
     /// `native` / `text_fallback`
     pub tool_mode: &'static str,
@@ -185,10 +190,21 @@ impl BridgeService {
     }
 
     pub fn status(&self) -> BridgeStatus {
+        let (writing, queued) = {
+            let foreground = self.foreground.lock().unwrap_or_else(|p| p.into_inner());
+            let queued = foreground
+                .waiting
+                .iter()
+                .map(|(_, campaign, _)| campaign.clone())
+                .collect();
+            (foreground.writing.clone(), queued)
+        };
         BridgeStatus {
             data_dir: self.data_dir.display().to_string(),
             active_campaign: self.active_campaign().map(|id| id.to_string()),
             busy: self.turn_lock.try_lock().is_err(),
+            writing,
+            queued,
             last_settle: self
                 .last_settle
                 .lock()

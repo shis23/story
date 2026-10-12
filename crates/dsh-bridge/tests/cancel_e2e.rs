@@ -17,6 +17,21 @@ async fn create_campaign(plugin: &mut FakePlugin, card: &std::path::Path) -> Str
     created["campaign_id"].as_str().unwrap().to_string()
 }
 
+/// 轮询 `bridge.status` 直到满足条件（排队请求进入等待队列是异步的）。
+async fn status_until(plugin: &mut FakePlugin, ready: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..200 {
+        let status = plugin
+            .request("bridge.status", json!({}))
+            .await
+            .expect("bridge.status");
+        if ready(&status) {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("bridge.status 没有到达预期状态");
+}
+
 fn turn_params(campaign_id: &str, intent: &str, history_turns: usize) -> Value {
     json!({ "campaign_id": campaign_id, "intent": intent, "history_turns": history_turns })
 }
@@ -53,6 +68,14 @@ async fn cancelling_a_queued_turn_leaves_the_previous_settle_alone() {
     while plugin.held.is_empty() {
         plugin.pump().await;
     }
+    // 状态区分「上一轮收尾」与「本轮排队」：锁被占、没有前台成文、本存档在排队。
+    let status = status_until(&mut plugin, |s| {
+        s["queued"].as_array().is_some_and(|q| !q.is_empty())
+    })
+    .await;
+    assert_eq!(status["busy"], true, "{status}");
+    assert!(status["writing"].is_null(), "{status}");
+    assert_eq!(status["queued"], json!([campaign_id]), "{status}");
 
     let cancel = plugin
         .send_request("turn.cancel", json!({ "campaign_id": campaign_id }))
@@ -95,6 +118,9 @@ async fn cancelling_while_writing_aborts_the_turn_and_writing_continues() {
     while plugin.held.is_empty() {
         plugin.pump().await;
     }
+    let status = status_until(&mut plugin, |s| !s["writing"].is_null()).await;
+    assert_eq!(status["writing"], campaign_id.as_str(), "{status}");
+    assert_eq!(status["queued"], json!([]), "{status}");
     // 其它存档的取消不影响这一轮。
     let other = plugin
         .send_request("turn.cancel", json!({ "campaign_id": "another-campaign" }))

@@ -195,6 +195,20 @@ window.__ModuleLoader__.load({
 			if (status.status?.busy) return { label: "写作引擎工作中", tone: "run", title: "正在写作或后台收尾" };
 			return { label: "写作引擎就绪", tone: "ok", title: status.bridge.pid ? `sidecar pid ${status.bridge.pid}` : undefined };
 		}
+
+		/**
+		 * 某个存档在写作引擎里的阶段：`queued`（排队等上一轮收尾或别的故事）、`writing`（前台成文）、
+		 * `settling`（后台收尾：摘要 / 后处理 / 自动接受），都不是则 null。旧 sidecar 没有
+		 * writing / queued 字段时退回「锁被占且是当前存档 = 收尾中」。
+		 */
+		function enginePhase(status, campaignId) {
+			const engine = status?.status;
+			if (!campaignId || !engine) return null;
+			if (engine.writing === campaignId) return "writing";
+			if ((engine.queued ?? []).includes(campaignId)) return "queued";
+			if (engine.busy && !engine.writing && engine.active_campaign === campaignId) return "settling";
+			return null;
+		}
 		//#endregion
 
 		//#region 故事登记（插件 sessions.json + DSH 会话列表）
@@ -373,7 +387,7 @@ window.__ModuleLoader__.load({
 			const live = (status?.settles ?? []).filter((report) => story?.campaignId && report.campaign_id === story.campaignId);
 			// 本次运行还没有收尾时，退回登记里落盘的最近一次。
 			const settles = live.length > 0 ? live : story?.lastSettle ? [story.lastSettle] : [];
-			const working = story?.campaignId && status?.status?.busy && status.status.active_campaign === story.campaignId;
+			const phase = enginePhase(status, story?.campaignId);
 			const kv = (label, value, title) => [h("dt", { key: `${label}-k` }, label), h("dd", { key: `${label}-v`, title }, value ?? "—")];
 			return h(
 				React.Fragment,
@@ -382,11 +396,13 @@ window.__ModuleLoader__.load({
 					"div",
 					{ className: "sf-panel-head", title: `会话 ${sessionId}` },
 					showTitle && h("div", { className: "sf-card-title" }, story?.displayTitle ?? "StoryForge"),
-					story?.running
-						? h(Badge, { tone: "run" }, "写作中")
-						: working
-							? h(Badge, { tone: "run" }, "后台收尾中")
-							: settles[0] && h(AcceptBadge, { report: settles[0] }),
+					phase === "queued"
+						? h(Badge, { tone: "run", title: "写作引擎正忙（上一轮在后台收尾，或另一个故事正在写），空出来后自动开始" }, "排队中")
+						: story?.running || phase === "writing"
+							? h(Badge, { tone: "run" }, "写作中")
+							: phase === "settling"
+								? h(Badge, { tone: "run" }, "后台收尾中")
+								: settles[0] && h(AcceptBadge, { report: settles[0] }),
 				),
 				story
 					? h(
@@ -483,8 +499,10 @@ window.__ModuleLoader__.load({
 			if (status?.pipeline === "fake") return h("div", { className: "sf-root sf-dock" }, "StoryForge · 假管线");
 			const story = status?.sessions?.[sessionId];
 			const model = status?.model ? status.model.model : "未选底层模型";
-			const working = story?.campaignId && status?.status?.busy && status.status.active_campaign === story.campaignId;
-			const state = !status?.bridge?.running ? "引擎待命" : working ? "写作 / 收尾中" : "空闲";
+			const phase = enginePhase(status, story?.campaignId);
+			const state = !status?.bridge?.running
+				? "引擎待命"
+				: { queued: "排队中", writing: "写作中", settling: "后台收尾中" }[phase] ?? "空闲";
 			const last =
 				(status?.settles ?? []).find((report) => story?.campaignId && report.campaign_id === story.campaignId) ?? story?.lastSettle;
 			return h(

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { nextFreeName, readCardName, sanitizeCardFileName } from '../lib/cards.js'
-import { fitSessionTitle, friendlyError, llmHint, openingText } from '../lib/text.js'
+import { fitSessionTitle, friendlyError, llmHint, readableText } from '../lib/text.js'
 import { pngCard } from './support/png.mjs'
 
 test('readCardName reads V3 before V2 from PNG text chunks and V1/V2 from JSON', () => {
@@ -53,7 +53,7 @@ test('fitSessionTitle leaves room for DSH fork suffixes within 80 bytes', () => 
   assert.equal(fitSessionTitle('x'.repeat(73)), `${'x'.repeat(69)}…`)
 })
 
-test('openingText turns status-bar HTML into readable markdown text', () => {
+test('readableText turns status-bar HTML into readable markdown text', () => {
   const html = [
     '<p>第一段&nbsp;正文。</p>',
     '<!-- 注释 -->',
@@ -71,15 +71,15 @@ test('openingText turns status-bar HTML into readable markdown text', () => {
     '<StatusPlaceHolderImpl/>',
     '<user> 走进来。',
   ].join('\n')
-  const text = openingText(html)
+  const text = readableText(html)
   assert.equal(
     text,
     ['第一段\u00a0正文。', '', '📓 状态栏', '', '❄️ 莫挽舟', '', '- 穿着: 校服', '- 数值: 5 & 20', '', '<user> 走进来。'].join('\n'),
   )
   assert.doesNotMatch(text, /^ {4}/m, '行首四个空格会被 Markdown 当成代码块')
   // 没有 HTML 的开场白原样返回（只去首尾空白），ST 宏不动。
-  assert.equal(openingText('  <USER> 推开门。\n\n　　她抬起头。 '), '<USER> 推开门。\n\n　　她抬起头。')
-  assert.equal(openingText(undefined), '')
+  assert.equal(readableText('  <USER> 推开门。\n\n　　她抬起头。 '), '<USER> 推开门。\n\n　　她抬起头。')
+  assert.equal(readableText(undefined), '')
 })
 
 test('llmHint and friendlyError explain known model failures', () => {

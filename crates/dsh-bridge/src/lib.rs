@@ -8,7 +8,8 @@
 //! 协议（每行一个 JSON 对象，格式见 [`rpc`]）：
 //!
 //! 插件 → sidecar 请求：
-//! - `bridge.status {}` → `BridgeStatus`
+//! - `bridge.status {}` → `BridgeStatus`（`busy` 写作锁占用；`writing` 前台成文的存档；
+//!   `queued` 排队中的存档。busy 且 writing 为空 = 后台收尾）
 //! - `bridge.configure {tool_mode?: "native" | "text_fallback"}` → `{tool_mode}`
 //! - `campaign.create {card_path, name?}` → `CampaignCreated`
 //! - `campaign.fork {campaign_id, history_turns, name?}` → `CampaignForked`（只从最新一轮）

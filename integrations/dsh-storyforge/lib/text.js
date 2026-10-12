@@ -40,11 +40,12 @@ const BLOCK_TAGS = 'p|div|ul|ol|h[1-6]|tr|table|details|summary|section|blockquo
 
 /**
  * 卡的开场白常带状态栏 HTML（`<div>` / `<details>` / `<li>` 以及 `<StatusPlaceHolderImpl/>`
- * 一类卡壳占位）。DSH 的对话视图按 Markdown 渲染，这些标签会变成整屏代码块。这里转成
- * 可读文字：去注释、脚本与样式，块级标签换行，`<li>` 变成 `- ` 列表，其余标签去掉。
- * 保留 `<user>` / `<char>` / `<bot>` 这类 ST 宏。存档里的开场白不变，只影响显示。
+ * 一类卡壳占位），模型照着开场白每轮也会写一份（StoryForge 的质量门把它当卡的既定格式放行）。
+ * DSH 的对话视图按 Markdown 渲染，这些标签会变成整屏代码块。这里转成可读文字：去注释、
+ * 脚本与样式，块级标签换行，`<li>` 变成 `- ` 列表，其余标签去掉。保留 `<user>` / `<char>` /
+ * `<bot>` 这类 ST 宏。存档里的原文不变，只影响显示；开场白与每轮回复共用。
  */
-export function openingText(raw) {
+export function readableText(raw) {
   const source = typeof raw === 'string' ? raw : ''
   if (!HTML_HINT.test(source)) return source.trim()
   const text = source
@@ -55,11 +56,11 @@ export function openingText(raw) {
     .replace(/<li\b[^>]*>/gi, '\n- ')
     .replace(new RegExp(`</?(?:${BLOCK_TAGS}|li)\\b[^>]*>`, 'gi'), '\n')
     .replace(/<\/?(?!(?:user|char|bot)>)[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?\/?>/g, '')
-  // \u884c\u9996\u7f29\u8fdb\u53bb\u6389\uff08Markdown \u91cc\u56db\u4e2a\u7a7a\u683c\u5c31\u6210\u4e86\u4ee3\u7801\u5757\uff1b\u5168\u89d2\u7a7a\u683c\u300c\u3000\u300d\u662f\u6b63\u6587\u7f29\u8fdb\uff0c\u4fdd\u7559\uff09\u3002
+  // 行首缩进去掉（Markdown 里四个空格就成了代码块；全角空格「　」是正文缩进，保留）。
   const lines = decodeEntities(text)
     .split('\n')
     .map((line) => line.replace(/^[ \t\u00a0]+|[ \t\u00a0]+$/g, ''))
-  // \u5217\u8868\u9879\u4e4b\u95f4\u7684\u7a7a\u884c\u53bb\u6389\uff0c\u514d\u5f97\u4e00\u6761\u72b6\u6001\u680f\u88ab\u62c6\u6210\u7a00\u758f\u7684\u677e\u6563\u5217\u8868\u3002
+  // 列表项之间的空行去掉，免得一条状态栏被拆成稀疏的松散列表。
   const kept = lines.filter((line, index) => {
     if (line) return true
     const previous = lines.slice(0, index).findLast((candidate) => candidate)
