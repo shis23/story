@@ -13,8 +13,9 @@
  *
  * 产物是手写的 CJS 工厂包（宿主只吃已构建的 lib/client.js，不做编译）。
  *
- * P2：首页选底层模型（StoryForge 管线内部每次模型调用都用它）与角色卡，新建故事
- * 时由 sidecar 导卡、识别角色、开档；停靠条与面板显示 sidecar 收尾状态。
+ * 首页（左侧栏 StoryForge）：新建故事、我的故事、管线设置（底层模型 / 生成模式 /
+ * 工具协议）、最近的收尾、底层模型调用；调试信息默认折叠。样式用 DSH 主题变量
+ * （`--dsw-alias-*`），亮 / 暗主题自动跟随。
  */
 window.__ModuleLoader__.load({
 	id: "dsh-plugin-storyforge",
@@ -45,7 +46,12 @@ window.__ModuleLoader__.load({
 			return body;
 		}
 
-		/** 定时拉取 `/status`（sidecar 状态、收尾报告）；组件卸载即停。 */
+		const postJson = (path, body) =>
+			api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+		const errorText = (e) => String(e?.message ?? e);
+
+		/** 定时拉取 `/status`（sidecar 状态、收尾报告、底层调用、故事登记）；组件卸载即停。 */
 		function useBridgeStatus(enabled, intervalMs = 3000) {
 			const [status, setStatus] = React.useState(null);
 			React.useEffect(() => {
@@ -65,53 +71,176 @@ window.__ModuleLoader__.load({
 			return status;
 		}
 
-		/** 本会话登记的故事信息（`/sessions` 里的一项）。 */
-		function useStoryInfo(enabled, sessionId) {
-			const [info, setInfo] = React.useState(null);
-			React.useEffect(() => {
-				if (!enabled) return;
-				api("/sessions")
-					.then((body) => setInfo(body.sessions?.[sessionId] ?? null))
-					.catch(() => setInfo(null));
-			}, [enabled, sessionId]);
-			return info;
+		/** DSH 的会话列表快照（标题、是否在跑）；拿不到时为 null。 */
+		function useSessionList() {
+			const list = rootCtx?.sessions?.list;
+			return React.useSyncExternalStore(
+				(onChange) => list?.subscribe?.(onChange) ?? (() => {}),
+				() => list?.getSnapshot?.() ?? null,
+			);
 		}
 
-		const ACCEPT_LABELS = { accepted: "已接受", accepted_degraded: "已接受（质量降级）", failed: "接受失败" };
-		const POSTPROCESS_LABELS = {
-			PostProcessDone: "后处理完成",
-			PostProcessFailed: "后处理失败",
-			PostProcessSkipped: "后处理跳过",
+		/** 有进行中的条目时每秒重绘一次（显示实时耗时）。 */
+		function useNow(active) {
+			const [now, setNow] = React.useState(() => Date.now());
+			React.useEffect(() => {
+				if (!active) return undefined;
+				const timer = setInterval(() => setNow(Date.now()), 1000);
+				return () => clearInterval(timer);
+			}, [active]);
+			return active ? Math.max(now, Date.now()) : now;
+		}
+
+		//#region 格式化
+		const pad = (n) => String(n).padStart(2, "0");
+
+		/** 本地时间：今天只显示时分秒，其它日期带月-日。 */
+		function formatTime(iso) {
+			if (!iso) return "—";
+			const d = new Date(iso);
+			if (Number.isNaN(d.getTime())) return String(iso);
+			const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+			return d.toDateString() === new Date().toDateString() ? time : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`;
+		}
+
+		function formatFullTime(iso) {
+			const d = new Date(iso);
+			return Number.isNaN(d.getTime()) ? String(iso ?? "") : d.toLocaleString("zh-CN", { hour12: false });
+		}
+
+		/** 列表用的短时间：今天「今天 14:32」，昨天「昨天 14:32」，更早「10-09 14:32」。 */
+		function formatShortTime(value) {
+			const d = new Date(value);
+			if (!value || Number.isNaN(d.getTime())) return "—";
+			const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+			const today = new Date();
+			if (d.toDateString() === today.toDateString()) return `今天 ${time}`;
+			const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+			if (d.toDateString() === yesterday.toDateString()) return `昨天 ${time}`;
+			return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`;
+		}
+
+		function formatDuration(ms) {
+			if (ms == null || Number.isNaN(ms)) return "—";
+			if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+			const seconds = ms / 1000;
+			if (seconds < 60) return `${seconds.toFixed(1)}s`;
+			const minutes = Math.floor(seconds / 60);
+			return `${minutes}m${pad(Math.floor(seconds - minutes * 60))}s`;
+		}
+
+		function formatTokens(n) {
+			if (n == null) return "—";
+			if (n < 1000) return String(n);
+			if (n < 100_000) return `${(n / 1000).toFixed(1)}k`;
+			if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+			return `${(n / 1_000_000).toFixed(1)}M`;
+		}
+
+		/** sidecar 的 UsageTotals → 一行文字。 */
+		function describeUsage(usage) {
+			if (!usage?.calls) return "—";
+			const failed = usage.failed_calls ? `，失败 ${usage.failed_calls}` : "";
+			const cached = usage.cache_read_tokens ? ` · 缓存 ${formatTokens(usage.cache_read_tokens)}` : "";
+			return `${usage.calls} 次${failed} · 入 ${formatTokens(usage.input_tokens)} 出 ${formatTokens(usage.output_tokens)}${cached}`;
+		}
+
+		const shortId = (id) => (id ? String(id).slice(0, 8) : "—");
+		//#endregion
+
+		//#region 状态 → 文案与色调
+		const ACCEPT = {
+			accepted: ["已接受", "ok"],
+			accepted_degraded: ["已接受（质量降级）", "warn"],
+			failed: ["接受失败", "err"],
 		};
+		const POSTPROCESS = {
+			PostProcessDone: ["后处理完成", "ok"],
+			PostProcessFailed: ["后处理失败", "err"],
+			PostProcessSkipped: ["后处理跳过", "idle"],
+		};
+		const LLM_STATUS = {
+			running: ["进行中", "run"],
+			ok: ["完成", "ok"],
+			error: ["失败", "err"],
+			aborted: ["已中止", "idle"],
+		};
+		const EXTRACTION = { extracted: "角色已识别", fallback: "角色识别失败（用兜底定义）" };
 
 		function describeSettle(report) {
 			if (!report) return "—";
-			const parts = [POSTPROCESS_LABELS[report.postprocess] ?? "后处理无终态", ACCEPT_LABELS[report.accept] ?? report.accept];
+			const parts = [POSTPROCESS[report.postprocess]?.[0] ?? "后处理无终态", ACCEPT[report.accept]?.[0] ?? report.accept];
 			if (report.accept_error) parts.push(report.accept_error);
 			if (report.usage?.calls) parts.push(`后处理 ${describeUsage(report.usage)}`);
 			return parts.join(" · ");
 		}
 
-		/** sidecar 的 UsageTotals → 一行文字。 */
-		function describeUsage(usage) {
-			if (!usage) return "—";
-			const failed = usage.failed_calls ? `（失败 ${usage.failed_calls}）` : "";
-			const cached = usage.cache_read_tokens ? ` 缓存 ${usage.cache_read_tokens}` : "";
-			return `${usage.calls} 次${failed} · 入 ${usage.input_tokens} 出 ${usage.output_tokens}${cached}`;
+		function Badge(props) {
+			return h("span", { className: `sf-badge sf-tone-${props.tone ?? "idle"}`, title: props.title }, props.children);
 		}
 
-		const LLM_STATUS_LABELS = { running: "进行中", ok: "完成", error: "失败", aborted: "已中止" };
-
-		/** 当前会话是否是 StoryForge 会话（预设名是会话头里的不可变事实，分叉会继承）。 */
-		function useIsStoryForge(props, sessionId) {
-			const selector = (state) => state?.byId?.[sessionId]?.projectionValues?.agentPreset === PRESET;
-			if (typeof props.useSessions === "function") return props.useSessions(selector);
-			const list = rootCtx?.sessions?.list;
-			return React.useSyncExternalStore(
-				(onChange) => list?.subscribe?.(onChange) ?? (() => {}),
-				() => (list ? selector(list.getSnapshot()) : false),
-			);
+		function AcceptBadge(props) {
+			const [label, tone] = ACCEPT[props.report?.accept] ?? [props.report?.accept ?? "—", "idle"];
+			return h(Badge, { tone, title: props.report?.accept_error ?? undefined }, label);
 		}
+
+		/** 写作引擎（sidecar 进程）整体状态。 */
+		function bridgeState(status) {
+			if (!status) return { label: "连接中…", tone: "idle" };
+			if (status.pipeline === "fake") return { label: "假管线", tone: "idle" };
+			if (status.statusError) return { label: "写作引擎异常", tone: "err", title: status.statusError };
+			if (!status.bridge?.running) return { label: "写作引擎待命", tone: "idle", title: "sidecar 未运行；新建故事或写作时自动启动" };
+			if (status.status?.busy) return { label: "写作引擎工作中", tone: "run", title: "正在写作或后台收尾" };
+			return { label: "写作引擎就绪", tone: "ok", title: status.bridge.pid ? `sidecar pid ${status.bridge.pid}` : undefined };
+		}
+		//#endregion
+
+		//#region 故事登记（插件 sessions.json + DSH 会话列表）
+		/**
+		 * 插件登记的故事，合上 DSH 会话列表的标题 / 运行状态和最近一次收尾，按最近活动排序。
+		 * 标题优先用 DSH 侧显示的标题（用户在侧栏看到的就是它）。
+		 */
+		function buildStories(status, snapshot) {
+			const registry = status?.sessions ?? {};
+			const settles = status?.settles ?? [];
+			// 会话列表还没加载（空）时不判"缺失"，免得一闪而过全部标成不在列表。
+			const loaded = Boolean(snapshot?.byId) && Object.keys(snapshot.byId).length > 0;
+			const stories = Object.entries(registry).map(([id, story]) => {
+				const summary = snapshot?.byId?.[id];
+				// 本次运行里的收尾优先，其次是登记里落盘的最近一次（跨 DSH 重启保留）。
+				const live = story.campaignId ? settles.find((report) => report.campaign_id === story.campaignId) : undefined;
+				const last = live ?? story.lastSettle;
+				// 最近活动：DSH 会话的最后一条消息、最近一次收尾、建档时间，取最晚的（毫秒）。
+				const activity = Math.max(
+					typeof summary?.updatedAt === "number" ? summary.updatedAt : 0,
+					Date.parse(last?.at ?? "") || 0,
+					Date.parse(story.createdAt ?? "") || 0,
+				);
+				return {
+					id,
+					...story,
+					displayTitle: summary?.displayTitle || story.title || id,
+					running: Boolean(summary?.running),
+					missing: loaded && !summary,
+					last,
+					activity,
+				};
+			});
+			// 分叉子会话在第一次发送前还没有存档，但来源会话有存档就能建立分支。
+			const byId = Object.fromEntries(stories.map((story) => [story.id, story]));
+			for (const story of stories) {
+				story.linked = Boolean(story.campaignId || (story.forkedFrom && byId[story.forkedFrom]?.campaignId));
+			}
+			stories.sort((a, b) => Number(b.linked) - Number(a.linked) || b.activity - a.activity);
+			return stories;
+		}
+
+		function campaignTitles(stories) {
+			const titles = {};
+			for (const story of stories) if (story.campaignId && !titles[story.campaignId]) titles[story.campaignId] = story.displayTitle;
+			return titles;
+		}
+		//#endregion
 
 		//#region 动态注册（引用计数：第一个持有者注册，最后一个释放者撤销；撤销幂等）
 		function dynamicRegistration(register) {
@@ -166,27 +295,30 @@ window.__ModuleLoader__.load({
 		);
 		//#endregion
 
-		const muted = { opacity: 0.6, fontSize: 12 };
-		const buttonStyle = {
-			all: "unset",
-			cursor: "pointer",
-			padding: "3px 10px",
-			borderRadius: 6,
-			fontSize: 12,
-			border: "1px solid color-mix(in srgb, currentColor 25%, transparent)",
-		};
-		const cellStyle = {
-			textAlign: "left",
-			padding: "4px 8px",
-			borderBottom: "1px solid color-mix(in srgb, currentColor 12%, transparent)",
-			verticalAlign: "top",
-		};
+		/** 当前会话是否是 StoryForge 会话（预设名是会话头里的不可变事实，分叉会继承）。 */
+		function useIsStoryForge(props, sessionId) {
+			const selector = (state) => state?.byId?.[sessionId]?.projectionValues?.agentPreset === PRESET;
+			if (typeof props.useSessions === "function") return props.useSessions(selector);
+			const list = rootCtx?.sessions?.list;
+			return React.useSyncExternalStore(
+				(onChange) => list?.subscribe?.(onChange) ?? (() => {}),
+				() => (list ? selector(list.getSnapshot()) : false),
+			);
+		}
 
 		function openPanel() {
 			try {
 				rootCtx.sidebarRight.openTab(PANEL_KIND);
 			} catch (e) {
 				console.error("[storyforge] open panel failed", e);
+			}
+		}
+
+		function openSession(sessionId) {
+			try {
+				rootCtx.uiWorkspace.openSession(sessionId);
+			} catch (e) {
+				console.error("[storyforge] open session failed", e);
 			}
 		}
 
@@ -225,61 +357,100 @@ window.__ModuleLoader__.load({
 			if (!isStoryForge) return null;
 			return h(
 				"button",
-				{ type: "button", style: buttonStyle, title: "打开 StoryForge 面板", onClick: openPanel },
+				{ type: "button", className: "sf-btn sf-btn-sm", title: "打开 StoryForge 面板", onClick: openPanel },
 				"StoryForge 面板",
 			);
 		}
 
-		/** 主区 StoryForge 视图（占位：验证可见性与切换；写作界面留到后续阶段）。 */
+		/** 本故事的信息与最近几轮的收尾（右栏面板与主区视图共用）。 */
+		function StoryDetails(props) {
+			const { sessionId, status, snapshot, showTitle } = props;
+			const stories = buildStories(status, snapshot);
+			const story = stories.find((entry) => entry.id === sessionId);
+			const parent = story?.forkedFrom ? stories.find((entry) => entry.id === story.forkedFrom) : undefined;
+			const live = (status?.settles ?? []).filter((report) => story?.campaignId && report.campaign_id === story.campaignId);
+			// 本次运行还没有收尾时，退回登记里落盘的最近一次。
+			const settles = live.length > 0 ? live : story?.lastSettle ? [story.lastSettle] : [];
+			const working = story?.campaignId && status?.status?.busy && status.status.active_campaign === story.campaignId;
+			const kv = (label, value, title) => [h("dt", { key: `${label}-k` }, label), h("dd", { key: `${label}-v`, title }, value ?? "—")];
+			return h(
+				React.Fragment,
+				null,
+				h(
+					"div",
+					{ className: "sf-panel-head", title: `会话 ${sessionId}` },
+					showTitle && h("div", { className: "sf-card-title" }, story?.displayTitle ?? "StoryForge"),
+					story?.running
+						? h(Badge, { tone: "run" }, "写作中")
+						: working
+							? h(Badge, { tone: "run" }, "后台收尾中")
+							: settles[0] && h(AcceptBadge, { report: settles[0] }),
+				),
+				story
+					? h(
+							"dl",
+							{ className: "sf-kv" },
+							kv("角色卡", story.cardName ?? story.cardFile, story.cardFile),
+							story.turns != null && kv("进度", story.turns === 0 ? "还没开始写" : `已写 ${story.turns} 轮`),
+							story.forkedFrom && kv("分叉自", `${parent?.displayTitle ?? shortId(story.forkedFrom)}${story.forkTurns != null ? ` · 第 ${story.forkTurns} 轮` : ""}`),
+							kv("存档", story.campaignId ? shortId(story.campaignId) : story.linked ? "第一次发送时建立分支" : "未关联", story.campaignId),
+							story.extractionStatus && kv("角色识别", EXTRACTION[story.extractionStatus] ?? story.extractionStatus),
+						)
+					: h("div", { className: "sf-muted" }, "未登记的 StoryForge 会话（例如从新会话页直接选了预设）。请从 StoryForge 首页新建故事。"),
+				h("div", { className: "sf-section-title" }, "最近几轮的收尾"),
+				settles.length === 0
+					? h("div", { className: "sf-muted" }, "写完一轮后显示后处理和接受的结果")
+					: h(
+							"ul",
+							{ className: "sf-settle-list" },
+							settles.map((report, i) =>
+								h(
+									"li",
+									{ key: `${report.at}-${i}` },
+									h("span", { className: "sf-muted sf-nowrap", title: formatFullTime(report.at) }, formatShortTime(report.at)),
+									h(AcceptBadge, { report }),
+									report.usage?.calls
+										? h("span", { className: "sf-muted" }, `后处理 ${describeUsage(report.usage)}`)
+										: h("span", { className: "sf-muted" }, POSTPROCESS[report.postprocess]?.[0] ?? ""),
+								),
+							),
+						),
+			);
+		}
+
+		/** 主区 StoryForge 视图：本故事概况；写作界面（角色状态、选项、卡片壳）留到后续阶段。 */
 		function StoryForgeView(props) {
 			const sessionId = props.sfSessionId ?? props.sessionId;
 			const isStoryForge = useIsStoryForge(props, sessionId);
-			return h("div", { style: { padding: "20px 24px", fontSize: 14, lineHeight: 1.7 } }, [
-				h("div", { key: "t", style: { fontSize: 16, fontWeight: 600, marginBottom: 8 } }, "StoryForge 写作视图（PoC 占位）"),
-				!isStoryForge &&
-					h("div", { key: "warn", style: { color: "#e57373", marginBottom: 8 } }, "此视图仅用于 StoryForge 会话。"),
-				h("div", { key: "id", style: muted }, `会话：${sessionId}`),
+			const status = useBridgeStatus(isStoryForge);
+			const snapshot = useSessionList();
+			if (!isStoryForge) return h("div", { className: "sf-root sf-view sf-muted" }, "此视图仅用于 StoryForge 会话。");
+			return h(
+				"div",
+				{ className: "sf-root sf-view" },
+				h(StoryDetails, { sessionId, status, snapshot, showTitle: true }),
 				h(
 					"p",
-					{ key: "p" },
-					"StoryForge 自己的写作界面（正文、角色状态、选项）留到后续阶段。正文与管线进度请看「对话」标签：思考块里是导演 / 角色 / 执笔的过程，回复正文是质量门之后的成文。",
+					{ className: "sf-muted sf-small" },
+					"正文在「对话」标签：思考块里是导演、角色、执笔的过程，回复是成文。角色状态、选项与卡片壳的写作界面留到后续阶段。",
 				),
-				h("button", { key: "b", type: "button", style: buttonStyle, onClick: openPanel }, "打开 StoryForge 面板"),
-			]);
+				h("div", null, h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: openPanel }, "在右栏打开")),
+			);
 		}
 
 		/** 右栏 StoryForge 面板。 */
 		function PanelTab(props) {
 			const sessionId = props.sessionId ?? rootCtx.sidebarRight?.mounted?.getSnapshot?.();
 			const isStoryForge = useIsStoryForge(props, sessionId);
-			const info = useStoryInfo(isStoryForge, sessionId);
 			const status = useBridgeStatus(isStoryForge);
-			if (!isStoryForge) {
-				return h("div", { style: { padding: 16, ...muted } }, "此面板仅用于 StoryForge 会话。");
-			}
-			const settles = (status?.settles ?? []).filter((report) => info?.campaignId && report.campaign_id === info.campaignId);
-			const row = (key, label, value) =>
-				h("div", { key }, [h("span", { key: "l", style: muted }, `${label}：`), h("span", { key: "v" }, value ?? "—")]);
-			return h("div", { style: { padding: 16, fontSize: 13, lineHeight: 1.7 } }, [
-				h("div", { key: "t", style: { fontWeight: 600, marginBottom: 6 } }, info?.title ?? "StoryForge"),
-				info
-					? h("div", { key: "info" }, [
-							row("card", "角色卡", info.cardName ? `${info.cardName}（${info.cardFile ?? ""}）` : null),
-							row("campaign", "存档", info.campaignId),
-							row("extract", "角色识别", info.extractionStatus),
-							info.forkedFrom && row("fork", "分叉自", info.forkedFrom),
-						])
-					: h("div", { key: "none", style: muted }, "未登记的 StoryForge 会话（例如从新会话页直接选了预设）"),
-				h("div", { key: "ht", style: { fontWeight: 600, margin: "12px 0 4px" } }, "最近几轮的收尾"),
-				settles.length === 0
-					? h("div", { key: "empty", style: muted }, "暂无")
-					: h(
-							"ul",
-							{ key: "settles", style: { margin: 0, paddingLeft: 18 } },
-							settles.map((report, i) => h("li", { key: i }, `${report.at.slice(11, 19)} ${describeSettle(report)}`)),
-						),
-				h("div", { key: "n", style: { ...muted, marginTop: 12 } }, "角色、知识、变量的查看与编辑留到后续阶段。"),
-			]);
+			const snapshot = useSessionList();
+			if (!isStoryForge) return h("div", { className: "sf-root sf-panel sf-muted" }, "此面板仅用于 StoryForge 会话。");
+			return h(
+				"div",
+				{ className: "sf-root sf-panel" },
+				h(StoryDetails, { sessionId, status, snapshot, showTitle: true }),
+				h("div", { className: "sf-muted sf-small" }, "角色、知识、变量的查看与编辑留到后续阶段。"),
+			);
 		}
 
 		/** 输入框模型位的只读标签（只在 StoryForge 会话里注册）。 */
@@ -287,7 +458,13 @@ window.__ModuleLoader__.load({
 			return h(
 				"span",
 				{
-					style: { ...muted, display: "var(--dsh-composer-model-text-display, inline)", whiteSpace: "nowrap", padding: "0 6px" },
+					style: {
+						display: "var(--dsh-composer-model-text-display, inline)",
+						whiteSpace: "nowrap",
+						padding: "0 6px",
+						fontSize: 12,
+						color: "var(--dsw-alias-label-tertiary, inherit)",
+					},
 					title: "StoryForge 会话的模型固定为 StoryForge 管线",
 				},
 				"StoryForge 管线",
@@ -298,47 +475,171 @@ window.__ModuleLoader__.load({
 		function DockStatus(props) {
 			const sessionId = props.sfSessionId ?? props.sessionId;
 			const isStoryForge = useIsStoryForge(props, sessionId);
-			const info = useStoryInfo(isStoryForge, sessionId);
 			const status = useBridgeStatus(isStoryForge);
 			if (!isStoryForge) return null;
-			if (status?.pipeline === "fake") return h("div", { style: { ...muted, padding: "2px 4px" } }, "StoryForge · 假管线");
-			const model = status?.model ? `${status.model.provider}/${status.model.model}` : "未选底层模型";
-			const busy = status?.status?.busy ? "写作 / 收尾中" : "空闲";
-			const last = (status?.settles ?? []).find((report) => info?.campaignId && report.campaign_id === info.campaignId);
-			const text = `StoryForge · ${model} · ${status?.bridge?.running ? busy : "sidecar 未启动"}${last ? ` · 上一轮：${describeSettle(last)}` : ""}`;
-			return h("div", { style: { ...muted, padding: "2px 4px" } }, text);
+			if (status?.pipeline === "fake") return h("div", { className: "sf-root sf-dock" }, "StoryForge · 假管线");
+			const story = status?.sessions?.[sessionId];
+			const model = status?.model ? status.model.model : "未选底层模型";
+			const working = story?.campaignId && status?.status?.busy && status.status.active_campaign === story.campaignId;
+			const state = !status?.bridge?.running ? "引擎待命" : working ? "写作 / 收尾中" : "空闲";
+			const last =
+				(status?.settles ?? []).find((report) => story?.campaignId && report.campaign_id === story.campaignId) ?? story?.lastSettle;
+			return h(
+				"div",
+				{ className: "sf-root sf-dock", title: status?.model ? `${status.model.provider}/${status.model.model}` : undefined },
+				`StoryForge · ${model} · ${state}${last ? ` · 上一轮（${formatTime(last.at)}）：${describeSettle(last)}` : ""}`,
+			);
 		}
 
-		/** 主区首页：底层模型、新建故事、sidecar 状态与调试信息。 */
-		function HomePanel() {
-			const [calls, setCalls] = React.useState([]);
-			const [events, setEvents] = React.useState([]);
-			const [models, setModels] = React.useState(null);
-			const [cards, setCards] = React.useState(null);
+		//#region 首页
+		function Card(props) {
+			return h(
+				"section",
+				{ className: `sf-card ${props.className ?? ""}` },
+				h(
+					"div",
+					{ className: "sf-card-head" },
+					h("div", { className: "sf-card-title" }, props.title),
+					props.sub && h("div", { className: "sf-card-sub" }, props.sub),
+					props.actions && h("div", { className: "sf-card-actions" }, props.actions),
+				),
+				props.children,
+			);
+		}
+
+		/** 表格列：`{ key, label, num?, render(row) }`。 */
+		function Table(props) {
+			const { columns, rows, rowKey, empty } = props;
+			if (rows.length === 0) return h("div", { className: "sf-empty" }, empty);
+			return h(
+				"div",
+				{ className: "sf-table-wrap" },
+				h(
+					"table",
+					{ className: "sf-table" },
+					h(
+						"thead",
+						null,
+						h(
+							"tr",
+							null,
+							columns.map((column) => h("th", { key: column.key, className: column.num ? "sf-num" : undefined }, column.label)),
+						),
+					),
+					h(
+						"tbody",
+						null,
+						rows.map((row, i) =>
+							h(
+								"tr",
+								{ key: rowKey(row, i) },
+								columns.map((column) =>
+									h("td", { key: column.key, className: column.num ? "sf-num" : column.className }, column.render(row)),
+								),
+							),
+						),
+					),
+				),
+			);
+		}
+
+		/** 列表默认只显示前 N 条，多出来的给一个展开按钮。 */
+		function useCollapsed(rows, limit) {
+			const [expanded, setExpanded] = React.useState(false);
+			const shown = expanded ? rows : rows.slice(0, limit);
+			const toggle =
+				rows.length > limit &&
+				h(
+					"button",
+					{ type: "button", className: "sf-btn sf-btn-sm sf-more", onClick: () => setExpanded((value) => !value) },
+					expanded ? "收起" : `显示全部 ${rows.length} 条`,
+				);
+			return [shown, toggle];
+		}
+
+		function NewStoryCard(props) {
+			const { cards, fake, modelReady, onCreated, onError } = props;
 			const [card, setCard] = React.useState("");
 			const [title, setTitle] = React.useState("");
 			const [busy, setBusy] = React.useState(false);
-			const [error, setError] = React.useState(null);
-			const status = useBridgeStatus(true, 4000);
-			const fake = status?.pipeline === "fake";
-
-			const refresh = React.useCallback(async () => {
-				try {
-					const [c, l, m, k] = await Promise.all([api("/debug/calls"), api("/debug/lifecycle"), api("/models"), api("/cards")]);
-					setCalls(c.calls ?? []);
-					setEvents(l.events ?? []);
-					setModels(m);
-					setCards(k);
-					setCard((current) => current || k.cards?.[0]?.file || "");
-					setError(null);
-				} catch (e) {
-					setError(String(e?.message ?? e));
-				}
-			}, []);
-
+			const files = cards?.cards ?? [];
 			React.useEffect(() => {
-				void refresh();
-			}, [refresh]);
+				if (!card && files[0]) setCard(files[0].file);
+			}, [card, files]);
+
+			const create = async () => {
+				setBusy(true);
+				onError(null);
+				try {
+					const { sessionId } = await postJson("/sessions", { title: title.trim() || undefined, card });
+					// 打开会话前写入整份会话状态：新会话默认停在 StoryForge 视图。
+					localStorage.setItem(
+						`${CONVERSATION_STORE_KEY}.${sessionId}`,
+						JSON.stringify({ draft: "", view: VIEW_ID, viewRequest: null }),
+					);
+					localStorage.setItem(AUTO_PANEL_KEY + sessionId, "1");
+					setTitle("");
+					onCreated();
+					openSession(sessionId);
+				} catch (e) {
+					onError(errorText(e));
+				} finally {
+					setBusy(false);
+				}
+			};
+
+			const blocker = fake ? null : !modelReady ? "先在「管线设置」里选底层模型" : !card ? "卡目录里还没有角色卡" : null;
+			return h(
+				Card,
+				{ title: "新建故事", sub: fake ? "假管线模式" : `${files.length} 张角色卡可选` },
+				h(
+					"div",
+					{ className: "sf-form" },
+					!fake && h("label", { htmlFor: "sf-card" }, "角色卡"),
+					!fake &&
+						h(
+							"select",
+							{ id: "sf-card", className: "sf-input", value: card, onChange: (e) => setCard(e.target.value) },
+							files.length === 0
+								? h("option", { value: "" }, "（卡目录为空）")
+								: files.map((entry) => h("option", { key: entry.file, value: entry.file }, entry.file)),
+						),
+					h("label", { htmlFor: "sf-title" }, "标题"),
+					h("input", {
+						id: "sf-title",
+						className: "sf-input",
+						value: title,
+						placeholder: "可空，默认用卡名",
+						onChange: (e) => setTitle(e.target.value),
+						onKeyDown: (e) => {
+							if (e.key === "Enter" && !busy && !blocker) void create();
+						},
+					}),
+				),
+				h(
+					"div",
+					{ className: "sf-actions" },
+					h(
+						"button",
+						{ type: "button", className: "sf-btn sf-btn-primary", disabled: busy || Boolean(blocker), onClick: () => void create() },
+						busy ? (fake ? "创建中…" : "导卡、识别角色中…") : "新建故事",
+					),
+					blocker
+						? h("span", { className: "sf-muted sf-small" }, blocker)
+						: busy && !fake && h("span", { className: "sf-muted sf-small" }, "识别角色要调一次底层模型，可能需要一两分钟"),
+				),
+				!fake && cards?.cardsDir && h("div", { className: "sf-muted sf-small sf-gap-top" }, `把 .png / .json 角色卡放进 ${cards.cardsDir}`),
+			);
+		}
+
+		function SettingsCard(props) {
+			const { models, onChange, onError } = props;
+			const [saved, setSaved] = React.useState(null);
+			React.useEffect(() => {
+				if (!saved) return undefined;
+				const timer = setTimeout(() => setSaved(null), 1600);
+				return () => clearTimeout(timer);
+			}, [saved]);
 
 			/** 下拉框的选项与 { provider, model } 一一对应（value 用序号，避免拼接 id）。 */
 			const choices = React.useMemo(
@@ -349,61 +650,13 @@ window.__ModuleLoader__.load({
 				[models],
 			);
 
-			const saveSetting = async (patch) => {
+			const save = async (field, patch, local) => {
 				try {
-					await api("/settings", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: JSON.stringify(patch),
-					});
-					setModels((current) => ({ ...current, ...patch }));
+					await postJson("/settings", patch);
+					onChange(local ?? patch);
+					setSaved(field);
 				} catch (e) {
-					setError(String(e?.message ?? e));
-				}
-			};
-			const optionSelect = (key, labels, value, onChange) =>
-				h(
-					"select",
-					{ key, value: value ?? "", onChange: (e) => void onChange(e.target.value) },
-					Object.entries(labels ?? {}).map(([id, label]) => h("option", { key: id, value: id }, label)),
-				);
-
-			const selectModel = async (index) => {
-				const choice = choices[Number(index)];
-				if (!choice) return;
-				try {
-					await api("/settings", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: JSON.stringify(choice),
-					});
-					setModels((current) => ({ ...current, selected: choice }));
-				} catch (e) {
-					setError(String(e?.message ?? e));
-				}
-			};
-
-			const createStory = async () => {
-				setBusy(true);
-				setError(null);
-				try {
-					const { sessionId } = await api("/sessions", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: JSON.stringify({ title: title.trim() || undefined, card }),
-					});
-					// 打开会话前写入整份会话状态：新会话默认停在 StoryForge 视图。
-					localStorage.setItem(
-						`${CONVERSATION_STORE_KEY}.${sessionId}`,
-						JSON.stringify({ draft: "", view: VIEW_ID, viewRequest: null }),
-					);
-					localStorage.setItem(AUTO_PANEL_KEY + sessionId, "1");
-					setTitle("");
-					rootCtx.uiWorkspace.openSession(sessionId);
-				} catch (e) {
-					setError(String(e?.message ?? e));
-				} finally {
-					setBusy(false);
+					onError(errorText(e));
 				}
 			};
 
@@ -412,190 +665,423 @@ window.__ModuleLoader__.load({
 				? choices.findIndex((choice) => choice.provider === selected.provider && choice.model === selected.model)
 				: -1;
 			let optionIndex = 0;
-			const modelSelect = h(
-				"select",
-				{
-					key: "model",
-					value: selectedIndex >= 0 ? String(selectedIndex) : "",
-					onChange: (e) => void selectModel(e.target.value),
-					style: { maxWidth: 360 },
-				},
-				[
-					h(
-						"option",
-						{ key: "none", value: "", disabled: true },
-						models ? (selected && selectedIndex < 0 ? `${selected.provider}/${selected.model}（已不可用）` : "选择底层模型…") : "加载中…",
-					),
-					...(models?.providers ?? []).map((provider) =>
-						h(
-							"optgroup",
-							{ key: provider.provider, label: provider.error ? `${provider.name}（${provider.error}）` : provider.name },
-							provider.models.map((model) => h("option", { key: model.id, value: String(optionIndex++) }, model.name)),
-						),
-					),
-				],
-			);
-			const cardSelect = h(
-				"select",
-				{ key: "card", value: card, onChange: (e) => setCard(e.target.value), style: { maxWidth: 260 } },
-				(cards?.cards ?? []).length === 0
-					? [h("option", { key: "none", value: "" }, "（卡目录为空）")]
-					: cards.cards.map((entry) => h("option", { key: entry.file, value: entry.file }, entry.file)),
-			);
-			const canCreate = !busy && (fake || Boolean(card && selected));
-
-			const header = ["时间", "会话", "用途", "模型", "消息数", "工具", "开场", "跳过的注入"];
-			const settleHeader = ["时间", "存档", "后处理", "接受", "后处理用量"];
-			const llmHeader = ["#", "时间", "模型", "消息", "工具", "状态", "耗时", "输入 / 输出", "工具调用"];
-			const llmCalls = status?.llmCalls ?? [];
-			const section = (key, text) => h("div", { key, style: { fontWeight: 600, margin: "16px 0 4px" } }, text);
-			const bridgeLine = !status
-				? "加载中…"
-				: fake
-					? "假管线模式（不启动 sidecar）"
-					: status.bridge.running
-						? `运行中 pid=${status.bridge.pid} · 活跃存档 ${status.status?.active_campaign ?? "无"} · ${status.status?.busy ? "忙" : "空闲"}${status.statusError ? ` · ${status.statusError}` : ""}`
-						: `未启动（第一次新建故事时拉起）${status.bridge.lastExit ? ` · 上次退出 code=${status.bridge.lastExit.code}` : ""} · 日志 ${status.bridge.logFile}`;
-			return h("div", { style: { height: "100%", boxSizing: "border-box", overflow: "auto", padding: "16px 20px", fontSize: 13 } }, [
-				h("div", { key: "head", style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 12 } }, [
-					h("span", { key: "t", style: { fontSize: 15, fontWeight: 600 } }, "StoryForge"),
-					h("button", { key: "r", type: "button", style: buttonStyle, onClick: () => void refresh() }, "刷新"),
-				]),
-				error && h("div", { key: "err", style: { color: "#e57373", marginBottom: 8, whiteSpace: "pre-wrap" } }, error),
-				!fake &&
-					h("div", { key: "m", style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } }, [
-						h("span", { key: "l" }, "底层模型"),
-						modelSelect,
-						h("span", { key: "hint", style: muted }, "导演、角色、编剧、后处理共用，只在 StoryForge 管线内部使用"),
-					]),
-				!fake &&
-					models &&
-					h("div", { key: "modes", style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 10 } }, [
-						h("span", { key: "gl" }, "生成模式"),
-						optionSelect("gm", models.generationModes, models.generationMode, (value) => saveSetting({ generationMode: value })),
-						h("span", { key: "tl" }, "工具协议"),
-						optionSelect("tm", models.toolModes, models.toolMode, (value) => saveSetting({ toolMode: value })),
-						h(
-							"span",
-							{ key: "hint", style: muted },
-							"自动路由遇到高成本群像会要求显式选择；文本降级给不支持工具调用的模型用",
-						),
-					]),
-				h("div", { key: "new", style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 10 } }, [
-					!fake && h("span", { key: "l" }, "角色卡"),
-					!fake && cardSelect,
-					h("input", {
-						key: "title",
-						value: title,
-						placeholder: "故事标题（可空，默认用卡名）",
-						onChange: (e) => setTitle(e.target.value),
-						style: { width: 220 },
-					}),
-					h(
-						"button",
-						{ key: "n", type: "button", style: buttonStyle, disabled: !canCreate, onClick: () => void createStory() },
-						busy ? (fake ? "创建中…" : "导卡、识别角色中…") : "新建故事",
-					),
-				]),
-				!fake && cards && h("div", { key: "cd", style: { ...muted, marginTop: 4 } }, `把 .png / .json 角色卡放进 ${cards.cardsDir}`),
-				section("st", "sidecar"),
-				h("div", { key: "status", style: muted }, bridgeLine),
-				section("sht", "最近的收尾（后处理 + 自动接受）"),
-				h("table", { key: "settles", style: { width: "100%", borderCollapse: "collapse" } }, [
-					h("thead", { key: "h" }, h("tr", null, settleHeader.map((label) => h("th", { key: label, style: cellStyle }, label)))),
-					h(
-						"tbody",
-						{ key: "b" },
-						(status?.settles ?? []).length === 0
-							? h("tr", null, h("td", { colSpan: settleHeader.length, style: cellStyle }, "暂无"))
-							: status.settles.map((report, i) =>
-									h("tr", { key: i }, [
-										h("td", { key: "at", style: cellStyle }, report.at.slice(11, 19)),
-										h("td", { key: "c", style: cellStyle }, report.campaign_id),
-										h(
-											"td",
-											{ key: "p", style: cellStyle },
-											`${POSTPROCESS_LABELS[report.postprocess] ?? "—"}${report.postprocess_detail ? `：${report.postprocess_detail}` : ""}`,
-										),
-										h(
-											"td",
-											{ key: "a", style: cellStyle },
-											`${ACCEPT_LABELS[report.accept] ?? report.accept}${report.accept_error ? `：${report.accept_error}` : ""}`,
-										),
-										h("td", { key: "u", style: cellStyle }, describeUsage(report.usage)),
-									]),
-								),
-					),
-				]),
-				section("llm", `底层模型调用（sidecar 经插件发出，共 ${status?.llmCallCount ?? 0} 次，显示最近 ${llmCalls.length} 次）`),
-				h("table", { key: "llmTable", style: { width: "100%", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums" } }, [
-					h("thead", { key: "h" }, h("tr", null, llmHeader.map((label) => h("th", { key: label, style: cellStyle }, label)))),
-					h(
-						"tbody",
-						{ key: "b" },
-						llmCalls.length === 0
-							? h("tr", null, h("td", { colSpan: llmHeader.length, style: cellStyle }, "还没有调用"))
-							: llmCalls.map((call) =>
-									h("tr", { key: call.seq }, [
-										h("td", { key: "n", style: cellStyle }, String(call.seq)),
-										h("td", { key: "at", style: cellStyle }, call.at.slice(11, 19)),
-										h("td", { key: "m", style: cellStyle }, call.model ?? "未选"),
-										h("td", { key: "msg", style: cellStyle }, String(call.messages)),
-										h("td", { key: "t", style: cellStyle }, call.tools ? String(call.tools) : "—"),
-										h(
-											"td",
-											{ key: "s", style: cellStyle, title: call.error ?? "" },
-											`${LLM_STATUS_LABELS[call.status] ?? call.status}${call.error ? `：${call.error.slice(0, 60)}` : ""}`,
-										),
-										h("td", { key: "ms", style: cellStyle }, call.ms != null ? `${(call.ms / 1000).toFixed(1)}s` : "—"),
-										h(
-											"td",
-											{ key: "u", style: cellStyle },
-											call.usage ? `${call.usage.input_tokens} / ${call.usage.output_tokens}` : "—",
-										),
-										h("td", { key: "tc", style: cellStyle }, call.toolCalls ? String(call.toolCalls) : "—"),
-									]),
-								),
-					),
-				]),
-				section("ct", "最近的适配器调用"),
-				h("table", { key: "calls", style: { width: "100%", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums" } }, [
-					h("thead", { key: "h" }, h("tr", null, header.map((label) => h("th", { key: label, style: cellStyle }, label)))),
-					h(
-						"tbody",
-						{ key: "b" },
-						calls.length === 0
-							? h("tr", null, h("td", { colSpan: header.length, style: cellStyle }, "还没有调用"))
-							: calls.map((call, i) =>
-									h("tr", { key: i }, [
-										h("td", { key: "at", style: cellStyle }, call.at.slice(11, 19)),
-										h("td", { key: "s", style: cellStyle }, call.sessionId ?? "—"),
-										h("td", { key: "p", style: cellStyle }, call.purpose ?? "对话"),
-										h("td", { key: "m", style: cellStyle }, `${call.provider}/${call.model}`),
-										h("td", { key: "n", style: cellStyle }, String(call.messageCount)),
-										h("td", { key: "tools", style: cellStyle }, call.toolNames.length === 0 ? "无" : `${call.toolNames.length} 个`),
-										h("td", { key: "o", style: cellStyle }, call.opening ? "是" : ""),
-										h("td", { key: "notice", style: cellStyle }, (call.injected ?? []).join("、")),
-									]),
-								),
-					),
-				]),
-				section("lt", "StoryForge 会话生命周期"),
+			const savedMark = (field) => saved === field && h("span", { className: "sf-saved" }, "已保存");
+			const field = (id, label, control, hint, key) => [
+				h("label", { key: `${id}-l`, htmlFor: id }, label),
+				h("div", { key: `${id}-c`, className: "sf-field" }, control, savedMark(key)),
+				hint && h("div", { key: `${id}-h`, className: "sf-hint" }, hint),
+			];
+			const optionSelect = (id, labels, value, onSelect) =>
 				h(
-					"ul",
-					{ key: "events", style: { margin: 0, paddingLeft: 18 } },
-					events.length === 0
-						? h("li", { style: muted }, "暂无")
-						: events.map((event, i) =>
+					"select",
+					{ id, className: "sf-input", value: value ?? "", onChange: (e) => void onSelect(e.target.value) },
+					Object.entries(labels ?? {}).map(([optionId, label]) => h("option", { key: optionId, value: optionId }, label)),
+				);
+
+			if (!models) return h(Card, { title: "管线设置" }, h("div", { className: "sf-muted" }, "加载中…"));
+			return h(
+				Card,
+				{ title: "管线设置", sub: "只作用于 StoryForge 会话" },
+				h(
+					"div",
+					{ className: "sf-form" },
+					field(
+						"sf-model",
+						"底层模型",
+						h(
+							"select",
+							{
+								id: "sf-model",
+								className: "sf-input",
+								value: selectedIndex >= 0 ? String(selectedIndex) : "",
+								onChange: (e) => {
+									const choice = choices[Number(e.target.value)];
+									if (choice) void save("model", choice, { selected: choice });
+								},
+							},
+							h(
+								"option",
+								{ value: "", disabled: true },
+								selected && selectedIndex < 0 ? `${selected.provider}/${selected.model}（已不可用）` : "选择底层模型…",
+							),
+							(models.providers ?? []).map((provider) =>
 								h(
-									"li",
-									{ key: i },
-									`${event.at.slice(11, 19)} ${event.sessionId} source=${event.source}${event.parentSession ? ` 分叉自 ${event.parentSession}` : ""}`,
+									"optgroup",
+									{ key: provider.provider, label: provider.error ? `${provider.name}（${provider.error}）` : provider.name },
+									provider.models.map((model) => h("option", { key: model.id, value: String(optionIndex++) }, model.name)),
 								),
 							),
+						),
+						"导演、角色、编剧、后处理共用；不影响 DSH 其它会话的模型",
+						"model",
+					),
+					field(
+						"sf-mode",
+						"生成模式",
+						optionSelect("sf-mode", models.generationModes, models.generationMode, (value) =>
+							save("generationMode", { generationMode: value }),
+						),
+						"自动路由想升到高成本群像时会报错，需要在这里显式选群像",
+						"generationMode",
+					),
+					field(
+						"sf-tools",
+						"工具协议",
+						optionSelect("sf-tools", models.toolModes, models.toolMode, (value) => save("toolMode", { toolMode: value })),
+						"模型不支持 function calling 时选文本降级",
+						"toolMode",
+					),
 				),
-			]);
+			);
 		}
+
+		function StoriesCard(props) {
+			const { stories, status } = props;
+			const linkedStories = stories.filter((story) => story.linked);
+			const unlinked = stories.filter((story) => !story.linked);
+			const [shown, toggle] = useCollapsed(linkedStories, 8);
+			const [showUnlinked, setShowUnlinked] = React.useState(false);
+			const busyCampaign = status?.status?.busy ? status.status.active_campaign : null;
+			const byId = Object.fromEntries(stories.map((story) => [story.id, story]));
+			const renderStory = (story) => {
+				const meta = [];
+				if (story.turns != null) meta.push(story.turns === 0 ? "还没开始写" : `已写 ${story.turns} 轮`);
+				if (story.cardName || story.cardFile) meta.push(story.cardName ?? story.cardFile);
+				if (story.forkedFrom) {
+					const parent = byId[story.forkedFrom];
+					meta.push(`分叉自「${parent?.displayTitle ?? shortId(story.forkedFrom)}」${story.forkTurns != null ? `第 ${story.forkTurns} 轮` : ""}`);
+				}
+				if (!story.campaignId) meta.push(story.linked ? "第一次发送时建立存档分支" : "未关联存档");
+				const state = story.running
+					? h(Badge, { tone: "run" }, "写作中")
+					: story.campaignId && busyCampaign === story.campaignId
+						? h(Badge, { tone: "run" }, "后台收尾中")
+						: story.missing
+							? h(Badge, { tone: "idle", title: "DSH 会话列表里没有它（可能已归档）" }, "不在会话列表")
+							: story.last && h(AcceptBadge, { report: story.last });
+				// 整行可点（键盘 Enter / 空格同样打开）；DSH 列表里已没有的会话不可打开。
+				const open = () => {
+					if (!story.missing) openSession(story.id);
+				};
+				return h(
+					"div",
+					{
+						key: story.id,
+						className: `sf-story${story.campaignId ? "" : " sf-story-dim"}${story.missing ? " sf-story-missing" : ""}`,
+						role: "button",
+						tabIndex: story.missing ? -1 : 0,
+						"aria-disabled": story.missing || undefined,
+						onClick: open,
+						onKeyDown: (e) => {
+							if (e.key !== "Enter" && e.key !== " ") return;
+							e.preventDefault();
+							open();
+						},
+					},
+					h(
+						"div",
+						{ className: "sf-story-main" },
+						h("div", { className: "sf-story-title", title: story.displayTitle }, story.displayTitle),
+						h("div", { className: "sf-story-meta", title: meta.join(" · ") }, meta.join(" · ") || "—"),
+					),
+					h(
+						"div",
+						{ className: "sf-story-side" },
+						story.activity > 0 &&
+							h(
+								"span",
+								{ className: "sf-muted sf-small sf-nowrap", title: `最近活动 ${formatFullTime(story.activity)}` },
+								formatShortTime(story.activity),
+							),
+						state,
+						!story.missing && h("span", { className: "sf-chevron", "aria-hidden": "true" }, "›"),
+					),
+				);
+			};
+			return h(
+				Card,
+				{ title: "我的故事", sub: linkedStories.length ? `${linkedStories.length} 个` : undefined },
+				linkedStories.length === 0
+					? h("div", { className: "sf-empty" }, "还没有故事。选一张角色卡新建一个。")
+					: h("div", { className: "sf-stories" }, shown.map(renderStory)),
+				toggle,
+				unlinked.length > 0 &&
+					h(
+						"button",
+						{ type: "button", className: "sf-btn sf-btn-sm sf-more", onClick: () => setShowUnlinked((value) => !value) },
+						showUnlinked ? "收起未关联存档的会话" : `显示 ${unlinked.length} 个未关联存档的会话`,
+					),
+				showUnlinked && h("div", { className: "sf-stories sf-gap-top" }, unlinked.map(renderStory)),
+			);
+		}
+
+		function SettlesCard(props) {
+			const { settles, titles } = props;
+			const [shown, toggle] = useCollapsed(settles, 6);
+			return h(
+				Card,
+				{ title: "最近的收尾", sub: "每轮正文出来后，后台做后处理并自动接受" },
+				h(Table, {
+					rows: shown,
+					rowKey: (report, i) => `${report.at}-${i}`,
+					empty: "写完一轮后，这里会显示后处理和接受的结果",
+					columns: [
+						{
+							key: "at",
+							label: "时间",
+							className: "sf-nowrap",
+							render: (report) => h("span", { title: formatFullTime(report.at) }, formatTime(report.at)),
+						},
+						{
+							key: "story",
+							label: "故事",
+							render: (report) => h("span", { title: report.campaign_id }, titles[report.campaign_id] ?? `存档 ${shortId(report.campaign_id)}`),
+						},
+						{ key: "accept", label: "接受", render: (report) => h(AcceptBadge, { report }) },
+						{
+							key: "post",
+							label: "后处理",
+							render: (report) => {
+								const [label, tone] = POSTPROCESS[report.postprocess] ?? ["无终态", "idle"];
+								return h(Badge, { tone, title: report.postprocess_detail ?? undefined }, label);
+							},
+						},
+						{ key: "usage", label: "后处理用量", className: "sf-nowrap", render: (report) => describeUsage(report.usage) },
+					],
+				}),
+				toggle,
+			);
+		}
+
+		function LlmCallsCard(props) {
+			const { calls, total } = props;
+			const running = calls.some((call) => call.status === "running");
+			const now = useNow(running);
+			const [shown, toggle] = useCollapsed(calls, 12);
+			const models = [...new Set(calls.map((call) => call.model ?? "未选"))];
+			const count = (state) => calls.filter((call) => call.status === state).length;
+			const sum = (field) => calls.reduce((acc, call) => acc + (call.usage?.[field] ?? 0), 0);
+			const stats = [
+				["共", `${total} 次`],
+				["进行中", count("running")],
+				["失败", count("error")],
+				["中止", count("aborted")],
+				["输入", formatTokens(sum("input_tokens"))],
+				["输出", formatTokens(sum("output_tokens"))],
+				["缓存读", formatTokens(sum("cache_read_tokens"))],
+			];
+			const columns = [
+				{ key: "seq", label: "#", num: true, render: (call) => call.seq },
+				{
+					key: "at",
+					label: "时间",
+					className: "sf-nowrap",
+					render: (call) => h("span", { title: formatFullTime(call.at) }, formatTime(call.at)),
+				},
+				{ key: "role", label: "角色", className: "sf-nowrap", render: (call) => call.role ?? "—" },
+				{
+					key: "status",
+					label: "状态",
+					render: (call) => {
+						const [label, tone] = LLM_STATUS[call.status] ?? [call.status, "idle"];
+						return h(
+							React.Fragment,
+							null,
+							h(Badge, { tone, title: call.error ?? undefined }, label),
+							call.error && h("div", { className: "sf-muted sf-small sf-error-line", title: call.error }, call.error),
+						);
+					},
+				},
+				{
+					key: "ms",
+					label: "耗时",
+					num: true,
+					render: (call) => formatDuration(call.status === "running" ? now - new Date(call.at).getTime() : call.ms),
+				},
+				{ key: "in", label: "输入", num: true, render: (call) => formatTokens(call.usage?.input_tokens) },
+				{ key: "out", label: "输出", num: true, render: (call) => formatTokens(call.usage?.output_tokens) },
+				{
+					key: "tools",
+					label: "工具 · 调用",
+					num: true,
+					render: (call) => (call.tools ? `${call.tools} · ${call.toolCalls ?? 0}` : call.toolCalls ? `— · ${call.toolCalls}` : "—"),
+				},
+				{ key: "msg", label: "消息", num: true, render: (call) => call.messages },
+			];
+			if (models.length > 1) columns.splice(3, 0, { key: "model", label: "模型", className: "sf-nowrap", render: (call) => call.model ?? "未选" });
+			return h(
+				Card,
+				{
+					title: "底层模型调用",
+					sub: models.length === 1 && calls.length ? `管线各 Agent 经 DSH 调模型 · 全部经 ${models[0]}` : "管线各 Agent 经 DSH 调模型",
+				},
+				calls.length > 0 &&
+					h(
+						"div",
+						{ className: "sf-stats" },
+						stats.map(([label, value]) => h("span", { key: label }, `${label} `, h("b", null, value))),
+						h("span", { className: "sf-muted" }, `（统计最近 ${calls.length} 次）`),
+					),
+				h(Table, { rows: shown, rowKey: (call) => call.seq, empty: "还没有调用。导演、角色、编剧、后处理的每次调用都会列在这里", columns }),
+				toggle,
+			);
+		}
+
+		function DebugDetails(props) {
+			const { status, titles } = props;
+			const [open, setOpen] = React.useState(false);
+			const [calls, setCalls] = React.useState([]);
+			const [events, setEvents] = React.useState([]);
+			const load = React.useCallback(async () => {
+				try {
+					const [c, l] = await Promise.all([api("/debug/calls"), api("/debug/lifecycle")]);
+					setCalls(c.calls ?? []);
+					setEvents(l.events ?? []);
+				} catch (e) {
+					console.error("[storyforge] debug load failed", e);
+				}
+			}, []);
+			React.useEffect(() => {
+				if (open) void load();
+			}, [open, load]);
+
+			const bridge = status?.bridge;
+			const active = status?.status?.active_campaign;
+			const kv = (label, value) => [h("dt", { key: `${label}-k` }, label), h("dd", { key: `${label}-v` }, value ?? "—")];
+			return h(
+				"details",
+				{ className: "sf-card sf-details", onToggle: (e) => setOpen(e.currentTarget.open) },
+				h("summary", null, "调试信息", h("span", { className: "sf-card-sub" }, "写作引擎进程、适配器调用、会话生命周期")),
+				open &&
+					h(
+						"div",
+						{ className: "sf-debug" },
+						h("div", { className: "sf-actions" }, h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => void load() }, "刷新调试数据")),
+						h("div", { className: "sf-section-title" }, "写作引擎（sidecar）"),
+						h(
+							"dl",
+							{ className: "sf-kv" },
+							kv("状态", bridgeState(status).label),
+							bridge?.pid && kv("进程", `pid ${bridge.pid}`),
+							bridge?.lastExit && kv("上次退出", `code=${bridge.lastExit.code ?? "—"} signal=${bridge.lastExit.signal ?? "—"}`),
+							kv("活跃存档", active ? `${titles[active] ?? ""} ${active}`.trim() : null),
+							kv("工具协议", status?.status?.tool_mode ?? status?.toolMode),
+							status?.status?.usage && kv("累计用量", describeUsage(status.status.usage)),
+							bridge?.logFile && kv("日志", h("span", { className: "sf-mono" }, bridge.logFile)),
+							status?.statusError && kv("错误", status.statusError),
+						),
+						h("div", { className: "sf-section-title" }, "适配器调用（DSH → StoryForge 适配器）"),
+						h(Table, {
+							rows: calls,
+							rowKey: (call, i) => `${call.at}-${i}`,
+							empty: "还没有调用",
+							columns: [
+								{ key: "at", label: "时间", className: "sf-nowrap", render: (call) => formatTime(call.at) },
+								{ key: "s", label: "会话", render: (call) => h("span", { className: "sf-mono" }, call.sessionId ?? "—") },
+								{ key: "p", label: "用途", render: (call) => call.purpose ?? "对话" },
+								{ key: "m", label: "模型", render: (call) => `${call.provider}/${call.model}` },
+								{ key: "n", label: "消息", num: true, render: (call) => call.messageCount },
+								{ key: "t", label: "工具", num: true, render: (call) => call.toolNames?.length || "—" },
+								{ key: "o", label: "开场", render: (call) => (call.opening ? "是" : "") },
+								{ key: "i", label: "跳过的注入", render: (call) => (call.injected ?? []).join("、") },
+							],
+						}),
+						h("div", { className: "sf-section-title" }, "StoryForge 会话生命周期"),
+						events.length === 0
+							? h("div", { className: "sf-muted" }, "暂无")
+							: h(
+									"ul",
+									{ className: "sf-plain-list" },
+									events.map((event, i) =>
+										h(
+											"li",
+											{ key: i },
+											h("span", { className: "sf-muted sf-nowrap" }, formatTime(event.at)),
+											" ",
+											h("span", { className: "sf-mono" }, event.sessionId),
+											` source=${event.source}${event.parentSession ? ` 分叉自 ${event.parentSession}` : ""}`,
+										),
+									),
+								),
+					),
+			);
+		}
+
+		/** 主区首页：新建故事、我的故事、管线设置、收尾与底层调用；调试信息折叠。 */
+		function HomePanel() {
+			const [models, setModels] = React.useState(null);
+			const [cards, setCards] = React.useState(null);
+			const [error, setError] = React.useState(null);
+			const status = useBridgeStatus(true, 3000);
+			const snapshot = useSessionList();
+			const fake = status?.pipeline === "fake";
+
+			const refresh = React.useCallback(async () => {
+				try {
+					const [m, k] = await Promise.all([api("/models"), api("/cards")]);
+					setModels(m);
+					setCards(k);
+					setError(null);
+				} catch (e) {
+					setError(errorText(e));
+				}
+			}, []);
+			React.useEffect(() => {
+				void refresh();
+			}, [refresh]);
+
+			const stories = buildStories(status, snapshot);
+			const titles = campaignTitles(stories);
+			const state = bridgeState(status);
+			return h(
+				"div",
+				{ className: "sf-root sf-home" },
+				h(
+					"div",
+					{ className: "sf-home-inner" },
+					h(
+						"header",
+						{ className: "sf-head" },
+						h(
+							"div",
+							null,
+							h("div", { className: "sf-title" }, "StoryForge"),
+							h("div", { className: "sf-subtitle" }, "多 Agent 写作管线 · 模型调用全部经 DSH"),
+						),
+						h("div", { className: "sf-spacer" }),
+						h(Badge, { tone: state.tone, title: state.title }, state.label),
+						h(
+							"button",
+							{ type: "button", className: "sf-btn sf-btn-sm", title: "重新读取模型与角色卡列表", onClick: () => void refresh() },
+							"刷新",
+						),
+					),
+					error &&
+						h(
+							"div",
+							{ className: "sf-error" },
+							h("span", { className: "sf-grow" }, error),
+							h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setError(null) }, "关闭"),
+						),
+					h(
+						"div",
+						{ className: "sf-grid" },
+						h(NewStoryCard, { cards, fake, modelReady: Boolean(models?.selected), onCreated: () => void refresh(), onError: setError }),
+						!fake &&
+							h(SettingsCard, {
+								models,
+								onError: setError,
+								onChange: (patch) => setModels((current) => ({ ...current, ...patch })),
+							}),
+					),
+					h(StoriesCard, { stories, status }),
+					h(SettlesCard, { settles: status?.settles ?? [], titles }),
+					h(LlmCallsCard, { calls: status?.llmCalls ?? [], total: status?.llmCallCount ?? 0 }),
+					h(DebugDetails, { status, titles }),
+				),
+			);
+		}
+		//#endregion
 
 		/** 左侧栏图标：一本打开的书。 */
 		function PanelIcon(props) {
@@ -603,17 +1089,137 @@ window.__ModuleLoader__.load({
 			return h(
 				"svg",
 				{ width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.6, "aria-hidden": "true" },
-				[
-					h("path", { key: "l", d: "M12 6c-2-1.5-5-2-8-1.5v13c3-.5 6 0 8 1.5", strokeLinejoin: "round" }),
-					h("path", { key: "r", d: "M12 6c2-1.5 5-2 8-1.5v13c-3-.5-6 0-8 1.5V6z", strokeLinejoin: "round" }),
-				],
+				h("path", { d: "M12 6c-2-1.5-5-2-8-1.5v13c3-.5 6 0 8 1.5", strokeLinejoin: "round" }),
+				h("path", { d: "M12 6c2-1.5 5-2 8-1.5v13c-3-.5-6 0-8 1.5V6z", strokeLinejoin: "round" }),
 			);
 		}
+
+		/**
+		 * 样式：颜色、圆角都取 DSH 主题变量（亮 / 暗主题各有一套值），自定义变量定义在
+		 * 每个根元素上，跟随所在位置的主题；取不到时退回 currentColor 混色。
+		 */
+		const STYLES = `
+.sf-root, .sf-btn, .sf-badge {
+	--sf-fg: var(--dsw-alias-label-primary, inherit);
+	--sf-fg2: var(--dsw-alias-label-secondary, inherit);
+	--sf-fg3: var(--dsw-alias-label-tertiary, inherit);
+	--sf-border: var(--dsw-alias-border-l2, color-mix(in srgb, currentColor 12%, transparent));
+	--sf-border-strong: var(--dsw-alias-border-l3, color-mix(in srgb, currentColor 22%, transparent));
+	--sf-card: var(--dsw-alias-settings-card-fill, transparent);
+	--sf-hover: var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 6%, transparent));
+	--sf-brand: var(--dsw-alias-brand-primary, #4d6bfe);
+	--sf-on-brand: var(--dsw-alias-label-primary-foreground, #fff);
+	--sf-ok: var(--dsw-alias-state-success-primary, #22c55e);
+	--sf-warn: var(--dsw-alias-state-warn-primary, #f59e0b);
+	--sf-err: var(--dsw-alias-state-error-primary, #ef4444);
+	--sf-idle: var(--dsw-alias-label-tertiary, #8a8f98);
+	--sf-radius: var(--dsw-radius-lg, 12px);
+	--sf-radius-sm: var(--dsw-radius-sm, 6px);
+}
+.sf-root { color: var(--sf-fg); font-size: 13px; line-height: 1.6; }
+.sf-home { height: 100%; box-sizing: border-box; overflow: auto; }
+.sf-home-inner { max-width: 1120px; margin: 0 auto; padding: 20px 24px 40px; display: flex; flex-direction: column; gap: 16px; }
+.sf-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sf-title { font-size: 18px; font-weight: 600; line-height: 1.4; }
+.sf-subtitle, .sf-card-sub { color: var(--sf-fg3); font-size: 12px; font-weight: 400; }
+.sf-spacer, .sf-grow { flex: 1; }
+.sf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; align-items: start; }
+.sf-card { background: var(--sf-card); border: 1px solid var(--sf-border); border-radius: var(--sf-radius); padding: 16px 18px; min-width: 0; }
+.sf-card-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.sf-card-title { font-size: 14px; font-weight: 600; }
+.sf-card-actions { margin-left: auto; }
+.sf-section-title { font-weight: 600; color: var(--sf-fg2); margin: 14px 0 6px; }
+.sf-form { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px 12px; align-items: center; }
+.sf-form > label { color: var(--sf-fg2); }
+.sf-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sf-hint { grid-column: 2; margin-top: -6px; color: var(--sf-fg3); font-size: 12px; }
+.sf-input { height: 32px; box-sizing: border-box; width: 100%; max-width: 420px; min-width: 0; padding: 0 10px; border-radius: var(--sf-radius-sm); border: 1px solid var(--sf-border-strong); background: transparent; color: inherit; font: inherit; }
+.sf-input:focus-visible, .sf-btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--sf-brand) 50%, transparent); outline-offset: 1px; }
+.sf-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 14px; box-sizing: border-box; border-radius: var(--sf-radius-sm); border: 1px solid var(--sf-border-strong); background: transparent; color: inherit; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.sf-btn:hover:not(:disabled) { background: var(--sf-hover); }
+.sf-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.sf-btn-primary { background: var(--sf-brand); border-color: var(--sf-brand); color: var(--sf-on-brand); font-weight: 500; }
+.sf-btn-primary:hover:not(:disabled) { background: color-mix(in srgb, var(--sf-brand) 86%, #000); }
+.sf-btn-sm { height: 28px; padding: 0 10px; font-size: 12px; }
+.sf-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.sf-more { margin-top: 10px; }
+.sf-gap-top { margin-top: 8px; }
+.sf-badge { display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; border-radius: 999px; font-size: 12px; line-height: 22px; white-space: nowrap; color: var(--sf-tone); background: color-mix(in srgb, var(--sf-tone) 14%, transparent); }
+.sf-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.sf-tone-ok { --sf-tone: var(--sf-ok); }
+.sf-tone-warn { --sf-tone: var(--sf-warn); }
+.sf-tone-err { --sf-tone: var(--sf-err); }
+.sf-tone-run { --sf-tone: var(--sf-brand); }
+.sf-tone-idle { --sf-tone: var(--sf-idle); }
+.sf-tone-run::before { animation: sf-pulse 1.2s ease-in-out infinite; }
+@keyframes sf-pulse { 50% { opacity: 0.25; } }
+.sf-saved { color: var(--sf-ok); font-size: 12px; white-space: nowrap; }
+.sf-error { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--sf-radius-sm); background: color-mix(in srgb, var(--sf-err) 10%, transparent); color: var(--sf-err); white-space: pre-wrap; overflow-wrap: anywhere; }
+.sf-error-line { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-muted { color: var(--sf-fg3); }
+.sf-small { font-size: 12px; }
+.sf-nowrap { white-space: nowrap; }
+.sf-mono { font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-size: 12px; overflow-wrap: anywhere; }
+.sf-empty { color: var(--sf-fg3); text-align: center; padding: 18px 0; }
+.sf-table-wrap { overflow-x: auto; }
+.sf-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.sf-table th { text-align: left; font-weight: 500; font-size: 12px; color: var(--sf-fg3); padding: 6px 8px; border-bottom: 1px solid var(--sf-border); white-space: nowrap; }
+.sf-table td { padding: 7px 8px; border-bottom: 1px solid var(--sf-border); vertical-align: middle; }
+.sf-table tbody tr:last-child td { border-bottom: 0; }
+.sf-table tbody tr:hover td { background: var(--sf-hover); }
+.sf-table .sf-num { text-align: right; white-space: nowrap; }
+.sf-stats { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-bottom: 8px; color: var(--sf-fg2); font-size: 12px; }
+.sf-stats b { color: var(--sf-fg); font-weight: 600; }
+.sf-stories { display: flex; flex-direction: column; }
+.sf-story { display: flex; align-items: center; gap: 12px; padding: 10px 8px; border-radius: var(--sf-radius-sm); cursor: pointer; }
+.sf-story:focus-visible { outline: 2px solid var(--sf-brand); outline-offset: -2px; }
+.sf-story-missing { cursor: default; opacity: 0.7; }
+.sf-chevron { color: var(--sf-fg3); font-size: 18px; line-height: 1; }
+.sf-story + .sf-story { border-top: 1px solid var(--sf-border); }
+.sf-story:not(.sf-story-missing):hover { background: var(--sf-hover); }
+.sf-story-dim .sf-story-title { color: var(--sf-fg2); font-weight: 500; }
+.sf-story-main { flex: 1; min-width: 0; }
+.sf-story-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-story-meta { color: var(--sf-fg3); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-story-side { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.sf-details > summary { cursor: pointer; list-style: none; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 14px; font-weight: 600; }
+.sf-details > summary::-webkit-details-marker { display: none; }
+.sf-details > summary::before { content: "▸"; display: inline-block; color: var(--sf-fg3); transition: transform 0.15s; }
+.sf-details[open] > summary::before { transform: rotate(90deg); }
+.sf-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.sf-kv dt { color: var(--sf-fg3); }
+.sf-kv dd { margin: 0; overflow-wrap: anywhere; }
+.sf-plain-list { margin: 0; padding-left: 18px; }
+.sf-panel { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.sf-panel .sf-section-title { margin: 6px 0 0; }
+.sf-panel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sf-settle-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.sf-settle-list li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.sf-view { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; font-size: 14px; line-height: 1.7; }
+.sf-view p { margin: 0; }
+.sf-dock { color: var(--sf-fg3); font-size: 12px; padding: 2px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) {
+	.sf-home-inner { padding: 16px 14px 32px; }
+	.sf-grid { grid-template-columns: minmax(0, 1fr); }
+	.sf-form { grid-template-columns: minmax(0, 1fr); }
+	.sf-hint { grid-column: 1; }
+	.sf-story-side { gap: 6px; }
+	.sf-btn, .sf-input { height: 40px; }
+}
+`;
 
 		const inject = ["slots", "sessions", "sidebarRight", "sidebarRightTabs", "uiWorkspace"];
 
 		function apply(ctx) {
 			rootCtx = ctx;
+
+			ctx.effect(() => {
+				const style = document.createElement("style");
+				style.dataset.storyforge = "";
+				style.textContent = STYLES;
+				document.head.appendChild(style);
+				return () => style.remove();
+			}, "storyforge: styles");
 
 			ctx.slots.inject("sidebar.panellist", () =>
 				ctx.slots.register({ name: "sidebar.panellist", id: "storyforge", order: 13, label: "StoryForge" }, PanelIcon),

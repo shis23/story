@@ -15,16 +15,18 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表、底层模型选择、sidecar 状态、调试） |
 | `lib/bridge.js` | sidecar 管理：懒启动、按行收发 JSON-RPC、执行 sidecar 发来的 `llm.stream`、转发管线事件 |
 | `lib/agent.js` | StoryForge 预设里的 agent 作用域插件：每次模型请求钉到 `storyforge/pipeline`；记录 agent 创建 / 分叉 |
-| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（底层模型、角色卡、新建故事、sidecar 状态、调试信息）；StoryForge 会话里的视图标签、右栏面板、会话头按钮、停靠条、模型锁 |
+| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板、会话头按钮、停靠条、模型锁。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
+| `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……） |
 | `lib/shared.js` | 常量与进程内共享状态（生命周期事件、分叉回调） |
 | `storyforge.patch.yml` | 启动时叠加的补丁：激活宿主插件（`debugEcho: true` 时多挂调试回显 provider）+ 新增 `storyforge` 预设（只有 persona，无工具） |
 | `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮 |
+| `test/roles.test.mjs` | 管线角色识别 |
 
 插件配置（补丁里 `config` 下，均可省略）：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `dataDir` | `$DSH_HOME/storyforge` | 会话映射、设置、日志 |
+| `dataDir` | `$DSH_HOME/storyforge` | 会话映射（含已写轮数与最近一次收尾）、设置、收尾报告（`settles.json`）、日志 |
 | `cardsDir` | `<dataDir>/cards` | 「新建故事」可选的角色卡（`.png` / `.json`） |
 | `bridgeBin` | 仓库 `target/debug/storyforge-dsh-bridge(.exe)` | sidecar 可执行文件 |
 | `bridgeDataDir` | `<dataDir>/bridge-data` | StoryForge 存储（JSON 后端），与桌面版数据完全分开 |
@@ -76,8 +78,11 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
      是卡的开场白；
    - 在会话里输入行动：思考块显示导演 / 角色 / 执笔的过程，末尾一行是本轮的模式与底层
      调用用量；回复正文是质量门之后的成文。会话里的用量是本轮正文阶段所有底层调用之和；
-     后处理在后台继续，结束后自动接受（停靠条与面板显示结果和后处理用量）。首页「底层模型
-     调用」表逐次列出 sidecar 经插件发出的调用；
+     后处理在后台继续，结束后自动接受（停靠条与面板显示结果和后处理用量）；
+   - 首页「我的故事」按最近活动列出关联存档的故事（已写轮数、角色卡、分叉来源、最近一次
+     接受结果），点整行打开；未关联存档的会话默认折叠。「最近的收尾」与故事进度落盘，DSH
+     重启后仍在。「底层模型调用」表逐次列出管线发出的调用，「角色」列标出是导演、哪个角色、
+     执笔还是后处理；
    - 从某条回复「分叉」：子会话第一次发送时映射成存档的分支（StoryForge 的 Campaign
      分支），之后两边各写各的。只支持从**最后一条**回复分叉。
 
@@ -93,8 +98,9 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 - 改 `lib/index.js` / `lib/bridge.js` / `lib/agent.js` / 补丁：重启实例。
 - 改 Rust：`cargo build -p storyforge-dsh-bridge` 后重启实例（sidecar 随插件拉起）。
 - 测试：`cargo test -p storyforge-dsh-bridge`（含拉起 sidecar 进程、Mock 模型跑两轮的端到端
-  测试）；`node --test integrations/dsh-storyforge/test/host-smoke.test.mjs`（需先构建 sidecar）。
-- 调试：左侧栏「StoryForge」首页列出最近的适配器调用（会话、用途、模型、消息数、工具、
+  测试）；`node --test integrations/dsh-storyforge/test/host-smoke.test.mjs integrations/dsh-storyforge/test/roles.test.mjs`
+  （冒烟需先构建 sidecar）。
+- 调试：左侧栏「StoryForge」首页底部的「调试信息」（默认折叠）列出写作引擎进程状态、最近的适配器调用（会话、用途、模型、消息数、工具、
   跳过的注入消息）与 StoryForge 会话的生命周期事件；`/api/storyforge/debug/calls` 另含每次
   调用末尾几条消息的来源结构。
 

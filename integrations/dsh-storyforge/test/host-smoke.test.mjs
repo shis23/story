@@ -3,10 +3,10 @@
 // 请求），覆盖协议两端的消息转换、块转发、思考块进度与正文输出。
 //
 // 需要先构建 sidecar：cargo build -p storyforge-dsh-bridge（找不到二进制时跳过）。
-// 运行：node --test integrations/dsh-storyforge/test/
+// 运行：node --test integrations/dsh-storyforge/test/*.test.mjs
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -218,6 +218,15 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     assert.equal(status.llmCallCount, llmCalls.length)
     assert.ok(status.llmCalls.every((entry) => entry.status === 'ok' && entry.model === 'fake/writer'))
     assert.ok(status.settles[0].usage.calls >= 1, '后处理用量应计入收尾报告')
+    // 每次底层调用都按真实系统提示词标出管线角色（首页「底层模型调用」表的「角色」列）。
+    const roles = new Set(status.llmCalls.map((entry) => entry.role))
+    assert.ok(!roles.has('其它') && roles.has('角色识别') && roles.has('执笔') && roles.has('后处理'), [...roles].join('、'))
+    // 首页「我的故事」从 /status 一次拿到故事登记。
+    assert.equal(status.sessions[sessionId].campaignId, created.campaign.campaign_id)
+    // 收尾后故事登记记下轮数与最近一次结果，收尾报告落盘（跨 DSH 重启保留）。
+    assert.equal(status.sessions[sessionId].turns, 1)
+    assert.match(status.sessions[sessionId].lastSettle.accept, /^accepted/)
+    assert.equal(JSON.parse(readFileSync(join(root, 'data', 'settles.json'), 'utf8')).reports.length, 1)
 
     // DSH 重新生成上一轮（历史里少一轮）：存档已采纳的轮次不能重写，明确拒绝。
     await assert.rejects(collect(adapter.stream({ sessionId, messages })), /不能重新生成/)

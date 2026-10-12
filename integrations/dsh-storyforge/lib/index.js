@@ -23,6 +23,7 @@ import { basename, dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { BridgeRpcError, createBridge } from './bridge.js'
+import { classifyCall } from './roles.js'
 
 import {
   API_BASE,
@@ -563,7 +564,7 @@ function abortError(signal) {
  * StoryForge 会话的一次模型调用：开场返回卡的开场白；用户行动交给 sidecar 跑一轮，
  * 管线进度流进思考块，成文（质量门 / autofix 之后的最终正文）作为回复正文。
  */
-function createPipelineStream({ sessions, bridge, runOptions }) {
+function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
   /**
    * 分叉出的子会话第一次写作时，把它映射到来源存档的分支（StoryForge 只支持从最新
    * 一轮分叉；从更早的位置分叉会被 sidecar 以 out_of_sync 拒绝并说明原因）。
@@ -586,6 +587,7 @@ function createPipelineStream({ sessions, bridge, runOptions }) {
       cardFile: parent.cardFile,
       sourceCampaignId: forked.source_campaign_id,
       forkTurns: forked.turns,
+      turns: forked.turns,
     })
     log(`fork mapped: ${sessionId} -> campaign ${forked.campaign_id} (branch of ${forked.source_campaign_id} at turn ${forked.turns})`)
     return forked.campaign_id
@@ -646,7 +648,10 @@ function createPipelineStream({ sessions, bridge, runOptions }) {
         }),
       )
       .then(
-        (result) => queue.close(result),
+        (result) => {
+          onTurnRan?.(campaignId, historyTurns + 1)
+          queue.close(result)
+        },
         (error) => queue.fail(error),
       )
     try {
@@ -714,7 +719,11 @@ export function apply(ctx, config) {
   const replayCache = createReplayCache()
   /** 最近的管线事件与收尾报告（首页调试用）。 */
   const turnEvents = []
-  const settleReports = []
+  /** 收尾报告落盘（首页「最近的收尾」与故事进度跨 DSH 重启保留）。 */
+  const settleStore = createJsonStore(join(dataDir, 'settles.json'))
+  const settleReports = Array.isArray(settleStore.get('reports')) ? settleStore.get('reports') : []
+  /** 正文已出、等收尾的轮次：campaignId → 接受后的已采纳轮数。 */
+  const pendingTurns = new Map()
   /** sidecar 经插件发出的每一次底层模型调用（DSH 侧的调用记录）。 */
   const llmLog = []
   let llmSeq = 0
@@ -729,6 +738,7 @@ export function apply(ctx, config) {
       seq: ++llmSeq,
       at: new Date().toISOString(),
       model: target ? `${target.provider}/${target.model}` : null,
+      role: classifyCall(params?.messages),
       messages: params?.messages?.length ?? 0,
       tools: params?.tools?.length ?? 0,
       status: 'running',
@@ -771,14 +781,34 @@ export function apply(ctx, config) {
           turnEvents.unshift({ at: new Date().toISOString(), campaignId: params?.campaign_id, type: params?.event?.type })
           turnEvents.length = Math.min(turnEvents.length, MAX_TURN_EVENTS)
         } else if (method === 'turn.settled') {
-          settleReports.unshift({ at: new Date().toISOString(), ...params?.report })
+          const report = { at: new Date().toISOString(), ...params?.report }
+          settleReports.unshift(report)
           settleReports.length = Math.min(settleReports.length, MAX_SETTLE_REPORTS)
+          settleStore.set('reports', settleReports)
+          recordStoryProgress(report)
           log(`turn settled: ${JSON.stringify(params?.report)}`)
         }
       }),
     'storyforge: bridge event log',
   )
   ctx.effect(() => () => void bridge.stop(), 'storyforge: bridge process')
+
+  /** 收尾后把轮数与最近一次结果记到故事登记里（首页「我的故事」不必拉起 sidecar）。 */
+  function recordStoryProgress(report) {
+    const campaignId = report.campaign_id
+    if (!campaignId) return
+    const turns = pendingTurns.get(campaignId)
+    pendingTurns.delete(campaignId)
+    const accepted = typeof report.accept === 'string' && report.accept.startsWith('accepted')
+    for (const [sessionId, story] of Object.entries(sessions.all())) {
+      if (story?.campaignId !== campaignId) continue
+      sessions.set(sessionId, {
+        ...story,
+        ...(accepted && turns != null ? { turns } : {}),
+        lastSettle: { at: report.at, accept: report.accept, postprocess: report.postprocess, accept_error: report.accept_error ?? null },
+      })
+    }
+  }
 
   // registerAdapter 内部经调用方的 ctx.effect 登记，插件卸载时自动撤销路由。
   ctx.llm.registerAdapter(
@@ -787,7 +817,9 @@ export function apply(ctx, config) {
       displayName: 'StoryForge',
       models: [],
       contextWindow: CONTEXT_WINDOW,
-      streamImpl: fake ? fakePipelineStream : createPipelineStream({ sessions, bridge, runOptions }),
+      streamImpl: fake
+        ? fakePipelineStream
+        : createPipelineStream({ sessions, bridge, runOptions, onTurnRan: (campaignId, turns) => pendingTurns.set(campaignId, turns) }),
       callLog,
     }),
   )
@@ -937,6 +969,7 @@ export function apply(ctx, config) {
             cardFile: body.card,
             opening: created.opening,
             extractionStatus: created.extraction_status,
+            turns: 0,
           })
           return json({ ok: true, sessionId, campaign: created })
         } catch (error) {
@@ -1021,6 +1054,7 @@ export function apply(ctx, config) {
           model: settings.get('model') ?? null,
           ...runOptions(),
           settles: settleReports,
+          sessions: sessions.all(),
           events: turnEvents.slice(0, 50),
           llmCalls: llmLog.slice(0, 50),
           llmCallCount: llmSeq,
