@@ -796,7 +796,7 @@ pub mod builtins {
                 id: Id::from_str("builtin-perspective-third"),
                 name: "第三人称".into(),
                 category: ModuleCategory::Perspective,
-                content: "使用第三人称叙事。以全知或限知视角描写场景和角色行为。避免使用「你」称呼角色，使用角色名字或代词。".into(),
+                content: "使用第三人称叙事。以全知或限知视角描写场景和角色行为。避免使用「你」称呼角色，使用角色名字或代词。若本轮上下文注明沿用开场白的人称，以开场白人称为准。".into(),
                 exclusivity: Exclusivity::Single,
                 source: ModuleSource::BuiltIn,
                 applicable_roles: editor_only(),

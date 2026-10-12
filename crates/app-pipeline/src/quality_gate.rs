@@ -28,13 +28,17 @@ pub fn run_quality_gate_with_contract(
     text: &str,
     contract: Option<&NarrativeContract>,
 ) -> QualityReport {
+    // 复读 / 字数只看正文：卡自带状态栏的标签与内联样式是模板，每轮照抄不算复读。
+    let prose = contract.map_or(std::borrow::Cow::Borrowed(text), |c| {
+        c.strip_card_markup(text)
+    });
     let mut warnings: Vec<QualityWarning> = vec![
-        check_ngram_repetition(text),
+        check_ngram_repetition(&prose),
         check_meta_description(text),
-        check_too_short(text),
+        check_too_short(&prose),
         check_perspective_leak(text),
-        check_format_leak(text),
-        check_consecutive_repeat(text),
+        check_format_leak(text, contract),
+        check_consecutive_repeat(&prose),
         check_em_dash(text, contract),
         check_negation_then_affirmation(text, contract),
     ]
@@ -242,14 +246,29 @@ fn check_perspective_leak(text: &str) -> Option<QualityWarning> {
 }
 
 /// 格式泄漏：代码块、think 标签、HTML 等非正文残留。
-fn check_format_leak(text: &str) -> Option<QualityWarning> {
-    const PATTERNS: &[&str] = &[
-        "```", "<think>", "</think>", "<div", "</div>", "<span", "</span>", "<p>", "</p>",
-        "```json", "```xml",
+///
+/// 卡开场白自己用过的标记（契约 `card_markup`，如状态栏的 `<div>`、代码围栏）
+/// 是卡的既定格式，不算泄漏——否则每轮都会触发 Editor auto-fix 并删掉状态栏。
+/// `<think>` 不在豁免之列。
+fn check_format_leak(text: &str, contract: Option<&NarrativeContract>) -> Option<QualityWarning> {
+    /// (模式, 豁免键)：豁免键是卡开场白里对应的标签名或 "```"
+    const PATTERNS: &[(&str, Option<&str>)] = &[
+        ("```", Some("```")),
+        ("<think>", None),
+        ("</think>", None),
+        ("<div", Some("div")),
+        ("</div>", Some("div")),
+        ("<span", Some("span")),
+        ("</span>", Some("span")),
+        ("<p>", Some("p")),
+        ("</p>", Some("p")),
     ];
 
-    for pat in PATTERNS {
-        if text.contains(pat) {
+    for (pat, card_key) in PATTERNS {
+        let card_format = card_key
+            .zip(contract)
+            .is_some_and(|(key, c)| c.allows_card_markup(key));
+        if !card_format && text.contains(pat) {
             return Some(QualityWarning {
                 code: QualityWarningCode::FormatLeak {
                     snippet: pat.to_string(),
@@ -959,6 +978,113 @@ mod tests {
                 .any(|w| matches!(&w.code, QualityWarningCode::FormatLeak { .. })),
             "应检出格式泄漏: {:?}",
             report.warnings
+        );
+    }
+
+    fn format_leaks(report: &QualityReport) -> Vec<String> {
+        report
+            .warnings
+            .iter()
+            .filter_map(|w| match &w.code {
+                QualityWarningCode::FormatLeak { snippet } => Some(snippet.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 真实卡的状态栏：每个 `<li>` 带同样的内联样式、标签之间是换行缩进，开场白还用破折号。
+    /// 带开场白契约时既不算复读也不算破折号违规，整份报告通过（不触发 auto-fix）；
+    /// 无契约时两项照旧报出。
+    #[test]
+    fn card_status_bar_styles_and_opening_em_dash_pass_with_opening_contract() {
+        use storyforge_domain::narrative_contract::OpeningStyle;
+
+        let items = [("时间", "周一上午"), ("地点", "高二A班"), ("事件", "初次重逢"), ("状态", "强装镇定"), ("破绽", "指节发白")]
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "<li style=\"padding: 2px 0; border-bottom: 1px dashed #d3c9b3\"><b>{k}:</b> {v}</li>"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n      ");
+        let bar = format!(
+            "<details style=\"padding: 12px\">\n  <summary>状态栏</summary>\n  <div>\n    <ul>\n      {items}\n    </ul>\n  </div>\n</details>"
+        );
+        let opening = format!("我瞥见——她握笔的手指在发抖。\n{bar}");
+        let contract =
+            NarrativeContract::default().with_opening_style(&OpeningStyle::from_opening(&opening));
+        let draft = format!(
+            "我在她身边站定——她没有抬头。窗外的蝉鸣忽远忽近，粉笔灰落在课桌一角。\
+             我想开口——又咽了回去。她的笔尖停在半空——像在等什么。\n{bar}"
+        );
+
+        let with_card = run_quality_gate_with_contract(&draft, Some(&contract));
+        assert!(with_card.passed(), "{:?}", with_card.warnings);
+
+        let without = run_quality_gate(&draft);
+        let codes: Vec<_> = without.warnings.iter().map(|w| &w.code).collect();
+        assert!(
+            codes
+                .iter()
+                .any(|c| matches!(c, QualityWarningCode::NgramRepetition { .. })),
+            "{codes:?}"
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|c| matches!(c, QualityWarningCode::EmDashDensity { .. })),
+            "{codes:?}"
+        );
+    }
+
+    /// 卡开场白自带的状态栏 HTML 是卡的既定格式：不算格式泄漏、不触发 auto-fix；
+    /// 开场白没用过的标签与 `<think>` 照旧拦截。
+    #[test]
+    fn card_markup_from_opening_is_not_a_format_leak() {
+        use storyforge_domain::narrative_contract::OpeningStyle;
+
+        let opening = "我推开门。\n<details><summary>状态栏</summary><div><ul><li>时间：上午</li></ul></div></details>";
+        let contract =
+            NarrativeContract::default().with_opening_style(&OpeningStyle::from_opening(opening));
+        let draft = "我在她对面坐下，她把笔记本合上，看了我一眼，又转头望向窗外的操场。\n\
+            <details><summary>状态栏</summary><div><ul><li>时间：中午</li></ul></div></details>";
+
+        let with_card = run_quality_gate_with_contract(draft, Some(&contract));
+        assert!(
+            format_leaks(&with_card).is_empty(),
+            "{:?}",
+            with_card.warnings
+        );
+        // 无契约（旧调用方）行为不变
+        assert_eq!(
+            format_leaks(&run_quality_gate(draft)),
+            vec!["<div".to_string()]
+        );
+
+        let span_draft = format!("{draft}<span>额外</span>");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &span_draft,
+                Some(&contract)
+            )),
+            vec!["<span".to_string()]
+        );
+        let think_draft = format!("<think>想一想</think>{draft}");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &think_draft,
+                Some(&contract)
+            )),
+            vec!["<think>".to_string()]
+        );
+        let fence_draft = format!("{draft}\n```\nHP: 3\n```");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &fence_draft,
+                Some(&contract)
+            )),
+            vec!["```".to_string()]
         );
     }
 

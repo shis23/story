@@ -156,6 +156,8 @@ User Intent
 
 质量门禁的单次自动修订是独立的 `PipelineOrchestrator::revise_draft`：输入已有正文、约束和 provenance，输出修订正文及更新后的溯源。它不调用旧模式局部重跑，不创建新变体；二次质量检查通过后再同步最终稿和 Attempt。
 
+开场白风格：对话首条开场白（卡的 first_mes 或所选 greeting；首节点、Final、无 provenance）经 `OpeningStyle::from_opening` 推断叙述人称（只看叙述，对白与 HTML 不计；「我」或「你」够数且不被「他/她」压倒时判第一/第二人称，否则保持默认限知第三人称）、卡自带标记（开场白出现过的 HTML 标签名、代码围栏）和是否用破折号（用了就关掉该卡的破折号禁令）。`PipelineOrchestrator::narrative_contract` 把它套到 NarrativeContract（`pov` / `pov_from_opening` / `card_markup`），Editor、质量门、自动修订共用同一份。质量门的格式泄漏检查放行 `card_markup` 里的标签（`<think>` 除外），复读与字数检查先用 `strip_card_markup` 去掉这些标签（状态栏的内联样式每轮照抄，不算复读），自动修订提示要求保留卡的 HTML 块；续写档执笔 tail 多一段【叙述风格】。前端 `RichContent` 把原文里完整闭合的块级 HTML（details/div/table/ul/ol/blockquote）经 DOMPurify 就地渲染（`contain: paint`），其余标签仍走转义文本。
+
 目标：
 
 - 保留更清晰的 provenance：哪些子表演被采用、删改或冲突解决。

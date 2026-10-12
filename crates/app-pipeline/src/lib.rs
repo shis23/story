@@ -803,6 +803,36 @@ impl PipelineOrchestrator {
         self.session.as_ref()
     }
 
+    /// 对话开场白确立的风格（人称 / 卡格式标记）；没有开场白时为默认值。
+    pub fn opening_style(
+        &self,
+        conversation_id: &Id,
+    ) -> storyforge_domain::narrative_contract::OpeningStyle {
+        self.conv_store
+            .opening_text(conversation_id)
+            .map(|text| storyforge_domain::narrative_contract::OpeningStyle::from_opening(&text))
+            .unwrap_or_default()
+    }
+
+    /// 本轮叙事契约：Plan + Campaign 快照 + 开场白风格。没有 Plan 时从默认契约起步，
+    /// 开场白风格（人称、卡格式豁免）照样生效。
+    pub fn narrative_contract(
+        &self,
+        plan: Option<&Plan>,
+        runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+        conversation_id: &Id,
+    ) -> storyforge_domain::narrative_contract::NarrativeContract {
+        let contract = match plan {
+            Some(plan) => {
+                storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                    plan, runtime,
+                )
+            }
+            None => storyforge_domain::narrative_contract::NarrativeContract::default(),
+        };
+        contract.with_opening_style(&self.opening_style(conversation_id))
+    }
+
     /// Phase 6: 获取本轮创建的临时 instance（供 Tauri 层落盘到 CampaignStore）
     pub fn pending_temporary_instances(&self) -> &[CharacterInstance] {
         &self.pending_temporary_instances
@@ -1094,6 +1124,7 @@ impl PipelineOrchestrator {
         });
         let _ = event_tx.send(PipelineEvent::WriterStarted);
 
+        let opening_style = self.opening_style(&ctx.conversation_id);
         let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
         let writer_config = make_writer_config(
             ctx.profile.as_ref(),
@@ -1132,7 +1163,7 @@ impl PipelineOrchestrator {
         let writer_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(writer_config.system_prompt.clone())
             .history(history)
-            .tail(|_| build_writer_tail(&dossier, ctx));
+            .tail(|_| build_writer_tail(&dossier, ctx, &opening_style));
 
         let (writer_progress_tx, mut writer_progress_rx) = mpsc::unbounded_channel::<String>();
         let writer_event_tx = event_tx.clone();
@@ -2811,11 +2842,11 @@ impl PipelineOrchestrator {
                 &self.reasoning_mode(),
             ),
         };
-        let editor_contract =
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                input.plan,
-                input.campaign_runtime,
-            );
+        let editor_contract = self.narrative_contract(
+            Some(input.plan),
+            input.campaign_runtime,
+            input.conversation_id,
+        );
         let performances_text =
             redact_performances_for_editor(input.performances, Some(&editor_contract));
 
@@ -3786,13 +3817,33 @@ fn make_duet_editor_config(
     }
 }
 
+/// 开场白风格提示（人称 / 卡格式）；开场白没给出信号时为 None，续写 tail 不变。
+fn render_opening_style_for_writer(
+    style: &storyforge_domain::narrative_contract::OpeningStyle,
+) -> Option<String> {
+    let contract = storyforge_domain::narrative_contract::NarrativeContract::default()
+        .with_opening_style(style);
+    let mut lines = Vec::new();
+    if contract.pov_from_opening {
+        lines.push(format!("- 叙述人称：{}，沿用开场白", contract.pov.label()));
+    }
+    if let Some(markup) = contract.card_markup_instruction() {
+        lines.push(format!("- {markup}"));
+    }
+    (!lines.is_empty()).then(|| format!("【叙述风格】\n{}", lines.join("\n")))
+}
+
 fn build_writer_tail(
     dossier: &turn_dossier::CompiledTurnDossier,
     ctx: &WritingContext,
+    opening_style: &storyforge_domain::narrative_contract::OpeningStyle,
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
     let mut tail = VolatileTail::new().push(dossier.render_for_writer());
+    if let Some(style) = render_opening_style_for_writer(opening_style) {
+        tail = tail.push(style);
+    }
     let selective_lore = build_triggered_selective_lore(&dossier.intent, ctx);
     if !selective_lore.trim().is_empty() {
         tail = tail.push(selective_lore);
@@ -5788,6 +5839,95 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, PipelineEvent::EditorStarted))
         );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    /// 第一人称 + 状态栏开场的卡：执笔 tail 带上开场白人称与卡格式说明，
+    /// 质量门契约豁免卡自带的标签；无开场白的对话 tail 不变。
+    #[tokio::test]
+    async fn opening_style_reaches_writer_tail_and_quality_contract() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmClient> = Arc::new(CapturingDirectorLlm {
+            requests: requests.clone(),
+            response: storyforge_domain::llm::ChatResponse {
+                content: "我没有立刻拆信，只把它推回灯下。".into(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        });
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_opening_style_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let with_opening = conv_store.create(None, None).id;
+        conv_store
+            .append_final_message(
+                &with_opening,
+                storyforge_domain::conversation::Role::Assistant,
+                "我推开门，她抬头看了我一眼。我没说话，我只是把信放在桌上。\n\
+                 <details><summary>状态栏</summary><div>时间：上午</div></details>"
+                    .into(),
+            )
+            .unwrap();
+        let plain = conv_store.create(None, None).id;
+
+        let contract = orchestrator.narrative_contract(None, None, &with_opening);
+        assert_eq!(
+            contract.pov,
+            storyforge_domain::narrative_contract::NarrativePov::First
+        );
+        assert!(contract.allows_card_markup("div"));
+        assert_eq!(
+            orchestrator.narrative_contract(None, None, &plain),
+            storyforge_domain::narrative_contract::NarrativeContract::default()
+        );
+
+        for (conversation_id, expect_style) in [(with_opening, true), (plain, false)] {
+            let ctx = WritingContext::legacy(vec![mock_character("林如")], None, conversation_id);
+            let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            orchestrator
+                .start_writing_with_mode(
+                    "续写".into(),
+                    &ctx,
+                    GenerationMode::Continuation,
+                    event_tx,
+                    cancel_rx,
+                )
+                .await
+                .expect("continuation writer should succeed");
+            let request = requests
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("writer request captured");
+            let tail = request
+                .messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let all = request
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(all.contains("【叙述风格】"), expect_style, "{tail}");
+            if expect_style {
+                assert!(all.contains("叙述人称：第一人称，沿用开场白"), "{all}");
+                assert!(all.contains("卡格式"), "{all}");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
