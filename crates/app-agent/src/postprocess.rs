@@ -342,10 +342,48 @@ struct NewTaskDto {
     title: String,
     #[serde(default)]
     description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_triggers")]
     triggers: Vec<TaskTrigger>,
     #[serde(default)]
     related_characters: Vec<String>,
+}
+
+/// 触发条件宽松解析。模型常把它写成纯字符串（`"triggers": ["三个月期限到达"]`）、
+/// 单个值，或漏写 `kind`；这些都是事件描述，按 `event` 收下。认不出的单条跳过并
+/// warn，不再让整条新任务（新埋的伏笔）因为一个触发条件被丢掉。
+fn lenient_triggers<'de, D>(deserializer: D) -> Result<Vec<TaskTrigger>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items = match <serde_json::Value as serde::Deserialize>::deserialize(deserializer)? {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Null => Vec::new(),
+        other => vec![other],
+    };
+    Ok(items.into_iter().filter_map(trigger_from_value).collect())
+}
+
+fn trigger_from_value(value: serde_json::Value) -> Option<TaskTrigger> {
+    let event = |text: &str| {
+        let description = text.trim();
+        (!description.is_empty()).then(|| TaskTrigger::Event {
+            description: description.to_string(),
+        })
+    };
+    match value {
+        serde_json::Value::String(text) => event(&text),
+        serde_json::Value::Object(map) if !map.contains_key("kind") => map
+            .get("description")
+            .and_then(|d| d.as_str())
+            .and_then(event),
+        other => match serde_json::from_value::<TaskTrigger>(other) {
+            Ok(trigger) => Some(trigger),
+            Err(error) => {
+                warn!(target: "postprocess", "task trigger 解析失败，已跳过该条: {error}");
+                None
+            }
+        },
+    }
 }
 
 /// W-10：广播目标归一（trim + 大小写不敏感）；"all"/"全体"/"所有人" → All。
@@ -584,6 +622,36 @@ mod tests {
             current_character_instance_id: None,
             regex_scripts: vec![],
         })
+    }
+
+    /// 真模型（gemini）把触发条件写成纯字符串或漏写 kind：按事件描述收下，新任务不丢。
+    #[test]
+    fn task_triggers_written_as_plain_text_still_create_the_task() {
+        let raw = r#"{"task_updates": [
+          {"new_status": "pending", "new_task": {"title": "解释地址", "description": "当年地址为何写错",
+            "triggers": ["莫挽舟解释当年地址为何写错"], "related_characters": ["莫挽舟"]}},
+          {"new_status": "pending", "new_task": {"title": "钥匙", "description": "老屋钥匙",
+            "triggers": {"description": "回到土龙村老屋"}}},
+          {"new_status": "pending", "new_task": {"title": "混合", "description": "混合写法",
+            "triggers": [{"kind": "turn_reminder", "at_turn": 30}, {"kind": "bogus"}, "  ", "期限到达"]}}
+        ]}"#;
+        let r = parse_postprocess_from_response(&make_resp(raw, vec![]));
+        let triggers: Vec<Vec<TaskTrigger>> = r
+            .task_updates
+            .iter()
+            .map(|t| t.new_task.as_ref().unwrap().triggers.clone())
+            .collect();
+        let event = |d: &str| TaskTrigger::Event {
+            description: d.into(),
+        };
+        assert_eq!(
+            triggers,
+            vec![
+                vec![event("莫挽舟解释当年地址为何写错")],
+                vec![event("回到土龙村老屋")],
+                vec![TaskTrigger::TurnReminder { at_turn: 30 }, event("期限到达")],
+            ]
+        );
     }
 
     #[test]
