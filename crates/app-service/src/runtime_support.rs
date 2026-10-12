@@ -970,6 +970,11 @@ const RECENT_SUMMARIES_LOAD_LIMIT: usize = 12;
 /// 剔除后仍能凑满注入上限。
 const FAR_MEMORY_RECALL_CANDIDATES: usize =
     storyforge_app_pipeline::FAR_MEMORY_INJECT_LIMIT + RECENT_SUMMARIES_LOAD_LIMIT;
+// 归档总结首行的「要点」要整行落在远记忆注入的截断窗口里，否则具体事实又会被截掉。
+const _: () = assert!(
+    storyforge_app_memory::archiver::ARCHIVE_LEAD_MAX_CHARS
+        < storyforge_app_pipeline::FAR_MEMORY_ITEM_MAX_CHARS
+);
 /// 按 turn 升序后只保留最近 `limit` 条，避免长战役全量摘要进内存/工具上下文。
 pub fn take_recent_summaries_for_context(
     mut summaries: Vec<storyforge_domain::agent::RoundSummary>,
