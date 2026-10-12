@@ -992,23 +992,24 @@ mod tests {
             .collect()
     }
 
-    /// 真实卡的状态栏：每个 `<li>` 带同样的内联样式，开场白还用破折号。
+    /// 真实卡的状态栏：每个 `<li>` 带同样的内联样式、标签之间是换行缩进，开场白还用破折号。
     /// 带开场白契约时既不算复读也不算破折号违规，整份报告通过（不触发 auto-fix）；
     /// 无契约时两项照旧报出。
     #[test]
     fn card_status_bar_styles_and_opening_em_dash_pass_with_opening_contract() {
         use storyforge_domain::narrative_contract::OpeningStyle;
 
-        let items: String = [("时间", "周一上午"), ("地点", "高二A班"), ("事件", "初次重逢"), ("状态", "强装镇定"), ("破绽", "指节发白")]
+        let items = [("时间", "周一上午"), ("地点", "高二A班"), ("事件", "初次重逢"), ("状态", "强装镇定"), ("破绽", "指节发白")]
             .iter()
             .map(|(k, v)| {
                 format!(
                     "<li style=\"padding: 2px 0; border-bottom: 1px dashed #d3c9b3\"><b>{k}:</b> {v}</li>"
                 )
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .join("\n      ");
         let bar = format!(
-            "<details style=\"padding: 12px\"><summary>状态栏</summary><div><ul>{items}</ul></div></details>"
+            "<details style=\"padding: 12px\">\n  <summary>状态栏</summary>\n  <div>\n    <ul>\n      {items}\n    </ul>\n  </div>\n</details>"
         );
         let opening = format!("我瞥见——她握笔的手指在发抖。\n{bar}");
         let contract =
