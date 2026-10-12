@@ -1,0 +1,42 @@
+[package]
+name = "storyforge-app-service"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "StoryForge 宿主无关的应用服务层：AppState、存储门面、Turn / 后处理工作流、派生索引、命令辅助"
+
+[dependencies]
+storyforge-domain.workspace = true
+storyforge-infra-util.workspace = true
+storyforge-infra-import.workspace = true
+storyforge-infra-llm.workspace = true
+storyforge-infra-regex.workspace = true
+storyforge-infra-sqlite.workspace = true
+storyforge-app-logging.workspace = true
+storyforge-app-agent.workspace = true
+storyforge-app-conversation.workspace = true
+storyforge-app-pipeline.workspace = true
+storyforge-app-meta.workspace = true
+storyforge-app-memory.workspace = true
+storyforge-infra-vector.workspace = true
+storyforge-infra-plugin-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+# Gate 4: SQLite-native Meta/MVU/Chronicle job repositories run against
+# infra-sqlite's UnitOfWork. Feature set is unified with infra-sqlite
+# (bundled+backup) by Cargo; no connection is opened here.
+rusqlite = "0.32"
+
+[features]
+# 宿主 crate（tauri-app）的测试需要的测试辅助（AppState::new_for_test、
+# 测试用全局存储等）。只在 dev-dependencies 里打开，生产构建不含。
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"

@@ -3840,11 +3840,11 @@ dependencies = [
  "storyforge-app-memory",
  "storyforge-app-meta",
  "storyforge-app-pipeline",
+ "storyforge-app-service",
  "storyforge-domain",
  "storyforge-infra-import",
  "storyforge-infra-llm",
  "storyforge-infra-plugin-host",
- "storyforge-infra-regex",
  "storyforge-infra-sqlite",
  "storyforge-infra-util",
  "storyforge-infra-vector",
@@ -3853,7 +3853,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -3964,6 +3963,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "storyforge-app-service"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "storyforge-app-agent",
+ "storyforge-app-conversation",
+ "storyforge-app-logging",
+ "storyforge-app-memory",
+ "storyforge-app-meta",
+ "storyforge-app-pipeline",
+ "storyforge-domain",
+ "storyforge-infra-import",
+ "storyforge-infra-llm",
+ "storyforge-infra-plugin-host",
+ "storyforge-infra-regex",
+ "storyforge-infra-sqlite",
+ "storyforge-infra-util",
+ "storyforge-infra-vector",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "storyforge-domain"
 version = "0.1.2"
 dependencies = [
@@ -3984,8 +4013,8 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
- "storyforge",
  "storyforge-app-logging",
+ "storyforge-app-service",
  "storyforge-domain",
  "storyforge-infra-llm",
  "storyforge-infra-sqlite",

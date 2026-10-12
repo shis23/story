@@ -9,7 +9,7 @@ use super::*;
 /// Returns `Ok(applied)` or `Err` for critical consistency failures that callers must
 /// surface (regenerate) / fail-closed (background start_writing).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_shared_postprocess_background(
+pub async fn run_shared_postprocess_background(
     storage: Arc<storage_backend::StorageFacade>,
     pipeline: PipelineOrchestrator,
     writing_ctx: WritingContext,
@@ -303,7 +303,7 @@ pub fn postprocess_pipeline_event(
     }
 }
 
-pub(crate) fn service_fail_turn(
+pub fn service_fail_turn(
     sink: &BackendTurnAttemptSink<'_>,
     identity: &production_postprocess::PostprocessIdentity,
     original: production_postprocess::ProductionPostprocessError,
@@ -328,7 +328,7 @@ pub(crate) fn service_fail_turn(
 }
 
 /// 读取-修改-写回 TurnRecord 的便捷辅助。
-pub(crate) fn update_turn_record<F>(
+pub fn update_turn_record<F>(
     storage: &storage_backend::StorageFacade,
     turn_id: &Id,
     f: F,
@@ -340,7 +340,7 @@ where
 }
 
 /// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
-pub(crate) fn update_turn_record_if<P, M>(
+pub fn update_turn_record_if<P, M>(
     storage: &storage_backend::StorageFacade,
     turn_id: &Id,
     predicate: P,
@@ -354,14 +354,25 @@ where
 }
 
 /// 后处理结果只能写回仍属于当前草稿的 Attempt。
-pub(crate) fn is_current_attempt_ready_for_postprocess(
+pub fn is_current_attempt_ready_for_postprocess(
     record: &storyforge_domain::turn::TurnRecord,
     attempt_id: &Id,
 ) -> bool {
     turn_lifecycle::is_current_attempt_ready_for_postprocess(record, attempt_id)
 }
 
-pub(crate) fn resolve_legacy_opening_message(
+/// 开场白落库前展开身份宏（`{{user}}` / `{{char}}` / `<user>` 等）：会话里显示的、
+/// 之后作为历史送给模型的都是成文，模型不会把占位符照抄进正文。`{{char}}` 取卡名
+/// （与 ST 一致）；取不到名字时角色宏原样保留。
+pub fn render_opening_message(message: &str, char_name: Option<&str>) -> String {
+    storyforge_domain::prompt_module::replace_identity_macros(
+        message,
+        char_name.map(str::trim).filter(|name| !name.is_empty()),
+        storyforge_domain::prompt_module::DEFAULT_USER_NAME,
+    )
+}
+
+pub fn resolve_legacy_opening_message(
     character: Option<&Arc<storyforge_domain::character::Character>>,
     requested: Option<String>,
 ) -> Option<String> {
@@ -372,10 +383,11 @@ pub(crate) fn resolve_legacy_opening_message(
         requested,
         "legacy",
     )
+    .map(|opening| render_opening_message(&opening, Some(&character.name)))
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_campaign_opening_message(
+#[cfg(any(test, feature = "test-support"))]
+pub fn resolve_campaign_opening_message(
     store: &storage::CharacterStore,
     source_character_id: &Id,
     requested: Option<String>,
@@ -389,7 +401,7 @@ pub(crate) fn resolve_campaign_opening_message(
     )
 }
 
-pub(crate) fn stored_character_for_id_or_source_in_store(
+pub fn stored_character_for_id_or_source_in_store(
     store: &storage::CharacterStore,
     character_id: &Id,
 ) -> Option<storage::StoredCharacter> {
@@ -402,14 +414,14 @@ pub(crate) fn stored_character_for_id_or_source_in_store(
     })
 }
 
-pub(crate) fn stored_character_for_source_id(
+pub fn stored_character_for_source_id(
     store: &storage::CharacterStore,
     source_character_id: &Id,
 ) -> Option<storage::StoredCharacter> {
     stored_character_for_id_or_source_in_store(store, source_character_id)
 }
 
-pub(crate) fn resolve_opening_message_from_parts(
+pub fn resolve_opening_message_from_parts(
     first_mes: &str,
     alternate_greetings: &[String],
     requested: Option<String>,
@@ -442,7 +454,7 @@ pub(crate) fn resolve_opening_message_from_parts(
 /// 从模块/Profile 存储加载预设配置到 WritingContext
 ///
 /// 无 Profile 时不动 ctx（profile 保持 None → 流水线用硬编码常量兜底）。
-pub(crate) fn collect_campaign_scoped_regex_scripts(
+pub fn collect_campaign_scoped_regex_scripts(
     campaign_id: &Id,
     store: &campaign_store::CampaignStore,
 ) -> Vec<RegexScript> {
@@ -510,7 +522,7 @@ pub fn collect_scoped_regex_scripts_for_backend(
         .unwrap_or_default())
 }
 
-pub(crate) fn merge_runtime_regex_scripts(
+pub fn merge_runtime_regex_scripts(
     scoped_scripts: Vec<RegexScript>,
     preset_store: &PresetStore,
     global_regex_store: &global_regex_store::GlobalRegexStore,
@@ -524,7 +536,7 @@ pub(crate) fn merge_runtime_regex_scripts(
     merge_regex_script_sources(&global_scripts, &preset_scripts, &scoped_scripts)
 }
 
-pub(crate) fn fill_regex_context(
+pub fn fill_regex_context(
     ctx: &mut WritingContext,
     preset_store: &PresetStore,
     global_regex_store: &global_regex_store::GlobalRegexStore,
@@ -534,7 +546,7 @@ pub(crate) fn fill_regex_context(
         merge_runtime_regex_scripts(scoped_scripts, preset_store, global_regex_store);
 }
 
-pub(crate) fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
+pub fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
     // 加载活跃 Profile
     if let Some(profile) = state.profile_store.get_active() {
         // 加载所有启用的模块
@@ -553,7 +565,7 @@ pub(crate) fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppStat
 /// 从活跃 Agent Profile Config 加载运行时配置覆盖到 WritingContext
 ///
 /// 无活跃配置时不动 ctx（agent_profile_config 保持 None → 流水线用硬编码默认值）。
-pub(crate) fn fill_agent_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
+pub fn fill_agent_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
     let config = state.agent_profile_config_store.get_active();
     ctx.agent_profile_config = Some(config);
 }
@@ -566,8 +578,8 @@ pub(crate) fn fill_agent_profile_context(ctx: &mut WritingContext, state: &Arc<A
 /// 优先读内存 `state.active_campaign`，磁盘 `load_active_campaign` 仅作 fallback。
 /// 历史 bug：旧实现绕过内存直接读磁盘，若 `set_active_campaign` 先改内存后写盘
 /// 但写盘失败（非原子），会用旧/空 campaign。
-#[cfg(test)]
-pub(crate) fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     clear_campaign_runtime(ctx, &state.tool_ctx);
 
     let active_id = {
@@ -594,7 +606,7 @@ pub(crate) fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) 
     }
 }
 
-pub(crate) async fn fill_campaign_context_async(
+pub async fn fill_campaign_context_async(
     ctx: &mut WritingContext,
     state: &Arc<AppState>,
 ) -> Result<(), TauriCommandError> {
@@ -630,10 +642,7 @@ pub(crate) async fn fill_campaign_context_async(
     Ok(())
 }
 
-pub(crate) fn clear_campaign_runtime(
-    ctx: &mut WritingContext,
-    tool_ctx: &Arc<RwLock<ToolContext>>,
-) {
+pub fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolContext>>) {
     // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留。
     ctx.campaign_runtime = None;
     ctx.recent_summaries.clear();
@@ -645,7 +654,7 @@ pub(crate) fn clear_campaign_runtime(
 }
 
 /// 取 `before_node_id` 之前最近一条 User 消息正文（用于 regenerate 无 hint 时的远记忆查询）。
-pub(crate) fn last_user_intent_before(
+pub fn last_user_intent_before(
     conv_store: &ConversationStore,
     conv_id: &Id,
     before_node_id: &Id,
@@ -676,7 +685,7 @@ pub(crate) fn last_user_intent_before(
 /// 有 campaign 时只召回同 campaign 记录；无 campaign（legacy）时只召回本会话或
 /// 无会话标签的 legacy 归档（作用域语义见 app-memory `recall.rs` 的 `accepts_scope`）。
 /// 配置了 Embedder 时走向量+关键词合并；否则纯关键词。
-pub(crate) async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
+pub async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
     ctx.far_memory_hits.clear();
     let intent = intent.trim();
     if intent.is_empty() {
@@ -735,7 +744,7 @@ pub(crate) async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppSt
 /// - 始终写关键词（无 Embedder 也能召回）
 /// - 若传入 `embedder`，best-effort 嵌入真实向量供 hybrid 召回
 /// - 幂等：以 summary.id 为向量记录 id upsert
-pub(crate) fn index_round_summaries_to_vector(
+pub fn index_round_summaries_to_vector(
     vector_store: &dyn VectorStore,
     batch: &storyforge_domain::turn::MutationBatch,
 ) {
@@ -744,7 +753,7 @@ pub(crate) fn index_round_summaries_to_vector(
 }
 
 /// 同 `index_round_summaries_to_vector`，但允许预计算向量（id → vector）。
-pub(crate) fn index_round_summaries_to_vector_with_vectors(
+pub fn index_round_summaries_to_vector_with_vectors(
     vector_store: &dyn VectorStore,
     batch: &storyforge_domain::turn::MutationBatch,
     vectors: &[(Id, Vec<f32>)],
@@ -763,7 +772,7 @@ pub(crate) fn index_round_summaries_to_vector_with_vectors(
 ///
 /// 2026-10-11 审计：整批一次 `upsert_batch` 落盘——旧实现逐条 upsert，每条都重写
 /// 整个向量库文件；分支/导入重建几百条摘要时退化成几百次全量写盘。
-pub(crate) fn index_summaries_with_vectors<'a>(
+pub fn index_summaries_with_vectors<'a>(
     vector_store: &dyn VectorStore,
     summaries: impl IntoIterator<Item = &'a storyforge_domain::agent::RoundSummary>,
     vectors: &[(Id, Vec<f32>)],
@@ -863,7 +872,7 @@ pub(crate) fn index_summaries_with_vectors<'a>(
 /// 后台：为 batch 中的 RoundSummary 补齐嵌入向量（有 Embedder 时）。
 ///
 /// 先关键词落盘保证可召回；嵌入成功后覆盖 upsert 写入真实向量。
-pub(crate) async fn index_round_summaries_async(
+pub async fn index_round_summaries_async(
     state: Arc<AppState>,
     batch: storyforge_domain::turn::MutationBatch,
 ) {
@@ -879,7 +888,7 @@ pub(crate) async fn index_round_summaries_async(
 }
 
 /// 后台：关键词立即入库，再在配置了 Embedder 时逐条补齐真实向量（best-effort）。
-pub(crate) async fn index_summaries_async(
+pub async fn index_summaries_async(
     state: Arc<AppState>,
     summaries: Vec<storyforge_domain::agent::RoundSummary>,
 ) {
@@ -953,7 +962,7 @@ pub struct CampaignContextSnapshot {
 /// turn 计数仍用全量 list_summaries.len()；注入侧再取 last 5。
 const RECENT_SUMMARIES_LOAD_LIMIT: usize = 12;
 /// 按 turn 升序后只保留最近 `limit` 条，避免长战役全量摘要进内存/工具上下文。
-pub(crate) fn take_recent_summaries_for_context(
+pub fn take_recent_summaries_for_context(
     mut summaries: Vec<storyforge_domain::agent::RoundSummary>,
     limit: usize,
 ) -> Vec<storyforge_domain::agent::RoundSummary> {
@@ -969,7 +978,7 @@ pub(crate) fn take_recent_summaries_for_context(
 }
 
 /// 渲染 ContextEpochSnapshot 用的 catalog：snapshot 引用的 code + 全部 leaf A。
-pub(crate) fn build_chronicle_prompt_catalog(
+pub fn build_chronicle_prompt_catalog(
     all: &[storyforge_domain::agent::RoundSummary],
     frozen: Option<&storyforge_domain::chronicle::ContextEpochSnapshot>,
 ) -> Vec<storyforge_domain::agent::RoundSummary> {
@@ -995,7 +1004,7 @@ pub(crate) fn build_chronicle_prompt_catalog(
 }
 
 /// 已提交 Turn 数：只计 Chronicle A（leaf），不计 B/C stage。
-pub(crate) fn committed_turn_count(summaries: &[storyforge_domain::agent::RoundSummary]) -> u32 {
+pub fn committed_turn_count(summaries: &[storyforge_domain::agent::RoundSummary]) -> u32 {
     summaries
         .iter()
         .filter(|s| s.is_leaf_a())
@@ -1005,13 +1014,13 @@ pub(crate) fn committed_turn_count(summaries: &[storyforge_domain::agent::RoundS
 }
 
 /// 下一写作轮次 = max(A.turn) + 1（无 A 时为 1）。
-pub(crate) fn next_writing_turn(summaries: &[storyforge_domain::agent::RoundSummary]) -> u32 {
+pub fn next_writing_turn(summaries: &[storyforge_domain::agent::RoundSummary]) -> u32 {
     committed_turn_count(summaries).saturating_add(1)
 }
 
 /// 工具侧 Chronicle 目录：优先保留全部 B/C，再保留最近的 A（按 turn_end）。
-#[cfg(test)]
-pub(crate) fn build_chronicle_tool_catalog(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_chronicle_tool_catalog(
     summaries: Vec<storyforge_domain::agent::RoundSummary>,
     limit: usize,
 ) -> Vec<storyforge_domain::agent::RoundSummary> {
@@ -1040,7 +1049,7 @@ pub(crate) fn build_chronicle_tool_catalog(
 }
 
 /// 旧存档：缺 lineage 的 summary 回填为 campaign.lineage_id 并落盘。
-pub(crate) fn backfill_summary_lineage_if_needed(
+pub fn backfill_summary_lineage_if_needed(
     store: &campaign_store::CampaignStore,
     lineage: &Id,
     summaries: &mut [storyforge_domain::agent::RoundSummary],
@@ -1060,7 +1069,7 @@ pub(crate) fn backfill_summary_lineage_if_needed(
 }
 
 /// ensure campaign.lineage_id；若新建则立即 persist。
-pub(crate) fn ensure_campaign_lineage_persisted(
+pub fn ensure_campaign_lineage_persisted(
     store: &campaign_store::CampaignStore,
     camp: &mut storyforge_domain::campaign::Campaign,
 ) -> Id {
@@ -1075,7 +1084,7 @@ pub(crate) fn ensure_campaign_lineage_persisted(
     lineage
 }
 
-pub(crate) fn load_campaign_context_snapshot(
+pub fn load_campaign_context_snapshot(
     store: &campaign_store::CampaignStore,
     active_id: &Id,
 ) -> Option<CampaignContextSnapshot> {
@@ -1286,10 +1295,7 @@ pub fn apply_campaign_context_snapshot(
 /// 此前只在第一次写作（fill_campaign_context）时填充——重启恢复/手动切换
 /// 活动后、未写作前，Meta 工具一律回答「当前没有 active Campaign」。
 /// 与 apply_campaign_context_snapshot 的 tool_ctx 侧保持同一写入集。
-pub(crate) fn apply_campaign_runtime_to_tool_ctx(
-    state: &AppState,
-    snapshot: CampaignContextSnapshot,
-) {
+pub fn apply_campaign_runtime_to_tool_ctx(state: &AppState, snapshot: CampaignContextSnapshot) {
     let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = Some(snapshot.runtime);
     tool_guard.archived_summaries = snapshot
@@ -1312,7 +1318,7 @@ pub(crate) fn apply_campaign_runtime_to_tool_ctx(
 /// 覆盖压缩后的 chronicle_revision / epoch / pending marker。
 ///
 /// `all_summaries` 仅作锁失败时的无落盘兜底输入；成功路径以锁内 list 为准。
-pub(crate) fn refresh_and_persist_context_epoch(
+pub fn refresh_and_persist_context_epoch(
     store: &campaign_store::CampaignStore,
     camp: &mut storyforge_domain::campaign::Campaign,
     all_summaries: &[storyforge_domain::agent::RoundSummary],
@@ -1366,7 +1372,7 @@ pub(crate) fn refresh_and_persist_context_epoch(
 }
 
 /// 纯计算：基于给定 camp/summaries 产出 snapshot + membership + 是否需要 persist + 新 revision。
-pub(crate) fn compute_context_epoch_refresh_parts(
+pub fn compute_context_epoch_refresh_parts(
     camp: &storyforge_domain::campaign::Campaign,
     all_summaries: &[storyforge_domain::agent::RoundSummary],
 ) -> (
@@ -1535,7 +1541,7 @@ pub fn fill_campaign_runtime_from_store(
     }
 }
 
-pub(crate) fn append_missing_campaign_scoped_regex_scripts(
+pub fn append_missing_campaign_scoped_regex_scripts(
     ctx: &mut WritingContext,
     scripts: Vec<RegexScript>,
 ) {
@@ -1553,7 +1559,7 @@ pub(crate) fn append_missing_campaign_scoped_regex_scripts(
     }
 }
 
-pub(crate) fn postprocess_variable_type_name(
+pub fn postprocess_variable_type_name(
     value_type: &storyforge_domain::variables::VariableType,
 ) -> &'static str {
     use storyforge_domain::variables::VariableType;
@@ -1566,7 +1572,7 @@ pub(crate) fn postprocess_variable_type_name(
     }
 }
 
-pub(crate) fn postprocess_json_value_type_name(value: &serde_json::Value) -> &'static str {
+pub fn postprocess_json_value_type_name(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Bool(_) => "bool",
         serde_json::Value::Number(number) if number.is_i64() => "int",
@@ -1576,16 +1582,11 @@ pub(crate) fn postprocess_json_value_type_name(value: &serde_json::Value) -> &'s
     }
 }
 
-pub(crate) fn postprocess_variable_hint(
-    key: &str,
-    scope: &str,
-    label: &str,
-    value_type: &str,
-) -> String {
+pub fn postprocess_variable_hint(key: &str, scope: &str, label: &str, value_type: &str) -> String {
     format!("{key}（{scope}/{label}/{value_type}）")
 }
 
-pub(crate) fn insert_postprocess_schema_hint(
+pub fn insert_postprocess_schema_hint(
     catalog: &mut std::collections::BTreeMap<String, String>,
     scope_key: &str,
     scope_label: &str,
@@ -1606,7 +1607,7 @@ pub(crate) fn insert_postprocess_schema_hint(
 ///
 /// 基础表提供常用角色/全局变量；CampaignRuntimeContext 提供当前卡自定义 schema、
 /// 已存在 Campaign 变量和 instance 变量，覆盖 MVU/initvar 与高玩自定义字段。
-pub(crate) fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
+pub fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
     let mut catalog = std::collections::BTreeMap::<String, String>::new();
 
     for field in storyforge_domain::variables::default_character_variables() {
@@ -1663,21 +1664,21 @@ pub(crate) fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(test)]
-pub(crate) struct TemporaryInstancesPersistContext {
+#[cfg(any(test, feature = "test-support"))]
+pub struct TemporaryInstancesPersistContext {
     campaign_id: Id,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TemporaryInstancesPersistContext {
-    pub(crate) fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
+    pub fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
         Some(Self {
             campaign_id: ctx.campaign_id.clone()?,
         })
     }
 }
-#[cfg(test)]
-pub(crate) fn persist_temporary_instances_to(
+#[cfg(any(test, feature = "test-support"))]
+pub fn persist_temporary_instances_to(
     store: &campaign_store::CampaignStore,
     ctx: &WritingContext,
     temporaries: &[storyforge_domain::campaign::CharacterInstance],
@@ -1688,8 +1689,8 @@ pub(crate) fn persist_temporary_instances_to(
     persist_temporary_instances_to_store(store, &persist_ctx, temporaries);
 }
 
-#[cfg(test)]
-pub(crate) fn persist_temporary_instances_to_store(
+#[cfg(any(test, feature = "test-support"))]
+pub fn persist_temporary_instances_to_store(
     store: &campaign_store::CampaignStore,
     persist_ctx: &TemporaryInstancesPersistContext,
     temporaries: &[storyforge_domain::campaign::CharacterInstance],
@@ -1740,7 +1741,7 @@ pub(crate) fn persist_temporary_instances_to_store(
 ///
 /// 查找链：present_chars → CampaignRuntimeContext.instances → definition_id →
 /// CampaignStore.cards → source_character_id → MvuTranslation.fallback_fragments
-pub(crate) fn collect_mvu_fallback_fragments(
+pub fn collect_mvu_fallback_fragments(
     ctx: &WritingContext,
     store: &campaign_store::CampaignStore,
     present_chars: &[String],
@@ -1808,7 +1809,7 @@ pub(crate) fn collect_mvu_fallback_fragments(
 ///
 /// 与 `collect_mvu_fallback_fragments` 同型的查找链，但按 source 卡去重：
 /// 同一张卡的多个在场实例只贡献一次规则（规则是卡级玩法，不随实例数翻倍）。
-pub(crate) fn collect_mvu_update_rules(
+pub fn collect_mvu_update_rules(
     ctx: &WritingContext,
     store: &campaign_store::CampaignStore,
     present_chars: &[String],
@@ -1875,14 +1876,14 @@ pub(crate) fn collect_mvu_update_rules(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PostprocessPersistContext {
-    pub(crate) campaign_id: Id,
-    pub(crate) conversation_id: Id,
-    pub(crate) turn: u32,
+pub struct PostprocessPersistContext {
+    pub campaign_id: Id,
+    pub conversation_id: Id,
+    pub turn: u32,
 }
 
 impl PostprocessPersistContext {
-    pub(crate) fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
+    pub fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
         Some(Self {
             campaign_id: ctx.campaign_id.clone()?,
             conversation_id: ctx.conversation_id.clone(),
@@ -1892,7 +1893,7 @@ impl PostprocessPersistContext {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn build_mutation_batch(
+pub fn build_mutation_batch(
     store: &campaign_store::CampaignStore,
     persist_ctx: &PostprocessPersistContext,
     outcome: &storyforge_app_agent::PostProcessOutcome,
@@ -1910,7 +1911,7 @@ pub(crate) fn build_mutation_batch(
         &[],
     )
 }
-pub(crate) fn persist_postprocess_outcome_to_store(
+pub fn persist_postprocess_outcome_to_store(
     store: &campaign_store::CampaignStore,
     persist_ctx: &PostprocessPersistContext,
     outcome: &storyforge_app_agent::PostProcessOutcome,
@@ -2242,7 +2243,7 @@ mod tests {
         ));
         // 带 scoped regex 脚本的角色（extensions.regex_scripts，ST 形状）。
         let stored = storage
-            .save_character(crate::commands::characters::CharacterInfo {
+            .save_character(crate::services::characters::CharacterInfo {
                 source_character_id: Some("src-1".to_string()),
                 name: "Alice".to_string(),
                 description: "主角".to_string(),

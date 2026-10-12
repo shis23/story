@@ -36,6 +36,10 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // 后台任务（向量索引补嵌入等）派发到本进程的运行时，不另起一个。
+    storyforge_app_service::background::install_background_runtime(
+        tokio::runtime::Handle::current(),
+    );
     if let Err(message) = storyforge_dsh_bridge::run_stdio(data_dir).await {
         tracing::error!("初始化失败: {message}");
         std::process::exit(1);

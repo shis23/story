@@ -8,7 +8,7 @@ use storyforge_domain::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BundleRuntime {
+pub struct BundleRuntime {
     pub conversation: Conversation,
     pub character: StoredCharacter,
     pub world_info: WorldInfoBook,
@@ -22,7 +22,7 @@ pub(crate) struct BundleRuntime {
 /// 包内的一条消息归档。向量与嵌入模型绑定、不可移植，所以不进包：导入后先按
 /// 关键词召回，配置了嵌入模型再补建向量。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BundleMessageArchive {
+pub struct BundleMessageArchive {
     pub content: String,
     #[serde(default)]
     pub keywords: Vec<String>,
@@ -33,7 +33,7 @@ pub(crate) struct BundleMessageArchive {
     pub message_end: Option<usize>,
 }
 
-pub(crate) fn validate_runtime(bundle: &CampaignBundle) -> Result<(), TauriCommandError> {
+pub fn validate_runtime(bundle: &CampaignBundle) -> Result<(), TauriCommandError> {
     let Some(runtime) = &bundle.runtime else {
         if bundle.format_version >= 3 {
             return Err(TauriCommandError::validation("v3 Bundle 缺少正文快照"));
@@ -171,7 +171,7 @@ fn remap_history(value: &mut serde_json::Value, ids: &HashMap<Id, Id>, field: &s
     }
 }
 
-pub(crate) fn rewrite_runtime(
+pub fn rewrite_runtime(
     mut runtime: BundleRuntime,
     ids: &mut HashMap<Id, Id>,
     source_character_id: &Id,
@@ -233,7 +233,7 @@ pub(crate) fn rewrite_runtime(
     Ok(runtime)
 }
 
-pub(crate) fn legacy_source(card: &storyforge_domain::character::CharacterCard) -> StoredCharacter {
+pub fn legacy_source(card: &storyforge_domain::character::CharacterCard) -> StoredCharacter {
     let character = storyforge_domain::character::Character {
         id: card.source_character_id.clone(),
         name: card.name.clone(),

@@ -15,6 +15,7 @@ members = [
     "crates/app-pipeline",
     "crates/app-memory",
     "crates/app-meta",
+    "crates/app-service",
     "crates/tauri-app",
     "crates/harness-real-llm",
     "crates/dsh-bridge",
@@ -80,6 +81,7 @@ storyforge-app-conversation = { path = "crates/app-conversation" }
 storyforge-app-pipeline = { path = "crates/app-pipeline" }
 storyforge-infra-vector = { path = "crates/infra-vector" }
 storyforge-app-memory = { path = "crates/app-memory" }
+storyforge-app-service = { path = "crates/app-service" }
 
 # L-20：显式 release profile。默认 profile 不 strip 符号、不做 LTO，发布产物偏大且
 # 含调试符号。开启 thin LTO + strip，减小体积并轻微提升运行时性能；codegen-unents=1

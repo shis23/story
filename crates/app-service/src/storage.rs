@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use crate::CharacterInfo;
 
 #[path = "json_store.rs"]
-pub(crate) mod json_store;
+pub mod json_store;
 
 /// 已存储的角色卡
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub struct CharacterStore {
 }
 
 impl CharacterStore {
-    pub(crate) fn insert(&self, stored: StoredCharacter) -> Result<(), String> {
+    pub fn insert(&self, stored: StoredCharacter) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if chars.iter().any(|c| {
             c.id == stored.id
@@ -128,7 +128,7 @@ impl CharacterStore {
             .ok_or_else(|| format!("角色卡不存在: {id_or_source}"))?;
         let mut candidate = chars.clone();
         let result = f(&mut candidate[index].info)?;
-        crate::commands::characters::refresh_world_info_counts(&mut candidate[index].info);
+        crate::services::characters::refresh_world_info_counts(&mut candidate[index].info);
         self.persist(&candidate)?;
         *chars = candidate;
         Ok(result)
@@ -161,7 +161,7 @@ impl CharacterStore {
                 .iter_mut()
                 .find(|c| c.id == *id)
                 .expect("existence pre-checked");
-            crate::commands::characters::apply_update_world_info_entries_bulk(
+            crate::services::characters::apply_update_world_info_entries_bulk(
                 &mut char.info,
                 new_entries.clone(),
             )?;

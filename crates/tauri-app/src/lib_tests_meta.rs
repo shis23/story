@@ -2,10 +2,23 @@ use super::*;
 
 #[test]
 fn gate3_meta_and_world_info_commands_do_not_probe_the_sqlite_runtime() {
+    // 命令外壳（tauri-app）与其宿主无关的另一半（app-service/services）都要查。
     for (name, source) in [
         ("meta", include_str!("commands/meta.rs")),
+        (
+            "meta (service)",
+            include_str!("../../app-service/src/services/meta.rs"),
+        ),
         ("meta_typed", include_str!("commands/meta_typed.rs")),
+        (
+            "meta_typed (service)",
+            include_str!("../../app-service/src/services/meta_typed.rs"),
+        ),
         ("world_info", include_str!("commands/world_info.rs")),
+        (
+            "world_info (service)",
+            include_str!("../../app-service/src/services/world_info.rs"),
+        ),
     ] {
         assert!(
             !source.contains("sqlite_runtime::is_sqlite_active()"),

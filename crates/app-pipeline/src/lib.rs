@@ -130,7 +130,9 @@ const EDITOR_SYSTEM_PROMPT: &str = r#"你是编剧。收集所有子 Agent 的�
 
 只输出正文本身，严禁输出任何说明、注释、改动标注、总结性文字、开场白或结语（例如「以下是合并后的成文」「我对某段做了裁剪」等）。第一行就必须是正文的开始。不需要调用工具。"#;
 
-const SUBAGENT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是角色 {name}。根据导演给你的任务和专属上下文，演出你这个角色在这场戏的行为/对白/心理。只演你自己，不要替别人说话。输出纯表演，不要解释。"#;
+/// 子 Agent 的公共 system 前缀。不含角色名：各调用方在其后追加本角色的身份句
+/// （`你是角色 X。` / 顺序剧组的 `你是顺序剧组演员 X`），这段在多个角色间共享以命中缓存。
+const SUBAGENT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你将扮演下文指定的角色。根据导演给你的任务和专属上下文，演出你这个角色在这场戏的行为/对白/心理。只演你自己，不要替别人说话。输出纯表演，不要解释。"#;
 
 const WRITER_SYSTEM_PROMPT: &str = r#"你是执笔者，不是故事里的任何角色。你的唯一任务是消费回合案卷并直接写出正文。
 
@@ -418,6 +420,32 @@ pub fn chronicle_partition_for_context(
         near_turns,
         band_turns,
     }
+}
+
+/// 送给模型的对话历史展开身份宏。开场白来自卡片原文，旧存档里可能还留着
+/// `{{user}}` / `{{char}}`，不展开时模型会把占位符当正文照抄。只动身份宏
+/// （见 `replace_identity_macros`），历史前缀逐轮稳定、不破坏缓存。
+pub fn expand_identity_macros_in_history(
+    mut history: Vec<storyforge_domain::llm::ChatMessage>,
+    template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+) -> Vec<storyforge_domain::llm::ChatMessage> {
+    let user_name = template_context
+        .map(|context| context.user_name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(storyforge_domain::prompt_module::DEFAULT_USER_NAME);
+    let char_name = template_context
+        .filter(|context| context.render_character_macros && !context.char_name.is_empty())
+        .map(|context| context.char_name.as_str());
+    for message in &mut history {
+        if message.content.contains("{{") || message.content.contains('<') {
+            message.content = storyforge_domain::prompt_module::replace_identity_macros(
+                &message.content,
+                char_name,
+                user_name,
+            );
+        }
+    }
+    history
 }
 
 /// 将对话 history 收敛到 near_raw turns（若已知）。
@@ -1098,6 +1126,7 @@ impl PipelineOrchestrator {
         };
         let chronicle_partition =
             chronicle_partition_for_context(chronicle_source, ctx.context_epoch.as_ref());
+        let history = expand_identity_macros_in_history(history, template_context.as_ref());
         let history = prepend_chronicle_history_prefix(history, &chronicle_partition);
         let history = filter_history_to_near_raw_turns(history, &chronicle_partition.near_turns);
         let writer_layout = storyforge_domain::message_layout::MessageLayout::build()
@@ -2517,6 +2546,7 @@ impl PipelineOrchestrator {
             near_turns = ?chronicle_partition.near_turns,
             "Director chronicle history prefix"
         );
+        let history = expand_identity_macros_in_history(history, input.template_context);
         let history = prepend_chronicle_history_prefix(history, &chronicle_partition);
         let history = filter_history_to_near_raw_turns(history, &chronicle_partition.near_turns);
         let director_layout = storyforge_domain::message_layout::MessageLayout::build()
@@ -2805,6 +2835,8 @@ impl PipelineOrchestrator {
                 "Editor history epoch"
             );
         }
+        let editor_history =
+            expand_identity_macros_in_history(editor_history, input.template_context);
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
@@ -3131,7 +3163,7 @@ fn prompt_template_context_for_writing(
         ctx.characters.first().map(|character| {
             storyforge_domain::prompt_module::TemplateVarContext::from_character(
                 character.as_ref(),
-                "玩家",
+                storyforge_domain::prompt_module::DEFAULT_USER_NAME,
             )
         })?
     };
@@ -3192,7 +3224,7 @@ fn prompt_template_context_from_campaign_runtime(
         .filter(|_| runtime.instances.len() == 1)
     else {
         return Some(storyforge_domain::prompt_module::TemplateVarContext {
-            user_name: "玩家".into(),
+            user_name: storyforge_domain::prompt_module::DEFAULT_USER_NAME.into(),
             variables,
             render_character_macros: false,
             ..Default::default()
@@ -3213,7 +3245,7 @@ fn prompt_template_context_from_campaign_runtime(
 
     Some(storyforge_domain::prompt_module::TemplateVarContext {
         char_name: instance.name.clone(),
-        user_name: "玩家".into(),
+        user_name: storyforge_domain::prompt_module::DEFAULT_USER_NAME.into(),
         description: runtime
             .resolved_persona_for(instance)
             .map(str::to_string)
@@ -5204,6 +5236,9 @@ mod tests {
         assert!(prompts.contains("SHARED_SUBAGENT_SUMMARY"));
         assert!(prompts.contains("SHARED_SUBAGENT_FAR_MEMORY"));
         assert!(!prompts.contains("顺序剧组演员协议"));
+        // 公共前缀不带未替换的占位符；角色身份由其后的 `你是角色 X。` 给出。
+        assert!(!prompts.contains("{name}"), "{prompts}");
+        assert!(prompts.contains("你是角色 actor-ok。"), "{prompts}");
         drop(captured);
 
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
@@ -6203,11 +6238,7 @@ mod tests {
                 stream: false,
             },
             MockScript {
-                match_keyword: SUBAGENT_SYSTEM_PROMPT_TEMPLATE
-                    .split("{name}")
-                    .next()
-                    .unwrap()
-                    .to_string(),
+                match_keyword: SUBAGENT_SYSTEM_PROMPT_TEMPLATE.chars().take(8).collect(),
                 response_content: "subagent performance".into(),
                 tool_calls: vec![],
                 stream: false,
@@ -9434,5 +9465,118 @@ A0001 far",
         assert!(texts.contains(&"u2"));
         assert!(texts.contains(&"u3"));
         assert!(!texts.contains(&"u1"));
+    }
+
+    #[test]
+    fn history_identity_macros_follow_template_context() {
+        use storyforge_domain::llm::ChatMessage;
+        let history = || {
+            vec![
+                ChatMessage::assistant("{{user}}，{{char}} 在门口等你。{{random::a::b}}"),
+                ChatMessage::user("我走向 <bot>。"),
+            ]
+        };
+        let single = storyforge_domain::prompt_module::TemplateVarContext {
+            char_name: "Seraphina".into(),
+            user_name: storyforge_domain::prompt_module::DEFAULT_USER_NAME.into(),
+            ..Default::default()
+        };
+        let texts = |messages: Vec<ChatMessage>| {
+            messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            texts(expand_identity_macros_in_history(history(), Some(&single))),
+            vec![
+                "玩家，Seraphina 在门口等你。{{random::a::b}}".to_string(),
+                "我走向 Seraphina。".to_string()
+            ]
+        );
+        // 多角色局面（或无上下文）：只展开 {{user}}，角色宏原样保留。
+        let multi = storyforge_domain::prompt_module::TemplateVarContext {
+            render_character_macros: false,
+            ..single.clone()
+        };
+        for context in [Some(&multi), None] {
+            assert_eq!(
+                texts(expand_identity_macros_in_history(history(), context)),
+                vec![
+                    "玩家，{{char}} 在门口等你。{{random::a::b}}".to_string(),
+                    "我走向 <bot>。".to_string()
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn director_history_sent_to_model_has_identity_macros_expanded() {
+        let (llm, captured_requests) = capturing_director_llm();
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_director_identity_macros_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let conversation_id = conv_store.create(None, None).id;
+        conv_store
+            .append_final_message(
+                &conversation_id,
+                storyforge_domain::conversation::Role::Assistant,
+                "{{user}} 推开木门，{{char}} 抬起头。".into(),
+            )
+            .unwrap();
+        let boundary = conv_store
+            .append_user_message(&conversation_id, "我坐下。".into())
+            .unwrap();
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conversation_id.clone(),
+        );
+        let template_context = storyforge_domain::prompt_module::TemplateVarContext::from_character(
+            ctx.characters[0].as_ref(),
+            storyforge_domain::prompt_module::DEFAULT_USER_NAME,
+        );
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        orchestrator
+            .run_director_stage(
+                DirectorStageInput {
+                    intent: "我坐下。",
+                    ctx: &ctx,
+                    conversation_id: &conversation_id,
+                    history_before_node_id: Some(&boundary),
+                    hint: None,
+                    template_context: Some(&template_context),
+                },
+                &event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("director stage should succeed");
+
+        let requests = captured_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sent = requests[0]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sent.contains("玩家 推开木门，Seraphina 抬起头。"), "{sent}");
+        assert!(
+            !sent.contains("{{user}}") && !sent.contains("{{char}}"),
+            "{sent}"
+        );
+        drop(requests);
+        let _ = std::fs::remove_dir_all(conv_dir);
     }
 }

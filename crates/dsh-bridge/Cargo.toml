@@ -15,7 +15,7 @@ storyforge-domain.workspace = true
 storyforge-infra-llm.workspace = true
 storyforge-infra-sqlite.workspace = true
 storyforge-app-logging.workspace = true
-storyforge-tauri-app = { package = "storyforge", path = "../tauri-app" }
+storyforge-app-service.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

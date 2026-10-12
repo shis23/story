@@ -1,0 +1,818 @@
+use super::super::*;
+
+// ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
+
+/// Meta 纯函数所需的当前 Campaign 快照（后端无关：JSON store 或 SQLite 权威）。
+pub struct MetaSnapshot {
+    pub campaign: storyforge_domain::campaign::Campaign,
+    pub definitions: Vec<storyforge_domain::character::CharacterDefinition>,
+    pub instances: Vec<storyforge_domain::campaign::CharacterInstance>,
+    pub knowledge: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>,
+    pub tasks: Vec<storyforge_domain::story_task::StoryTask>,
+}
+
+/// 从 JSON CampaignStore 组装快照（既有 in_store 路径）。
+pub fn load_meta_snapshot_from_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+) -> Result<MetaSnapshot, TauriCommandError> {
+    let campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+    // M-11：卡缺失时**不得**降级为空 definitions。空定义集会把每个带
+    // definition_id 的实例判成 orphan_instance，并生成「解绑 definition 转临时
+    // 角色」的破坏性修复提案（接受后 instance.is_temporary = true，角色定义/
+    // persona/schema 全部脱离）。SQLite 路径（meta_backend.rs）已显式 fail
+    // closed，这里与之对齐。
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!(
+                "Campaign 的卡不存在: {}（拒绝按空 definitions 体检）",
+                campaign.card_id
+            ))
+        })?
+        .card
+        .character_definitions;
+    let instances = store.list_instances(campaign_id);
+    let knowledge = store.list_knowledge(campaign_id);
+    let tasks = store.list_tasks(campaign_id);
+    Ok(MetaSnapshot {
+        campaign,
+        definitions,
+        instances,
+        knowledge,
+        tasks,
+    })
+}
+
+/// 从 pinned backend 组装 Meta 快照（分派在 backend_workflows 白名单内）。
+pub fn load_meta_snapshot(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+) -> Result<MetaSnapshot, TauriCommandError> {
+    crate::backend_workflows::load_meta_snapshot_for_backend(storage, campaign_id)
+        .map_err(TauriCommandError::storage)
+}
+
+/// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
+pub fn build_preview_input<'a>(
+    snapshot: &'a MetaSnapshot,
+) -> storyforge_app_meta::PreviewInput<'a> {
+    storyforge_app_meta::PreviewInput {
+        instances: &snapshot.instances,
+        definitions: &snapshot.definitions,
+        knowledge: &snapshot.knowledge,
+        tasks: &snapshot.tasks,
+        campaign: Some(&snapshot.campaign),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn meta_propose_campaign_repairs_in_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
+    let snapshot = load_meta_snapshot_from_store(store, &cid)?;
+    propose_patches_from_snapshot(&snapshot, state, &cid)
+}
+
+pub fn meta_propose_campaign_repairs_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
+    let snapshot = load_meta_snapshot(storage, &cid)?;
+    propose_patches_from_snapshot(&snapshot, state, &cid)
+}
+
+/// 快照 → health issue → typed patch（纯函数），propose 时盖章 campaign_revision。
+fn propose_patches_from_snapshot(
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+    _cid: &Id,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let input = build_preview_input(snapshot);
+
+    let issues =
+        storyforge_app_meta::check_campaign_health(&storyforge_app_meta::CampaignHealthSnapshot {
+            instances: &snapshot.instances,
+            definitions: &snapshot.definitions,
+            knowledge: &snapshot.knowledge,
+            tasks: &snapshot.tasks,
+        });
+
+    let mut patches: Vec<storyforge_app_meta::TypedPatch> = Vec::new();
+    for issue in &issues {
+        if let Some(mut patch) = storyforge_app_meta::build_patch_for_issue(issue, &input) {
+            // Gate 4 revision 校验：提案盖章，accept 时比对。
+            patch.campaign_revision = Some(snapshot.campaign.revision);
+            patches.push(patch);
+        }
+    }
+
+    let visible_patches = {
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut visible = Vec::new();
+        for patch in patches {
+            if let Some(existing) = typed
+                .iter_mut()
+                .find(|existing| is_same_pending_typed_patch(existing, &patch))
+            {
+                existing.description = patch.description.clone();
+                existing.diff = patch.diff.clone();
+                visible.push(existing.clone());
+            } else {
+                visible.push(patch.clone());
+                typed.push(patch);
+            }
+        }
+        visible
+    };
+
+    visible_patches
+        .into_iter()
+        .map(|p| to_json_value(&p, "typed patch proposal"))
+        .collect()
+}
+
+pub fn is_same_pending_typed_patch(
+    existing: &storyforge_app_meta::TypedPatch,
+    proposed: &storyforge_app_meta::TypedPatch,
+) -> bool {
+    existing.status == storyforge_app_meta::TypedPatchStatus::Pending
+        && existing.source_issue_category == proposed.source_issue_category
+        && existing.affected_id == proposed.affected_id
+        && canonical_typed_patch_actions_json(&existing.actions)
+            == canonical_typed_patch_actions_json(&proposed.actions)
+}
+
+pub fn canonical_typed_patch_actions_json(
+    actions: &[storyforge_app_meta::TypedPatchAction],
+) -> Option<serde_json::Value> {
+    use storyforge_app_meta::TypedPatchAction;
+
+    let mut canonical = actions.to_vec();
+    for action in &mut canonical {
+        match action {
+            TypedPatchAction::SyncInstanceVariables {
+                add_keys,
+                remove_keys,
+                ..
+            } => {
+                add_keys.sort();
+                remove_keys.sort();
+            }
+            TypedPatchAction::PruneOrphanTaskReferences {
+                orphan_character_ids,
+                ..
+            } => orphan_character_ids.sort_by(|a, b| a.as_str().cmp(b.as_str())),
+            _ => {}
+        }
+    }
+    serde_json::to_value(canonical).ok()
+}
+
+/// M-03：TypedPatch 必须与「提议时的 Campaign」绑定。
+/// `None` = 旧格式内存 patch（无绑定信息）→ 不满足（fail closed，需重新提案）。
+pub fn patch_campaign_binding_ok(
+    patch: &storyforge_app_meta::TypedPatch,
+    campaign_id: &str,
+) -> bool {
+    patch.campaign_id.as_deref() == Some(campaign_id)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn meta_preview_typed_patch_in_store(
+    store: &campaign_store::CampaignStore,
+    patch_id: &str,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<serde_json::Value, TauriCommandError> {
+    let snapshot = load_meta_snapshot_from_store(store, &Id::from_str(campaign_id))?;
+    meta_preview_typed_patch_with_snapshot(patch_id, campaign_id, &snapshot, state)
+}
+
+pub fn meta_preview_typed_patch_with_snapshot(
+    patch_id: &str,
+    campaign_id: &str,
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+) -> Result<serde_json::Value, TauriCommandError> {
+    let _cid = Id::from_str(campaign_id);
+    // 找到 patch
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let patch = typed
+        .iter_mut()
+        .find(|p| p.id == patch_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
+
+    let input = build_preview_input(snapshot);
+
+    // M-03：patch 必须绑定到它被提议时的 Campaign。
+    // 旧实现只信入参 campaign_id，因此 A 战役的提案（`UpdateCampaignVariable`
+    // 无 target id）可以在 B 战役的 UI 上预览通过并被接受；`None` 表示旧格式
+    // 内存 patch（无绑定信息），同样 fail closed。
+    if !patch_campaign_binding_ok(patch, campaign_id) {
+        patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        let patch_json = to_json_value(&*patch, "typed patch preview")?;
+        return Ok(serde_json::json!({
+            "stale": true,
+            "reason": "campaign_mismatch",
+            "patch": patch_json,
+        }));
+    }
+
+    // Preview 与 Accept 共用同一前置条件纯函数（Gate 2 Batch 2.4）：
+    // target 缺失或 definition/schema 前置条件不满足时都标 Stale，确保 Preview 看到的
+    // 可接受性与 Accept 的判定一致（不再出现「Preview 通过但 Accept 失败」）。
+    if storyforge_app_meta::validate_patch_preconditions(patch, &input).is_err() {
+        patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        let patch_json = to_json_value(&*patch, "typed patch preview")?;
+        return Ok(serde_json::json!({
+            "stale": true,
+            "patch": patch_json,
+        }));
+    }
+
+    let patch_json = to_json_value(&*patch, "typed patch preview")?;
+    let diff_json = to_json_value(&patch.diff, "typed patch diff")?;
+    Ok(serde_json::json!({
+        "stale": false,
+        "patch": patch_json,
+        "diff": diff_json,
+    }))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn meta_accept_typed_patch_in_store(
+    store: &campaign_store::CampaignStore,
+    patch_id: &str,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<(), TauriCommandError> {
+    let snapshot = load_meta_snapshot_from_store(store, &Id::from_str(campaign_id))?;
+    meta_accept_typed_patch_with_writer(
+        |campaign_id, actions, _expected_revision| {
+            // JSON 路径：barrier + 快照 revision 校验 + with_campaign_lock 全局
+            // 锁已原子化，事务内重校验仅 SQLite 单事务 UoW 需要。
+            crate::turn_coordinator::with_campaign_lock(|| {
+                for (index, action) in actions.iter().enumerate() {
+                    apply_typed_action(store, campaign_id, action).map_err(|error| {
+                        crate::turn_coordinator::CommitError::Storage(format!(
+                            "第 {} 个 action 失败: {error}",
+                            index + 1
+                        ))
+                    })?;
+                }
+                Ok(())
+            })
+            .map_err(|e| TauriCommandError::storage(e.to_string()))
+        },
+        patch_id,
+        campaign_id,
+        &snapshot,
+        state,
+    )
+}
+
+/// Accept 核心：pending 校验 → revision/stale/前置条件 → 纯函数预演 →
+/// 注入的写盘闭包（JSON 逐 action + 全局锁 / SQLite 单事务 UoW）。
+pub fn meta_accept_typed_patch_with_writer<F>(
+    write: F,
+    patch_id: &str,
+    campaign_id: &str,
+    snapshot: &MetaSnapshot,
+    state: &AppState,
+) -> Result<(), TauriCommandError>
+where
+    F: FnOnce(
+        &Id,
+        &[storyforge_app_meta::TypedPatchAction],
+        Option<u64>,
+    ) -> Result<(), TauriCommandError>,
+{
+    let _accept_guard = state
+        .typed_patch_accept_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let cid = Id::from_str(campaign_id);
+    // 1. 找到 patch，必须 Pending
+    let patch = {
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let p = typed.iter().find(|p| p.id == patch_id).ok_or_else(|| {
+            TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}"))
+        })?;
+        if p.status != storyforge_app_meta::TypedPatchStatus::Pending {
+            return Err(TauriCommandError::validation(format!(
+                "Patch 状态不是 Pending（当前: {:?}），无法接受",
+                p.status
+            )));
+        }
+        p.clone()
+    };
+
+    // 1.5 M-03：Campaign 绑定校验（fail closed）。必须在写盘前，且与 preview
+    //     使用同一判据，避免「A 战役的提案写进 B 战役」。
+    if !patch_campaign_binding_ok(&patch, campaign_id) {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(TauriCommandError::validation(format!(
+            "Patch 未绑定当前 Campaign（patch.campaign_id={:?}, 目标={campaign_id}），已标记过期；请重新生成后再接受",
+            patch.campaign_id
+        )));
+    }
+
+    // 2. revision 校验（Gate 4）：提案盖章的 revision 与当前不一致 = campaign
+    //    已被推进，patch 视为过期，拒绝而非静默应用到新状态。
+    if let Some(proposed_revision) = patch.campaign_revision
+        && proposed_revision != snapshot.campaign.revision
+    {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(TauriCommandError::validation(format!(
+            "patch 已过期：提案基于 campaign revision {proposed_revision}，当前为 {}",
+            snapshot.campaign.revision
+        )));
+    }
+
+    let input = build_preview_input(snapshot);
+
+    // 3. stale 检查
+    if storyforge_app_meta::is_patch_stale(&patch, &input) {
+        mark_typed_patch_stale(state, patch_id);
+        return Err("patch 已过期，target 不存在".into());
+    }
+
+    if let Err(e) = validate_typed_patch_targets(
+        &patch,
+        &snapshot.campaign,
+        &snapshot.definitions,
+        &snapshot.instances,
+        &snapshot.knowledge,
+        &snapshot.tasks,
+    ) {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(e);
+    }
+
+    // 4. 纯函数预演（clone 可变快照）
+    {
+        let mut inst_clone = snapshot.instances.clone();
+        let mut def_clone = snapshot.definitions.clone();
+        let mut know_clone = snapshot.knowledge.clone();
+        let mut task_clone = snapshot.tasks.clone();
+        let mut camp_clone = snapshot.campaign.clone();
+        let mut snap = storyforge_app_meta::PreviewInputMut {
+            instances: &mut inst_clone,
+            definitions: &mut def_clone,
+            knowledge: &mut know_clone,
+            tasks: &mut task_clone,
+            campaign: Some(&mut camp_clone),
+            turn: 0, // preview 不持久化，turn 值不影响验证
+        };
+        storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
+            .map_err(|e| TauriCommandError::pipeline(format!("纯函数预演失败: {e}"), false))?;
+    }
+    // 5. 真正写盘（后端分派：JSON 逐 action + 全局锁 / SQLite 单事务 UoW）。
+    //    写盘失败，patch 保持 Pending（不标记 Accepted）。
+    //    expected_revision 传给 SQLite UoW：事务内与最新 revision 原子比对
+    //    （Gate 4 评审 P1-2，与快照层 stale 校验互为双保险）。
+    write(&cid, &patch.actions, patch.campaign_revision)?;
+
+    // 6. 写盘成功，标记 Accepted
+    {
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
+            p.status = storyforge_app_meta::TypedPatchStatus::Accepted;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn mark_typed_patch_stale(state: &AppState, patch_id: &str) {
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
+        p.status = storyforge_app_meta::TypedPatchStatus::Stale;
+    }
+}
+
+pub fn validate_typed_patch_targets(
+    patch: &storyforge_app_meta::TypedPatch,
+    campaign: &storyforge_domain::campaign::Campaign,
+    definitions: &[storyforge_domain::character::CharacterDefinition],
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    knowledge: &[storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
+    tasks: &[storyforge_domain::story_task::StoryTask],
+) -> Result<(), TauriCommandError> {
+    // 委托 app-meta 的单一纯函数：target 存在性 + SyncInstanceVariables 的
+    // definition/schema 前置条件都只此一份实现（Gate 2 Batch 2.4）。
+    let input = storyforge_app_meta::PreviewInput {
+        instances,
+        definitions,
+        knowledge,
+        tasks,
+        campaign: Some(campaign),
+    };
+    storyforge_app_meta::validate_patch_preconditions(patch, &input).map_err(|e| match e {
+        storyforge_app_meta::TypedPatchError::TargetMissing(msg) => {
+            TauriCommandError::not_found(msg)
+        }
+        storyforge_app_meta::TypedPatchError::PreconditionFailed(msg) => {
+            TauriCommandError::validation(msg)
+        }
+        storyforge_app_meta::TypedPatchError::Stale => {
+            TauriCommandError::validation("patch 已过期")
+        }
+    })
+}
+
+/// 执行单个 TypedPatchAction 到 CampaignStore（写盘辅助）
+pub fn apply_typed_action(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+    action: &storyforge_app_meta::TypedPatchAction,
+) -> Result<(), TauriCommandError> {
+    use storyforge_app_meta::TypedPatchAction;
+
+    match action {
+        TypedPatchAction::SyncInstanceVariables {
+            instance_id,
+            definition_id,
+            add_keys,
+            remove_keys,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
+
+            // 与 A 的 apply_to_snapshot 纯函数保持一致：从 definition.variable_schema
+            // 取 add_keys 的 default 值，而非硬编码 null。否则 accept 前的纯函数预演
+            // （显示 schema 默认值）与真正写盘（写 null）结果不一致。
+            // 查找路径：campaign -> card_id -> card.character_definitions -> 按 definition_id 匹配
+            let schema_defaults: std::collections::HashMap<String, serde_json::Value> = (|| {
+                let campaign = store.get_campaign(campaign_id)?;
+                let stored = store.get_card(&campaign.card_id)?;
+                let def = stored
+                    .card
+                    .character_definitions
+                    .iter()
+                    .find(|d| &d.id == definition_id)?;
+                Some(
+                    def.variable_schema
+                        .iter()
+                        .map(|f| (f.key.clone(), f.default.clone()))
+                        .collect(),
+                )
+            })(
+            )
+            .unwrap_or_default();
+
+            // 添加缺失 key（用 schema default，缺失 schema 时回退 null）
+            for key in add_keys {
+                if instance.get_variable(key).is_none() {
+                    let default_val = schema_defaults
+                        .get(key)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    instance.set_variable(key, default_val, 0);
+                }
+            }
+
+            // 删除多余 key
+            instance.variables.retain(|v| !remove_keys.contains(&v.key));
+
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::PruneOrphanTaskReferences {
+            task_id,
+            orphan_character_ids,
+        } => {
+            let mut task = store.get_task(task_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str()))
+            })?;
+
+            task.related_characters
+                .retain(|id| !orphan_character_ids.contains(id));
+
+            store
+                .update_task(task)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+            store
+                .delete_knowledge(knowledge_id)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+                .then_some(())
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Knowledge 不存在: {}",
+                        knowledge_id.as_str()
+                    ))
+                })?;
+            Ok(())
+        }
+        TypedPatchAction::RepointInstanceDefinition {
+            instance_id,
+            new_definition_id,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
+
+            instance.definition_id = new_definition_id.clone();
+            // 与纯函数预演一致（typed_patch.rs）：解除绑定后实例转为临时角色
+            // （Gate 4 评审 P2-5：预览与落盘结果一致）。
+            if new_definition_id.is_none() {
+                instance.is_temporary = true;
+            }
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::UpdateCampaignVariable { key, value } => {
+            let mut campaign = store.get_campaign(campaign_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Campaign 不存在: {}", campaign_id.as_str()))
+            })?;
+            campaign.set_variable(key, value.clone(), 0);
+            store
+                .update_campaign(campaign)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::UpdateInstanceVariable {
+            instance_id,
+            key,
+            value,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
+            instance.set_variable(key, value.clone(), 0);
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::AddKnowledge {
+            character_id,
+            knowledge_text,
+            source,
+        } => {
+            let entry = storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+                id: Id::new(),
+                campaign_id: campaign_id.clone(),
+                character_id: character_id.clone(),
+                knowledge_text: knowledge_text.clone(),
+                source: source.clone(),
+                source_character_id: None,
+                source_knowledge_id: None,
+                turn_number: 0,
+                event_id: None,
+                pinned: false,
+                propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
+            };
+            store
+                .add_knowledge(vec![entry])
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+        TypedPatchAction::UpdateTaskStatus {
+            task_id,
+            new_status,
+        } => {
+            let mut task = store.get_task(task_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str()))
+            })?;
+            task.status = new_status.clone();
+            store
+                .update_task(task)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+pub fn meta_dismiss_typed_patch_in_state(
+    patch_id: &str,
+    state: &AppState,
+) -> Result<(), TauriCommandError> {
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let patch = typed
+        .iter_mut()
+        .find(|p| p.id == patch_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
+    patch.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
+    Ok(())
+}
+
+/// MVU 翻译的精简 DTO（前端列表用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MvuTranslationSummaryDto {
+    pub source_character_id: String,
+    pub character_name: String,
+    pub analyzed_at: String,
+    /// M-27d：必须是 `MvuRouting` 的 serde 形态（`{"kind":"native"|"hybrid",…}`），
+    /// 不是 Rust `Debug` 字符串。旧实现写 `format!("{:?}", …)`，而前端
+    /// `routingText()`（frontend/src/utils/campaignDisplay.js:29-34）按对象解析，
+    /// 于是恒返回「混合（）」。
+    pub routing: serde_json::Value,
+    pub ui_binding_count: usize,
+    pub fallback_count: usize,
+    pub analysis_confidence: f64,
+}
+
+/// MVU 翻译的完整 DTO（前端渲染状态栏用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MvuTranslationDetailDto {
+    pub source_character_id: String,
+    pub character_name: String,
+    pub analyzed_at: String,
+    pub translation: storyforge_domain::mvu_translation::MvuTranslation,
+    pub complexity: serde_json::Value,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn save_mvu_translation_async(
+    store: Arc<campaign_store::CampaignStore>,
+    stored: campaign_store::StoredMvuTranslation,
+) -> Result<(), TauriCommandError> {
+    tokio::task::spawn_blocking(move || save_mvu_translation_to_store(store.as_ref(), stored))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn save_mvu_translation_to_store(
+    store: &campaign_store::CampaignStore,
+    stored: campaign_store::StoredMvuTranslation,
+) -> Result<(), TauriCommandError> {
+    store
+        .save_mvu(stored)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+}
+
+pub fn meta_apply_mvu_schema_in_store(
+    store: &campaign_store::CampaignStore,
+    source_character_id: &Id,
+    definition_id: &Id,
+) -> Result<(), TauriCommandError> {
+    let source_character_id = source_character_id.as_str().to_string();
+    let definition_id = definition_id.as_str().to_string();
+    let src_id = Id::from_str(&source_character_id);
+    let def_id = Id::from_str(&definition_id);
+
+    let mvu = store.get_mvu(&src_id).ok_or_else(|| {
+        TauriCommandError::not_found(
+            MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string(),
+        )
+    })?;
+
+    let stored_card = store.get_card_by_source(&src_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 source_character_id={source_character_id} 的 card"
+        ))
+    })?;
+
+    // 找到目标 definition
+    let def = stored_card
+        .card
+        .character_definitions
+        .iter()
+        .find(|d| d.id == def_id)
+        .ok_or_else(|| {
+            TauriCommandError::not_found(
+                MvuApplyError::DefinitionNotFound(definition_id.clone()).to_string(),
+            )
+        })?;
+
+    // 先计算预览，确认有变化。存量翻译产物可能带旧记法键（斜杠 / stat_data.
+    // 前缀 / <> 占位符），应用边界统一归一（新导入已在解析层归一，此处兜底）。
+    let normalized_mvu_schema = storyforge_domain::variables::normalize_schema_keys(
+        mvu.translation.variable_schema.clone(),
+    );
+    let preview = compute_apply_preview(
+        &def.variable_schema,
+        &normalized_mvu_schema,
+        def.id.as_str(),
+        &def.name,
+        &source_character_id,
+    );
+    if !preview.has_changes {
+        return Err(TauriCommandError::validation(
+            MvuApplyError::NoChanges.to_string(),
+        ));
+    }
+
+    // 写盘：clone card → 改对应 definition → update_card
+    let mut card = stored_card.card.clone();
+    if let Some(target_def) = card
+        .character_definitions
+        .iter_mut()
+        .find(|d| d.id == def_id)
+    {
+        apply_schema_to_definition(target_def, preview.merged_schema.clone());
+    }
+    let updated_card = store
+        .update_card(card.clone())
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    if updated_card.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到要更新的 card: {}",
+            card.id
+        )));
+    }
+
+    // Best-effort：对已存在的 instances 补齐合并后 schema 中仍缺失的变量。
+    // 注意：instance 与 definition 的关联是 definition_id，与 campaign 无关——
+    // 一张卡的某个 definition 可能被多个 campaign 引用，全部都该 backfill。
+    // 因此这里用 list_all_instances() 全量遍历，再按 definition_id 过滤。
+    // （历史 bug：曾用 list_instances(&card.id)，把 card.id 当 campaign_id 传，
+    // 而 list_instances 按 campaign_id 过滤 → instance.campaign_id 永不等于
+    // card.id → loop 体永不执行 → 生产 backfill 是死代码。）
+    for instance in store.list_all_instances() {
+        if instance.definition_id.as_ref() != Some(&def_id) {
+            continue;
+        }
+        let mut updated = instance.clone();
+        let missing_fields: Vec<_> = preview
+            .merged_schema
+            .iter()
+            .filter(|f| !updated.variables.iter().any(|v| v.key == f.key))
+            .collect();
+        if missing_fields.is_empty() {
+            continue;
+        }
+        for field in missing_fields {
+            use storyforge_domain::variables::VariableValue;
+            updated.variables.push(VariableValue::new(
+                field.key.clone(),
+                field.default.clone(),
+                0,
+            ));
+        }
+        store
+            .update_instance(updated)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    }
+
+    Ok(())
+}
+
+pub async fn load_preset_for_classification_async(
+    store: &'static PresetStore,
+    preset_id: String,
+) -> Result<preset_store::StoredPreset, TauriCommandError> {
+    tokio::task::spawn_blocking(move || load_preset_for_classification(store, preset_id))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("读取预设任务失败: {e}")))?
+}
+
+pub fn load_preset_for_classification(
+    store: &PresetStore,
+    preset_id: String,
+) -> Result<preset_store::StoredPreset, TauriCommandError> {
+    store
+        .get(&preset_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("预设不存在: {preset_id}")))
+}

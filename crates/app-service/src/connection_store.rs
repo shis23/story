@@ -249,9 +249,8 @@ impl ConnectionStore {
     /// logs a warning and keeps plaintext (resolve_secret_value passes it
     /// through), so the app keeps working either way.
     ///
-    /// The only call site is Android-gated (lib.rs ndk-context retry task);
-    /// desktop builds never invoke it.
-    #[cfg_attr(not(target_os = "android"), expect(dead_code))]
+    /// The only call site is Android-gated (tauri-app lib.rs ndk-context retry
+    /// task); desktop builds never invoke it.
     pub fn retry_migration(&self) {
         if let Err(e) = self.migrate_plaintext_api_keys() {
             tracing::warn!("重试迁移连接 API key 到系统凭据库失败，保留旧文件: {e}");

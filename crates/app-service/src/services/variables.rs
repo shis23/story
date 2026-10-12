@@ -1,0 +1,154 @@
+use super::super::*;
+
+pub fn parse_campaign_variable_type(
+    value_type: &str,
+) -> Result<storyforge_domain::variables::VariableType, TauriCommandError> {
+    use storyforge_domain::variables::VariableType;
+    match value_type.trim().to_ascii_lowercase().as_str() {
+        "int" | "integer" => Ok(VariableType::Int),
+        "float" | "number" => Ok(VariableType::Float),
+        "string" | "text" => Ok(VariableType::String),
+        "bool" | "boolean" => Ok(VariableType::Bool),
+        "json" | "object" | "array" => Ok(VariableType::Json),
+        _ => Err(TauriCommandError::validation(format!(
+            "不支持的变量类型: {value_type}"
+        ))),
+    }
+}
+
+pub fn validate_campaign_variable_default(
+    value_type: &storyforge_domain::variables::VariableType,
+    value: &serde_json::Value,
+) -> Result<(), TauriCommandError> {
+    use storyforge_domain::variables::VariableType;
+    let valid = match value_type {
+        VariableType::Int => value.as_i64().is_some(),
+        VariableType::Float => value.as_f64().is_some(),
+        VariableType::String => value.as_str().is_some(),
+        VariableType::Bool => value.as_bool().is_some(),
+        VariableType::Json => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(TauriCommandError::validation("初始值与变量类型不匹配"))
+    }
+}
+
+pub fn validate_campaign_variable_input(
+    key: &str,
+    label: &str,
+    description: Option<&str>,
+    default_value: &serde_json::Value,
+) -> Result<(), TauriCommandError> {
+    let valid_key = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !key.split('.').any(|segment| segment.starts_with("__"));
+    if !valid_key {
+        return Err(TauriCommandError::validation(
+            "变量键名只能包含文字、数字、点、下划线或连字符，不能超过 128 字节或使用 __ 内部段",
+        ));
+    }
+    if label.chars().count() > 80 {
+        return Err(TauriCommandError::validation(
+            "变量中文名称不能超过 80 个字符",
+        ));
+    }
+    if description.is_some_and(|value| value.chars().count() > 500) {
+        return Err(TauriCommandError::validation("变量说明不能超过 500 个字符"));
+    }
+    if serde_json::to_vec(default_value)
+        .map(|bytes| bytes.len() > 64 * 1024)
+        .unwrap_or(true)
+    {
+        return Err(TauriCommandError::validation("变量初始值不能超过 64 KiB"));
+    }
+    Ok(())
+}
+
+/// 写入路径（`set_*_variable`）的键名守卫。
+///
+/// 2026-09-13 域4 修复 T-06：`set_campaign_variable` / `set_character_variable`
+/// 此前对 `key` **不做任何校验**，而 `__storyforge*` 内部命名空间（例如
+/// `__storyforge_card_shell_variables`）的拒绝只写在前端
+/// `frontend/src/utils/shellVariableOutbox.js`。前端守卫不是安全边界——这与本项目
+/// 对插件通道已确立的标准（`plugin-bridge` 前端权限数组之外，后端
+/// `PluginRegistry` 二次校验）不一致，属防御纵深缺口：经命令层可写入内部键，
+/// 而 `utils/mvuStatTree.js` 正是靠该前缀把内部键排除出 stat_data 树的。
+/// 这里复用 `validate_campaign_variable_input` 的键名规则做后端侧守卫。
+pub fn validate_variable_write_key(key: &str) -> Result<(), TauriCommandError> {
+    let valid = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !key.split('.').any(|segment| segment.starts_with("__"));
+    if valid {
+        Ok(())
+    } else {
+        Err(TauriCommandError::validation(
+            "变量键名只能包含文字、数字、点、下划线或连字符，不能超过 128 字节或使用 __ 内部段",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CampaignVariableSchemaSyncDto {
+    pub added: usize,
+}
+
+/// 测试用 JSON 直连同步（等价 JSON `CampaignStore` 语义，仅测试夹具）。
+#[cfg(any(test, feature = "test-support"))]
+pub fn sync_campaign_variable_schema_in_store(
+    store: &crate::campaign_store::CampaignStore,
+    campaign_id: &Id,
+) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
+    let mut campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let card = store
+        .get_card(&campaign.card_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id)))?;
+    let added = campaign.sync_variable_schema(&card.card.effective_campaign_variable_schema());
+    store
+        .update_campaign(campaign)
+        .map_err(|error| TauriCommandError::storage(format!("同步 Campaign 变量失败: {error}")))?;
+    Ok(CampaignVariableSchemaSyncDto { added })
+}
+
+/// backend-neutral 版本：读 Campaign/卡经 facade，同步后经
+/// `StorageFacade::update_campaign` 落盘（JSON 文件 / SQLite 行）。
+pub fn sync_campaign_variable_schema_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
+    let record = storage
+        .get_campaign(campaign_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let card = storage
+        .get_card(&record.campaign.card_id)
+        .map_err(TauriCommandError::storage)?
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("找不到 card {}", record.campaign.card_id))
+        })?;
+    let schema = card.card.effective_campaign_variable_schema();
+    // 三.5：活动 Turn 屏障 + 读改写 + 写盘在同一原子单元内完成。
+    let added = std::cell::Cell::new(0usize);
+    let applied = storage
+        .mutate_idle_campaign(campaign_id, |campaign| {
+            let n = campaign.sync_variable_schema(&schema);
+            added.set(n);
+            Ok(())
+        })
+        .map_err(|error| TauriCommandError::storage(format!("同步 Campaign 变量失败: {error}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
+    Ok(CampaignVariableSchemaSyncDto { added: added.get() })
+}

@@ -1,5 +1,5 @@
 use super::*;
-use crate::commands::writing_regenerate::validate_regenerate_campaign_scope;
+use crate::services::writing_regenerate::validate_regenerate_campaign_scope;
 
 #[test]
 fn sync_attempt_after_autofix_updates_hash_to_final_text() {

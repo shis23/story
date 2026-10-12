@@ -23,7 +23,7 @@ use storyforge_domain::agent::RoundSummary;
 use storyforge_infra_vector::{MetadataFilter, VectorKind, VectorRecord, VectorStore};
 
 use crate::AppState;
-use crate::commands::bundle_runtime::BundleMessageArchive;
+use crate::services::bundle_runtime::BundleMessageArchive;
 use crate::storage::StoredCharacter;
 
 /// 角色库世界书向量记录的来源标签（metadata key → `StoredCharacter.id`）。
@@ -38,7 +38,7 @@ static WORLD_INFO_SYNC: Mutex<()> = Mutex::new(());
 /// 此前没有任何生产路径调用 `delete_by_campaign`，删档后其 RoundSummary/归档向量
 /// 永久滞留，持续占用 H-7 配额直到 upsert 被拒、所有 Campaign 的远记忆索引一起停摆。
 /// Campaign 本体已删，清理失败只告警、不回报删档失败。
-pub(crate) fn purge_campaign_vectors(state: &AppState, campaign_id: &Id) {
+pub fn purge_campaign_vectors(state: &AppState, campaign_id: &Id) {
     match state.vector_store.delete_by_campaign(campaign_id) {
         Ok(0) => {}
         Ok(removed) => tracing::debug!(
@@ -61,7 +61,7 @@ pub(crate) fn purge_campaign_vectors(state: &AppState, campaign_id: &Id) {
 /// 取代旧的「导入时按关键词删旧条目 + 逐条 upsert」：旧做法删卡、删条目、改路由
 /// 都不碰向量库，已删除的世界书仍会被 `search_vectors` 搜到；按关键词去重还会误删
 /// 其它卡共享关键词的条目。角色库读取失败时保持现状（不把索引清空）。
-pub(crate) fn sync_world_info_vectors(state: &AppState) {
+pub fn sync_world_info_vectors(state: &AppState) {
     let _serial = WORLD_INFO_SYNC.lock().unwrap_or_else(|p| p.into_inner());
     let characters = match state.storage().list_characters() {
         Ok(characters) => characters,
@@ -94,7 +94,7 @@ fn world_info_records(characters: &[StoredCharacter]) -> Vec<VectorRecord> {
     let mut records = Vec::new();
     for stored in characters {
         for (index, entry) in stored.info.world_info_entries.iter().enumerate() {
-            let route = crate::commands::world_info::parse_lore_route(entry.route.as_str())
+            let route = crate::services::world_info::parse_lore_route(entry.route.as_str())
                 .unwrap_or(LoreRoute::Selective);
             if !matches!(route, LoreRoute::Selective | LoreRoute::Both) {
                 continue;
@@ -145,7 +145,7 @@ fn indexable_summaries(summaries: Vec<RoundSummary>) -> Vec<RoundSummary> {
 /// `reuse_from` 为分支来源 Campaign：正文相同的摘要直接复用来源记录的向量，
 /// 不重新调用嵌入 API。其余摘要先写关键词索引；配置了 Embedder 时在后台补嵌入
 /// （与 accept 后的索引路径同一策略）。返回同步写入的记录数。
-pub(crate) fn index_campaign_summaries(
+pub fn index_campaign_summaries(
     state: &Arc<AppState>,
     campaign_id: &Id,
     reuse_from: Option<&Id>,
@@ -208,7 +208,7 @@ pub(crate) fn index_campaign_summaries(
         .is_some();
     if has_embedder && !needs_embedding.is_empty() {
         let state = state.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::background::spawn_background(async move {
             crate::runtime_support::index_summaries_async(state, needs_embedding).await;
         });
     }
@@ -220,7 +220,7 @@ pub(crate) fn index_campaign_summaries(
 ///
 /// 只写关键词索引，**不在启动时调用嵌入 API**（避免一次启动产生大量计费请求）；
 /// 已有记录（含已嵌入的向量）原样保留。幂等，可重复调用。
-pub(crate) fn reconcile_on_startup(state: &AppState) {
+pub fn reconcile_on_startup(state: &AppState) {
     sync_world_info_vectors(state);
     let purged = purge_orphan_campaign_vectors(state);
     if purged > 0 {
@@ -338,10 +338,7 @@ fn message_range(record: &VectorRecord) -> Option<(usize, usize)> {
 /// 不超过来源水位；所有记录都带消息区间时，再收紧到「从 0 起连续覆盖」的末端——
 /// 保证水位之前的每条消息确实有归档，缺的那段由自动归档重新补上，不会留下永久空洞。
 /// 有旧记录（无区间）时无法核对，沿用来源水位。没有任何归档时为 0。
-pub(crate) fn carried_archive_watermark(
-    ranges: &[Option<(usize, usize)>],
-    source_upto: usize,
-) -> usize {
+pub fn carried_archive_watermark(ranges: &[Option<(usize, usize)>], source_upto: usize) -> usize {
     if ranges.is_empty() {
         return 0;
     }
@@ -414,7 +411,7 @@ fn land_archives(
 /// 分支只允许从已提交的末尾正文创建，分支会话的消息与来源逐条相同，所以来源的
 /// 归档区间对分支同样成立。此前分支会话的水位被置 0 且没有任何归档——在下一次
 /// 自动归档之前，分支没有会话级远记忆，自动归档还要把同一段旧剧情再花钱总结一遍。
-pub(crate) fn copy_message_archives(
+pub fn copy_message_archives(
     state: &AppState,
     source_conversation_id: &Id,
     target_campaign_id: &Id,
@@ -438,7 +435,7 @@ pub(crate) fn copy_message_archives(
 }
 
 /// 导出：某会话的消息归档（不含向量）。
-pub(crate) fn export_message_archives(
+pub fn export_message_archives(
     state: &AppState,
     conversation_id: &Id,
 ) -> Vec<BundleMessageArchive> {
@@ -458,7 +455,7 @@ pub(crate) fn export_message_archives(
 
 /// 导入：把包内的消息归档写成新会话的关键词记录，恢复归档水位；配置了嵌入模型时
 /// 在后台补建向量。返回写入条数。
-pub(crate) fn import_message_archives(
+pub fn import_message_archives(
     state: &Arc<AppState>,
     archives: Vec<BundleMessageArchive>,
     source_upto: usize,
@@ -521,17 +518,17 @@ pub struct MemoryEmbeddingReport {
 static EMBEDDING_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 持有期间占住补建槽位；drop 时释放。
-pub(crate) struct EmbeddingBackfillGuard(());
+pub struct EmbeddingBackfillGuard(());
 
 impl EmbeddingBackfillGuard {
-    pub(crate) fn try_acquire() -> Option<Self> {
+    pub fn try_acquire() -> Option<Self> {
         EMBEDDING_BACKFILL_RUNNING
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
             .then_some(Self(()))
     }
 
-    pub(crate) fn is_running() -> bool {
+    pub fn is_running() -> bool {
         EMBEDDING_BACKFILL_RUNNING.load(Ordering::Acquire)
     }
 }
@@ -544,10 +541,7 @@ impl Drop for EmbeddingBackfillGuard {
 
 /// 需要（重新）嵌入的远记忆记录：没有向量，或维度与当前嵌入模型不一致
 /// （换了嵌入模型之后旧向量无法与新查询向量比较，向量召回会整体退回关键词）。
-pub(crate) fn archive_records_needing_embedding(
-    store: &dyn VectorStore,
-    dim: usize,
-) -> Vec<VectorRecord> {
+pub fn archive_records_needing_embedding(store: &dyn VectorStore, dim: usize) -> Vec<VectorRecord> {
     let mut records: Vec<VectorRecord> = store
         .records_matching(&MetadataFilter::new())
         .into_iter()
@@ -559,10 +553,7 @@ pub(crate) fn archive_records_needing_embedding(
 }
 
 /// 远记忆记录总数 / 其中缺向量的条数（`dim = None` 表示未配置嵌入模型，全部按缺失计）。
-pub(crate) fn archive_embedding_counts(
-    store: &dyn VectorStore,
-    dim: Option<usize>,
-) -> (usize, usize) {
+pub fn archive_embedding_counts(store: &dyn VectorStore, dim: Option<usize>) -> (usize, usize) {
     let records: Vec<VectorRecord> = store
         .records_matching(&MetadataFilter::new())
         .into_iter()
@@ -582,7 +573,7 @@ pub(crate) fn archive_embedding_counts(
 ///
 /// 嵌入接口失败时立即停下（多半是配置或网络问题，继续请求只会重复失败、白白计费），
 /// 已完成的批次保留。补建期间被删除的记录（删档）不会被写回。
-pub(crate) async fn embed_archive_records(
+pub async fn embed_archive_records(
     store: &dyn VectorStore,
     embedder: &storyforge_infra_llm::Embedder,
     records: Vec<VectorRecord>,
@@ -632,7 +623,7 @@ pub(crate) async fn embed_archive_records(
 /// 用当前嵌入配置为远记忆补建向量（`only` 给定时只处理这些记录）。
 ///
 /// 未配置嵌入模型、或已有补建在跑时返回 `None`。
-pub(crate) async fn run_embedding_backfill(
+pub async fn run_embedding_backfill(
     state: &AppState,
     only: Option<&[Id]>,
 ) -> Option<Result<MemoryEmbeddingReport, String>> {
@@ -670,7 +661,7 @@ pub(crate) async fn run_embedding_backfill(
 }
 
 /// 后台补建（导入后、保存嵌入配置后）。没配嵌入模型或已有补建在跑时什么也不做。
-pub(crate) fn spawn_embedding_backfill(state: &Arc<AppState>, only: Option<Vec<Id>>) {
+pub fn spawn_embedding_backfill(state: &Arc<AppState>, only: Option<Vec<Id>>) {
     if state
         .embed_config
         .read()
@@ -680,7 +671,7 @@ pub(crate) fn spawn_embedding_backfill(state: &Arc<AppState>, only: Option<Vec<I
         return;
     }
     let state = state.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::background::spawn_background(async move {
         if let Some(Err(e)) = run_embedding_backfill(&state, only.as_deref()).await {
             tracing::warn!(target: "far_memory", "后台远记忆向量补建失败: {e}");
         }

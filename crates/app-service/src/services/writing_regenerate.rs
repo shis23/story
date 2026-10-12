@@ -27,7 +27,7 @@ pub struct RegenerateRequestDto {
 }
 
 /// 把 DTO 的 target 字符串解析为 PartialRollTarget
-pub(crate) fn parse_target_dto(
+pub fn parse_target_dto(
     target: &RegenerateTargetDto,
 ) -> Result<PartialRollTarget, TauriCommandError> {
     match target.kind.as_str() {
@@ -51,7 +51,7 @@ pub(crate) fn parse_target_dto(
 /// Turn belong to the same selected Campaign. This check must happen before
 /// `PipelineOrchestrator::regenerate`, because that pipeline mutates the
 /// requested conversation's draft in place.
-pub(crate) fn validate_regenerate_campaign_scope(
+pub fn validate_regenerate_campaign_scope(
     active_campaign: Option<&Id>,
     conversation: &Conversation,
     active_turn: Option<&storyforge_domain::turn::TurnRecord>,

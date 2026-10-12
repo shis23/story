@@ -29,7 +29,7 @@ use storyforge_infra_sqlite::production::{
 };
 use storyforge_infra_sqlite::{current_version, migrate};
 
-use crate::commands::characters::CharacterInfo;
+use crate::services::characters::CharacterInfo;
 use crate::storage::StoredCharacter;
 
 /// Process-owned SQLite handle. Opened once when SQLite is selected.
@@ -220,11 +220,11 @@ fn list_turns_for_campaign_in_db(
     .collect()
 }
 
-pub(crate) fn export_campaign_snapshot(
+pub fn export_campaign_snapshot(
     campaign_id: &Id,
-) -> Result<crate::commands::import_export::CampaignBundle, String> {
-    use crate::commands::bundle_runtime::BundleRuntime;
-    use crate::commands::import_export::CampaignBundle;
+) -> Result<crate::services::import_export::CampaignBundle, String> {
+    use crate::services::bundle_runtime::BundleRuntime;
+    use crate::services::import_export::CampaignBundle;
     with_db(|db| {
         // All repository reads use this connection and therefore this one
         // SQLite read transaction, including writes from other connections.
@@ -294,8 +294,8 @@ pub(crate) fn export_campaign_snapshot(
             summaries: SqliteProductionRepository::list_summaries(db, campaign_id)
                 .map_err(|e| e.to_string())?,
         };
-        crate::commands::bundle_runtime::validate_runtime(&bundle).map_err(|e| e.to_string())?;
-        crate::commands::import_export::validate_bundle_summary_graph(
+        crate::services::bundle_runtime::validate_runtime(&bundle).map_err(|e| e.to_string())?;
+        crate::services::import_export::validate_bundle_summary_graph(
             &bundle.campaign,
             &bundle.summaries,
         )
@@ -546,7 +546,7 @@ fn with_active_turn_mutation<R>(
 }
 
 /// 活动 Turn 屏障 + Campaign 读改写（单 UoW）。返回更新后的 Campaign。
-pub(crate) fn mutate_idle_campaign<F>(campaign_id: &Id, f: F) -> Result<Option<Campaign>, String>
+pub fn mutate_idle_campaign<F>(campaign_id: &Id, f: F) -> Result<Option<Campaign>, String>
 where
     F: FnOnce(&mut Campaign) -> Result<(), String>,
 {
@@ -593,7 +593,7 @@ where
 }
 
 /// 活动 Turn 屏障 + 角色实例读改写（单 UoW）。返回更新后的实例。
-pub(crate) fn mutate_idle_instance<F>(
+pub fn mutate_idle_instance<F>(
     campaign_id: &Id,
     instance_id: &Id,
     f: F,
@@ -640,7 +640,7 @@ where
 
 /// 活动 Turn 屏障 + Campaign 存在性校验 + 实例写入（单 UoW）。
 /// `validate` 在事务内、写入前对既有实例做重复检查。
-pub(crate) fn add_idle_instance(
+pub fn add_idle_instance(
     campaign_id: &Id,
     instance: &CharacterInstance,
     validate: impl FnOnce(&[CharacterInstance]) -> Result<(), String>,
@@ -696,7 +696,7 @@ pub(crate) fn add_idle_instance(
 }
 
 /// 活动 Turn 屏障 + 新建任务（单 UoW；任务的 campaign 必须与守卫一致）。
-pub(crate) fn add_idle_task(campaign_id: &Id, task: &StoryTask) -> Result<(), String> {
+pub fn add_idle_task(campaign_id: &Id, task: &StoryTask) -> Result<(), String> {
     if &task.campaign_id != campaign_id {
         return Err(format!(
             "任务 {} campaign 不匹配: {}, expected={campaign_id}",
@@ -718,7 +718,7 @@ pub(crate) fn add_idle_task(campaign_id: &Id, task: &StoryTask) -> Result<(), St
 }
 
 /// 活动 Turn 屏障 + 任务读改写（单 UoW；屏障按任务所属 campaign 校验）。
-pub(crate) fn mutate_idle_task<F>(task_id: &Id, f: F) -> Result<Option<StoryTask>, String>
+pub fn mutate_idle_task<F>(task_id: &Id, f: F) -> Result<Option<StoryTask>, String>
 where
     F: FnOnce(&mut StoryTask) -> Result<(), String>,
 {
@@ -1716,7 +1716,7 @@ pub fn mutate_character<T>(
             serde_json::from_str(&info_json).map_err(|e| format!("解析角色卡失败: {e}"))?;
         let result = f(&mut info)?;
         // 同步更新计数（对齐 JSON CharacterStore 编辑路径）。
-        crate::commands::characters::refresh_world_info_counts(&mut info);
+        crate::services::characters::refresh_world_info_counts(&mut info);
         let new_json =
             serde_json::to_string(&info).map_err(|e| format!("序列化角色卡失败: {e}"))?;
         db.connection()
@@ -1768,7 +1768,7 @@ pub fn update_world_info_entries_bulk_multi(
                 .map_err(|e| e.to_string())?;
             let mut info: CharacterInfo =
                 serde_json::from_str(&info_json).map_err(|e| format!("解析角色卡失败: {e}"))?;
-            crate::commands::characters::apply_update_world_info_entries_bulk(
+            crate::services::characters::apply_update_world_info_entries_bulk(
                 &mut info,
                 new_entries.clone(),
             )
@@ -2085,7 +2085,7 @@ pub fn import_campaign_bundle_into_db(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn import_campaign_bundle_with_runtime_into_db(
+pub fn import_campaign_bundle_with_runtime_into_db(
     conversation: &Conversation,
     card: &CharacterCard,
     campaign: &Campaign,
@@ -2095,7 +2095,7 @@ pub(crate) fn import_campaign_bundle_with_runtime_into_db(
     summaries: &[RoundSummary],
     runtime: Option<(
         &crate::storage::StoredCharacter,
-        Option<&crate::commands::bundle_runtime::BundleRuntime>,
+        Option<&crate::services::bundle_runtime::BundleRuntime>,
     )>,
     reuse_card: bool,
 ) -> Result<(), String> {

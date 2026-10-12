@@ -279,7 +279,7 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 - `PostProcessStarted`
 - `PostProcessDone { knowledge_count, variable_count, task_count }`
 - `PostProcessFailed { reason }`（best-effort，不阻断成文）
-- `PostProcessSkipped { reason }`（两种情况：① `AgentProfileConfig` 关闭 postprocess/summarizer 时发出，区别于真失败；② **取消**——`crates/tauri-app/src/runtime_support.rs:131-177` 的 `postprocess_pipeline_event`：runner 前/后取消或结果 `skipped_reason="cancelled"` 时发恰好一个 `PostProcessSkipped { reason: "postprocess cancelled" }`。`PostProcessFailed` 只在持久化真失败（`Err`）时发出，其它 skipped 原因不发事件；2026-09-13 回写，W-28）
+- `PostProcessSkipped { reason }`（两种情况：① `AgentProfileConfig` 关闭 postprocess/summarizer 时发出，区别于真失败；② **取消**——`crates/app-service/src/runtime_support.rs` 的 `postprocess_pipeline_event`：runner 前/后取消或结果 `skipped_reason="cancelled"` 时发恰好一个 `PostProcessSkipped { reason: "postprocess cancelled" }`。`PostProcessFailed` 只在持久化真失败（`Err`）时发出，其它 skipped 原因不发事件；2026-09-13 回写，W-28）
 - `SummaryDone { char_count }`
 - `Committed { session_id, variant_id }`
 - `Error { message }`

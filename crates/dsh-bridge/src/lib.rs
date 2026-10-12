@@ -2,7 +2,7 @@
 //!
 //! - [`rpc`]：双向 JSON-RPC 对端（传输无关）
 //! - [`llm`]：`DshLlmClient`，模型调用反向交给 DSH 插件
-//! - [`service`]：`BridgeService`，调用 tauri-app 命令本体跑生产写作路径
+//! - [`service`]：`BridgeService`，调用 `storyforge-app-service` 的命令本体跑生产写作路径
 //! - 本文件：AppState 装配、请求分发与 stdio 外壳 [`run_stdio`]
 //!
 //! 协议（每行一个 JSON 对象，格式见 [`rpc`]）：
@@ -34,13 +34,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use storyforge_app_service::AppState;
+use storyforge_app_service::storage_backend::StorageFacade;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::generation::GenerationMode;
 use storyforge_domain::llm::RetryConfig;
 use storyforge_infra_llm::{LlmClient, RetryingClient};
 use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
-use storyforge_tauri_app::AppState;
-use storyforge_tauri_app::storage_backend::StorageFacade;
 
 use crate::llm::{DshLlmClient, LlmBridgeState};
 use crate::rpc::{Incoming, Peer, RpcError};
@@ -53,7 +53,7 @@ pub fn build_app(
     llm: Arc<LlmBridgeState>,
 ) -> Result<Arc<AppState>, String> {
     // 必须先于任何存储构造：否则全局连接 / 预设存储会解析到用户真实的数据目录。
-    let data_dir = storyforge_tauri_app::pin_app_data_dir(data_dir)?;
+    let data_dir = storyforge_app_service::pin_app_data_dir(data_dir)?;
     let storage = StorageFacade::new(
         data_dir.clone(),
         PinnedBackend::new(StorageBackend::Json, BackendSource::Config),
@@ -72,11 +72,13 @@ pub fn build_app(
     app.install_llm_client(Arc::new(logged));
     // 与 Tauri setup 相同：重放 Committing 态 Turn、把中断的活动 Turn 标记失败
     // （sidecar 崩溃或被杀后，下一轮才不会被活动 Turn 屏障挡住）。
-    storyforge_tauri_app::startup_recovery::run_startup_recovery(&app);
+    storyforge_app_service::startup_recovery::run_startup_recovery(&app);
     // 派生向量索引对账只写本地索引、不调嵌入 API，放后台线程。
     {
         let app = app.clone();
-        std::thread::spawn(move || app.reconcile_vector_indexes_on_startup());
+        std::thread::spawn(move || {
+            storyforge_app_service::vector_index::reconcile_on_startup(&app)
+        });
     }
     Ok(app)
 }

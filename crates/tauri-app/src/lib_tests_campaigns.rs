@@ -2,11 +2,16 @@ use super::*;
 
 #[test]
 fn gate3_character_commands_do_not_probe_the_sqlite_runtime() {
-    let source = include_str!("commands/characters.rs");
-    assert!(
-        !source.contains("sqlite_runtime::is_sqlite_active()"),
-        "character commands must select storage through AppState::storage()"
-    );
+    // 命令外壳（tauri-app）与其宿主无关的另一半（app-service/services）都要查。
+    for source in [
+        include_str!("commands/characters.rs"),
+        include_str!("../../app-service/src/services/characters.rs"),
+    ] {
+        assert!(
+            !source.contains("sqlite_runtime::is_sqlite_active()"),
+            "character commands must select storage through AppState::storage()"
+        );
+    }
 }
 
 #[test]
@@ -410,6 +415,35 @@ fn resolve_legacy_opening_message_accepts_only_card_greetings() {
     assert_eq!(
         resolve_legacy_opening_message(Some(&character), Some("   ".into())),
         Some("default opening".into())
+    );
+}
+
+#[test]
+fn opening_messages_are_saved_with_identity_macros_expanded() {
+    // 选择仍按卡片原文匹配，落库的是展开后的成文。
+    let mut character = make_test_character("Greeter");
+    character.first_mes = "{{user}} 推门进来，{{char}} 抬起头。".into();
+    character.alternate_greetings = vec!["<USER> 又来了，<BOT> 笑了。".into()];
+    let character = Arc::new(character);
+    assert_eq!(
+        resolve_legacy_opening_message(Some(&character), None),
+        Some("玩家 推门进来，Greeter 抬起头。".into())
+    );
+    assert_eq!(
+        resolve_legacy_opening_message(
+            Some(&character),
+            Some("<USER> 又来了，<BOT> 笑了。".into())
+        ),
+        Some("玩家 又来了，Greeter 笑了。".into())
+    );
+    // 取不到卡名时只展开用户宏。
+    assert_eq!(
+        crate::runtime_support::render_opening_message("{{user}} 与 {{char}}", None),
+        "玩家 与 {{char}}"
+    );
+    assert_eq!(
+        crate::runtime_support::render_opening_message("{{user}} 与 {{char}}", Some("  ")),
+        "玩家 与 {{char}}"
     );
 }
 
@@ -1206,6 +1240,20 @@ fn test_apply_campaign_opening_rewrites_first_assistant_message() {
     assert_eq!(conv.nodes.len(), 1);
     assert_eq!(conv.nodes[0].active_content(), "scene-2");
 
+    // 开场壳选中的开场来自卡片原文：落库前展开身份宏，{{char}} 取卡名。
+    apply_campaign_opening_in_store(
+        &store,
+        &conv_store,
+        &campaign_id,
+        "{{user}} 见到了 {{char}}。".into(),
+    )
+    .unwrap();
+    assert_eq!(
+        conv_store.get(&conv_id).unwrap().nodes[0].active_content(),
+        "玩家 见到了 Opening Source。"
+    );
+    apply_campaign_opening_in_store(&store, &conv_store, &campaign_id, "scene-2".into()).unwrap();
+
     // \u{91cd}\u{8f7d}\u{540e}\u{4ecd}\u{662f}\u{6539}\u{5199}\u{503c}\u{ff1a}\u{786e}\u{8ba4}\u{771f}\u{6b63}\u{843d}\u{76d8}\u{800c}\u{975e}\u{4ec5}\u{7f13}\u{5b58}
     let reloaded = ConversationStore::new(dir.join("conversations"));
     assert_eq!(
@@ -1516,7 +1564,7 @@ async fn test_prepare_start_conversation_async_persists_legacy_and_existing_path
 
 #[test]
 fn runtime_support_routes_backend_selection_through_the_injected_facade() {
-    let source = include_str!("runtime_support.rs");
+    let source = include_str!("../../app-service/src/runtime_support.rs");
     assert!(
         !source.contains("is_sqlite_active("),
         "runtime_support must not read the process-global SQLite flag"
@@ -1827,9 +1875,34 @@ fn delete_character_command_clears_active_pointer_and_conversation_cache() {
 /// `_owned`）的 `json_character_store` 调用，其所在函数体必须存在
 /// `require_supported(..., CharacterCommands, ...)` 守卫——即该路径在 SQLite
 /// 下 fail-closed 而非静默读 JSON。
+///
+/// 命令的宿主无关部分抽到 `storyforge-app-service` 后，扫描范围是
+/// `tauri-app/src/commands/` 与 `app-service/src/services/` 两棵树；两边都必须
+/// 扫到文件，防止路径漂移让门禁静默失效。
 fn collect_command_rust_files() -> Vec<(String, String)> {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+    for base in [
+        crates_dir.join("tauri-app").join("src").join("commands"),
+        crates_dir.join("app-service").join("src").join("services"),
+    ] {
+        let before = files.len();
+        collect_rust_files_under(&crates_dir, base.clone(), &mut files);
+        assert!(
+            files.len() > before,
+            "command sources must exist under {}",
+            base.display()
+        );
+    }
+    files.sort();
+    files
+}
+
+fn collect_rust_files_under(
+    crates_dir: &std::path::Path,
+    base: std::path::PathBuf,
+    files: &mut Vec<(String, String)>,
+) {
     let mut stack = vec![base];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -1839,7 +1912,7 @@ fn collect_command_rust_files() -> Vec<(String, String)> {
                     stack.push(path);
                 } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                     let name = path
-                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .strip_prefix(crates_dir)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .replace('\\', "/");
@@ -1849,8 +1922,6 @@ fn collect_command_rust_files() -> Vec<(String, String)> {
             }
         }
     }
-    files.sort();
-    files
 }
 
 /// Unsupported 能力集合：SQLite 下 `require_supported` 对这些能力 fail-closed，

@@ -461,7 +461,7 @@ impl<'a> BackendTurnAttemptSink<'a> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_json_store(json_turn_store: &'a TurnStore) -> Self {
         Self {
             storage: None,
@@ -469,7 +469,7 @@ impl<'a> BackendTurnAttemptSink<'a> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_backend_store(storage: Arc<StorageFacade>, json_turn_store: &'a TurnStore) -> Self {
         Self {
             storage: Some(storage),
@@ -956,7 +956,7 @@ pub fn prepare_start_conversation(
 pub fn character_instance_dto_for_backend(
     storage: &StorageFacade,
     instance: &storyforge_domain::campaign::CharacterInstance,
-) -> Result<crate::commands::campaigns::CharacterInstanceDto, String> {
+) -> Result<crate::services::campaigns::CharacterInstanceDto, String> {
     if storage.is_json() {
         let store = storage.json_campaign_store(
             BackendCapability::CampaignInstanceRead,
@@ -964,7 +964,7 @@ pub fn character_instance_dto_for_backend(
         )?;
         return Ok(character_instance_dto_from_store(store, instance));
     }
-    use crate::commands::campaigns::CharacterInstanceDto;
+    use crate::services::campaigns::CharacterInstanceDto;
     let role_type = instance.definition_id.as_ref().and_then(|definition_id| {
         let campaign = crate::sqlite_runtime::get_campaign(&instance.campaign_id).ok()??;
         let payload = crate::sqlite_runtime::get_card_payload(&campaign.card_id).ok()??;
@@ -985,8 +985,8 @@ pub fn character_instance_dto_for_backend(
 pub fn character_instance_dto_from_store(
     store: &CampaignStore,
     instance: &storyforge_domain::campaign::CharacterInstance,
-) -> crate::commands::campaigns::CharacterInstanceDto {
-    use crate::commands::campaigns::CharacterInstanceDto;
+) -> crate::services::campaigns::CharacterInstanceDto {
+    use crate::services::campaigns::CharacterInstanceDto;
     let role_type = instance.definition_id.as_ref().and_then(|definition_id| {
         let campaign = store.get_campaign(&instance.campaign_id)?;
         let card = store.get_card(&campaign.card_id)?;
@@ -1347,11 +1347,11 @@ pub async fn persist_postprocess_outcome_async(
 pub fn load_meta_snapshot_for_backend(
     storage: &StorageFacade,
     campaign_id: &Id,
-) -> Result<crate::commands::meta_typed::MetaSnapshot, String> {
+) -> Result<crate::services::meta_typed::MetaSnapshot, String> {
     if storage.is_json() {
         let store =
             storage.json_campaign_store(BackendCapability::TypedMetaPatch, "load Meta snapshot")?;
-        return crate::commands::meta_typed::load_meta_snapshot_from_store(store, campaign_id)
+        return crate::services::meta_typed::load_meta_snapshot_from_store(store, campaign_id)
             .map_err(|e| e.to_string());
     }
     let campaign = storage
@@ -1367,7 +1367,7 @@ pub fn load_meta_snapshot_for_backend(
     let instances = storage.list_instances(campaign_id)?;
     let knowledge = storage.list_knowledge(campaign_id)?;
     let tasks = storage.list_tasks(campaign_id)?;
-    Ok(crate::commands::meta_typed::MetaSnapshot {
+    Ok(crate::services::meta_typed::MetaSnapshot {
         campaign,
         definitions,
         instances,
@@ -1404,7 +1404,7 @@ pub fn apply_typed_patch_actions_for_backend(
             .json_campaign_store(BackendCapability::TypedMetaPatch, "accept typed Meta patch")?;
         crate::turn_coordinator::with_campaign_lock(|| {
             for (index, action) in actions.iter().enumerate() {
-                crate::commands::meta_typed::apply_typed_action(store, campaign_id, action)
+                crate::services::meta_typed::apply_typed_action(store, campaign_id, action)
                     .map_err(|error| {
                         crate::turn_coordinator::CommitError::Storage(format!(
                             "第 {} 个 action 失败: {error}",
@@ -1488,7 +1488,7 @@ pub fn apply_mvu_schema_for_backend(
     } else {
         let store =
             storage.json_campaign_store(BackendCapability::MvuSchemaApply, "MVU schema apply")?;
-        crate::commands::meta_typed::meta_apply_mvu_schema_in_store(
+        crate::services::meta_typed::meta_apply_mvu_schema_in_store(
             store,
             source_character_id,
             definition_id,
@@ -1537,7 +1537,7 @@ pub fn load_campaign_world_info_for_backend(
                 "seed campaign world info from character template",
             )
             .map_err(|e| e.to_string())?;
-        crate::commands::campaigns::resolve_template_world_info_for_card(character_store, &card)
+        crate::services::campaigns::resolve_template_world_info_for_card(character_store, &card)
     };
     if !template.entries.is_empty() {
         book = storage.ensure_world_info_from_book(campaign_id, &template)?;

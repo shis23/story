@@ -1,6 +1,6 @@
 //! `BridgeService`：传输无关的桥接核心。
 //!
-//! 每个方法直接调用 tauri-app 的命令本体（`*_for_host` / `accept_variant_async`），
+//! 每个方法直接调用 `storyforge-app-service` 的命令本体（`*_for_host` / `accept_variant_async`），
 //! 跑的是与 Tauri 命令同一份生产代码；本层只负责编排：
 //! - 一次只跑一轮。上一轮成文后，后处理 + 自动接受在后台继续（"收尾"），
 //!   下一轮（或开新档）先等收尾结束，与生产的活动 Turn 屏障一致。
@@ -21,16 +21,16 @@ use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, mpsc};
 use tokio::task::JoinHandle;
 
-use storyforge_domain::Id;
-use storyforge_domain::agent::PipelineEvent;
-use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
-use storyforge_domain::generation::GenerationMode;
-use storyforge_tauri_app::error::TauriCommandError;
-use storyforge_tauri_app::{
+use storyforge_app_service::error::TauriCommandError;
+use storyforge_app_service::{
     AppState, StartWritingRequest, accept_variant_async, create_campaign_for_backend,
     extract_characters_for_host, fork_campaign_for_host, import_character_for_host,
     set_active_campaign_for_host, start_writing_for_host,
 };
+use storyforge_domain::Id;
+use storyforge_domain::agent::PipelineEvent;
+use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
+use storyforge_domain::generation::GenerationMode;
 
 use crate::llm::{LlmBridgeState, UsageTotals};
 
