@@ -299,9 +299,33 @@ pub struct ArchiveMeta {
 
 // ─── 辅助函数 ──────────────────────────────────────────────────────────────
 
+/// 归档总结首行「要点」的字数上限。
+///
+/// 远记忆注入时每条只保留开头一段（app-pipeline `FAR_MEMORY_ITEM_MAX_CHARS`），
+/// 而总结正文按优先级先写人物关系和背景，暗号、门牌号这类具体细节常落在截断点之后。
+/// 首行先列具体事实，注入时就不会被截掉；app-service 有编译期断言保证它小于注入上限。
+pub const ARCHIVE_LEAD_MAX_CHARS: usize = 120;
+
+fn archive_prompt(messages_text: &str, max_chars: usize) -> String {
+    format!(
+        r#"你负责将一批较早的对话整理为可供长期召回的远记忆大总结。
+目标：生成一条可被向量召回使用的高密度长期记忆。
+硬性长度约束：最终输出最高 {max_chars} 字符；信息过多优先压缩，不要扩写。
+格式：
+第一行以「要点：」开头，不超过 {ARCHIVE_LEAD_MAX_CHARS} 字，只列这批对话里最具体、日后最可能被追问的事实——人名、地名与门牌、物件与信物、数字与日期、暗号与约定、许下的承诺；用顿号或分号隔开，不写背景、不写评价。
+第二行起写正文，内容优先级：人物关系、关键事件、目标变化、冲突、重要道具、地点、时间线、未解决伏笔。
+不要输出标题、分节编号或 markdown 标记。
+输出要求：只输出最终远记忆大总结正文。
+
+待整理的对话：
+{messages_text}"#
+    )
+}
+
 /// 归档一批消息（LLM 压缩）
 ///
-/// 复用 shujuku 的总结 prompt：高密度，优先级：人物关系/关键事件/目标变化/冲突/道具/伏笔。
+/// 复用 shujuku 的总结 prompt：高密度，优先级：人物关系/关键事件/目标变化/冲突/道具/伏笔；
+/// 首行先列具体事实（见 [`ARCHIVE_LEAD_MAX_CHARS`]）。
 async fn archive_batch(
     llm: &dyn LlmClient,
     messages: &[&str],
@@ -310,17 +334,7 @@ async fn archive_batch(
 ) -> Result<(String, Vec<String>), MemoryError> {
     let messages_text = messages.join("\n---\n");
 
-    let prompt = format!(
-        r#"你负责将一批较早的对话整理为可供长期召回的远记忆大总结。
-目标：生成一条可被向量召回使用的高密度长期记忆。
-硬性长度约束：最终输出最高 {} 字符；信息过多优先压缩，不要扩写。
-内容优先级：人物关系、关键事件、目标变化、冲突、重要道具、地点、时间线、未解决伏笔。
-输出要求：只输出最终远记忆大总结正文。
-
-待整理的对话：
-{}"#,
-        max_chars, messages_text
-    );
+    let prompt = archive_prompt(&messages_text, max_chars);
 
     let req = storyforge_domain::llm::ChatRequest {
         messages: vec![storyforge_domain::llm::ChatMessage::user(&prompt)],
@@ -479,6 +493,16 @@ mod tests {
         ) -> Result<ChatResponse, LlmError> {
             self.chat(req).await
         }
+    }
+
+    #[test]
+    fn archive_prompt_puts_concrete_facts_in_the_first_line() {
+        let prompt = archive_prompt("他把刻着土龙村17号的铜钥匙放在桌上", 2000);
+        assert!(prompt.contains("第一行以「要点：」开头"));
+        assert!(prompt.contains(&format!("不超过 {ARCHIVE_LEAD_MAX_CHARS} 字")));
+        assert!(prompt.contains("最高 2000 字符"));
+        assert!(prompt.contains("不要输出标题"));
+        assert!(prompt.ends_with("他把刻着土龙村17号的铜钥匙放在桌上"));
     }
 
     #[test]

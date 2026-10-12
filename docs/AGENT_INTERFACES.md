@@ -216,6 +216,7 @@ User Intent
 职责：
 
 - 对话**消息正文**过长时，按 `archived_upto` 水位批取前缀，LLM 压成 `ArchivedSummary`，keywords + 可选 embedding 写入向量库。嵌入模型是可选项（2026-10-11）：没配置或嵌入失败时照样以关键词记录入库、水位照常推进，之后可在嵌入模型设置里补建向量；记录带绝对消息区间 `message_start` / `message_end`。
+- 总结首行是「要点：」行（≤ `ARCHIVE_LEAD_MAX_CHARS` = 120 字），先列人名、地名、门牌、物件、数字、暗号、约定这类具体事实，再写正文。远记忆注入每条只保留开头 `FAR_MEMORY_ITEM_MAX_CHARS` = 200 字，这样具体事实不会被截掉；app-service 有编译期断言保证前者小于后者。只影响之后新生成的归档，旧记录不重写。
 - 供写作时 **auto recall**（`FarMemoryHit` → tail）；**v1 不进入 `search_chronicle`**（该工具仅 Chronicle A/B/C）。
 - 分支时复制来源会话的归档（复用向量）并对齐水位；故事快照导出 / 导入时随包搬运（不含向量），导入后按归档实际覆盖的区间恢复水位。
 
