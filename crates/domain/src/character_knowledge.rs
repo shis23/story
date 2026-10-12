@@ -319,7 +319,9 @@ mod tests {
 
     #[test]
     fn player_reference_covers_first_person_and_user_macros() {
-        for name in ["我", " 我 ", "玩家", "用户", "user", "User", "{{user}}", "<USER>"] {
+        for name in [
+            "我", " 我 ", "玩家", "用户", "user", "User", "{{user}}", "<USER>",
+        ] {
             assert!(is_player_reference(name), "{name:?} 应识别为玩家");
         }
         for name in ["莫挽舟", "我们", "旁白", "", "users"] {
