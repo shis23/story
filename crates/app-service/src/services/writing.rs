@@ -865,6 +865,10 @@ fn should_block_source_knowledge_propagation(
         return false;
     };
     let Some(source) = find_instance_by_name_or_id(store, camp_id, source_id) else {
+        // 玩家本人告诉角色的事：玩家没有传播策略，照常放行，不算 fail-open。
+        if storyforge_domain::character_knowledge::is_player_reference(source_id.as_str()) {
+            return false;
+        }
         tracing::warn!(
             target: "knowledge_propagation",
             reason = "source character unresolved",

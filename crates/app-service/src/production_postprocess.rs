@@ -1180,6 +1180,10 @@ fn source_propagation_blocks(
         return PropagationGate::allow_unresolved(GATE_SOURCE_MISSING);
     };
     let Some(source) = resolve(source_raw) else {
+        // 玩家本人告诉角色的事：玩家没有传播策略，照常放行，不算 fail-open。
+        if storyforge_domain::character_knowledge::is_player_reference(source_raw.as_str()) {
+            return PropagationGate::allow();
+        }
         return PropagationGate::allow_unresolved(GATE_SOURCE_UNRESOLVED);
     };
     let Some(policy) = source_lookup(&source.id, &update.knowledge_text) else {
@@ -1556,6 +1560,15 @@ mod tests {
             source_propagation_blocks(&unresolved_source, None, resolve, group_member, no_policy);
         assert!(!gate.blocked, "源不可解析时按放行处理（有意 best-effort）");
         assert_eq!(gate.unresolved, Some(GATE_SOURCE_UNRESOLVED));
+
+        // ②′ 源是玩家本人（第一人称卡写「我」）：照常放行，但这不是解析失败，不记 fail-open。
+        for player in ["我", "玩家", "{{user}}"] {
+            let told_by_player = gate_update(KnowledgeSource::ToldByOther, Some(player), None);
+            let gate =
+                source_propagation_blocks(&told_by_player, None, resolve, group_member, no_policy);
+            assert!(!gate.blocked, "玩家告知的知识必须放行（{player}）");
+            assert_eq!(gate.unresolved, None, "玩家来源不是解析失败（{player}）");
+        }
 
         // ③ 源可解析但没有同文本条目 ⇒ 策略未知（told_by_other 常见形态）。
         let no_entry = gate_update(KnowledgeSource::ToldByOther, Some("inst-lin"), None);
