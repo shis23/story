@@ -38,14 +38,14 @@ pub use commands::campaigns::{
     add_campaign_instance, apply_campaign_opening, create_campaign, delete_campaign,
     extract_characters, fork_campaign,
 };
+#[cfg(test)]
+use commands::cards::*;
 pub use commands::cards::{delete_card, get_card, list_cards};
 pub use commands::memory::{abandon_task, complete_task, create_task};
 pub use commands::variables::{
     add_campaign_variable, promote_temporary_instance, set_campaign_variable,
     set_character_variable, sync_campaign_variable_schema,
 };
-#[cfg(test)]
-use commands::cards::*;
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 #[cfg(test)]
