@@ -364,11 +364,17 @@ pub fn parse_response(result: &Value, keep_reasoning: bool) -> Result<ChatRespon
 }
 
 /// 插件侧失败（DSH `LlmFailure` 的 code/status）→ `LlmError` 分类。
+///
+/// DSH 的重试由它自己的 agent 循环执行，插件直接调 `ctx.llm.stream` 时不重试，
+/// 所以这里按 DSH 默认的可重试码（`TRANSPORT` / `SERVER` / `EMPTY_RESPONSE` /
+/// `TIMEOUT` / `RATE_LIMIT`）落到 `RetryingClient` 会重试的类别；额度用尽
+/// （`QUOTA` / `ACCOUNT_QUOTA`）即使带 429 也不重试。
 pub fn map_error(error: RpcError) -> LlmError {
     let message = error.message.clone();
     match (error.code.as_str(), error.status) {
         ("aborted", _) => LlmError::Cancelled,
-        ("timeout", _) => LlmError::Timeout,
+        ("timeout" | "TIMEOUT", _) => LlmError::Timeout,
+        ("QUOTA" | "ACCOUNT_QUOTA", _) => LlmError::Http(format!("{}: {message}", error.code)),
         (_, Some(401 | 403)) => LlmError::Auth(message),
         (_, Some(429)) => match error.retry_after_ms {
             // RetryingClient 从消息尾部解析 `retry-after: Ns`。
@@ -379,6 +385,10 @@ pub fn map_error(error: RpcError) -> LlmError {
         },
         (_, Some(400)) => LlmError::BadRequest(message),
         (_, Some(status)) if status >= 500 => LlmError::ServerError(message),
+        ("RATE_LIMIT", _) => LlmError::RateLimited(message),
+        ("TRANSPORT" | "SERVER" | "EMPTY_RESPONSE", _) => {
+            LlmError::ServerError(format!("{}: {message}", error.code))
+        }
         ("disconnected", _) => LlmError::Http(format!("DSH 插件已断开: {message}")),
         ("no_model", _) => LlmError::BadRequest(message),
         _ => LlmError::Http(format!("{}: {message}", error.code)),
@@ -487,6 +497,33 @@ mod tests {
             LlmError::Cancelled
         ));
         assert!(!map_error(RpcError::disconnected()).is_retryable());
+    }
+
+    /// DSH `LlmFailure` 的大写错误码：瞬时故障可重试，额度用尽不重试。
+    #[test]
+    fn dsh_failure_codes_follow_dsh_retry_policy() {
+        for code in [
+            "TRANSPORT",
+            "SERVER",
+            "EMPTY_RESPONSE",
+            "TIMEOUT",
+            "RATE_LIMIT",
+        ] {
+            let mapped = map_error(RpcError::new(code, "Connection error."));
+            assert!(mapped.is_retryable(), "{code}: {mapped:?}");
+        }
+        match map_error(RpcError::new("TRANSPORT", "Connection error.")) {
+            LlmError::ServerError(message) => assert_eq!(message, "TRANSPORT: Connection error."),
+            other => panic!("unexpected {other:?}"),
+        }
+        for code in ["QUOTA", "ACCOUNT_QUOTA"] {
+            let quota = RpcError {
+                status: Some(429),
+                ..RpcError::new(code, "insufficient quota")
+            };
+            assert!(!map_error(quota).is_retryable(), "{code}");
+        }
+        assert!(!map_error(RpcError::new("INVALID_CREDENTIAL", "bad key")).is_retryable());
     }
 
     #[tokio::test]

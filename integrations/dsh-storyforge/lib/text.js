@@ -76,6 +76,7 @@ const LLM_HINTS = [
   [/INVALID_CREDENTIAL/, '底层模型的 API Key 无效。到 DSH「设置 → 模型」检查密钥后重试。'],
   [/ACCOUNT_QUOTA|insufficient[_ ]quota|quota exceeded/i, '底层模型账户额度不足。充值或换一个模型后重试。'],
   [/\b429\b|rate[_ ]limit/i, '底层模型限流（请求太频繁）。稍等一会儿再试。'],
+  [/TRANSPORT|EMPTY_RESPONSE|Connection error|服务端错误 \(5xx\)|LLM error: 超时/i, '底层模型服务暂时连不上（网络中断、超时或服务端出错，自动重试后仍失败）。稍后重发这一轮即可，已写的故事不受影响。'],
   [/no_model|还没有选 StoryForge 的底层模型/, '还没有选 StoryForge 的底层模型：到左侧栏 StoryForge 首页「管线设置」选择后再试。'],
 ]
 

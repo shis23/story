@@ -87,6 +87,8 @@ test('llmHint and friendlyError explain known model failures', () => {
   assert.match(llmHint(raw), /还没有配置 API Key/)
   assert.match(llmHint('INVALID_CREDENTIAL: bad'), /无效/)
   assert.match(llmHint('HTTP 429 Too Many Requests'), /限流/)
+  assert.match(llmHint('LLM error: 服务端错误 (5xx): TRANSPORT: Connection error.'), /暂时连不上/)
+  assert.match(llmHint('LLM error: 超时'), /暂时连不上/)
   assert.equal(llmHint('something else'), null)
 
   const error = Object.assign(new Error(raw), { code: 'llm' })
