@@ -228,6 +228,23 @@ impl CharacterKnowledgeUpdate {
     }
 }
 
+/// 后处理在 `source_character_id` 里指代玩家本人的写法：第一人称卡常写「我」，
+/// 没有用户人设时 `{{user}}` 渲染成 [`crate::prompt_module::DEFAULT_USER_NAME`]，
+/// 宏没展开时原样出现。
+///
+/// 玩家不是 `CharacterInstance`，没有传播策略可查。传播门禁先按实例解析，解析不到时
+/// 用它把「玩家告诉了某角色」和「来源角色解析失败」区分开：前者照常放行、不记
+/// fail-open 警告。用户在人设里自定义的名字这里认不出（持久化层拿不到人设），仍按
+/// 解析失败处理。
+pub fn is_player_reference(raw: &str) -> bool {
+    let name = raw.trim();
+    name == crate::prompt_module::DEFAULT_USER_NAME
+        || matches!(name, "我" | "用户")
+        || ["user", "{{user}}", "<user>"]
+            .iter()
+            .any(|alias| name.eq_ignore_ascii_case(alias))
+}
+
 // ─── 注入子 Agent 上下文时的渲染（确定性查表，零 LLM）────────────────────
 
 type KnowledgeNameResolver<'a> = dyn Fn(&Id) -> Option<String> + 'a;
@@ -299,6 +316,16 @@ pub fn render_knowledge_for_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_reference_covers_first_person_and_user_macros() {
+        for name in ["我", " 我 ", "玩家", "用户", "user", "User", "{{user}}", "<USER>"] {
+            assert!(is_player_reference(name), "{name:?} 应识别为玩家");
+        }
+        for name in ["莫挽舟", "我们", "旁白", "", "users"] {
+            assert!(!is_player_reference(name), "{name:?} 不是玩家");
+        }
+    }
 
     #[test]
     fn test_backstory_entry_auto_pinned() {
