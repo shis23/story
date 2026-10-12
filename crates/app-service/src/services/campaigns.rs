@@ -1,4 +1,6 @@
 use super::super::*;
+use crate::services::world_info::apply_campaign_world_info_to_tool_ctx;
+use crate::storage_backend::{BackendCapability, CapabilityStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignSummaryDto {
@@ -894,4 +896,280 @@ pub fn add_campaign_instance_for_backend(
         .map_err(|error| TauriCommandError::storage(format!("添加角色失败: {error}")))?;
     crate::backend_workflows::character_instance_dto_for_backend(storage, &instance)
         .map_err(TauriCommandError::storage)
+}
+
+/// `extract_characters` 命令的本体。Tauri 命令与非 Tauri 宿主（DSH sidecar）共用这一份实现。
+pub async fn extract_characters_for_host(
+    state: &Arc<AppState>,
+    source_character_id: String,
+    force: Option<bool>,
+) -> Result<CardSummaryDto, TauriCommandError> {
+    use storyforge_app_agent::AgentRuntime;
+    use storyforge_domain::character::CharacterExtractionStatus;
+    use storyforge_domain::variables::{
+        extract_campaign_variable_schema_from_extensions, extract_mvu_schema_from_extensions,
+    };
+
+    let character_store = state.storage();
+
+    // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
+    let character = {
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        // 1. 直接按 Character.id 查（前端 extractCharacters 传卡本身 id 时命中）
+        let direct = ctx
+            .characters
+            .iter()
+            .find(|c| c.id.as_str() == source_character_id)
+            .map(|c| (*c).clone());
+        match direct {
+            Some(c) => Some(c),
+            None => {
+                // 2. 回退：前端可能传了存储 id（import_character 返回的 StoredCharacter.id，
+                //    与 Character.id 无关）。用存储 id 查角色库拿到 name，再按 name 查 tool_ctx。
+                character_store
+                    .get_character(&source_character_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|stored| {
+                        ctx.characters
+                            .iter()
+                            .find(|c| c.name == stored.info.name)
+                            .map(|c| (*c).clone())
+                    })
+            }
+        }
+    }
+    .ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 source_character_id={source_character_id} 的角色卡"
+        ))
+    })?;
+
+    // 已存在则直接返回
+    let force = force.unwrap_or(false);
+    let mut card =
+        match prepare_character_extraction_card_for_backend(state.storage(), &character, force)? {
+            CharacterExtractionDecision::ReturnExisting(existing) => {
+                return Ok(CardSummaryDto::from(&existing));
+            }
+            CharacterExtractionDecision::Run(card) => card,
+        };
+
+    // MVU schema 探测
+    let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
+    card.campaign_variable_schema =
+        extract_campaign_variable_schema_from_extensions(&character.extensions);
+    if !mvu_schema.is_empty() {
+        tracing::info!(
+            "卡「{}」探测到 {} 个 MVU 字段",
+            character.name,
+            mvu_schema.len()
+        );
+    }
+
+    // 有真实连接时跑识别 Agent；无连接或调用失败时安全降级为源卡自身的单角色定义。
+    // 生产态绝不使用开发 Mock，避免示例人物污染持久化数据。
+    let (definitions, extraction_status, extraction_message) = match state.active_llm() {
+        Some(llm) => {
+            let tool_ctx = state.snapshot_tool_ctx();
+            let runtime = AgentRuntime::new(llm, tool_ctx);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            match storyforge_app_agent::extract_characters(
+                &runtime,
+                &character,
+                &mvu_schema,
+                cancel_rx,
+            )
+            .await
+            {
+                Ok(defs) => (defs, CharacterExtractionStatus::Extracted, None),
+                Err(error) => {
+                    tracing::warn!("角色识别失败，降级建单角色: {error}");
+                    fallback_character_extraction(&character, &mvu_schema)
+                }
+            }
+        }
+        None => {
+            tracing::info!(
+                "未配置活跃 LLM，角色识别按源卡「{}」安全降级",
+                character.name
+            );
+            fallback_character_extraction(&character, &mvu_schema)
+        }
+    };
+
+    // 建卡 + 回填 card_id
+    let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
+    card.character_definitions = definitions;
+    card.extraction_status = extraction_status;
+    card.extraction_message = extraction_message;
+    let stored = if force {
+        save_character_card_force_rerun_for_backend(state.storage().clone(), card).await?
+    } else {
+        save_character_card_for_backend(state.storage().clone(), card).await?
+    };
+
+    Ok(CardSummaryDto::from(&stored))
+}
+
+/// `fork_campaign` 命令的本体。Tauri 命令与非 Tauri 宿主（DSH sidecar）共用这一份实现。
+pub fn fork_campaign_for_host(
+    state: &Arc<AppState>,
+    source_campaign_id: String,
+    fork_node_id: String,
+    name: String,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    let source_cid = Id::from_str(&source_campaign_id);
+
+    // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
+    if state
+        .storage()
+        .get_active_turn(&source_cid)
+        .map_err(TauriCommandError::storage)?
+        .is_some()
+    {
+        return Err(TauriCommandError::validation(
+            "源 Campaign 有未完成的 Turn，请先 Accept、Discard 或 Abandon 后再 fork（阶段 A 只支持从已提交 head fork）".to_string(),
+        ));
+    }
+
+    let source_conversation_id = state
+        .storage()
+        .get_campaign(&source_cid)
+        .ok()
+        .flatten()
+        .and_then(|record| record.campaign.conversation_id);
+    let forked = fork_campaign_for_backend(
+        state.storage(),
+        state.conv_store.as_ref(),
+        source_cid.clone(),
+        Id::from_str(&fork_node_id),
+        name,
+    )?;
+    let forked_campaign_id = Id::from_str(&forked.id);
+    // 分支的摘要换了新 id：复用来源局已有向量补建远记忆索引（不重新嵌入）。
+    crate::vector_index::index_campaign_summaries(state, &forked_campaign_id, Some(&source_cid));
+    // 会话级远记忆（消息归档）连同归档水位一起带给分支。
+    if let (Some(source_conversation), Some(forked_conversation)) =
+        (source_conversation_id, forked.conversation_id.as_deref())
+    {
+        crate::vector_index::copy_message_archives(
+            state,
+            &source_conversation,
+            &forked_campaign_id,
+            &Id::from_str(forked_conversation),
+        );
+    }
+    Ok(forked)
+}
+
+/// `set_active_campaign` 命令的本体。Tauri 命令与非 Tauri 宿主（DSH sidecar）共用这一份实现。
+pub fn set_active_campaign_for_host(
+    state: &Arc<AppState>,
+    id: String,
+) -> Result<(), TauriCommandError> {
+    let campaign_id = Id::from_str(&id);
+
+    // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书（WorldInfo 能力声明式门控）。
+    // 经 backend-neutral facade 读取——SQLite 下不得触碰 JSON store。
+    //
+    // Gate 4 五审 P1 修复：世界书读取 / 模板解析 / 惰性种子全部前移到活跃指针
+    // 提交**之前**——任意一步失败，命令返回错误时指针尚未改变（失败原子性，
+    // 不再出现“指针已改、命令却失败”的半成功状态）。指针提交仍走
+    // set_active_campaign_in_state：锁内重新校验存在性，删除无法在读取与提交
+    // 之间使选择失效。
+    let prepared_book: Option<storyforge_domain::world_info::WorldInfoBook> = if state
+        .storage()
+        .capability(BackendCapability::WorldInfo)
+        == CapabilityStatus::Supported
+    {
+        let mut book = state
+            .storage()
+            .get_world_info(&campaign_id)
+            .map_err(TauriCommandError::storage)?;
+        if book.entries.is_empty()
+            && let Some(camp) = state
+                .storage()
+                .get_campaign(&campaign_id)
+                .map_err(TauriCommandError::storage)?
+        {
+            // 模板来源：角色库内嵌世界书（backend-neutral facade），其次 ST 卡
+            // 模板（SQLite 专用 facade 方法）。读取错误传播（不静默吞掉）。
+            let mut template: Option<storyforge_domain::world_info::WorldInfoBook> = None;
+            if let Some(card) = state
+                .storage()
+                .get_card(&camp.campaign.card_id)
+                .map_err(TauriCommandError::storage)?
+            {
+                template = state
+                    .storage()
+                    .resolve_character_world_info_template(&card.card.source_character_id)
+                    .map_err(TauriCommandError::storage)?;
+                if template.is_none() {
+                    template = state
+                        .storage()
+                        .template_world_info_from_card(&serde_json::to_value(&card).map_err(
+                            |e| TauriCommandError::internal(format!("卡序列化失败: {e}")),
+                        )?)
+                        .map_err(TauriCommandError::storage)?;
+                }
+            }
+            if let Some(template) = template {
+                book = state
+                    .storage()
+                    .ensure_world_info_from_book(&campaign_id, &template)
+                    .map_err(TauriCommandError::storage)?;
+            }
+        }
+        Some(book)
+    } else {
+        None
+    };
+
+    // 活跃 runtime 快照在取锁前预加载（纯存储读，无本侧锁；失败仅降级为
+    // 「暂不填充」——写作路径的 fill_campaign_context 仍是权威加载点）。
+    // 2026-09-01 B5：没有这份快照，重启恢复/切换活动后 Meta 工具在首次
+    // 写作前一律回答「当前没有 active Campaign」。
+    let prepared_runtime =
+        match crate::backend_workflows::load_campaign_context_snapshot_for_backend(
+            state.storage(),
+            &campaign_id,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "active Campaign runtime 快照加载失败（首次写作前 Meta 工具不可用）: {error}"
+                );
+                None
+            }
+        };
+
+    // 世界书已就绪，此刻才提交活跃指针（失败不改指针）。tool_ctx 世界书写入
+    // 作为 after_commit 钩子在锁内执行（Gate 4 六审 P1：与指针提交原子，
+    // 删除线程无法在指针提交后、世界书写入前插入清指针）。
+    set_active_campaign_in_state(
+        state.as_ref(),
+        campaign_id.clone(),
+        || {
+            if !state
+                .storage()
+                .campaign_exists(&campaign_id)
+                .map_err(TauriCommandError::internal)?
+            {
+                return Err(TauriCommandError::not_found(format!(
+                    "找不到 campaign id={id}"
+                )));
+            }
+            Ok(())
+        },
+        |state, id| {
+            if let Some(book) = prepared_book {
+                apply_campaign_world_info_to_tool_ctx(state, id, &book);
+            }
+            if let Some(snapshot) = prepared_runtime {
+                crate::runtime_support::apply_campaign_runtime_to_tool_ctx(state, snapshot);
+            }
+        },
+    )?;
+    Ok(())
 }

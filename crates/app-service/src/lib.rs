@@ -72,6 +72,16 @@ pub use backend_workflows::*;
 pub use runtime_support::*;
 pub use startup_support::*;
 
+// 非 Tauri 宿主（DSH sidecar）的入口：与 Tauri 命令同一份命令本体与 DTO。
+pub use services::campaigns::{
+    CampaignSummaryDto, create_campaign_for_backend, extract_characters_for_host,
+    fork_campaign_for_host, set_active_campaign_for_host,
+};
+pub use services::cards::CardSummaryDto;
+pub use services::characters::{CharacterSummary, import_character_for_host};
+pub use services::turns::accept_variant_async;
+pub use services::writing::{StartWritingRequest, start_writing_for_host};
+
 pub type PromptHookPendingMap =
     Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<PromptHookReply>>>>;
 
@@ -264,7 +274,7 @@ pub fn install_mvu_runtime(
     MVU_RUNTIME.set(runtime).is_ok()
 }
 
-/// 由 Tauri setup 阶段确认的进程级数据目录。
+/// 由宿主启动阶段确认的进程级数据目录（Tauri setup 或非 Tauri 宿主的 `pin_app_data_dir`）。
 ///
 /// Android 的真实私有目录依赖运行中的 Activity，不能在 Builder 构造前猜测；
 /// setup 完成后，所有延迟初始化的 store 都通过这里取得同一目录。
@@ -355,6 +365,32 @@ pub fn get_app_data_dir() -> PathBuf {
 
     initialize_app_data_dir(None)
         .unwrap_or_else(|error| panic!("failed to initialize application data directory: {error}"))
+}
+
+/// 非 Tauri 宿主在构造任何存储之前钉住应用数据目录。
+///
+/// 桌面端经 [`initialize_app_data_dir`] 解析到用户真实的 `%APPDATA%/StoryForge`
+/// 一类位置（并做旧目录迁移）；sidecar 必须先钉到自己的隔离目录，否则全局连接 /
+/// 预设 / 正则存储会读写真实数据。不做旧目录迁移。同一路径重复调用幂等，
+/// 不同路径报错。
+pub fn pin_app_data_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
+    let data_dir = data_dir.to_path_buf();
+    if let Some(existing) = APP_DATA_DIR.get() {
+        if existing != &data_dir {
+            return Err(format!(
+                "application data directory already initialized as {}, refusing {}",
+                existing.display(),
+                data_dir.display()
+            ));
+        }
+        return Ok(existing.clone());
+    }
+    APP_DATA_DIR
+        .set(data_dir.clone())
+        .map_err(|_| "application data directory initialization raced".to_string())?;
+    Ok(data_dir)
 }
 
 pub fn initialize_app_data_dir(framework_data_dir: Option<&Path>) -> Result<PathBuf, String> {

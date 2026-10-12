@@ -10,42 +10,7 @@ pub(crate) fn import_character(
     data: Vec<u8>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterSummary, TauriCommandError> {
-    require_character_commands(state.inner().as_ref(), "import character")?;
-    let character =
-        storyforge_infra_import::import_character(&data).map_err(TauriCommandError::from)?;
-    let info = CharacterInfo::from(&character);
-    let stored = state
-        .storage()
-        .save_character(info)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
-
-    // 同步到 tool_ctx：角色卡 + 世界书（覆盖为当前角色的，符合"当前角色"语义）
-    {
-        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-        // 避免重复导入同一张卡导致 characters 列表膨胀
-        ctx.characters.retain(|c| c.name != character.name);
-        // 提取世界书（内嵌的优先）
-        let world_info = character.embedded_world_info.clone();
-        ctx.characters.push(Arc::new(character));
-        if let Some(wi) = world_info {
-            ctx.world_info = Some(Arc::new(wi));
-        }
-    }
-    // 绿灯世界书条目入向量库（search_vectors 用）：按角色库全量重建，取代旧的
-    // 「按关键词删旧条目 + 逐条 upsert」（见 vector_index::sync_world_info_vectors）。
-    crate::vector_index::sync_world_info_vectors(state.inner());
-
-    Ok(CharacterSummary {
-        id: stored.id,
-        name: stored.info.name,
-        description: stored.info.description,
-        tags: stored.info.tags,
-        creator: stored.info.creator,
-        spec_version: stored.info.spec_version,
-        world_info_count: stored.info.world_info_count,
-        has_renderable_assets: stored.info.has_renderable_assets,
-        imported_at: stored.imported_at,
-    })
+    import_character_for_host(state.inner(), data)
 }
 
 #[tauri::command]

@@ -10,9 +10,9 @@ mod shell_doc_protocol;
 pub use storyforge_app_service::*;
 
 use commands::{
-    campaigns::*, card_shell::*, cards::*, characters::*, connections::*, conversations::*,
-    diagnostics::*, import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*,
-    presets::*, profiles::*, turns::*, variables::*, world_info::*, writing::*,
+    campaigns::*, card_shell::*, characters::*, connections::*, conversations::*, diagnostics::*,
+    import_export::*, memory::*, meta::*, meta_typed::*, mvu::*, plugins::*, presets::*,
+    profiles::*, turns::*, variables::*, world_info::*, writing::*,
 };
 // Stable crate-root surface used by deterministic/real-LLM harnesses. Keep the
 // command module private while exposing only the shared postprocess helpers.
@@ -44,6 +44,8 @@ pub use commands::variables::{
     add_campaign_variable, promote_temporary_instance, set_campaign_variable,
     set_character_variable, sync_campaign_variable_schema,
 };
+#[cfg(test)]
+use commands::cards::*;
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
 #[cfg(test)]
