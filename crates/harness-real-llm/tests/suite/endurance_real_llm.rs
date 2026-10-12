@@ -18,7 +18,7 @@
 //! $env:STORYFORGE_EVAL_MAX_CALLS='700'
 //! $env:STORYFORGE_EVAL_MAX_TURNS='100'
 //! $env:STORYFORGE_EVAL_TIMEOUT_SECS='180'
-//! cargo test -p harness-real-llm --test endurance_real_llm -- endurance_real_llm_full_100_turn --ignored --nocapture
+//! cargo test -p harness-real-llm --test suite endurance_real_llm::endurance_real_llm_full_100_turn -- --ignored --nocapture
 //! ```
 //!
 //! Evidence retention notes:

@@ -3,7 +3,7 @@
 //! 前置：用社区 forge CLI 把两张验收卡 unpack 到某目录（命令见
 //! `src/forge_differential.rs` 模块头），然后：
 //! ```text
-//! STORYFORGE_FORGE_OUT=<out> cargo test -p harness-real-llm --test forge_differential -- --nocapture
+//! STORYFORGE_FORGE_OUT=<out> cargo test -p harness-real-llm --test suite forge_differential:: -- --nocapture
 //! ```
 //! 未设 `STORYFORGE_FORGE_OUT` 或卡文件缺失时跳过（不 fail）。
 

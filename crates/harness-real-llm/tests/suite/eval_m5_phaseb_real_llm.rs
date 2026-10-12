@@ -13,7 +13,7 @@
 //! $env:STORYFORGE_EVAL_MAX_TURNS='16'
 //! $env:STORYFORGE_EVAL_TIMEOUT_SECS='180'
 //! $env:STORYFORGE_EVAL_FIXTURE_CARD='C:\path\to\card.png'
-//! cargo test -p harness-real-llm --test eval_m5_phaseb_real_llm -- --ignored --nocapture
+//! cargo test -p harness-real-llm --test suite eval_m5_phaseb_real_llm:: -- --ignored --nocapture
 //! ```
 
 use std::sync::Arc;
