@@ -313,8 +313,9 @@ impl NarrativeContract {
     }
 
     /// 去掉卡自带的标记（`card_markup` 里的 HTML 标签与 HTML 注释），只留其中文字；
-    /// 去掉的标签处断行，免得相邻条目粘成一串。给复读 / 字数这类正文检查用：
-    /// 状态栏的标签与内联样式是模板，不是复读。
+    /// 每个去掉的标签处换成一个换行（连同两侧的缩进空白），免得相邻条目粘成一串、
+    /// 也免得标签间的缩进被当成复读。给复读 / 字数这类正文检查用：状态栏的标签、
+    /// 内联样式与排版缩进是模板，不是复读。
     pub fn strip_card_markup<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         if !self.card_markup.iter().any(|m| m != "```") {
             return std::borrow::Cow::Borrowed(text);
@@ -335,10 +336,11 @@ impl NarrativeContract {
                 });
             match card_tag {
                 Some(end) => {
-                    if !out.is_empty() && !out.ends_with('\n') {
+                    out.truncate(out.trim_end().len());
+                    if !out.is_empty() {
                         out.push('\n');
                     }
-                    rest = &tail[end..];
+                    rest = tail[end..].trim_start();
                 }
                 None => {
                     out.push('<');
@@ -759,13 +761,14 @@ mod tests {
     fn strip_card_markup_keeps_text_and_foreign_tags() {
         let contract = NarrativeContract::default()
             .with_opening_style(&OpeningStyle::from_opening(FIRST_PERSON_OPENING));
-        let draft = "我坐下。a < b\n<!-- 注释 -->\
-            <details><summary style=\"padding: 4px\">状态栏</summary>\
-            <div style=\"line-height:1.6\"><ul><li><b>时间:</b> 中午</li></ul></div></details>\
-            <span>外来</span>";
+        // 状态栏照真实卡的排版：标签之间是换行加缩进
+        let draft = "我坐下。a < b\n<!-- 注释 -->\n\
+            <details><summary style=\"padding: 4px\">状态栏</summary>\n      \
+            <div style=\"line-height:1.6\">\n\n      <ul>\n      <li><b>时间:</b> 中午</li>\n    \
+            </ul></div></details>\n<span>外来</span>";
         assert_eq!(
             contract.strip_card_markup(draft),
-            "我坐下。a < b\n状态栏\n时间:\n 中午\n<span>外来</span>"
+            "我坐下。a < b\n状态栏\n时间:\n中午\n<span>外来</span>"
         );
         // 没有卡标记：原样借用，不分配
         let plain = NarrativeContract::default();
