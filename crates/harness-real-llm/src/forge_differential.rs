@@ -7,7 +7,7 @@
 //!     --file test-card.png --output <out>/destiny --fresh
 //! node <tavern-cards>/scripts/tavern-cards-forge.mjs unpack qingqing \
 //!     --file "卿卿 (33).png" --output <out>/qingqing --fresh
-//! STORYFORGE_FORGE_OUT=<out> cargo test -p harness-real-llm --test forge_differential
+//! STORYFORGE_FORGE_OUT=<out> cargo test -p harness-real-llm --test suite forge_differential::
 //! ```
 //!
 //! 对照维度（v1，结构字段级）：

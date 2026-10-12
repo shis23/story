@@ -13,7 +13,7 @@
 //! $env:LLM_MODEL='deepseek-v4-pro'          # require_real_llm 兜底用；实际模型见下
 //! $env:STORYFORGE_CT_MODELS='deepseek-v4-pro,deepseek-v4-flash'
 //! $env:STORYFORGE_LLM_TIMEOUT_SECS='600'
-//! cargo test -p harness-real-llm --test card_translation_acceptance -- --ignored --nocapture
+//! cargo test -p harness-real-llm --test suite card_translation_acceptance:: -- --ignored --nocapture
 //! ```
 //! 每个（卡 × 模型）组合写一份脱敏证据 JSON 到 artifacts/card-translation/。
 

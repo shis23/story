@@ -512,7 +512,7 @@ compress_batch_id?
 
 | 项 | 值 |
 | --- | --- |
-| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory m5_s{1,3,4,6}_* -- --ignored` |
+| 执行 | `cargo test -p harness-real-llm --test suite m5_cache_and_memory::m5_s{1,3,4,6}_* -- --ignored` |
 | 基线 | `a338cfb` + S3 实体/标识符匹配小修 |
 | endpoint host | `cli.2529985.xyz` |
 | model | `grok-4.5` |
