@@ -19,6 +19,136 @@ pub enum NarrativePov {
     First,
     /// 多焦点/群像（仍禁止跨角色私密全知）
     Ensemble,
+    /// 第二人称（「你」）
+    Second,
+}
+
+/// 开场白确立的叙事风格。
+///
+/// 对话首条开场白（卡的 first_mes / 所选 greeting）决定两件事：
+/// - 叙述人称：第一/第二人称开场的卡，正文沿用同一人称；
+/// - 卡自带标记：开场白里出现的 HTML 标签（状态栏等）与代码围栏是卡的既定格式，
+///   质量门不把它们当格式泄漏。`<think>` 永远不算卡的格式。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpeningStyle {
+    /// 推断出的人称；None = 判断不出（沿用默认限知第三人称）
+    pub pov: Option<NarrativePov>,
+    /// 小写 HTML 标签名，代码围栏记为 "```"；去重排序
+    pub card_markup: Vec<String>,
+}
+
+/// 人称判定的最低出现次数（叙述部分）
+const OPENING_POV_MIN_HITS: usize = 3;
+
+impl OpeningStyle {
+    pub fn from_opening(text: &str) -> Self {
+        Self {
+            pov: infer_opening_pov(text),
+            card_markup: collect_card_markup(text),
+        }
+    }
+}
+
+fn collect_card_markup(text: &str) -> Vec<String> {
+    let mut tags = std::collections::BTreeSet::new();
+    if text.contains("```") {
+        tags.insert("```".to_string());
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if j < bytes.len() && bytes[j] == b'/' {
+            j += 1;
+        }
+        let start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+            j += 1;
+        }
+        let terminated =
+            j < bytes.len() && matches!(bytes[j], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n');
+        if j > start && bytes[start].is_ascii_alphabetic() && terminated {
+            let name = text[start..j].to_ascii_lowercase();
+            if name != "think" {
+                tags.insert(name);
+            }
+        }
+        i = j.max(i + 1);
+    }
+    tags.into_iter().collect()
+}
+
+/// 只留叙述：去掉 HTML 注释与标签、引号内对白（按行复位，防止不成对的引号吞掉全文）。
+fn opening_narration(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        rest = match rest[start..].find("-->") {
+            Some(end) => &rest[start + end + 3..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+
+    let mut narration = String::with_capacity(out.len());
+    let mut in_tag = false;
+    let mut depth = 0i32;
+    let mut ascii_quote = false;
+    for ch in out.chars() {
+        if in_tag {
+            in_tag = ch != '>';
+            continue;
+        }
+        match ch {
+            '<' => in_tag = true,
+            '\n' => {
+                depth = 0;
+                ascii_quote = false;
+                narration.push('\n');
+            }
+            '「' | '『' | '“' => depth += 1,
+            '」' | '』' | '”' => depth = (depth - 1).max(0),
+            '"' => ascii_quote = !ascii_quote,
+            _ if depth == 0 && !ascii_quote => narration.push(ch),
+            _ => {}
+        }
+    }
+    narration
+}
+
+fn infer_opening_pov(text: &str) -> Option<NarrativePov> {
+    let narration = opening_narration(text);
+    let mut first = narration.matches('我').count();
+    let mut second = narration.matches('你').count();
+    let mut third = narration.matches('他').count() + narration.matches('她').count();
+    for word in narration
+        .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
+        .filter(|w| !w.is_empty())
+    {
+        match word.to_ascii_lowercase().as_str() {
+            "i" | "me" | "my" | "myself" | "i'm" | "i'd" | "i'll" | "i've" => first += 1,
+            "you" | "your" | "yourself" | "you're" => second += 1,
+            "he" | "she" | "him" | "her" | "his" | "himself" | "herself" => third += 1,
+            _ => {}
+        }
+    }
+    // 第一/第二人称叙述里也会频繁出现「他/她」（指别人），所以只要求本人称
+    // 不被三人称压倒（≥ 1/3）；限知第三人称里偶发的无引号心声达不到这个比例。
+    let dominant = |hits: usize, rival: usize| {
+        hits >= OPENING_POV_MIN_HITS && hits >= rival && hits * 3 >= third
+    };
+    if dominant(first, second) {
+        Some(NarrativePov::First)
+    } else if dominant(second, first) {
+        Some(NarrativePov::Second)
+    } else {
+        None
+    }
 }
 
 /// 文风侧短开关（由 DraftQualityGate 执行）
@@ -138,6 +268,12 @@ pub struct NarrativeContract {
     pub must_not_resolve: Option<String>,
     #[serde(default)]
     pub style_constraints: StyleConstraints,
+    /// pov 由开场白推断（渲染时注明沿用开场白）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pov_from_opening: bool,
+    /// 卡开场白确立的格式标记（见 [`OpeningStyle::card_markup`]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_markup: Vec<String>,
 }
 
 impl Default for NarrativeContract {
@@ -150,11 +286,28 @@ impl Default for NarrativeContract {
             must_not_reveal: vec![],
             must_not_resolve: None,
             style_constraints: StyleConstraints::default(),
+            pov_from_opening: false,
+            card_markup: vec![],
         }
     }
 }
 
 impl NarrativeContract {
+    /// 套用开场白风格：推断出人称时覆盖默认视角，并登记卡自带的格式标记。
+    pub fn with_opening_style(mut self, style: &OpeningStyle) -> Self {
+        if let Some(pov) = style.pov {
+            self.pov = pov;
+            self.pov_from_opening = true;
+        }
+        self.card_markup = style.card_markup.clone();
+        self
+    }
+
+    /// 卡开场白是否用过该标记（小写标签名，或 "```"）
+    pub fn allows_card_markup(&self, key: &str) -> bool {
+        self.card_markup.iter().any(|m| m == key)
+    }
+
     /// 从 Plan + 可选 CampaignRuntime 构造契约。
     pub fn from_plan_and_runtime(plan: &Plan, runtime: Option<&CampaignRuntimeContext>) -> Self {
         let focalizers: Vec<String> = plan
@@ -220,6 +373,8 @@ impl NarrativeContract {
             must_not_reveal,
             must_not_resolve,
             style_constraints: StyleConstraints::default(),
+            pov_from_opening: false,
+            card_markup: vec![],
         }
     }
 
@@ -260,12 +415,17 @@ impl NarrativeContract {
     /// 渲染为 Editor/Director 短约束
     pub fn render_for_prompt(&self) -> String {
         let mut lines = vec!["【叙事契约 NarrativeContract】".to_string()];
-        let pov = match self.pov {
-            NarrativePov::LimitedThird => "限知第三人称",
-            NarrativePov::First => "第一人称",
-            NarrativePov::Ensemble => "多焦点群像（仍禁止跨角色私密全知）",
-        };
-        lines.push(format!("- 视角：{pov}"));
+        let pov = self.pov.label();
+        if self.pov_from_opening {
+            lines.push(format!(
+                "- 视角：{pov}（沿用开场白的叙述人称，优先于其它人称设定）"
+            ));
+        } else {
+            lines.push(format!("- 视角：{pov}"));
+        }
+        if let Some(markup) = self.card_markup_instruction() {
+            lines.push(format!("- {markup}"));
+        }
         if !self.focalizers.is_empty() {
             lines.push(format!("- 焦点角色：{}", self.focalizers.join("、")));
         }
@@ -306,6 +466,28 @@ impl NarrativeContract {
         lines
             .push("- 硬规则：角色对话/心理只能使用其已知信息；禁止作者视角剧透未公开秘密。".into());
         lines.join("\n")
+    }
+
+    /// 卡开场白自带 HTML 标记（状态栏等）时给写作/修订的格式说明；没有则 None。
+    pub fn card_markup_instruction(&self) -> Option<String> {
+        if !self.card_markup.iter().any(|m| m != "```") {
+            return None;
+        }
+        Some(
+            "卡格式：开场白里的 HTML 块（状态栏等）是这张卡的既定格式；正文带有同样的块时保持其结构、更新其中内容，不要删除它、改成纯文本或另造别的 HTML。"
+                .into(),
+        )
+    }
+}
+
+impl NarrativePov {
+    pub fn label(self) -> &'static str {
+        match self {
+            NarrativePov::LimitedThird => "限知第三人称",
+            NarrativePov::First => "第一人称",
+            NarrativePov::Ensemble => "多焦点群像（仍禁止跨角色私密全知）",
+            NarrativePov::Second => "第二人称",
+        }
     }
 }
 
@@ -430,6 +612,109 @@ mod tests {
             "prompt must not dump full secret text: {rendered}"
         );
         assert!(rendered.contains("私密归属角色") || rendered.contains("私密知识"));
+    }
+
+    /// 第一人称开场 + 卡自带 HTML 状态栏（对话里的「我」不计入叙述）
+    const FIRST_PERSON_OPENING: &str = "我推开教室门的时候，她已经坐在窗边了。\n\
+        “你迟到了。”她头也没抬。\n\
+        我把书包塞进桌肚，假装没听见。她的笔尖停了一下，又继续写。\n\
+        我知道她在等我先开口，可我偏不。\n\n\
+        <details><summary>📓 状态栏</summary>\n\
+        <!-- 当前情境 -->\n\
+        <div style=\"line-height:1.6\"><ul><li><b>时间:</b> 周一上午</li></ul></div>\n\
+        </details>\n<StatusPlaceHolderImpl/>";
+
+    #[test]
+    fn opening_style_detects_first_person_and_card_markup() {
+        let style = OpeningStyle::from_opening(FIRST_PERSON_OPENING);
+        assert_eq!(style.pov, Some(NarrativePov::First));
+        for tag in [
+            "details",
+            "summary",
+            "div",
+            "ul",
+            "li",
+            "b",
+            "statusplaceholderimpl",
+        ] {
+            assert!(
+                style.card_markup.iter().any(|m| m == tag),
+                "missing {tag}: {:?}",
+                style.card_markup
+            );
+        }
+        assert!(!style.card_markup.iter().any(|m| m == "```"));
+    }
+
+    #[test]
+    fn opening_style_third_person_narration_keeps_default() {
+        // 对白里大量「我」「你」，叙述是第三人称：不得判成第一/第二人称
+        let opening = "林秋把伞收好，抬头看了陈警官一眼。\n\
+            “我不知道你在说什么，我那天根本没去过诊所，你问我也没用。”\n\
+            他没有接话，只是把照片推到她面前。她盯着照片，手指慢慢收紧。\n\
+            *我该怎么解释*，她想。";
+        let style = OpeningStyle::from_opening(opening);
+        assert_eq!(style.pov, None);
+        assert!(style.card_markup.is_empty());
+    }
+
+    #[test]
+    fn opening_style_detects_second_person() {
+        let opening = "你醒来的时候，窗外在下雨。你摸到枕边的手机，屏幕亮着一条未读消息。\n\
+            你犹豫了一下，还是点开了它。";
+        assert_eq!(
+            OpeningStyle::from_opening(opening).pov,
+            Some(NarrativePov::Second)
+        );
+    }
+
+    #[test]
+    fn opening_style_english_first_person_and_code_fence() {
+        let opening = "I pushed the door open. She was already there, and I knew she had \
+            been waiting for me.\n```\nHP: 10\n```";
+        let style = OpeningStyle::from_opening(opening);
+        assert_eq!(style.pov, Some(NarrativePov::First));
+        assert_eq!(style.card_markup, vec!["```".to_string()]);
+    }
+
+    #[test]
+    fn opening_markup_never_includes_think_and_unclosed_quote_does_not_swallow_text() {
+        // 不成对的引号按行复位，后面几行的第一人称叙述仍要计入
+        let opening = "“半句没说完的话\n我站在门口。\n我听见楼下有人喊。\n我没动。<think>x</think>";
+        let style = OpeningStyle::from_opening(opening);
+        assert_eq!(style.pov, Some(NarrativePov::First));
+        assert!(style.card_markup.is_empty(), "{:?}", style.card_markup);
+    }
+
+    #[test]
+    fn with_opening_style_overrides_pov_and_renders_card_format() {
+        let contract = NarrativeContract::default()
+            .with_opening_style(&OpeningStyle::from_opening(FIRST_PERSON_OPENING));
+        assert_eq!(contract.pov, NarrativePov::First);
+        assert!(contract.pov_from_opening);
+        assert!(contract.allows_card_markup("div"));
+        assert!(!contract.allows_card_markup("span"));
+        let rendered = contract.render_for_prompt();
+        assert!(
+            rendered.contains("视角：第一人称（沿用开场白"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("卡格式"), "{rendered}");
+
+        // 开场白没有信号：契约保持旧行为，渲染不变
+        let plain = NarrativeContract::default().with_opening_style(&OpeningStyle::default());
+        assert_eq!(plain, NarrativeContract::default());
+        assert!(!plain.render_for_prompt().contains("沿用开场白"));
+        assert!(plain.card_markup_instruction().is_none());
+    }
+
+    #[test]
+    fn contract_without_opening_fields_serializes_as_before() {
+        let json = serde_json::to_value(NarrativeContract::default()).unwrap();
+        assert!(json.get("pov_from_opening").is_none());
+        assert!(json.get("card_markup").is_none());
+        let old: NarrativeContract = serde_json::from_str(r#"{"pov":"limited_third"}"#).unwrap();
+        assert_eq!(old, NarrativeContract::default());
     }
 
     #[test]

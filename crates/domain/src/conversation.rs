@@ -272,6 +272,20 @@ impl Conversation {
         }
     }
 
+    /// 开场白：首个节点、Final 状态且无溯源的 assistant 消息（卡的 first_mes /
+    /// 所选 greeting）。流水线生成的首条消息带 provenance 或仍是 Draft，不算开场白。
+    pub fn opening_text(&self) -> Option<&str> {
+        let first = self.nodes.first()?;
+        if first.parent_id.is_some() {
+            return None;
+        }
+        let variant = first.active()?;
+        (variant.role == Role::Assistant
+            && variant.status == VariantStatus::Final
+            && variant.provenance.is_none())
+        .then_some(variant.content.as_str())
+    }
+
     /// 追加一条消息（自动链接 parent）
     pub fn append_message(&mut self, role: Role, content: String) -> Id {
         let parent_id = self.nodes.last().map(|n| n.id.clone());
@@ -611,6 +625,45 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn opening_text_is_the_leading_assistant_message_without_provenance() {
+        let mut c = Conversation::new(None, None);
+        assert_eq!(c.opening_text(), None);
+        c.append_message(Role::Assistant, "开场白".into());
+        c.append_message(Role::User, "你好".into());
+        assert_eq!(c.opening_text(), Some("开场白"));
+
+        // 用户先开口：没有开场白
+        let mut user_first = Conversation::new(None, None);
+        user_first.append_message(Role::User, "直接开始".into());
+        user_first.append_message(Role::Assistant, "回复".into());
+        assert_eq!(user_first.opening_text(), None);
+
+        // 未采纳的首条草稿不是开场白
+        let mut draft_first = Conversation::new(None, None);
+        draft_first.append_ai_draft("草稿".into(), None);
+        assert_eq!(draft_first.opening_text(), None);
+
+        // 流水线生成的首条消息带 provenance，不是卡的开场白
+        let mut generated = Conversation::new(None, None);
+        generated.append_ai_draft(
+            "生成稿".into(),
+            Some(Provenance {
+                session_id: Id::new(),
+                plan: None,
+                subagent_results: vec![],
+                profile_id: None,
+                generation_mode: None,
+                seed: 1,
+                last_hint: None,
+                director_reasoning: None,
+                writer_reasoning: None,
+                editor_reasoning: None,
+            }),
+        );
+        assert_eq!(generated.opening_text(), None);
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub fn run_quality_gate_with_contract(
         check_meta_description(text),
         check_too_short(text),
         check_perspective_leak(text),
-        check_format_leak(text),
+        check_format_leak(text, contract),
         check_consecutive_repeat(text),
         check_em_dash(text, contract),
         check_negation_then_affirmation(text, contract),
@@ -242,14 +242,29 @@ fn check_perspective_leak(text: &str) -> Option<QualityWarning> {
 }
 
 /// 格式泄漏：代码块、think 标签、HTML 等非正文残留。
-fn check_format_leak(text: &str) -> Option<QualityWarning> {
-    const PATTERNS: &[&str] = &[
-        "```", "<think>", "</think>", "<div", "</div>", "<span", "</span>", "<p>", "</p>",
-        "```json", "```xml",
+///
+/// 卡开场白自己用过的标记（契约 `card_markup`，如状态栏的 `<div>`、代码围栏）
+/// 是卡的既定格式，不算泄漏——否则每轮都会触发 Editor auto-fix 并删掉状态栏。
+/// `<think>` 不在豁免之列。
+fn check_format_leak(text: &str, contract: Option<&NarrativeContract>) -> Option<QualityWarning> {
+    /// (模式, 豁免键)：豁免键是卡开场白里对应的标签名或 "```"
+    const PATTERNS: &[(&str, Option<&str>)] = &[
+        ("```", Some("```")),
+        ("<think>", None),
+        ("</think>", None),
+        ("<div", Some("div")),
+        ("</div>", Some("div")),
+        ("<span", Some("span")),
+        ("</span>", Some("span")),
+        ("<p>", Some("p")),
+        ("</p>", Some("p")),
     ];
 
-    for pat in PATTERNS {
-        if text.contains(pat) {
+    for (pat, card_key) in PATTERNS {
+        let card_format = card_key
+            .zip(contract)
+            .is_some_and(|(key, c)| c.allows_card_markup(key));
+        if !card_format && text.contains(pat) {
             return Some(QualityWarning {
                 code: QualityWarningCode::FormatLeak {
                     snippet: pat.to_string(),
@@ -959,6 +974,67 @@ mod tests {
                 .any(|w| matches!(&w.code, QualityWarningCode::FormatLeak { .. })),
             "应检出格式泄漏: {:?}",
             report.warnings
+        );
+    }
+
+    fn format_leaks(report: &QualityReport) -> Vec<String> {
+        report
+            .warnings
+            .iter()
+            .filter_map(|w| match &w.code {
+                QualityWarningCode::FormatLeak { snippet } => Some(snippet.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 卡开场白自带的状态栏 HTML 是卡的既定格式：不算格式泄漏、不触发 auto-fix；
+    /// 开场白没用过的标签与 `<think>` 照旧拦截。
+    #[test]
+    fn card_markup_from_opening_is_not_a_format_leak() {
+        use storyforge_domain::narrative_contract::OpeningStyle;
+
+        let opening = "我推开门。\n<details><summary>状态栏</summary><div><ul><li>时间：上午</li></ul></div></details>";
+        let contract =
+            NarrativeContract::default().with_opening_style(&OpeningStyle::from_opening(opening));
+        let draft = "我在她对面坐下，她把笔记本合上，看了我一眼，又转头望向窗外的操场。\n\
+            <details><summary>状态栏</summary><div><ul><li>时间：中午</li></ul></div></details>";
+
+        let with_card = run_quality_gate_with_contract(draft, Some(&contract));
+        assert!(
+            format_leaks(&with_card).is_empty(),
+            "{:?}",
+            with_card.warnings
+        );
+        // 无契约（旧调用方）行为不变
+        assert_eq!(
+            format_leaks(&run_quality_gate(draft)),
+            vec!["<div".to_string()]
+        );
+
+        let span_draft = format!("{draft}<span>额外</span>");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &span_draft,
+                Some(&contract)
+            )),
+            vec!["<span".to_string()]
+        );
+        let think_draft = format!("<think>想一想</think>{draft}");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &think_draft,
+                Some(&contract)
+            )),
+            vec!["<think>".to_string()]
+        );
+        let fence_draft = format!("{draft}\n```\nHP: 3\n```");
+        assert_eq!(
+            format_leaks(&run_quality_gate_with_contract(
+                &fence_draft,
+                Some(&contract)
+            )),
+            vec!["```".to_string()]
         );
     }
 

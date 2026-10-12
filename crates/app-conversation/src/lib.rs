@@ -735,6 +735,12 @@ impl ConversationStore {
         self.get(conv_id).map(|c| c.archived_upto).unwrap_or(0)
     }
 
+    /// 对话开场白（见 `Conversation::opening_text`）
+    pub fn opening_text(&self, conv_id: &Id) -> Option<String> {
+        self.get(conv_id)
+            .and_then(|c| c.opening_text().map(str::to_owned))
+    }
+
     /// 获取最近 N 条消息（用于上下文窗口）
     pub fn recent_messages(&self, conv_id: &Id, n: usize) -> Vec<String> {
         self.get(conv_id)

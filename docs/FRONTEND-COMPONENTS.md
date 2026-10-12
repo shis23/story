@@ -123,7 +123,7 @@
 | `ChatMessage` | 单条用户/助手消息；active variant、操作菜单、provenance 摘要。 |
 | `MessageVariantSwitcher` | 上/下一版、版本计数、采纳、删除、分支。 |
 | `MessageActionMenu` | 重 roll、编辑、添加变体、分支、删除。 |
-| `RichContent` | 安全展示 display-only HTML；Markdown/纯文本降级。 |
+| `RichContent` | 安全展示 display-only HTML；原文里完整闭合的块级 HTML（卡的状态栏等）经 DOMPurify 就地渲染；其余 Markdown/纯文本降级。 |
 | `StreamingMessage` | Director/Subagent/Editor 流式过程，可折叠。 |
 | `ProcessReview` | 本轮写完后的过程/质量回顾（可收起，不抢消息主角）。 |
 | `Composer` | 写作意图输入、开始/停止、禁用提示、快捷键。 |
