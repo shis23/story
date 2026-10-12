@@ -9,7 +9,7 @@
  * - 右栏页面类型不声明 guide：只出现在主动打开它的会话里（布局按会话持久化）。
  * - 会话头按钮、停靠区状态条在非 StoryForge 会话里渲染 null。
  * - 新建故事时，在打开会话**之前**写入视图偏好 `dsh.conversation.<id>`（整份状态），
- *   使新会话默认停在 StoryForge 视图。
+ *   使新会话默认停在「对话」视图（开场白在那里），并自动打开右栏 StoryForge 面板。
  *
  * 产物是手写的 CJS 工厂包（宿主只吃已构建的 lib/client.js，不做编译）。
  *
@@ -30,6 +30,8 @@ window.__ModuleLoader__.load({
 		const API_BASE = "/api/storyforge";
 		const PRESET = "storyforge";
 		const VIEW_ID = "storyforge";
+		/** DSH 自带的「对话」视图 id（`ui-conversation` 的 DEFAULT_VIEW_ID）。 */
+		const CHAT_VIEW_ID = "chat";
 		const PANEL_KIND = "storyforge-panel";
 		const PANEL_TYPE_ID = "dsh-plugin-storyforge.panel";
 		const CONVERSATION_STORE_KEY = "dsh.conversation";
@@ -395,6 +397,7 @@ window.__ModuleLoader__.load({
 							story.forkedFrom && kv("分叉自", `${parent?.displayTitle ?? shortId(story.forkedFrom)}${story.forkTurns != null ? ` · 第 ${story.forkTurns} 轮` : ""}`),
 							kv("存档", story.campaignId ? shortId(story.campaignId) : story.linked ? "第一次发送时建立分支" : "未关联", story.campaignId),
 							story.extractionStatus && kv("角色识别", EXTRACTION[story.extractionStatus] ?? story.extractionStatus),
+							story.extractionError && kv("识别失败原因", story.extractionError, story.extractionErrorDetail),
 						)
 					: h("div", { className: "sf-muted" }, "未登记的 StoryForge 会话（例如从新会话页直接选了预设）。请从 StoryForge 首页新建故事。"),
 				h("div", { className: "sf-section-title" }, "最近几轮的收尾"),
@@ -557,30 +560,58 @@ window.__ModuleLoader__.load({
 			return [shown, toggle];
 		}
 
+		/** 进行中的操作计时（秒），busy 为假时归零。 */
+		function useElapsed(busy) {
+			const [seconds, setSeconds] = React.useState(0);
+			React.useEffect(() => {
+				if (!busy) {
+					setSeconds(0);
+					return undefined;
+				}
+				const started = Date.now();
+				const timer = setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+				return () => clearInterval(timer);
+			}, [busy]);
+			return seconds;
+		}
+
+		/** 打开新建的故事：先写会话状态（默认停在「对话」看开场白）并约定自动打开右栏。 */
+		function openNewStory(sessionId) {
+			localStorage.setItem(
+				`${CONVERSATION_STORE_KEY}.${sessionId}`,
+				JSON.stringify({ draft: "", view: CHAT_VIEW_ID, viewRequest: null }),
+			);
+			localStorage.setItem(AUTO_PANEL_KEY + sessionId, "1");
+			openSession(sessionId);
+		}
+
+		const cardLabel = (entry) => (entry.name && entry.name !== entry.file ? `${entry.name}（${entry.file}）` : entry.file);
+
 		function NewStoryCard(props) {
-			const { cards, fake, modelReady, onCreated, onError } = props;
+			const { cards, fake, modelReady, onCreated, onCardsChanged, onError } = props;
 			const [card, setCard] = React.useState("");
 			const [title, setTitle] = React.useState("");
 			const [busy, setBusy] = React.useState(false);
+			const [importing, setImporting] = React.useState(false);
+			const [notice, setNotice] = React.useState(null);
+			const fileInput = React.useRef(null);
+			const elapsed = useElapsed(busy);
 			const files = cards?.cards ?? [];
 			React.useEffect(() => {
-				if (!card && files[0]) setCard(files[0].file);
+				if (!files.some((entry) => entry.file === card) && files[0]) setCard(files[0].file);
 			}, [card, files]);
 
 			const create = async () => {
 				setBusy(true);
+				setNotice(null);
 				onError(null);
 				try {
-					const { sessionId } = await postJson("/sessions", { title: title.trim() || undefined, card });
-					// 打开会话前写入整份会话状态：新会话默认停在 StoryForge 视图。
-					localStorage.setItem(
-						`${CONVERSATION_STORE_KEY}.${sessionId}`,
-						JSON.stringify({ draft: "", view: VIEW_ID, viewRequest: null }),
-					);
-					localStorage.setItem(AUTO_PANEL_KEY + sessionId, "1");
+					const { sessionId, warning } = await postJson("/sessions", { title: title.trim() || undefined, card });
 					setTitle("");
 					onCreated();
-					openSession(sessionId);
+					// 识别失败（多半是底层模型没配好）时先留在首页说明原因，由用户决定是否打开。
+					if (warning) setNotice({ tone: "warn", text: warning, sessionId });
+					else openNewStory(sessionId);
 				} catch (e) {
 					onError(errorText(e));
 				} finally {
@@ -588,7 +619,29 @@ window.__ModuleLoader__.load({
 				}
 			};
 
-			const blocker = fake ? null : !modelReady ? "先在「管线设置」里选底层模型" : !card ? "卡目录里还没有角色卡" : null;
+			const importCard = async (file) => {
+				if (!file) return;
+				setImporting(true);
+				setNotice(null);
+				onError(null);
+				try {
+					const { card: saved } = await api(`/cards/import?name=${encodeURIComponent(file.name)}`, {
+						method: "POST",
+						headers: { "content-type": "application/octet-stream" },
+						body: file,
+					});
+					await onCardsChanged();
+					setCard(saved.file);
+					setNotice({ tone: "ok", text: `已导入「${saved.name}」（${saved.file}）` });
+				} catch (e) {
+					onError(`导入角色卡失败：${errorText(e)}`);
+				} finally {
+					setImporting(false);
+					if (fileInput.current) fileInput.current.value = "";
+				}
+			};
+
+			const blocker = fake ? null : !modelReady ? "先在「管线设置」里选底层模型" : !card ? "先导入一张角色卡" : null;
 			return h(
 				Card,
 				{ title: "新建故事", sub: fake ? "假管线模式" : `${files.length} 张角色卡可选` },
@@ -598,11 +651,33 @@ window.__ModuleLoader__.load({
 					!fake && h("label", { htmlFor: "sf-card" }, "角色卡"),
 					!fake &&
 						h(
-							"select",
-							{ id: "sf-card", className: "sf-input", value: card, onChange: (e) => setCard(e.target.value) },
-							files.length === 0
-								? h("option", { value: "" }, "（卡目录为空）")
-								: files.map((entry) => h("option", { key: entry.file, value: entry.file }, entry.file)),
+							"div",
+							{ className: "sf-row" },
+							h(
+								"select",
+								{ id: "sf-card", className: "sf-input", value: card, onChange: (e) => setCard(e.target.value) },
+								files.length === 0
+									? h("option", { value: "" }, "（还没有角色卡）")
+									: files.map((entry) => h("option", { key: entry.file, value: entry.file }, cardLabel(entry))),
+							),
+							h("input", {
+								ref: fileInput,
+								type: "file",
+								accept: ".png,.json,image/png,application/json",
+								hidden: true,
+								onChange: (e) => void importCard(e.target.files?.[0]),
+							}),
+							h(
+								"button",
+								{
+									type: "button",
+									className: "sf-btn",
+									disabled: importing || busy,
+									title: "导入 SillyTavern 角色卡（.png / .json）",
+									onClick: () => fileInput.current?.click(),
+								},
+								importing ? "导入中…" : "导入角色卡…",
+							),
 						),
 					h("label", { htmlFor: "sf-title" }, "标题"),
 					h("input", {
@@ -622,13 +697,36 @@ window.__ModuleLoader__.load({
 					h(
 						"button",
 						{ type: "button", className: "sf-btn sf-btn-primary", disabled: busy || Boolean(blocker), onClick: () => void create() },
-						busy ? (fake ? "创建中…" : "导卡、识别角色中…") : "新建故事",
+						busy ? (fake ? "创建中…" : `导卡、识别角色中… ${elapsed} 秒`) : "新建故事",
 					),
 					blocker
 						? h("span", { className: "sf-muted sf-small" }, blocker)
 						: busy && !fake && h("span", { className: "sf-muted sf-small" }, "识别角色要调一次底层模型，可能需要一两分钟"),
 				),
-				!fake && cards?.cardsDir && h("div", { className: "sf-muted sf-small sf-gap-top" }, `把 .png / .json 角色卡放进 ${cards.cardsDir}`),
+				notice &&
+					h(
+						"div",
+						{ className: `sf-notice sf-notice-${notice.tone}` },
+						h("span", { className: "sf-grow" }, notice.text),
+						notice.sessionId &&
+							h(
+								"button",
+								{
+									type: "button",
+									className: "sf-btn sf-btn-sm",
+									onClick: () => {
+										const { sessionId } = notice;
+										setNotice(null);
+										openNewStory(sessionId);
+									},
+								},
+								"仍然打开故事",
+							),
+						h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setNotice(null) }, "关闭"),
+					),
+				!fake &&
+					cards?.cardsDir &&
+					h("div", { className: "sf-muted sf-small sf-gap-top" }, `也可以直接把 .png / .json 角色卡放进 ${cards.cardsDir}，再点右上角「刷新」`),
 			);
 		}
 
@@ -664,6 +762,28 @@ window.__ModuleLoader__.load({
 			const selectedIndex = selected
 				? choices.findIndex((choice) => choice.provider === selected.provider && choice.model === selected.model)
 				: -1;
+
+			/** 「测试连接」：结果跟着当前选中的模型走，换模型就清掉。 */
+			const selectedKey = selected ? `${selected.provider}/${selected.model}` : "";
+			const [probe, setProbe] = React.useState(null);
+			const testing = probe?.running === true;
+			const probeElapsed = useElapsed(testing);
+			React.useEffect(() => setProbe(null), [selectedKey]);
+			const runProbe = async () => {
+				setProbe({ running: true });
+				try {
+					const result = await postJson("/models/test", {});
+					setProbe({ key: selectedKey, ...result });
+				} catch (e) {
+					setProbe({ key: selectedKey, passed: false, error: errorText(e) });
+				}
+			};
+			const probeLine = testing
+				? h("span", { className: "sf-muted sf-small" }, `正在请求 ${selectedKey}… ${probeElapsed} 秒`)
+				: probe?.key === selectedKey &&
+					(probe.passed
+						? h("span", { className: "sf-probe-ok sf-small" }, `连接正常 · ${(probe.ms / 1000).toFixed(1)} 秒`)
+						: h("span", { className: "sf-probe-err sf-small", title: probe.detail ?? "" }, probe.error));
 			let optionIndex = 0;
 			const savedMark = (field) => saved === field && h("span", { className: "sf-saved" }, "已保存");
 			const field = (id, label, control, hint, key) => [
@@ -714,6 +834,23 @@ window.__ModuleLoader__.load({
 						),
 						"导演、角色、编剧、后处理共用；不影响 DSH 其它会话的模型",
 						"model",
+					),
+					h("div", { key: "sf-probe-l" }),
+					h(
+						"div",
+						{ key: "sf-probe-c", className: "sf-field sf-probe" },
+						h(
+							"button",
+							{
+								type: "button",
+								className: "sf-btn sf-btn-sm",
+								disabled: !selected || selectedIndex < 0 || testing,
+								title: "用选中的模型发一条很短的请求，确认密钥与网络可用",
+								onClick: () => void runProbe(),
+							},
+							"测试连接",
+						),
+						probeLine,
 					),
 					field(
 						"sf-mode",
@@ -1066,7 +1203,14 @@ window.__ModuleLoader__.load({
 					h(
 						"div",
 						{ className: "sf-grid" },
-						h(NewStoryCard, { cards, fake, modelReady: Boolean(models?.selected), onCreated: () => void refresh(), onError: setError }),
+						h(NewStoryCard, {
+							cards,
+							fake,
+							modelReady: Boolean(models?.selected),
+							onCreated: () => void refresh(),
+							onCardsChanged: () => api("/cards").then(setCards),
+							onError: setError,
+						}),
 						!fake &&
 							h(SettingsCard, {
 								models,
@@ -1156,6 +1300,14 @@ window.__ModuleLoader__.load({
 .sf-saved { color: var(--sf-ok); font-size: 12px; white-space: nowrap; }
 .sf-error { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--sf-radius-sm); background: color-mix(in srgb, var(--sf-err) 10%, transparent); color: var(--sf-err); white-space: pre-wrap; overflow-wrap: anywhere; }
 .sf-error-line { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sf-row > .sf-input { flex: 1 1 auto; }
+.sf-notice { display: flex; align-items: flex-start; gap: 10px; margin-top: 12px; padding: 10px 12px; border-radius: var(--sf-radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+.sf-notice-ok { background: color-mix(in srgb, var(--sf-ok) 10%, transparent); }
+.sf-notice-warn { background: color-mix(in srgb, var(--sf-warn) 14%, transparent); }
+.sf-probe { margin-top: -4px; flex-wrap: wrap; }
+.sf-probe-ok { color: var(--sf-ok); }
+.sf-probe-err { color: var(--sf-err); overflow-wrap: anywhere; }
 .sf-muted { color: var(--sf-fg3); }
 .sf-small { font-size: 12px; }
 .sf-nowrap { white-space: nowrap; }

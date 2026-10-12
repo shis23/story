@@ -23,7 +23,9 @@ import { basename, dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { BridgeRpcError, createBridge } from './bridge.js'
+import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
 import { classifyCall } from './roles.js'
+import { fitSessionTitle, friendlyError, llmHint, openingText } from './text.js'
 
 import {
   API_BASE,
@@ -609,7 +611,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
 
     const turn = currentTurn(options.messages)
     if (turn.opening) {
-      const opening = session?.opening?.trim() || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
+      const opening = openingText(session?.opening) || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
       yield* streamBlock(0, 'text', opening, signal, 64, 0)
       yield* finishStop(opening.length)
       return
@@ -628,12 +630,20 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
       )
     }
 
+    // sidecar 一次只跑一轮（上一轮的后台收尾也算）：要排队时先在思考块里说明，免得像卡住了。
+    const queued = await bridge
+      .request('bridge.status')
+      .then((status) => status?.busy === true)
+      .catch(() => false)
+    if (signal?.aborted) throw abortError(signal)
+
     const queue = createEventQueue()
     const unsubscribe = bridge.subscribe((method, params) => {
       if (method === 'turn.event' && params?.campaign_id === campaignId) queue.push(params.event)
     })
+    // 只取消本会话的这一轮：排队中的放弃，成文中的中止；上一轮的收尾照常完成。
     const onAbort = () => {
-      bridge.request('turn.cancel').catch(() => {})
+      bridge.request('turn.cancel', { campaign_id: campaignId }).catch(() => {})
     }
     signal?.addEventListener('abort', onAbort, { once: true })
     const { toolMode, generationMode } = runOptions()
@@ -657,6 +667,10 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
     try {
       let reasoning = ''
       yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+      if (queued) {
+        reasoning = '【排队】写作引擎正忙（上一轮在后台收尾，或另一个故事正在写），空出来后自动开始本轮；现在停止只放弃这一轮。\n'
+        yield { type: 'reasoning-delta', index: 0, text: reasoning }
+      }
       try {
         for await (const event of queue) {
           const line = describeEvent(event)
@@ -666,7 +680,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
         }
       } catch (error) {
         if (signal?.aborted) throw abortError(signal)
-        throw error
+        throw friendlyError(error)
       }
       const result = queue.result()
       const mode = GENERATION_MODE_LABELS[result?.generation_mode] ?? result?.generation_mode ?? '—'
@@ -761,7 +775,7 @@ export function apply(ctx, config) {
       Object.assign(entry, {
         status: aborted ? 'aborted' : 'error',
         ms: Date.now() - started,
-        error: String(error?.message ?? error),
+        error: [error?.code, String(error?.message ?? error)].filter(Boolean).join(': '),
       })
       throw error
     }
@@ -855,11 +869,80 @@ export function apply(ctx, config) {
     'storyforge: fork observer',
   )
 
+  /** 卡名缓存：文件名 → { mtimeMs, size, name }（只在文件变了时重新解析）。 */
+  const cardNames = new Map()
+
+  function cardName(file, stat) {
+    const cached = cardNames.get(file)
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.name
+    let name = null
+    try {
+      name = readCardName(readFileSync(join(cardsDir, file)), extname(file))
+    } catch (error) {
+      log(`card name unreadable: ${file}: ${error?.message ?? error}`)
+    }
+    cardNames.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, name })
+    return name
+  }
+
   function listCards() {
     if (!existsSync(cardsDir)) return []
     return readdirSync(cardsDir)
       .filter((file) => CARD_EXTENSIONS.has(extname(file).toLowerCase()))
-      .map((file) => ({ file, size: statSync(join(cardsDir, file)).size }))
+      .map((file) => {
+        const stat = statSync(join(cardsDir, file))
+        return { file, size: stat.size, name: cardName(file, stat) }
+      })
+  }
+
+  /**
+   * 首页「导入角色卡」：请求体是卡文件原始字节，`?name=` 是原文件名。只收能读出卡名的
+   * PNG / JSON 卡；同名不覆盖，自动编号。
+   */
+  async function importCard(request) {
+    const url = new URL(request.url)
+    const file = sanitizeCardFileName(url.searchParams.get('name'))
+    if (!file) throw new Error('只支持 .png 或 .json 角色卡')
+    const declared = Number(request.headers.get('content-length'))
+    if (Number.isFinite(declared) && declared > MAX_CARD_BYTES) throw new Error(`角色卡超过 ${MAX_CARD_BYTES / 1024 / 1024} MB`)
+    const bytes = Buffer.from(await request.arrayBuffer())
+    if (bytes.length === 0) throw new Error('文件是空的')
+    if (bytes.length > MAX_CARD_BYTES) throw new Error(`角色卡超过 ${MAX_CARD_BYTES / 1024 / 1024} MB`)
+    const name = readCardName(bytes, extname(file))
+    if (!name) throw new Error('没有在文件里找到角色卡数据（PNG 需要带 chara / ccv3 信息，JSON 需要有角色名）')
+    mkdirSync(cardsDir, { recursive: true })
+    const saved = nextFreeName(file, (candidate) => existsSync(join(cardsDir, candidate)))
+    writeFileSync(join(cardsDir, saved), bytes, { flag: 'wx' })
+    log(`card imported: ${saved} (${name}, ${bytes.length} bytes)`)
+    return { file: saved, name, size: bytes.length }
+  }
+
+  /** 「测试连接」：用选定的底层模型发一条很短的请求，报告耗时或可操作的错误。 */
+  async function testModel(target) {
+    const started = Date.now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error('60 秒内没有回应')), 60_000)
+    try {
+      const result = await serveLlm(
+        ctx,
+        target,
+        replayCache,
+        {
+          messages: [
+            { role: 'system', content: '这是连接测试。只回复两个字：收到' },
+            { role: 'user', content: '测试连接' },
+          ],
+          max_tokens: 64,
+        },
+        { signal: controller.signal, onChunk: () => {} },
+      )
+      return { ok: true, ms: Date.now() - started, reply: String(result.content ?? '').slice(0, 40), usage: result.usage }
+    } catch (error) {
+      const message = [error?.code, String(error?.message ?? error)].filter(Boolean).join(': ')
+      return { ok: false, ms: Date.now() - started, error: llmHint(message) ?? message, detail: message }
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** 首页传来的卡文件名 → cardsDir 下的绝对路径（只接受目录里真实存在的文件名）。 */
@@ -906,7 +989,7 @@ export function apply(ctx, config) {
       try {
         await workspace.attachSession(sessionId)
         attached = true
-        ctx.sessionTitle.rename(handle.agent.session, title)
+        ctx.sessionTitle.rename(handle.agent.session, fitSessionTitle(title))
         sessions.set(sessionId, { title, createdAt: new Date().toISOString(), ...story })
         handle.agent.followup(
           createUserMessage('（开始新故事）', {
@@ -957,10 +1040,17 @@ export function apply(ctx, config) {
             return json({ ok: true, sessionId })
           }
           await bridge.request('bridge.configure', { tool_mode: runOptions().toolMode })
+          const seqBefore = llmSeq
           const created = await bridge.request('campaign.create', {
             card_path: resolveCard(body?.card),
             name: requestedTitle || undefined,
           })
+          // 角色识别降级时，把这次开档里最后一个底层调用错误记成原因（首页与右栏显示）。
+          const extractionErrorDetail =
+            created.extraction_status === 'fallback'
+              ? (llmLog.find((entry) => entry.seq > seqBefore && entry.status === 'error')?.error ?? null)
+              : null
+          const extractionError = extractionErrorDetail && (llmHint(extractionErrorDetail) ?? extractionErrorDetail)
           const title = requestedTitle || created.card_name || '新的故事'
           const sessionId = await createStorySession(title, {
             campaignId: created.campaign_id,
@@ -969,9 +1059,16 @@ export function apply(ctx, config) {
             cardFile: body.card,
             opening: created.opening,
             extractionStatus: created.extraction_status,
+            extractionError,
+            extractionErrorDetail,
             turns: 0,
           })
-          return json({ ok: true, sessionId, campaign: created })
+          return json({
+            ok: true,
+            sessionId,
+            campaign: created,
+            warning: extractionError ? `故事已建好，但角色识别失败，先用兜底定义开档。${extractionError}` : null,
+          })
         } catch (error) {
           log(`create session failed: ${error?.stack ?? error}`)
           return failure(error)
@@ -982,7 +1079,32 @@ export function apply(ctx, config) {
       path: `${API_BASE}/cards`,
       methods: ['GET'],
       requestBody: 'buffered',
-      fetch: async () => json({ ok: true, cardsDir, cards: listCards() }),
+      fetch: async () => json({ ok: true, cardsDir, cards: listCards(), maxBytes: MAX_CARD_BYTES }),
+    },
+    {
+      path: `${API_BASE}/cards/import`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          return json({ ok: true, card: await importCard(request) })
+        } catch (error) {
+          log(`card import failed: ${error?.message ?? error}`)
+          return failure(error, 400)
+        }
+      },
+    },
+    {
+      path: `${API_BASE}/models/test`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        const target = settings.get('model')
+        if (!target?.provider || !target?.model) return failure('先选底层模型', 400)
+        const result = await testModel(target)
+        log(`model test ${target.provider}/${target.model}: ${result.ok ? `ok ${result.ms}ms` : result.detail}`)
+        return json({ ...result, ok: true, passed: result.ok, model: `${target.provider}/${target.model}` })
+      },
     },
     {
       path: `${API_BASE}/models`,

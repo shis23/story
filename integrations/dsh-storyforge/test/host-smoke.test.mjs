@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import { apply } from '../lib/index.js'
 import { notifyFork } from '../lib/shared.js'
+import { pngCard } from './support/png.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const bin = resolve(
@@ -44,6 +45,7 @@ function fakeModel(calls) {
 }
 
 function fakeCtx(llmCalls) {
+  const titles = []
   const adapters = new Map()
   const routes = new Map()
   const disposers = []
@@ -79,13 +81,14 @@ function fakeCtx(llmCalls) {
     agents: {
       create: async () => ({ agent: { session: {}, followup: () => {} }, dispose: async () => {} }),
     },
-    sessionTitle: { rename: () => {} },
+    sessionTitle: { rename: (_session, title) => titles.push(title) },
   }
-  return { ctx, adapters, routes, dispose: () => Promise.all(disposers.map((d) => d())) }
+  return { ctx, adapters, routes, titles, dispose: () => Promise.all(disposers.map((d) => d())) }
 }
 
 async function call(routes, path, init) {
-  const route = routes.get(`/api/storyforge${path}`)
+  // DSH 按 pathname 匹配受保护路由（查询串不参与）。
+  const route = routes.get(`/api/storyforge${path.split('?')[0]}`)
   assert.ok(route, `route ${path}`)
   const response = await route.fetch(new Request(`http://localhost/api/storyforge${path}`, init))
   return response.json()
@@ -129,7 +132,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     }),
   )
   const llmCalls = []
-  const { ctx, adapters, routes, dispose } = fakeCtx(llmCalls)
+  const { ctx, adapters, routes, titles, dispose } = fakeCtx(llmCalls)
   try {
     apply(ctx, { dataDir: join(root, 'data'), cardsDir })
     const adapter = adapters.get('storyforge')
@@ -159,7 +162,25 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     assert.equal(badMode.ok, false)
 
     const cards = await call(routes, '/cards')
-    assert.deepEqual(cards.cards.map((card) => card.file), ['seraphina.json'])
+    assert.deepEqual(cards.cards.map((card) => [card.file, card.name]), [['seraphina.json', 'Seraphina']])
+
+    // 首页导入角色卡：PNG 原始字节 + 原文件名；读不出卡名的拒收，同名自动编号、不覆盖。
+    const importCard = (name, body) =>
+      call(routes, `/cards/import?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body,
+      })
+    const png = pngCard({ chara: { spec: 'chara_card_v2', data: { name: '林间小屋' } } })
+    const imported = await importCard(String.raw`C:\Downloads\林间.png`, png)
+    assert.deepEqual(imported.card, { file: '林间.png', name: '林间小屋', size: png.length })
+    assert.equal((await importCard('林间.png', png)).card.file, '林间 (2).png')
+    assert.equal((await importCard('notes.txt', png)).ok, false)
+    const notACard = await importCard('plain.png', Buffer.from('not a card'))
+    assert.equal(notACard.ok, false)
+    assert.match(notACard.error, /没有在文件里找到角色卡数据/)
+    const listed = await call(routes, '/cards')
+    assert.deepEqual(listed.cards.map((card) => card.name).sort(), ['Seraphina', '林间小屋', '林间小屋'])
     const created = await call(routes, '/sessions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -260,6 +281,41 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     await assert.rejects(
       collect(adapter.stream({ sessionId: 'session-unknown', messages: [userMessage('hi', 'user')] })),
       /没有关联 StoryForge 存档/,
+    )
+
+    // 「测试连接」：用选定的底层模型发一条短请求。
+    const probe = await call(routes, '/models/test', { method: 'POST' })
+    assert.equal(probe.passed, true, JSON.stringify(probe))
+    assert.equal(probe.model, 'fake/writer')
+
+    // 底层模型没配密钥：测试连接、开档与写作都给出可操作的提示，而不是原始错误。
+    ctx.llm.stream = async function* () {
+      yield {
+        type: 'finish',
+        reason: { kind: 'error', failure: { code: 'MISSING_CREDENTIAL', message: 'llm-fake: no API key for provider route "fake"' } },
+      }
+    }
+    const failedProbe = await call(routes, '/models/test', { method: 'POST' })
+    assert.equal(failedProbe.passed, false)
+    assert.match(failedProbe.error, /还没有配置 API Key/)
+    assert.match(failedProbe.detail, /MISSING_CREDENTIAL/)
+    const longTitle = '我的假小子黑皮青梅不可能变成清冷校花，更别提她还有个美艳继母'
+    const unconfigured = await call(routes, '/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ card: '林间.png', title: longTitle }),
+    })
+    assert.equal(unconfigured.ok, true, unconfigured.error)
+    assert.equal(unconfigured.campaign.extraction_status, 'fallback')
+    assert.match(unconfigured.warning, /角色识别失败.*还没有配置 API Key/)
+    const story = (await call(routes, '/sessions')).sessions[unconfigured.sessionId]
+    assert.equal(story.title, longTitle, '插件登记里保留完整标题')
+    assert.match(story.extractionErrorDetail, /MISSING_CREDENTIAL/)
+    // 给 DSH 的标题预先截断，分叉时 DSH 追加的 " (1)" 不会被 80 字节上限截成半个括号。
+    assert.ok(titles.at(-1).endsWith('…') && Buffer.byteLength(`${titles.at(-1)} (1)`) <= 80, titles.at(-1))
+    await assert.rejects(
+      collect(adapter.stream({ sessionId: unconfigured.sessionId, messages: [opening, userMessage('你好。', 'user')] })),
+      /底层模型还没有配置 API Key[\s\S]*原始错误/,
     )
   } finally {
     await dispose()
