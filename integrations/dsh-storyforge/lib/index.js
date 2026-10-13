@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url'
 import { BridgeRpcError, createBridge } from './bridge.js'
 import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
 import { renderableBlocks, splitForDsh } from './html.js'
+import { panelModel, planInteraction } from './mvu.js'
 import { classifyCall } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
@@ -1086,6 +1087,108 @@ export function apply(ctx, config) {
     )
   }
 
+  /** MVU 面板对应的存档：本会话已关联存档时返回 id，否则返回 null（分叉子会话第一次发送前）。 */
+  function mvuCampaign(sessionId) {
+    const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined
+    if (!session) throw httpError('不是 StoryForge 故事会话', 404)
+    return session.campaignId ?? null
+  }
+
+  function httpError(message, status) {
+    const error = new Error(message)
+    error.status = status
+    return error
+  }
+
+  /** 这次操作里最近一条底层模型调用错误（分析器失败时会静默降级，这里把原因找回来）。 */
+  function llmErrorSince(seqBefore) {
+    const detail = llmLog.find((entry) => entry.seq > seqBefore && entry.status === 'error')?.error ?? null
+    return detail ? (llmHint(detail) ?? detail) : null
+  }
+
+  async function mvuPanel(sessionId) {
+    const campaignId = mvuCampaign(sessionId)
+    if (fake) return { state: 'none', reason: 'fake' }
+    if (!campaignId) return { state: 'none', reason: 'unlinked' }
+    return panelModel(await bridge.request('mvu.status', { campaign_id: campaignId }))
+  }
+
+  async function mvuAnalyze(sessionId) {
+    const campaignId = mvuCampaign(sessionId)
+    if (fake || !campaignId) throw httpError('这个会话还没有关联存档', 400)
+    await bridge.request('bridge.configure', { tool_mode: runOptions().toolMode })
+    const seqBefore = llmSeq
+    const analyzed = await bridge.request('mvu.analyze', { campaign_id: campaignId })
+    const error = analyzed.empty ? llmErrorSince(seqBefore) : null
+    log(`mvu analyzed: campaign=${campaignId} empty=${analyzed.empty}${error ? ` error=${error}` : ''}`)
+    return { model: panelModel(analyzed.status), empty: analyzed.empty, usage: analyzed.usage, error }
+  }
+
+  async function mvuApply(sessionId) {
+    const campaignId = mvuCampaign(sessionId)
+    if (fake || !campaignId) throw httpError('这个会话还没有关联存档', 400)
+    const status = await bridge.request('mvu.apply', { campaign_id: campaignId })
+    log(`mvu schema applied: campaign=${campaignId}`)
+    return { model: panelModel(status) }
+  }
+
+  /**
+   * 点交互按钮：按最新变量重新算计划（桌面 `dispatchMvuInteraction` 同口径），写入交给
+   * sidecar。浏览器只报按钮位置与文字——写哪些变量、写什么值都由卡的翻译产物决定。
+   * 有写入失败时不返回下一轮提示（桌面同样跳过下一轮生成）。
+   */
+  async function mvuInteract(sessionId, index, label) {
+    const campaignId = mvuCampaign(sessionId)
+    if (fake || !campaignId) throw httpError('这个会话还没有关联存档', 400)
+    const status = await bridge.request('mvu.status', { campaign_id: campaignId })
+    const mapping = status.translation?.interactions?.[index]
+    if (!mapping || mapping.element_label !== label) throw httpError('交互按钮已经变了，刷新面板后再试', 409)
+    const { plan, writes, rejected } = planInteraction(status, mapping)
+    let written = { results: [], status }
+    if (writes.length > 0) {
+      written = await bridge.request('variables.set', {
+        campaign_id: campaignId,
+        writes: writes.map((write) => ({
+          scope: write.scope,
+          instance_id: write.instanceId ?? undefined,
+          key: write.key,
+          value: write.value,
+        })),
+      })
+    }
+    const results = [
+      ...written.results.map((result) => ({ ok: result.ok, scope: result.scope, key: result.key, error: result.error ?? null })),
+      ...rejected.map((result) => ({ ok: false, scope: result.scope, key: result.key, error: result.error })),
+    ]
+    const failed = results.filter((result) => !result.ok)
+    log(
+      `mvu interaction "${plan.label}": campaign=${campaignId} writes=${results.length} failed=${failed.length} hints=${plan.hints.length} skipped=${plan.skipped.length}`,
+    )
+    return {
+      label: plan.label,
+      results,
+      failed: failed.length,
+      hints: failed.length > 0 ? [] : plan.hints,
+      skipped: plan.skipped,
+      model: panelModel(written.status),
+    }
+  }
+
+  const mvuRoute = (suffix, handler) => ({
+    path: `${API_BASE}/mvu${suffix}`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const body = await request.json().catch(() => ({}))
+      try {
+        return json({ ok: true, ...(await handler(body)) })
+      } catch (error) {
+        log(`mvu${suffix || ''} failed: ${error?.message ?? error}`)
+        return failure(error, error?.status ?? 500)
+      }
+    },
+  })
+
   let purifySource = null
 
   const json = (body, status = 200) =>
@@ -1278,6 +1381,15 @@ export function apply(ctx, config) {
         }
       },
     },
+    mvuRoute('', (body) => mvuPanel(body?.sessionId).then((model) => ({ model }))),
+    mvuRoute('/analyze', (body) => mvuAnalyze(body?.sessionId)),
+    mvuRoute('/apply', (body) => mvuApply(body?.sessionId)),
+    mvuRoute('/interact', (body) => {
+      if (!Number.isInteger(body?.index) || body.index < 0 || typeof body?.label !== 'string') {
+        throw httpError('需要 index（非负整数）与 label', 400)
+      }
+      return mvuInteract(body.sessionId, body.index, body.label)
+    }),
     {
       path: `${API_BASE}/vendor/purify.js`,
       methods: ['GET'],
