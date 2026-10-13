@@ -47,10 +47,13 @@ const CELL = '\uE000'
  * 脚本与样式，块级标签换行，`<li>` 变成 `- ` 列表，表格每行变成 `- 甲 | 乙`（单元格不再
  * 粘连；用列表而不是裸行，Markdown 不会把相邻两行并成一段），其余标签去掉。保留 `<user>` / `<char>` /
  * `<bot>` 这类 ST 宏。存档里的原文不变，只影响显示；开场白与每轮回复共用。
+ *
+ * `html: true`：不看有没有 HTML 迹象，一律按 HTML 处理（状态栏块已切走、剩下的正文里
+ * 只剩 `<StatusPlaceHolderImpl/>` 一类卡壳占位时用）。
  */
-export function readableText(raw) {
+export function readableText(raw, { html = false } = {}) {
   const source = typeof raw === 'string' ? raw : ''
-  if (!HTML_HINT.test(source)) return source.trim()
+  if (!html && !HTML_HINT.test(source)) return source.trim()
   const text = source
     .replace(/\r\n?/g, '\n')
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -66,7 +69,7 @@ export function readableText(raw) {
     .split('\n')
     .map((line) => {
       if (!line.includes(CELL)) return trim(line)
-      // \u8868\u683c\u884c\uff1a\u7a7a\u5355\u5143\u683c\uff08\u6392\u7248\u7528\uff09\u4e22\u6389\uff1b\u6574\u884c\u90fd\u7a7a\u5c31\u5f53\u7a7a\u884c\u3002
+      // 表格行：空单元格（排版用）丢掉；整行都空就当空行。
       const cells = line.split(CELL).map(trim).filter(Boolean)
       return cells.length ? `- ${cells.join(' | ')}` : ''
     })

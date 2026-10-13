@@ -24,8 +24,9 @@ import { fileURLToPath } from 'node:url'
 
 import { BridgeRpcError, createBridge } from './bridge.js'
 import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
+import { renderableBlocks, splitForDsh } from './html.js'
 import { classifyCall } from './roles.js'
-import { fitSessionTitle, friendlyError, llmHint, readableText } from './text.js'
+import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
 import {
   API_BASE,
@@ -157,13 +158,32 @@ async function* streamBlock(index, blockType, text, signal, chunkSize = 12, dela
   yield { type: 'block-end', index, block: { type: blockType, text } }
 }
 
-async function* finishStop(outputTokens = 0) {
-  yield* finishWithUsage({ inputTokens: 0, outputTokens })
+async function* finishStop(outputTokens = 0, replayState) {
+  yield* finishWithUsage({ inputTokens: 0, outputTokens }, replayState)
 }
 
-async function* finishWithUsage(usage) {
+/** `replayState` 随 finish 块交给 DSH，DSH 原样存进这条回复（`source.replayState`）。 */
+async function* finishWithUsage(usage, replayState) {
   yield { type: 'usage', usage }
-  yield { type: 'finish', reason: { kind: 'stop' } }
+  yield replayState === undefined
+    ? { type: 'finish', reason: { kind: 'stop' } }
+    : { type: 'finish', reason: { kind: 'stop' }, replayState }
+}
+
+/** 回放数据版本：浏览器半边认不出的版本当作没有。 */
+const REPLAY_VERSION = 1
+
+/**
+ * 这条回复在 StoryForge 存档里的位置，写进 DSH 回放数据；浏览器半边把它发布成 Turn 级
+ * 数据，Turn 尾部据此取展示文本。`nodeIndex` 供分叉后兜底（分叉换了节点 id、顺序不变）；
+ * `blocks` 是从正文里拿掉、交给 Turn 尾部渲染的 HTML 块数（0 时尾部不取数据）。
+ */
+function storyforgeReplay({ campaignId, conversationId, nodeId, nodeIndex, blocks }) {
+  if (!conversationId) return undefined
+  const ref = { v: REPLAY_VERSION, campaignId, conversationId, blocks }
+  if (nodeId) ref.nodeId = nodeId
+  if (Number.isInteger(nodeIndex)) ref.nodeIndex = nodeIndex
+  return { response: { storyforge: ref } }
 }
 
 /** sidecar 的 UsageTotals → DSH usage（同为不重叠口径）。 */
@@ -611,9 +631,20 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
 
     const turn = currentTurn(options.messages)
     if (turn.opening) {
-      const opening = readableText(session?.opening) || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
+      const split = splitForDsh(session?.openingDisplay ?? session?.opening)
+      const opening = split.body || '（这张卡没有开场白，直接写下你的第一步行动吧。）'
       yield* streamBlock(0, 'text', opening, signal, 64, 0)
-      yield* finishStop(opening.length)
+      yield* finishStop(
+        opening.length,
+        storyforgeReplay({
+          campaignId: session?.campaignId,
+          conversationId: session?.conversationId,
+          nodeId: session?.openingNodeId,
+          // 早于 openingNodeIndex 的会话：开场白总是对话的第一个节点。
+          nodeIndex: session?.openingNodeIndex ?? 0,
+          blocks: split.blocks,
+        }),
+      )
       return
     }
     const intent = textBlocks(turn.message).join('\n').trim()
@@ -688,9 +719,18 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
       reasoning += summary
       yield { type: 'reasoning-delta', index: 0, text: summary }
       yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: reasoning } }
-      const text = readableText(result?.text)
+      // 正文用展示正则之后的文本，去掉 Turn 尾部会渲染的 HTML 块。
+      const split = splitForDsh(result?.display ?? result?.text)
+      const text = split.body
       yield* streamBlock(1, 'text', text, signal, 64, 0)
-      yield* result?.usage ? finishWithUsage(toDshUsage(result.usage)) : finishStop(text.length)
+      const replay = storyforgeReplay({
+        campaignId: result?.campaign_id,
+        conversationId: result?.conversation_id,
+        nodeId: result?.node_id,
+        nodeIndex: result?.node_index,
+        blocks: split.blocks,
+      })
+      yield* result?.usage ? finishWithUsage(toDshUsage(result.usage), replay) : finishStop(text.length, replay)
     } finally {
       unsubscribe()
       signal?.removeEventListener('abort', onAbort)
@@ -715,6 +755,19 @@ const GENERATION_MODE_LABELS = {
 const TOOL_MODE_LABELS = { native: '原生工具调用', text_fallback: '文本降级' }
 const CARD_EXTENSIONS = new Set(['.png', '.json'])
 const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+/** 浏览器半边净化卡片 HTML 用的 DOMPurify（ES 模块，经 `/vendor/purify.js` 动态 import）。 */
+const PURIFY_FILE = join(PLUGIN_ROOT, 'lib', 'vendor', 'purify.es.mjs')
+/** 一次 `/display` 最多查的节点数（与 sidecar 的 MAX_DISPLAY_REFS 一致）。 */
+const MAX_DISPLAY_REFS = 200
+
+/** 浏览器半边发来的一条回放数据（存档位置）→ sidecar 查询；格式不对返回 null。 */
+function displayQuery(ref) {
+  if (typeof ref?.key !== 'string' || !ref.key || ref.key.length > 256) return null
+  if (typeof ref.conversationId !== 'string' || !ref.conversationId) return null
+  if (ref.nodeId !== undefined && typeof ref.nodeId !== 'string') return null
+  if (ref.nodeIndex !== undefined && !(Number.isInteger(ref.nodeIndex) && ref.nodeIndex >= 0)) return null
+  return { key: ref.key, conversation_id: ref.conversationId, node_id: ref.nodeId, node_index: ref.nodeIndex }
+}
 const DEFAULT_BRIDGE_BIN = resolve(
   PLUGIN_ROOT,
   '../../target/debug',
@@ -1012,6 +1065,29 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * Turn 尾部的展示数据：浏览器半边把可见 Turn 的回放数据（存档位置）合批发来，这里经
+   * sidecar 取当前展示文本、切出要渲染的 HTML 块。展示正则的深度随对话变长而变，不缓存。
+   * 分叉继承的轮次由 sidecar 按位置到本会话当前存档（分支）的对话里取。
+   */
+  async function displayItems(sessionId, refs) {
+    const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined
+    const queries = refs.map(displayQuery).filter(Boolean)
+    if (fake || !session || queries.length === 0) return {}
+    const { items } = await bridge.request('conversation.display', {
+      refs: queries,
+      campaign_id: session.campaignId,
+    })
+    return Object.fromEntries(
+      Object.entries(items ?? {}).map(([key, item]) => {
+        const blocks = item ? renderableBlocks(item.display_content) : []
+        return [key, blocks.length > 0 ? { blocks } : null]
+      }),
+    )
+  }
+
+  let purifySource = null
+
   const json = (body, status = 200) =>
     new Response(JSON.stringify(body), {
       status,
@@ -1058,6 +1134,9 @@ export function apply(ctx, config) {
             cardName: created.card_name,
             cardFile: body.card,
             opening: created.opening,
+            openingDisplay: created.opening_display,
+            openingNodeId: created.opening_node_id ?? undefined,
+            openingNodeIndex: created.opening_node_index ?? undefined,
             extractionStatus: created.extraction_status,
             extractionError,
             extractionErrorDetail,
@@ -1180,6 +1259,33 @@ export function apply(ctx, config) {
           events: turnEvents.slice(0, 50),
           llmCalls: llmLog.slice(0, 50),
           llmCallCount: llmSeq,
+        })
+      },
+    },
+    {
+      path: `${API_BASE}/display`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const body = await request.json().catch(() => ({}))
+        if (!Array.isArray(body?.refs)) return failure('refs 应为数组', 400)
+        if (body.refs.length > MAX_DISPLAY_REFS) return failure(`一次最多查 ${MAX_DISPLAY_REFS} 条`, 400)
+        try {
+          return json({ ok: true, items: await displayItems(body.sessionId, body.refs) })
+        } catch (error) {
+          log(`display failed: ${error?.message ?? error}`)
+          return failure(error)
+        }
+      },
+    },
+    {
+      path: `${API_BASE}/vendor/purify.js`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        purifySource ??= readFileSync(PURIFY_FILE, 'utf8')
+        return new Response(purifySource, {
+          headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'private, max-age=3600' },
         })
       },
     },
