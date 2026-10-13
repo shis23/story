@@ -131,14 +131,18 @@ pub fn parse_mvu_translation_from_response(
     // 模型偶发在参数 JSON 后附加尾随文本（2026-07-26 真实验收观测：
     // "trailing characters at column 16463"），严格 from_str 会整层 miss——
     // 失败时用括号配平从参数串中抠出第一个合法对象兜底。
+    // 工具参数解析失败的原因（全 miss 时写进错误，否则日志里只看得到空 content）。
+    let mut tool_errors = Vec::new();
     for tc in &resp.tool_calls {
         if tc.function.name != "emit_mvu_translation" {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-            && let Ok(t) = parse_mvu_from_value(&val, field_schema)
-        {
-            return Ok(t);
+        match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+            Ok(val) => match parse_mvu_from_value(&val, field_schema) {
+                Ok(t) => return Ok(t),
+                Err(e) => tool_errors.push(e),
+            },
+            Err(e) => tool_errors.push(format!("参数不是合法 JSON: {e}")),
         }
         if let Some(t) =
             storyforge_app_agent::llm_parse::try_each_braces(&tc.function.arguments, |candidate| {
@@ -181,8 +185,20 @@ pub fn parse_mvu_translation_from_response(
         return Ok(t);
     }
 
+    let tool_detail = resp
+        .tool_calls
+        .iter()
+        .find(|tc| tc.function.name == "emit_mvu_translation")
+        .map(|tc| {
+            format!(
+                "；工具参数解析失败: {}；参数前 300 字: {}",
+                tool_errors.join(" / "),
+                tc.function.arguments.chars().take(300).collect::<String>()
+            )
+        })
+        .unwrap_or_default();
     Err(format!(
-        "5 层兜底全miss；content 前 200 字: {}",
+        "5 层兜底全miss{tool_detail}；content 前 200 字: {}",
         content.chars().take(200).collect::<String>()
     ))
 }
@@ -251,6 +267,41 @@ mod tool_arg_tolerance_tests {
     }
 
     #[test]
+    fn string_encoded_array_items_are_decoded() {
+        // 2026-10-14 DSH 插件实测（gemini 原生工具调用）：对象数组的元素被编码成字符串。
+        let args = serde_json::json!({
+            "variable_schema": [r#"{"key":"体力","label":"体力","value_type":"int","default":60}"#],
+            "ui_bindings": [r#"{"element":"stamina_bar","variable_key":"体力","display":{"kind":"bar","max":100}}"#],
+            "update_rules": ["劳累时 体力 下降"],
+            "interactions": [r#"{"element_label":"休息","actions":[{"kind":"modify_variable","key":"体力","value_expr":"+20"},{"kind":"trigger_next_turn","hint":"我歇了一会儿"}]}"#],
+            "fallback_fragments": [],
+            "routing": r#"{"kind":"native"}"#,
+            "analysis_confidence": 0.95
+        })
+        .to_string();
+        let resp = ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t3".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_mvu_translation".into(),
+                    arguments: args,
+                },
+            }],
+            usage: None,
+            reasoning_content: None,
+            finish_reason: None,
+        };
+        let t = parse_mvu_translation_from_response(&resp, &[]).expect("字符串元素应解码");
+        assert_eq!(t.variable_schema.len(), 1);
+        assert_eq!(t.ui_bindings.len(), 1);
+        assert_eq!(t.interactions.len(), 1);
+        assert_eq!(t.interactions[0].element_label, "休息");
+        assert_eq!(t.update_rules, vec!["劳累时 体力 下降".to_string()]);
+    }
+
+    #[test]
     fn truncated_tool_args_fail_instead_of_yielding_near_empty_translation() {
         // 外层对象被截断未闭合，但内部含一个完整的小对象（单个 variable 字段）。
         // 括号配平回退不得把它误抓成"合法但近空"的翻译——应整体解析失败走降级。
@@ -270,9 +321,13 @@ mod tool_arg_tolerance_tests {
             reasoning_content: None,
             finish_reason: None,
         };
+        let err = parse_mvu_translation_from_response(&resp, &[])
+            .expect_err("截断参数应解析失败并走降级路径，而不是近空产物");
+        // 失败原因带上工具参数（content 为空时日志里只剩这一处线索）。
+        assert!(err.contains("工具参数解析失败: 参数不是合法 JSON"), "{err}");
         assert!(
-            parse_mvu_translation_from_response(&resp, &[]).is_err(),
-            "截断参数应解析失败并走降级路径，而不是近空产物"
+            err.contains(r#"参数前 300 字: {"variable_schema""#),
+            "{err}"
         );
     }
 }
@@ -287,17 +342,51 @@ fn parse_mvu_from_value(
     // 直接解析 {result:{...}} 会得到一个"合法但全空"的结构，吞掉真正的内容。
     for wrapper in ["result", "mvu_translation", "translation", "data"] {
         if let Some(inner) = val.get(wrapper)
-            && let Ok(t) = serde_json::from_value::<MvuTranslationRaw>(inner.clone())
+            && let Ok(t) =
+                serde_json::from_value::<MvuTranslationRaw>(decode_string_items(inner.clone()))
         {
             return Ok(t.into_translation(field_schema));
         }
     }
 
     // 直接反序列化（serde tag 已对齐）
-    match serde_json::from_value::<MvuTranslationRaw>(val.clone()) {
+    match serde_json::from_value::<MvuTranslationRaw>(decode_string_items(val.clone())) {
         Ok(t) => Ok(t.into_translation(field_schema)),
         Err(e) => Err(format!("无法解析为 MvuTranslation: {e}")),
     }
+}
+
+/// 对象数组里写成 JSON 字符串的元素解码回对象（`routing` 同理）。
+///
+/// 2026-10-14 DSH 插件实测（gemini-3.8-flash-high 原生工具调用）：工具 schema 的数组没声明
+/// `items` 时，模型把每个元素编码成字符串（`"ui_bindings": ["{\"element\": …}"]`），严格
+/// 反序列化整体失败、分析静默降级成只有字段。schema 已补 `items`，这里兜住旧行为。
+/// 解不出对象的字符串原样保留（照旧由反序列化报错）。
+fn decode_string_items(mut val: serde_json::Value) -> serde_json::Value {
+    fn decode(item: &mut serde_json::Value) {
+        if let serde_json::Value::String(text) = item
+            && let Ok(decoded @ serde_json::Value::Object(_)) =
+                serde_json::from_str::<serde_json::Value>(text)
+        {
+            *item = decoded;
+        }
+    }
+    if let Some(obj) = val.as_object_mut() {
+        for key in [
+            "variable_schema",
+            "ui_bindings",
+            "interactions",
+            "fallback_fragments",
+        ] {
+            if let Some(serde_json::Value::Array(items)) = obj.get_mut(key) {
+                items.iter_mut().for_each(decode);
+            }
+        }
+        if let Some(routing) = obj.get_mut("routing") {
+            decode(routing);
+        }
+    }
+    val
 }
 
 /// 容错反序列化结构（字段大多 Option/default，避免 LLM 漏字段就失败）
