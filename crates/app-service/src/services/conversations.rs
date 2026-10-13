@@ -452,6 +452,23 @@ fn message_variant_display_dto(
     }
 }
 
+/// 单个节点（当前采用的变体）的展示文本，与 [`conversation_display_dto`] 同口径：只跑
+/// 展示正则（markdown_only），深度按节点在对话里的位置算。下标越界或节点没有变体时
+/// 返回 None。供非 Tauri 宿主（DSH sidecar）按节点取展示文本，不必为几条消息跑整个对话。
+pub fn node_display_content(
+    conversation: &Conversation,
+    index: usize,
+    regex_scripts: &[RegexScript],
+) -> Option<String> {
+    let variant = conversation.nodes.get(index)?.active()?;
+    let depth = conversation.nodes.len().saturating_sub(index + 1);
+    Some(render_variant_display_content(
+        variant,
+        &display_only_regex_scripts(regex_scripts),
+        depth,
+    ))
+}
+
 fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<RegexScript> {
     regex_scripts
         .iter()
@@ -663,12 +680,23 @@ mod tests {
         script.min_depth = Some(0);
         script.max_depth = Some(1);
 
-        let dto = conversation_display_dto(&conversation, &[script]);
+        let dto = conversation_display_dto(&conversation, std::slice::from_ref(&script));
 
         let old_variant = &dto.nodes[0].variants[0];
         let new_variant = &dto.nodes[2].variants[0];
         assert_eq!(old_variant.display_content, "<status>old</status>");
         assert_eq!(new_variant.display_content, "[new]");
+
+        // 按节点取的展示文本与整份 DTO 同口径（含深度）。
+        for (index, node) in dto.nodes.iter().enumerate() {
+            assert_eq!(
+                node_display_content(&conversation, index, std::slice::from_ref(&script))
+                    .as_deref(),
+                Some(node.variants[node.active_variant].display_content.as_str()),
+                "node {index}"
+            );
+        }
+        assert_eq!(node_display_content(&conversation, 3, &[script]), None);
     }
 
     /// 2026-10-11 审计：同一对话的归档槽位互斥，释放后可再次获取；不同对话互不影响。
