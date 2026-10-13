@@ -437,7 +437,7 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** 主区 StoryForge 视图：本故事概况；写作界面（角色状态、选项、卡片壳）留到后续阶段。 */
+		/** 主区 StoryForge 视图：本故事概况；卡内状态在右栏面板，卡片壳留到后续阶段。 */
 		function StoryForgeView(props) {
 			const sessionId = props.sfSessionId ?? props.sessionId;
 			const isStoryForge = useIsStoryForge(props, sessionId);
@@ -451,11 +451,316 @@ window.__ModuleLoader__.load({
 				h(
 					"p",
 					{ className: "sf-muted sf-small" },
-					"正文在「对话」标签：思考块里是导演、角色、执笔的过程，回复是成文。角色状态、选项与卡片壳的写作界面留到后续阶段。",
+					"正文在「对话」标签：思考块里是导演、角色、执笔的过程，回复是成文。卡内状态栏和按钮在右栏 StoryForge 面板；卡片壳（卡自带的网页界面）留到后续阶段。",
 				),
 				h("div", null, h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: openPanel }, "在右栏打开")),
 			);
 		}
+
+		//#region 卡内状态面板（MVU 原生渲染 + 交互按钮）
+		/**
+		 * 每个 StoryForge 会话的输入框（停靠区状态条在本会话挂载时登记）。交互按钮的「下一轮
+		 * 提示」经它发出——就是用户自己发了一条消息，DSH 照常记一轮。
+		 */
+		const composers = new Map();
+
+		/** 输入框里写入 `text` 并发送；输入框不在、正忙或有草稿时不动它，返回原因。 */
+		async function sendViaComposer(sessionId, text) {
+			const composer = composers.get(sessionId);
+			if (!composer) return "no-composer";
+			const before = composer.read();
+			if (before.phase !== "plain") return "busy";
+			if (before.draft.trim()) return "draft";
+			composer.actions.setDraft(text);
+			// 编辑器异步落草稿：等输入状态里出现这段文字再发送，免得发出空消息。
+			for (let i = 0; i < 20 && composer.read().draft.trim() !== text.trim(); i++) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			if (composer.read().draft.trim() !== text.trim()) return "busy";
+			composer.actions.submit();
+			return "sent";
+		}
+
+		const MVU_NOT_SENT = {
+			"no-composer": "输入框不在当前页面",
+			busy: "输入框正忙",
+			draft: "输入框里有没发出去的草稿",
+		};
+
+		/**
+		 * 面板数据：挂载、换会话、本存档有新的收尾（后处理写回变量）时重取。
+		 * `refreshKey` 由调用方拼（存档 id + 最近一次收尾时间 + 轮数）。
+		 */
+		function useMvuModel(sessionId, enabled, refreshKey) {
+			const [state, setState] = React.useState({ model: null, error: null, loading: false });
+			const seq = React.useRef(0);
+			const load = React.useCallback(() => {
+				const current = ++seq.current;
+				setState((prev) => ({ ...prev, loading: true }));
+				return postJson("/mvu", { sessionId })
+					.then((body) => current === seq.current && setState({ model: body.model, error: null, loading: false }))
+					.catch((e) => current === seq.current && setState({ model: null, error: errorText(e), loading: false }));
+			}, [sessionId]);
+			React.useEffect(() => {
+				if (!enabled || !sessionId) return;
+				void load();
+			}, [enabled, sessionId, refreshKey, load]);
+			const replace = React.useCallback((model) => {
+				seq.current++;
+				setState({ model, error: null, loading: false });
+			}, []);
+			return [state, load, replace];
+		}
+
+		function MvuRow(props) {
+			const { row } = props;
+			if (row.kind === "bar") {
+				return h(
+					"div",
+					{ className: "sf-mvu-row", title: row.element },
+					h("span", { className: "sf-mvu-label" }, row.label),
+					h(
+						"span",
+						{ className: `sf-mvu-bar sf-tone-${row.tone}`, role: "progressbar", "aria-valuenow": row.value ?? 0, "aria-valuemax": row.max },
+						h("span", { className: "sf-mvu-fill", style: { width: `${row.percent}%` } }),
+					),
+					h("span", { className: "sf-mvu-value" }, `${row.value ?? "—"} / ${row.max}`),
+				);
+			}
+			return h(
+				"div",
+				{ className: "sf-mvu-row", title: row.element },
+				h("span", { className: "sf-mvu-label" }, row.label),
+				row.kind === "tag"
+					? h("span", { className: "sf-mvu-tag" }, row.text)
+					: h("span", { className: `sf-mvu-text${row.kind === "icon" ? " sf-mvu-icon" : ""}` }, row.text),
+			);
+		}
+
+		/** 右栏里的卡内状态：分析 / 应用变量定义 / 状态行 / 交互按钮。 */
+		function MvuPanel(props) {
+			const { sessionId, status, snapshot } = props;
+			const story = status?.sessions?.[sessionId];
+			const campaignId = story?.campaignId ?? null;
+			const lastSettle = (status?.settles ?? []).find((report) => campaignId && report.campaign_id === campaignId);
+			const refreshKey = `${campaignId}|${lastSettle?.at ?? story?.lastSettle?.at ?? ""}|${story?.turns ?? ""}`;
+			const [{ model, error, loading }, reload, replace] = useMvuModel(sessionId, Boolean(story), refreshKey);
+			const [action, setAction] = React.useState(null);
+			const [notice, setNotice] = React.useState(null);
+			const elapsed = useElapsed(action === "analyze");
+			const phase = enginePhase(status, campaignId);
+			const running = Boolean(snapshot?.byId?.[sessionId]?.running);
+			const engineBusy = Boolean(phase) || running;
+			const disabled = Boolean(action) || engineBusy;
+			const busyTitle = engineBusy ? "写作或后台收尾结束后再操作" : undefined;
+
+			const run = async (name, work) => {
+				setAction(name);
+				setNotice(null);
+				try {
+					await work();
+				} catch (e) {
+					setNotice({ tone: "err", text: errorText(e) });
+					if (/刷新面板/.test(errorText(e))) void reload();
+				} finally {
+					setAction(null);
+				}
+			};
+
+			const analyze = () =>
+				run("analyze", async () => {
+					const result = await postJson("/mvu/analyze", { sessionId });
+					replace(result.model);
+					const cost = result.usage?.calls ? `（${describeUsage(result.usage)}）` : "";
+					if (result.empty) {
+						setNotice({
+							tone: "warn",
+							text: result.error
+								? `分析没拿到状态栏规则：${result.error}${cost}`
+								: `分析没找到可原生渲染的状态栏或交互按钮，只得到变量字段${cost}。`,
+						});
+					} else {
+						setNotice({ tone: "ok", text: `分析完成${cost}` });
+					}
+				});
+
+			const applySchema = () =>
+				run("apply", async () => {
+					const result = await postJson("/mvu/apply", { sessionId });
+					replace(result.model);
+					setNotice({ tone: "ok", text: "变量定义已应用到角色，已有角色补上了默认值。" });
+				});
+
+			const interact = (item) =>
+				run(`interact-${item.index}`, async () => {
+					const result = await postJson("/mvu/interact", { sessionId, index: item.index, label: item.label });
+					replace(result.model);
+					if (result.failed > 0) {
+						const detail = result.results
+							.filter((entry) => !entry.ok)
+							.map((entry) => `${entry.key}：${entry.error}`)
+							.join("\n");
+						setNotice({ tone: "err", text: `「${result.label}」有 ${result.failed} 个变量没写进去，没有发送下一轮提示：\n${detail}` });
+						return;
+					}
+					// 卡规则里解释不了的动作（例如带函数的取值表达式）不执行，照实说明。
+					const skipped = (result.skipped ?? [])
+						.map((entry) => `${entry.key ?? entry.kind}：${entry.reason}`)
+						.join("；");
+					const updated = result.results.length > 0 ? "已更新变量" : "没有改变量";
+					const head = `「${result.label}」${updated}${skipped ? `（未执行：${skipped}）` : ""}`;
+					const tone = skipped ? "warn" : "ok";
+					const hint = result.hints.join("\n");
+					if (!hint) {
+						setNotice({ tone, text: `${head}。` });
+						return;
+					}
+					const sent = await sendViaComposer(sessionId, hint);
+					setNotice(
+						sent === "sent"
+							? { tone, text: `${head}，并发送了：${hint}` }
+							: { tone: "warn", text: `${head}。下一轮提示没有自动发送（${MVU_NOT_SENT[sent]}），需要的话自己发：`, hint },
+					);
+				});
+
+			if (!story) return null;
+			const head = h(
+				"div",
+				{ className: "sf-panel-head" },
+				h("div", { className: "sf-section-title" }, "卡内状态"),
+				model?.state === "ready" &&
+					h(
+						"span",
+						{ className: "sf-muted sf-small", title: model.analyzedAt ? `分析于 ${formatFullTime(model.analyzedAt)}` : undefined },
+						`${model.bindingCount} 项状态 · ${model.interactions.length} 个按钮 · ${model.ruleCount} 条更新规则`,
+					),
+				h("span", { className: "sf-spacer" }),
+				h(
+					"button",
+					{ type: "button", className: "sf-btn sf-btn-sm", disabled: loading || Boolean(action), onClick: () => void reload(), title: "重新读取变量" },
+					"刷新",
+				),
+			);
+			const noticeView =
+				notice &&
+				h(
+					"div",
+					{ className: `sf-notice sf-notice-${notice.tone === "err" ? "warn" : notice.tone}`, role: notice.tone === "err" ? "alert" : "status" },
+					h(
+						"div",
+						{ className: "sf-grow" },
+						notice.text,
+						notice.hint && h("div", { className: "sf-mono sf-gap-top" }, notice.hint),
+					),
+					notice.hint &&
+						navigator.clipboard &&
+						h(
+							"button",
+							{ type: "button", className: "sf-btn sf-btn-sm", onClick: () => void navigator.clipboard.writeText(notice.hint) },
+							"复制",
+						),
+					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setNotice(null) }, "知道了"),
+				);
+			const body = (() => {
+				if (error) return h("div", { className: "sf-error" }, error);
+				if (!model) return h("div", { className: "sf-muted sf-small" }, "读取中…");
+				if (model.state === "none") {
+					return h(
+						"div",
+						{ className: "sf-muted sf-small" },
+						model.reason === "unlinked" ? "这个分叉还没有存档，第一次发送后显示。" : "当前管线没有卡内状态。",
+					);
+				}
+				const analyzeButton = h(
+					"button",
+					{ type: "button", className: "sf-btn sf-btn-sm", disabled, title: busyTitle, onClick: analyze },
+					action === "analyze" ? `分析中… ${elapsed}s` : model.state === "ready" ? "重新分析" : "分析变量规则",
+				);
+				if (model.state === "unanalyzed") {
+					return h(
+						React.Fragment,
+						null,
+						h(
+							"div",
+							{ className: "sf-muted sf-small" },
+							"这张卡还没分析过状态栏和变量规则。分析会调用一次底层模型（大卡要几十秒），之后状态栏和卡里的按钮在这里原生显示。",
+						),
+						h("div", null, analyzeButton),
+					);
+				}
+				const pending = model.pendingApply ?? [];
+				return h(
+					React.Fragment,
+					null,
+					pending.length > 0 &&
+						h(
+							"div",
+							{ className: "sf-notice sf-notice-warn" },
+							h(
+								"div",
+								{ className: "sf-grow" },
+								"分析出的变量定义还没应用到角色：",
+								pending.map((entry) =>
+									h(
+										"div",
+										{ key: entry.definition_id, className: "sf-small" },
+										`${entry.definition_name || shortId(entry.definition_id)}：新增 ${entry.added.length} 项${entry.overwritten.length ? `，改写 ${entry.overwritten.length} 项` : ""}`,
+									),
+								),
+							),
+							h(
+								"button",
+								{ type: "button", className: "sf-btn sf-btn-sm sf-btn-primary", disabled, title: busyTitle, onClick: applySchema },
+								action === "apply" ? "应用中…" : "应用到角色",
+							),
+						),
+					model.sections.length === 0
+						? h(
+								"div",
+								{ className: "sf-muted sf-small" },
+								model.bindingCount === 0
+									? "分析没找到可原生显示的状态项。"
+									: "还没有绑定这张卡角色定义的角色，状态项暂时没有可显示的对象。",
+							)
+						: model.sections.map((section) =>
+								h(
+									"div",
+									{ key: section.instanceId, className: "sf-mvu-section" },
+									model.sections.length > 1 && h("div", { className: "sf-mvu-name" }, section.instanceName || shortId(section.instanceId)),
+									section.rows.map((row, i) => h(MvuRow, { key: `${row.element}-${i}`, row })),
+								),
+							),
+					model.interactions.length > 0 &&
+						h(
+							"div",
+							{ className: "sf-mvu-actions" },
+							model.interactions.map((item) =>
+								h(
+									"button",
+									{ key: item.index, type: "button", className: "sf-btn sf-btn-sm", disabled, title: busyTitle, onClick: () => interact(item) },
+									action === `interact-${item.index}` ? `${item.label}…` : item.label,
+								),
+							),
+						),
+					model.fallbacks.length > 0 &&
+						h(
+							"details",
+							{ className: "sf-mvu-fallbacks" },
+							h("summary", { className: "sf-muted sf-small" }, `${model.fallbacks.length} 处需要卡内脚本，DSH 里不执行`),
+							h(
+								"ul",
+								{ className: "sf-plain-list sf-small" },
+								model.fallbacks.map((fragment, i) =>
+									h("li", { key: i }, fragment.description || "（无说明）", fragment.reason && h("span", { className: "sf-muted" }, ` · ${fragment.reason}`)),
+								),
+							),
+						),
+					h("div", null, analyzeButton),
+				);
+			})();
+			return h("div", { className: "sf-mvu" }, head, noticeView, body);
+		}
+		//#endregion
 
 		/** 右栏 StoryForge 面板。 */
 		function PanelTab(props) {
@@ -468,7 +773,7 @@ window.__ModuleLoader__.load({
 				"div",
 				{ className: "sf-root sf-panel" },
 				h(StoryDetails, { sessionId, status, snapshot, showTitle: true }),
-				h("div", { className: "sf-muted sf-small" }, "角色、知识、变量的查看与编辑留到后续阶段。"),
+				h(MvuPanel, { key: sessionId, sessionId, status, snapshot }),
 			);
 		}
 
@@ -490,11 +795,26 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** 停靠区状态条（输入框下方）。 */
+		/** 停靠区状态条（输入框下方）。顺带登记本会话的输入框，供右栏交互按钮发下一轮提示。 */
 		function DockStatus(props) {
 			const sessionId = props.sfSessionId ?? props.sessionId;
 			const isStoryForge = useIsStoryForge(props, sessionId);
 			const status = useBridgeStatus(isStoryForge);
+			const input = typeof props.useInput === "function" ? props.useInput((state) => state) : null;
+			const inputRef = React.useRef(input);
+			inputRef.current = input;
+			const inputActions = props.inputActions;
+			React.useEffect(() => {
+				if (!isStoryForge || !sessionId || !inputActions) return undefined;
+				const entry = {
+					actions: inputActions,
+					read: () => ({ draft: inputRef.current?.draft ?? "", phase: inputRef.current?.phase ?? "plain" }),
+				};
+				composers.set(sessionId, entry);
+				return () => {
+					if (composers.get(sessionId) === entry) composers.delete(sessionId);
+				};
+			}, [isStoryForge, sessionId, inputActions]);
 			if (!isStoryForge) return null;
 			if (status?.pipeline === "fake") return h("div", { className: "sf-root sf-dock" }, "StoryForge · 假管线");
 			const story = status?.sessions?.[sessionId];
@@ -1368,6 +1688,23 @@ window.__ModuleLoader__.load({
 .sf-view { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; font-size: 14px; line-height: 1.7; }
 .sf-view p { margin: 0; }
 .sf-dock { color: var(--sf-fg3); font-size: 12px; padding: 2px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-mvu { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--sf-border); }
+.sf-mvu .sf-section-title { margin: 0; }
+.sf-mvu .sf-notice { margin-top: 0; }
+.sf-mvu-section { display: flex; flex-direction: column; gap: 4px; }
+.sf-mvu-section + .sf-mvu-section { margin-top: 6px; }
+.sf-mvu-name { font-weight: 600; color: var(--sf-fg2); }
+.sf-mvu-row { display: grid; grid-template-columns: minmax(56px, max-content) minmax(0, 1fr) max-content; align-items: center; gap: 8px; font-size: 12px; }
+.sf-mvu-row > :nth-child(2):last-child { grid-column: 2 / 4; }
+.sf-mvu-label { color: var(--sf-fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-mvu-bar { height: 8px; border-radius: 999px; background: color-mix(in srgb, var(--sf-tone) 16%, transparent); overflow: hidden; }
+.sf-mvu-fill { display: block; height: 100%; border-radius: inherit; background: var(--sf-tone); transition: width 0.3s; }
+.sf-mvu-value { color: var(--sf-fg3); font-variant-numeric: tabular-nums; }
+.sf-mvu-text { overflow-wrap: anywhere; }
+.sf-mvu-icon { font-size: 14px; }
+.sf-mvu-tag { justify-self: start; padding: 0 8px; border-radius: 999px; line-height: 20px; background: var(--sf-hover); border: 1px solid var(--sf-border); }
+.sf-mvu-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.sf-mvu-fallbacks > summary { cursor: pointer; }
 /* Turn 尾部的卡片 HTML：外层 contain: paint 是 fixed 定位的包含块，卡样式里的
    :host { position: fixed } 也逃不出这个框。 */
 .sf-turn-tail { contain: paint; position: relative; max-width: 100%; overflow-x: auto; margin: 6px 0 2px; }

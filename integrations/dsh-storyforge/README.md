@@ -12,21 +12,23 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 
 | 文件 | 作用 |
 |---|---|
-| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 取回 `/display` 与净化库 `/vendor/purify.js`、调试） |
+| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 取回 `/display` 与净化库 `/vendor/purify.js`、卡内状态 `/mvu`（读取 / 分析 / 应用变量定义 / 交互按钮）、调试） |
 | `lib/bridge.js` | sidecar 管理：懒启动、按行收发 JSON-RPC、执行 sidecar 发来的 `llm.stream`、转发管线事件 |
 | `lib/agent.js` | StoryForge 预设里的 agent 作用域插件：每次模型请求钉到 `storyforge/pipeline`；记录 agent 创建 / 分叉 |
-| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板、会话头按钮、停靠条、模型锁、每轮回复下方的卡片 HTML（`conversation.chat.turnTail` 槽）。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
+| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板（故事信息 + 卡内状态：状态行、交互按钮）、会话头按钮、停靠条（兼登记本会话的输入框，交互按钮经它发下一轮提示）、模型锁、每轮回复下方的卡片 HTML（`conversation.chat.turnTail` 槽）。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
 | `lib/html.js` | 卡片 HTML 块切分（与桌面 `splitRawHtmlBlocks` 同口径）：DSH 正文去掉完整块、块数写进 replayState，`/display` 返回的块附文字版 |
 | `lib/vendor/purify.es.mjs` | DOMPurify 3.4.12（上游双许可 Apache-2.0 / MPL-2.0；同目录 `DOMPURIFY-LICENSE` 是 npm 包自带的许可全文），取自 `frontend/node_modules`，只去掉了 source map 注释行；随插件分发，浏览器半边按需加载 |
+| `lib/mvu.js` | 卡内状态（MVU 原生渲染）：桌面 `mvuKey` / `mvuStatusBarModel` / `campaignMvuStatusBar` / `mvuInteractions` / `shellVariableOutbox` 的逻辑逐字移植（键记法、状态行取值、分节、交互解释、写入作用域），加上面板数据与交互计划的装配 |
 | `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……） |
 | `lib/shared.js` | 常量与进程内共享状态（生命周期事件、分叉回调） |
 | `lib/cards.js` | 角色卡：从 PNG（`ccv3` / `chara`）或 JSON 读卡名；导入时的文件名清洗与同名编号 |
 | `lib/text.js` | 面向用户的文字：会话标题按 DSH 的 80 字节上限预先截断、开场白 HTML 转可读文字、底层模型错误转成可操作的提示 |
 | `storyforge.patch.yml` | bundle 补丁（`package.json` 的 `dsh.bundle.patch`，装插件后每次启动自动叠加）：激活宿主插件 + 新增 `storyforge` 预设（只有 persona，无工具） |
-| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入 |
+| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入；卡内状态的分析 / 应用 / 交互按钮 |
 | `test/helpers.test.mjs` | 卡名解析、文件名清洗、标题截断、开场白转换、错误提示 |
 | `test/roles.test.mjs` | 管线角色识别 |
 | `test/html.test.mjs` | 块切分与桌面实现对拍、正文去块与兜底 |
+| `test/mvu.test.mjs` | 卡内状态各函数与桌面实现对拍、面板数据、交互写入目标 |
 
 插件配置（`storyforge.patch.yml` 里 `config` 下，均可省略；要改就在 profile 自己的补丁里覆盖）：
 
@@ -99,6 +101,10 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
      接受结果），点整行打开；未关联存档的会话默认折叠。「最近的收尾」与故事进度落盘，DSH
      重启后仍在。「底层模型调用」表逐次列出管线发出的调用，「角色」列标出是导演、哪个角色、
      执笔还是后处理；
+   - 右栏 StoryForge 面板下半部是「卡内状态」：卡里有 MVU 变量脚本时，点「分析变量规则」（调用一次
+     底层模型）把卡的状态栏和按钮翻译成原生面板，再点「应用到角色」把分析出的变量定义写进卡内角色
+     （已有角色补默认值）。之后状态行（进度条 / 文字 / 标签 / 图标）随每轮后处理更新；点交互按钮
+     按卡的规则改变量，带「下一轮提示」的按钮再替你发一条消息；
    - 从某条回复「分叉」：子会话第一次发送时映射成存档的分支（StoryForge 的 Campaign
      分支），之后两边各写各的。只支持从**最后一条**回复分叉。
 
@@ -144,9 +150,12 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
   `table` / `ul` / `ol` / `blockquote` 块（与桌面版 `splitRawHtmlBlocks` 同口径）从正文切走，
   经 DOMPurify（配置同桌面版）净化后渲染在这一轮回复下方。样式关在 Shadow DOM 里，外层
   `contain: paint`，卡里的 `position: fixed` 一类样式出不了框。脚本、事件属性、表单、iframe
-  一律去掉；交互按钮、卡壳 iframe、卡内 MVU 脚本都不支持（sidecar 没有 WebView，MVU 翻译产物
-  的原生路径照常生效）。远程图片照常加载，链接一律新窗口打开（`rel="noopener noreferrer"`）。
+  一律去掉，卡壳 iframe 与卡内脚本都不支持（sidecar 没有 WebView）；卡里的状态栏和按钮另走右栏
+  的卡内状态面板（见下一条）。远程图片照常加载，链接一律新窗口打开（`rel="noopener noreferrer"`）。
   存档里的原文不变。
+  - 切块前先整段去掉完整的 `<script>` 元素：MVU 状态栏一类卡会在脚本的字符串里拼 `<div>`，不去掉
+    会被当成顶层块，尾部渲染出 `' + s.体力 + '` 一类碎片。这类卡的尾部通常只剩静态占位（如
+    「加载中…」），真正的状态看右栏卡内状态面板。
   - 渲染内容取自存档的展示文本（sidecar `conversation.display`：按节点套卡的展示正则），不缓存。
     展示正则带深度限制（`maxDepth`）的卡，旧轮次随对话变长退回原文，状态栏只在最近几轮显示，
     与桌面版一致；所以每多一轮，已挂载的回复尾部整批重取一次。
@@ -160,6 +169,23 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
   - 质量门的格式泄漏检查只看 `<div>` / `<span>` / `<p>` 与代码块围栏：开场白里用过的算这张卡
     的既定格式，模型每轮照写时放行；开场白没用过的交给 autofix 改写。`<think>` 一律算泄漏，
     其余标签（如 `<details>`、`<table>`）不检查。
+- 卡内状态面板（MVU 原生渲染，与桌面版写作页的状态面板同口径）：
+  - 分析是手动的（桌面版同样不自动跑），每次调用一次底层模型，大卡要几十秒。分析结果存在 sidecar
+    自己的数据目录里，与桌面版不共用；每个新故事都重新导入角色卡，所以每个故事要各分析一次，
+    分叉出的子会话共用来源故事的分析。模型调用失败时分析器会退回只有变量字段的结果：面板提示
+    「没拿到状态栏规则」并附上底层错误，可以修好模型后「重新分析」。
+  - 分析器只把 `extensions.tavern_helper.scripts`、`extensions.mvu.script`、卡资源 JS 当作卡内脚本，
+    卡里也没有 `mvu.initvar` / `stat_data` 一类变量数据时直接按纯数据卡处理、不调用模型（面板提示
+    「只得到变量字段」）。只把脚本写在正则替换串里的卡属于这种情况（桌面版同样如此）。
+  - 「应用到角色」改的是这张卡在 sidecar 里的角色定义（本故事与它的分叉共用同一张卡），已有角色只补缺的变量、不覆盖现值。
+  - 交互按钮：浏览器只报按钮位置和文字，写哪些变量、写什么值由插件服务端按最新变量重新计算
+    （面板过期时拒绝并刷新）。写入目标与桌面版相同：卡绑定的角色恰好一个时写到它身上，否则整局
+    只有一个角色时写到它身上，都不是就写到存档全局变量。键名守卫与桌面写变量命令是同一个入口
+    （`__` 内部段、字符集、长度）。写变量、分析、应用都排在上一轮后台收尾之后，写作或收尾进行中
+    按钮禁用。有写入失败时不发下一轮提示；输入框里有草稿、正忙或不在当前页面时也不发，提示文字
+    留在面板里自己发。按钮规则里解释不了的取值表达式（桌面版同口径：只认 `+N` / `-N`、`变量 ± N`、
+    JSON 字面量与纯文字，`min(100, 体力 + 20)` 一类带函数的不认）不执行，面板说明跳过了哪些。
+  - 需要卡内脚本的部分（分析结果里的兜底片段）只列出说明，不执行。
 - 插件管理页可以热停用 / 启用（不用重启）。停用后 StoryForge 首页消失、sidecar 退出，StoryForge
   会话从会话列表隐藏，数据保留在磁盘上；重新启用后刷新一次页面，会话回到列表。
 - DSH 会话标题上限 80 字节，分叉时在末尾追加 ` (1)`。插件给 DSH 的标题预先截到 72 字节并补
