@@ -37,12 +37,15 @@ function decodeEntities(text) {
 /** 开场白里出现这些标签才当 HTML 处理（只有 `<user>` 一类宏的纯文本原样返回）。 */
 const HTML_HINT = /<\/?(?:div|p|br|span|ul|ol|li|h[1-6]|details|summary|table|tr|td|th|b|i|u|strong|em|font|center|img|hr|style|script|blockquote|pre|code|section)\b/i
 const BLOCK_TAGS = 'p|div|ul|ol|h[1-6]|tr|table|details|summary|section|blockquote|pre|hr'
+/** 表格单元格的占位（私用区字符，正文里不会出现），按行拼成 `- 甲 | 乙`。 */
+const CELL = '\uE000'
 
 /**
  * 卡的开场白常带状态栏 HTML（`<div>` / `<details>` / `<li>` 以及 `<StatusPlaceHolderImpl/>`
  * 一类卡壳占位），模型照着开场白每轮也会写一份（StoryForge 的质量门把它当卡的既定格式放行）。
  * DSH 的对话视图按 Markdown 渲染，这些标签会变成整屏代码块。这里转成可读文字：去注释、
- * 脚本与样式，块级标签换行，`<li>` 变成 `- ` 列表，其余标签去掉。保留 `<user>` / `<char>` /
+ * 脚本与样式，块级标签换行，`<li>` 变成 `- ` 列表，表格每行变成 `- 甲 | 乙`（单元格不再
+ * 粘连；用列表而不是裸行，Markdown 不会把相邻两行并成一段），其余标签去掉。保留 `<user>` / `<char>` /
  * `<bot>` 这类 ST 宏。存档里的原文不变，只影响显示；开场白与每轮回复共用。
  */
 export function readableText(raw) {
@@ -54,12 +57,19 @@ export function readableText(raw) {
     .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<li\b[^>]*>/gi, '\n- ')
+    .replace(/<t[dh]\b[^>]*>/gi, CELL)
     .replace(new RegExp(`</?(?:${BLOCK_TAGS}|li)\\b[^>]*>`, 'gi'), '\n')
     .replace(/<\/?(?!(?:user|char|bot)>)[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?\/?>/g, '')
   // 行首缩进去掉（Markdown 里四个空格就成了代码块；全角空格「　」是正文缩进，保留）。
+  const trim = (line) => line.replace(/^[ \t\u00a0]+|[ \t\u00a0]+$/g, '')
   const lines = decodeEntities(text)
     .split('\n')
-    .map((line) => line.replace(/^[ \t\u00a0]+|[ \t\u00a0]+$/g, ''))
+    .map((line) => {
+      if (!line.includes(CELL)) return trim(line)
+      // \u8868\u683c\u884c\uff1a\u7a7a\u5355\u5143\u683c\uff08\u6392\u7248\u7528\uff09\u4e22\u6389\uff1b\u6574\u884c\u90fd\u7a7a\u5c31\u5f53\u7a7a\u884c\u3002
+      const cells = line.split(CELL).map(trim).filter(Boolean)
+      return cells.length ? `- ${cells.join(' | ')}` : ''
+    })
   // 列表项之间的空行去掉，免得一条状态栏被拆成稀疏的松散列表。
   const kept = lines.filter((line, index) => {
     if (line) return true
