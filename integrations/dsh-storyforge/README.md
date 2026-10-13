@@ -12,10 +12,12 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 
 | 文件 | 作用 |
 |---|---|
-| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、调试） |
+| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 取回 `/display` 与净化库 `/vendor/purify.js`、调试） |
 | `lib/bridge.js` | sidecar 管理：懒启动、按行收发 JSON-RPC、执行 sidecar 发来的 `llm.stream`、转发管线事件 |
 | `lib/agent.js` | StoryForge 预设里的 agent 作用域插件：每次模型请求钉到 `storyforge/pipeline`；记录 agent 创建 / 分叉 |
-| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板、会话头按钮、停靠条、模型锁。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
+| `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板、会话头按钮、停靠条、模型锁、每轮回复下方的卡片 HTML（`conversation.chat.turnTail` 槽）。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
+| `lib/html.js` | 卡片 HTML 块切分（与桌面 `splitRawHtmlBlocks` 同口径）：DSH 正文去掉完整块、块数写进 replayState，`/display` 返回的块附文字版 |
+| `lib/vendor/purify.es.mjs` | DOMPurify 3.4.12（上游双许可 Apache-2.0 / MPL-2.0；同目录 `DOMPURIFY-LICENSE` 是 npm 包自带的许可全文），取自 `frontend/node_modules`，只去掉了 source map 注释行；随插件分发，浏览器半边按需加载 |
 | `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……） |
 | `lib/shared.js` | 常量与进程内共享状态（生命周期事件、分叉回调） |
 | `lib/cards.js` | 角色卡：从 PNG（`ccv3` / `chara`）或 JSON 读卡名；导入时的文件名清洗与同名编号 |
@@ -24,6 +26,7 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入 |
 | `test/helpers.test.mjs` | 卡名解析、文件名清洗、标题截断、开场白转换、错误提示 |
 | `test/roles.test.mjs` | 管线角色识别 |
+| `test/html.test.mjs` | 块切分与桌面实现对拍、正文去块与兜底 |
 
 插件配置（`storyforge.patch.yml` 里 `config` 下，均可省略；要改就在 profile 自己的补丁里覆盖）：
 
@@ -87,7 +90,7 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
      再点「刷新」；
    - 点「新建故事」：sidecar 导入卡、跑角色识别（会调用模型）、开档，然后打开新会话（建在
      `stories` 工作区，停在「对话」视图并打开右栏 StoryForge 面板），第一条回复是卡的开场白
-     （开场白里的状态栏 HTML 转成文字列表显示，存档里的原文不变）。角色识别失败时（多半是
+     （开场白里的状态栏 HTML 渲染在回复下方，见「已知限制」的卡片 HTML 一条）。角色识别失败时（多半是
      底层模型没配好）留在首页说明原因，可以修好模型后新建，也可以「仍然打开故事」；
    - 在会话里输入行动：思考块显示导演 / 角色 / 执笔的过程，末尾一行是本轮的模式与底层
      调用用量；回复正文是质量门之后的成文。会话里的用量是本轮正文阶段所有底层调用之和；
@@ -108,7 +111,7 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 ## 开发循环
 
 - 改 `lib/client.js`：刷新页面即可生效。
-- 改 `lib/index.js` / `lib/bridge.js` / `lib/agent.js` / `lib/cards.js` / `lib/text.js` / 补丁：重启实例。
+- 改 `lib/index.js` / `lib/bridge.js` / `lib/agent.js` / `lib/cards.js` / `lib/text.js` / `lib/html.js` / 补丁：重启实例。
 - 改 Rust：`cargo build -p storyforge-dsh-bridge` 后重启实例（sidecar 随插件拉起）。
 - 测试：`cargo test -p storyforge-dsh-bridge`（含拉起 sidecar 进程、Mock 模型跑两轮的端到端
   测试）；`node --test integrations/dsh-storyforge/test/*.test.mjs`
@@ -137,12 +140,26 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
   `out_of_sync`。目前没有自动补救：从上一条已接受的回复分叉继续，或新建故事。
 - 停止：成文中停止会中止这一轮；排队时（思考块第一行是「【排队】」）停止只放弃这一轮，上一轮的
   收尾照常完成。
-- 卡壳（状态栏美化、交互按钮、卡内脚本）在 DSH 里不渲染：开场白和每轮回复里的状态栏 HTML
-  转成文字列表显示（表格每行一项，单元格用 ` | ` 分隔），存档里的原文不变。质量门的格式泄漏
-  检查只看 `<div>` / `<span>` / `<p>` 与代码块围栏：开场白里用过的算这张卡的既定格式，模型
-  每轮照写时放行；开场白没用过的交给 autofix 改写。`<think>` 一律算泄漏，其余标签（如
-  `<details>`、`<table>`）不检查。
-- sidecar 没有 WebView，卡内 MVU 脚本不执行（MVU 翻译产物的原生路径照常生效）。
+- 卡片 HTML 只做了净化渲染这一层：开场白和每轮回复里**完整闭合**的顶层 `details` / `div` /
+  `table` / `ul` / `ol` / `blockquote` 块（与桌面版 `splitRawHtmlBlocks` 同口径）从正文切走，
+  经 DOMPurify（配置同桌面版）净化后渲染在这一轮回复下方。样式关在 Shadow DOM 里，外层
+  `contain: paint`，卡里的 `position: fixed` 一类样式出不了框。脚本、事件属性、表单、iframe
+  一律去掉；交互按钮、卡壳 iframe、卡内 MVU 脚本都不支持（sidecar 没有 WebView，MVU 翻译产物
+  的原生路径照常生效）。远程图片照常加载，链接一律新窗口打开（`rel="noopener noreferrer"`）。
+  存档里的原文不变。
+  - 渲染内容取自存档的展示文本（sidecar `conversation.display`：按节点套卡的展示正则），不缓存。
+    展示正则带深度限制（`maxDepth`）的卡，旧轮次随对话变长退回原文，状态栏只在最近几轮显示，
+    与桌面版一致；所以每多一轮，已挂载的回复尾部整批重取一次。
+  - 正文里没有完整块时（未闭合的块、`<data_block>` 一类数据标签）照旧整段转文字列表（表格每行
+    一项，单元格用 ` | ` 分隔）。整条回复只有块时正文退回整段文字版、尾部不再重复（DSH 不收空
+    回复，空回复会让下一轮错位）。DOMPurify 加载失败或净化后为空时显示文字版；取回失败显示一行
+    错误和「重试」。
+  - 分叉出的子会话里，继承来的回复按节点位置在分支存档里取（分支会重写节点 id）。源对话还在时
+    比对正文，对不上就不渲染。
+  - 本功能之前写下的回复没有渲染引用，不显示尾部，正文仍是当时的文字版。
+  - 质量门的格式泄漏检查只看 `<div>` / `<span>` / `<p>` 与代码块围栏：开场白里用过的算这张卡
+    的既定格式，模型每轮照写时放行；开场白没用过的交给 autofix 改写。`<think>` 一律算泄漏，
+    其余标签（如 `<details>`、`<table>`）不检查。
 - 插件管理页可以热停用 / 启用（不用重启）。停用后 StoryForge 首页消失、sidecar 退出，StoryForge
   会话从会话列表隐藏，数据保留在磁盘上；重新启用后刷新一次页面，会话回到列表。
 - DSH 会话标题上限 80 字节，分叉时在末尾追加 ` (1)`。插件给 DSH 的标题预先截到 72 字节并补

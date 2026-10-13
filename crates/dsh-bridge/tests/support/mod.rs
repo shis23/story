@@ -50,6 +50,49 @@ pub fn write_card(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// 状态栏卡：开场白末尾带 `<status>` 数据标签，卡自带一条展示正则把它换成 HTML
+/// （只作用于最新一条消息，`maxDepth: 0`）。
+pub const STATUS_OPENING: &str = "林间的光斑落在木屋门前。\n<status>体力 80</status>";
+
+pub fn write_status_card(dir: &Path) -> std::path::PathBuf {
+    let card = json!({
+        "spec": "chara_card_v2",
+        "spec_version": "2.0",
+        "data": {
+            "name": "Seraphina",
+            "description": "守护森林的女法师，温柔而警惕。",
+            "personality": "温柔、警惕",
+            "scenario": "旅人在森林里迷路，被 Seraphina 救回木屋。",
+            "first_mes": STATUS_OPENING,
+            "mes_example": "",
+            "alternate_greetings": [],
+            "tags": [],
+            "creator": "dsh-bridge-test",
+            "character_version": "1",
+            "extensions": {
+                "regex_scripts": [{
+                    "id": "status-bar",
+                    "scriptName": "状态栏美化",
+                    "findRegex": "<status>(.*?)</status>",
+                    "replaceString": "<div class=\"sf-bar\">$1</div>",
+                    "placement": [2],
+                    "disabled": false,
+                    "markdownOnly": true,
+                    "promptOnly": false,
+                    "runOnEdit": true,
+                    "substituteRegex": 0,
+                    "trimStrings": [],
+                    "minDepth": null,
+                    "maxDepth": 0
+                }]
+            }
+        }
+    });
+    let path = dir.join("status-card.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+    path
+}
+
 /// 协议参数 → ChatRequest（`llm::call_params` 的逆映射）。
 pub fn chat_request(params: &Value) -> ChatRequest {
     let messages = params["messages"]

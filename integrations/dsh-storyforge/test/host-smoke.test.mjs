@@ -24,6 +24,10 @@ const bin = resolve(
 )
 const OPENING = '林间的光斑落在木屋门前，Seraphina 抬起头望向你。'
 const PROSE = '木门吱呀一声推开，炉火映着 Seraphina 的侧脸。她示意你坐下，把一碗热汤推到你面前。'
+/** 开场白末尾的状态栏：DSH 正文里拿掉，交给 Turn 尾部渲染。 */
+const STATUS_BAR = '<details><summary>状态</summary><ul><li>体力：80</li></ul></details>'
+const FIRST_MES = `${OPENING}\n${STATUS_BAR}`
+const JSON_HEADERS = { 'content-type': 'application/json' }
 
 function fakeModel(calls) {
   return async function* stream(options) {
@@ -121,7 +125,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
         description: '守护森林的女法师。',
         personality: '温柔',
         scenario: '旅人在森林里迷路。',
-        first_mes: OPENING,
+        first_mes: FIRST_MES,
         mes_example: '',
         alternate_greetings: [],
         tags: [],
@@ -187,7 +191,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       body: JSON.stringify({ card: 'seraphina.json' }),
     })
     assert.equal(created.ok, true, created.error)
-    assert.equal(created.campaign.opening, OPENING)
+    assert.equal(created.campaign.opening, FIRST_MES)
     const { sessionId } = created
 
     // 路径穿越被拒。
@@ -201,7 +205,17 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     const opening = userMessage('（开始新故事）', 'storyforge')
     const openingChunks = await collect(adapter.stream({ sessionId, messages: [opening] }))
     const openingText = openingChunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
-    assert.equal(openingText, OPENING)
+    assert.equal(openingText, OPENING, '状态栏不进 DSH 正文')
+    // 回放数据：开场白在存档里的位置 + 交给 Turn 尾部的块数（DSH 原样存进这条回复）。
+    const openingRef = openingChunks.at(-1).replayState?.response?.storyforge
+    assert.deepEqual(openingRef, {
+      v: 1,
+      campaignId: created.campaign.campaign_id,
+      conversationId: created.campaign.conversation_id,
+      nodeId: created.campaign.opening_node_id,
+      nodeIndex: 0,
+      blocks: 1,
+    })
 
     const callsBeforeTurn = llmCalls.length
     const messages = [
@@ -219,6 +233,11 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
     assert.ok(text.trim().length > 0)
     assert.equal(chunks.at(-1).type, 'finish')
+    const turnRef = chunks.at(-1).replayState?.response?.storyforge
+    assert.equal(turnRef.conversationId, created.campaign.conversation_id)
+    assert.equal(turnRef.nodeIndex, 2, '开场 0、用户 1、回复 2')
+    assert.equal(turnRef.blocks, 0)
+    assert.ok(turnRef.nodeId)
     assert.ok(llmCalls.length > callsBeforeTurn, '本轮应经 ctx.llm 调用底层模型')
     // DSH 拿到的是底层调用的真实用量（假模型每次 10 入 / 20 出），而不是正文字数估算。
     const usage = chunks.find((c) => c.type === 'usage').usage
@@ -249,6 +268,28 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     assert.match(status.sessions[sessionId].lastSettle.accept, /^accepted/)
     assert.equal(JSON.parse(readFileSync(join(root, 'data', 'settles.json'), 'utf8')).reports.length, 1)
 
+    // Turn 尾部按回放数据合批取展示数据：开场白有一个状态栏块，本轮没有；格式不对的忽略。
+    const shown = await call(routes, '/display', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        sessionId,
+        refs: [{ key: 'opening', ...openingRef }, { key: 'turn', ...turnRef }, { key: 'bad', conversationId: 7 }],
+      }),
+    })
+    assert.equal(shown.ok, true, shown.error)
+    assert.deepEqual(shown.items, {
+      opening: { blocks: [{ html: STATUS_BAR, text: '状态\n\n- 体力：80' }] },
+      turn: null,
+    })
+    const notArray = await call(routes, '/display', { method: 'POST', headers: JSON_HEADERS, body: '{"refs":1}' })
+    assert.equal(notArray.ok, false)
+    const purify = await routes
+      .get('/api/storyforge/vendor/purify.js')
+      .fetch(new Request('http://localhost/api/storyforge/vendor/purify.js'))
+    assert.match(purify.headers.get('content-type'), /javascript/)
+    assert.match(await purify.text(), /export \{ purify as default \}/)
+
     // DSH 重新生成上一轮（历史里少一轮）：存档已采纳的轮次不能重写，明确拒绝。
     await assert.rejects(collect(adapter.stream({ sessionId, messages })), /不能重新生成/)
 
@@ -265,6 +306,13 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     const mapped = (await call(routes, '/sessions')).sessions['session-child']
     assert.ok(mapped.campaignId && mapped.campaignId !== created.campaign.campaign_id, JSON.stringify(mapped))
     assert.equal(mapped.forkTurns, 1)
+    // 分叉后继承的开场白：sidecar 按位置到分支存档的对话里取（来源对话不在也一样）。
+    const viaFork = await call(routes, '/display', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId: 'session-child', refs: [{ key: 'opening', conversationId: 'gone', nodeIndex: 0 }] }),
+    })
+    assert.equal(viaFork.items.opening?.blocks[0].html, STATUS_BAR, JSON.stringify(viaFork))
     const parentChunks = await collect(
       adapter.stream({ sessionId, messages: [...history, userMessage('我留在木屋里。', 'user')] }),
     )

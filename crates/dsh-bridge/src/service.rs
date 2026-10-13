@@ -16,15 +16,19 @@
 //!   中止。收尾不受 DSH 停止按钮影响——正文已经显示在 DSH 里，半途停下后处理会让
 //!   这一轮无法接受，会话与存档从此错位。
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use storyforge_app_service::error::TauriCommandError;
+use storyforge_app_service::services::conversations::{
+    collect_conversation_regex_scripts, node_display_content,
+};
 use storyforge_app_service::{
     AppState, StartWritingRequest, accept_variant_async, create_campaign_for_backend,
     extract_characters_for_host, fork_campaign_for_host, import_character_for_host,
@@ -34,6 +38,7 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
 use storyforge_domain::generation::GenerationMode;
+use storyforge_domain::preset::RegexScript;
 
 use crate::llm::{LlmBridgeState, UsageTotals};
 
@@ -55,6 +60,11 @@ pub struct CampaignCreated {
     pub extraction_status: String,
     /// 存进对话的开场白（卡的第一条问候）；没有则为空串。
     pub opening: String,
+    /// 开场白跑过展示正则之后的文本（与桌面会话视图同口径）；没有开场白为空串。
+    pub opening_display: String,
+    /// 开场白所在节点（插件记进 DSH 回放数据，之后按它取展示文本）。
+    pub opening_node_id: Option<String>,
+    pub opening_node_index: Option<usize>,
     /// 开档期间的底层调用（角色识别）。
     pub usage: UsageTotals,
 }
@@ -73,8 +83,12 @@ pub struct TurnOutput {
     pub campaign_id: String,
     pub conversation_id: String,
     pub node_id: String,
+    /// 节点在对话里的位置（分叉换了节点 id 时按它兜底）。
+    pub node_index: Option<usize>,
     /// 质量门 / autofix 之后的最终正文（与对话里存的一致）。
     pub text: String,
+    /// 正文跑过展示正则之后的文本（与桌面会话视图同口径）；取不到时同 `text`。
+    pub display: String,
     pub generation_mode: Value,
     /// 成文之前的底层调用（导演、角色、执笔、编剧、autofix）。
     pub usage: UsageTotals,
@@ -94,6 +108,34 @@ pub struct SettleReport {
     /// 成文之后的底层调用（摘要、后处理）。
     pub usage: UsageTotals,
 }
+
+/// `conversation.display` 的一条查询：DSH 一个 Turn 里记下的存档位置（插件写进回放数据）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisplayRef {
+    /// 调用方自己的键，结果按它返回。
+    pub key: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub node_index: Option<usize>,
+}
+
+/// 一个助手节点当前的展示文本。
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeDisplay {
+    pub conversation_id: String,
+    pub node_id: String,
+    pub node_index: usize,
+    /// 展示正则之后的文本（深度按节点在对话里的当前位置算，每轮都可能变）。
+    pub display_content: String,
+    /// 回放数据记的是别的对话（分叉继承的轮次），按位置从会话当前存档的对话里取的。
+    pub by_position: bool,
+}
+
+/// 一次 `conversation.display` 最多查的节点数。
+pub const MAX_DISPLAY_REFS: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BridgeStatus {
@@ -365,14 +407,27 @@ impl BridgeService {
             .conv_store
             .get(&Id::from_str(&conversation_id))
             .and_then(|conversation| {
-                conversation
-                    .nodes
-                    .iter()
-                    .filter_map(|node| node.active())
-                    .find(|variant| variant.role == Role::Assistant)
-                    .map(|variant| variant.content.clone())
-            })
-            .unwrap_or_default();
+                let index = conversation.nodes.iter().position(|node| {
+                    node.active()
+                        .is_some_and(|variant| variant.role == Role::Assistant)
+                })?;
+                let content = conversation.nodes[index].active()?.content.clone();
+                let display = self
+                    .node_display(&conversation, index)
+                    .unwrap_or_else(|| content.clone());
+                Some((
+                    conversation.nodes[index].id.to_string(),
+                    index,
+                    content,
+                    display,
+                ))
+            });
+        let (opening_node_id, opening_node_index, opening, opening_display) = match opening {
+            Some((node_id, index, content, display)) => {
+                (Some(node_id), Some(index), content, display)
+            }
+            None => (None, None, String::new(), String::new()),
+        };
         Ok(CampaignCreated {
             campaign_id: campaign.id,
             conversation_id,
@@ -381,6 +436,9 @@ impl BridgeService {
             instance_count: campaign.instance_count,
             extraction_status: card.extraction_status,
             opening,
+            opening_display,
+            opening_node_id,
+            opening_node_index,
             usage: self.llm.usage().since(&usage_before),
         })
     }
@@ -546,11 +604,29 @@ impl BridgeService {
         };
         // 成文时刻的计数：之前记到本轮正文，之后记到收尾。
         let usage_at_text = self.llm.usage();
+        let conversation_id = field("conversation_id")?;
+        let node_id = field("node_id")?;
+        let text = field("text")?;
+        let placed = self
+            .app
+            .conv_store
+            .get(&Id::from_str(&conversation_id))
+            .and_then(|conversation| {
+                let index = conversation
+                    .nodes
+                    .iter()
+                    .position(|node| node.id.as_str() == node_id)?;
+                Some((index, self.node_display(&conversation, index)))
+            });
         let output = TurnOutput {
             campaign_id: campaign_id.to_string(),
-            conversation_id: field("conversation_id")?,
-            node_id: field("node_id")?,
-            text: field("text")?,
+            node_index: placed.as_ref().map(|(index, _)| *index),
+            display: placed
+                .and_then(|(_, display)| display)
+                .unwrap_or_else(|| text.clone()),
+            conversation_id,
+            node_id,
+            text,
             generation_mode: value.get("generation_mode").cloned().unwrap_or(Value::Null),
             usage: usage_at_text.since(&usage_before),
         };
@@ -570,6 +646,120 @@ impl BridgeService {
         *self.settling.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         Ok(output)
     }
+
+    /// 节点的展示文本（展示正则按该对话所属存档 / 角色卡收集）。
+    fn node_display(&self, conversation: &Conversation, index: usize) -> Option<String> {
+        let scripts = collect_conversation_regex_scripts(conversation, &self.app);
+        node_display_content(conversation, index, &scripts)
+    }
+
+    /// 按 DSH 回放数据里记下的存档位置批量取助手节点的当前展示文本（只读，不占写作锁）。
+    ///
+    /// `campaign_id` 是 DSH 会话当前对应的存档。回放数据记的就是它的对话时按节点 id 取；
+    /// 记的是别的对话（分叉继承的轮次）时按节点位置到当前对话里取——分叉复制前缀时顺序
+    /// 与正文不变、只换节点 id，展示正则的深度也该按用户正在看的这条对话算。记下的来源
+    /// 对话还在时核对两边正文一致，不一致不返回（宁缺勿错）。没有当前存档时按记下的
+    /// 对话取。找不到或不是助手消息的返回 None。
+    pub fn display_nodes(
+        &self,
+        refs: &[DisplayRef],
+        campaign_id: Option<&str>,
+    ) -> Result<BTreeMap<String, Option<NodeDisplay>>, BridgeError> {
+        if refs.len() > MAX_DISPLAY_REFS {
+            return Err(BridgeError::new(
+                "invalid_params",
+                format!("一次最多查 {MAX_DISPLAY_REFS} 个节点，收到 {}", refs.len()),
+            ));
+        }
+        let home = campaign_id
+            .and_then(|id| self.campaign_conversation(&Id::from_str(id)).ok())
+            .map(|conversation| {
+                let scripts = collect_conversation_regex_scripts(&conversation, &self.app);
+                (conversation, scripts)
+            });
+        let mut recorded = HashMap::new();
+        for id in refs.iter().filter_map(|r| r.conversation_id.as_deref()) {
+            let is_home = home
+                .as_ref()
+                .is_some_and(|(conversation, _)| conversation.id.as_str() == id);
+            if is_home || recorded.contains_key(id) {
+                continue;
+            }
+            let loaded = self
+                .app
+                .conv_store
+                .get(&Id::from_str(id))
+                .map(|conversation| {
+                    // 有当前存档时，记下的对话只用来核对正文，用不上展示正则。
+                    let scripts = match home {
+                        Some(_) => Vec::new(),
+                        None => collect_conversation_regex_scripts(&conversation, &self.app),
+                    };
+                    (conversation, scripts)
+                });
+            recorded.insert(id, loaded);
+        }
+        Ok(refs
+            .iter()
+            .map(|display_ref| {
+                let item = locate_display(display_ref, home.as_ref(), &recorded);
+                (display_ref.key.clone(), item)
+            })
+            .collect())
+    }
+}
+
+type LoadedConversation = (Conversation, Vec<RegexScript>);
+
+/// 回放数据里记的节点在对话里的位置：有节点 id 按 id 找，没有按记下的位置。
+fn recorded_index(conversation: &Conversation, display_ref: &DisplayRef) -> Option<usize> {
+    match display_ref.node_id.as_deref() {
+        Some(node_id) => conversation
+            .nodes
+            .iter()
+            .position(|node| node.id.as_str() == node_id),
+        None => display_ref.node_index,
+    }
+}
+
+/// `display_nodes` 的单条解析，规则见其文档。
+fn locate_display(
+    display_ref: &DisplayRef,
+    home: Option<&LoadedConversation>,
+    recorded: &HashMap<&str, Option<LoadedConversation>>,
+) -> Option<NodeDisplay> {
+    let recorded_id = display_ref.conversation_id.as_deref();
+    let source = recorded_id.and_then(|id| recorded.get(id));
+    let ((conversation, scripts), index, by_position) = match home {
+        Some(home) if recorded_id.is_none_or(|id| id == home.0.id.as_str()) => {
+            (home, recorded_index(&home.0, display_ref)?, false)
+        }
+        Some(home) => {
+            let index = display_ref.node_index?;
+            if let Some(Some((source, _))) = source {
+                let original = source.nodes.get(recorded_index(source, display_ref)?)?;
+                if original.active()?.content != home.0.nodes.get(index)?.active()?.content {
+                    return None;
+                }
+            }
+            (home, index, true)
+        }
+        None => {
+            let loaded = source?.as_ref()?;
+            (loaded, recorded_index(&loaded.0, display_ref)?, false)
+        }
+    };
+    let node = conversation.nodes.get(index)?;
+    if node.active()?.role != Role::Assistant {
+        return None;
+    }
+    Some(NodeDisplay {
+        conversation_id: conversation.id.to_string(),
+        node_id: node.id.to_string(),
+        node_index: index,
+        display_content: node_display_content(conversation, index, scripts)?,
+        by_position,
+    })
 }
 
 /// 后处理落定之后自动接受。

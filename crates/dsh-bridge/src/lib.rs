@@ -18,6 +18,10 @@
 //!   `sequential_crew`，省略走自动路由；`history_turns` 与存档不一致时报 `out_of_sync`）
 //! - `turn.cancel {campaign_id?}` → `{cancelled}`（只取消前台：排队中的写作请求放弃，
 //!   正在成文的一轮中止；收尾照常完成。省略 `campaign_id` 时不区分存档）
+//! - `conversation.display {refs: [{key, conversation_id?, node_id?, node_index?}],
+//!   campaign_id?}` → `{items: {key: NodeDisplay | null}}`（`campaign_id` 是 DSH 会话当前
+//!   对应的存档；只读，不占写作锁；解析规则见 `BridgeService::display_nodes`，一次最多
+//!   `MAX_DISPLAY_REFS` 条）
 //! - `bridge.shutdown {}` → `{}` 后退出
 //!
 //! sidecar → 插件：
@@ -46,7 +50,7 @@ use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBack
 
 use crate::llm::{DshLlmClient, LlmBridgeState};
 use crate::rpc::{Incoming, Peer, RpcError};
-use crate::service::{BridgeError, BridgeService, SettleReport, TurnObserver};
+use crate::service::{BridgeError, BridgeService, DisplayRef, SettleReport, TurnObserver};
 
 /// 在 sidecar 自己的数据目录上构造 JSON 后端的 AppState，并注入 DSH 模型客户端。
 pub fn build_app(
@@ -202,6 +206,17 @@ pub async fn handle_request(
         "turn.cancel" => {
             let campaign_id = params.get("campaign_id").and_then(Value::as_str);
             Ok(json!({ "cancelled": service.cancel(campaign_id) }))
+        }
+        "conversation.display" => {
+            let refs: Vec<DisplayRef> = match params.get("refs") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    RpcError::new("invalid_params", format!("refs 无效: {error}"))
+                })?,
+            };
+            let campaign_id = params.get("campaign_id").and_then(Value::as_str);
+            let items = service.display_nodes(&refs, campaign_id).map_err(to_rpc)?;
+            encode(serde_json::to_value(items).map(|items| json!({ "items": items })))
         }
         other => Err(RpcError::new("unknown_method", format!("未知方法 {other}"))),
     }
