@@ -22,11 +22,12 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 - Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
 - M5 endurance runner 已合入；Gate 6 真实模型证据：Canary3/Coverage12/TextFallback3/Stability30 已 PASS 并 seal；Full100 受 relay 间歇不稳定阻断未完成（r3 跑到 58/100 全健康），Gate 6 已按决议关闭（关闭非 PASS）。
 - **默认存储已切换为 SQLite**（Gate 7，2026-08-05）：无配置启动即 SQLite 权威；全新用户初始化空 SQLite 库；旧 JSON 数据启动时自动迁移（缺集合按空导入、孤儿行跳过并计数，迁移前自动备份且不删除旧 JSON）；JSON 保留为显式回退（`STORYFORGE_STORAGE_BACKEND=json`）。
-- 11 步确定性门禁已三轮全绿且计数完全一致（secret 扫描、Pester 四套 198 项、fmt、严格 Clippy、Rust 1980 通过/0 失败/33 忽略、前端 504+119+9+28+2=662 项、生产构建）；另有 Windows 原生 13/13 项真实 IPC 检查、Android 凭据生命周期真机、世界书往返和保留数据升级通过。真实模型写作（Windows 原生 + Android 真机 9/9 环节）、第三方插件两条通道、正式分发安装包（v0.1.2 已发布并核对三产物哈希）与远端 CI（GitHub tag 构建全绿）均已闭合，详见[发布状态](docs/RELEASE-STATUS.md)。仍未闭合：Windows EXE 代码签名、任意历史回滚、ST 99 事件全集、JSON 生产写路径删除、记忆参数标定和 CoT 长程研究；调试包或浏览器测试不能替代真机与真实产物验证。
+- 宿主无关的应用服务已抽成不依赖 tauri 的 `crates/app-service`。DSH 插件版 PoC（`crates/dsh-bridge` + `integrations/dsh-storyforge`）已合入，属实验性集成，不在发布产物和发布范围内。
+- 11 步确定性门禁最近一次完整运行（2026-10-13，合并后的 main）全绿：secret 扫描、Pester 五套 208 项、fmt、严格 Clippy、Rust 2260 通过/0 失败/33 忽略、前端 535+161+9+28+2=735 项、生产构建。v0.1.2 收尾时（2026-09-06）三轮全绿且计数完全一致（Pester 198、Rust 1980、前端 662）；另有 Windows 原生 13/13 项真实 IPC 检查、Android 凭据生命周期真机、世界书往返和保留数据升级通过。真实模型写作（Windows 原生 + Android 真机 9/9 环节）、第三方插件两条通道、正式分发安装包（v0.1.2 已发布并核对三产物哈希）与远端 CI（GitHub tag 构建全绿）均已闭合，详见[发布状态](docs/RELEASE-STATUS.md)。仍未闭合：Windows EXE 代码签名、任意历史回滚、ST 99 事件全集、JSON 生产写路径删除、记忆参数标定和 CoT 长程研究；调试包或浏览器测试不能替代真机与真实产物验证。
 
 ## 技术栈
 
-- Rust workspace，16 个 crate。
+- Rust workspace，18 个 crate（含 DSH 插件版 PoC 的 sidecar `dsh-bridge`）。
 - Tauri v2，178 个 command。
 - Vue 3 + Pinia + Vite + Tailwind v4。
 - OpenAI-compatible LLM API。
@@ -87,8 +88,11 @@ crates/app-conversation    对话树、variant、Provenance
 crates/app-memory          摘要归档与记忆召回
 crates/app-meta            Meta Agent、MVU 分析、补丁会话
 crates/infra-*             LLM、SQLite、导入、插件、向量、正则、通用 IO
-crates/tauri-app           Tauri 命令、应用服务、JSON/SQLite 组合根
+crates/app-service         宿主无关的应用服务、AppState、JSON/SQLite 组合根（不依赖 tauri）
+crates/tauri-app           Tauri 启动与命令外壳、Card Studio、卡片壳协议与缓存、MVU WebView 运行时
 crates/harness-real-llm    确定性与真实模型评估、M5 endurance 证据
+crates/dsh-bridge          DSH 插件版 PoC 的 stdio JSON-RPC sidecar
+integrations/dsh-storyforge DSH 插件版 PoC 的插件（宿主半边与前端）
 frontend                   Vue 3 / Pinia 前端
 docs                       当前规格、架构、验收和历史归档
 ```
