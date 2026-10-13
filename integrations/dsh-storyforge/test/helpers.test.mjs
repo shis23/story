@@ -82,6 +82,24 @@ test('readableText turns status-bar HTML into readable markdown text', () => {
   assert.equal(readableText(undefined), '')
 })
 
+test('readableText keeps table cells apart, one list line per row', () => {
+  const html = [
+    '<details open><summary>状态栏</summary>',
+    '<table>',
+    '  <tr><th>属性</th><th>数值</th></tr>',
+    '  <tr><td>体力</td><td>80</td></tr>',
+    '  <tr><td><b>好感</b></td><td></td><td>35</td></tr>',
+    '  <tr><td></td></tr>',
+    '</table>',
+    '</details>',
+    '<p>她转身离开。</p>',
+  ].join('\n')
+  // 空单元格与全空行丢掉；行用列表项，Markdown 不会把相邻两行并成一段。
+  assert.equal(readableText(html), ['状态栏', '', '- 属性 | 数值', '- 体力 | 80', '- 好感 | 35', '', '她转身离开。'].join('\n'))
+  // 省略 </td> 的写法也能分开。
+  assert.equal(readableText('<table><tr><td>甲<td>乙</table>'), '- 甲 | 乙')
+})
+
 test('llmHint and friendlyError explain known model failures', () => {
   const raw = 'LLM error: HTTP 请求失败: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"'
   assert.match(llmHint(raw), /还没有配置 API Key/)
