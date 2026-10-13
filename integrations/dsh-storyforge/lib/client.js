@@ -1368,6 +1368,12 @@ window.__ModuleLoader__.load({
 .sf-view { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; font-size: 14px; line-height: 1.7; }
 .sf-view p { margin: 0; }
 .sf-dock { color: var(--sf-fg3); font-size: 12px; padding: 2px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Turn 尾部的卡片 HTML：外层 contain: paint 是 fixed 定位的包含块，卡样式里的
+   :host { position: fixed } 也逃不出这个框。 */
+.sf-turn-tail { contain: paint; position: relative; max-width: 100%; overflow-x: auto; margin: 6px 0 2px; }
+.sf-turn-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--sf-fg2); font-size: 13px; }
+.sf-turn-text > div + div { margin-top: 6px; }
+.sf-turn-error { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 640px) {
 	.sf-home-inner { padding: 16px 14px 32px; }
 	.sf-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1378,7 +1384,262 @@ window.__ModuleLoader__.load({
 }
 `;
 
-		const inject = ["slots", "sessions", "sidebarRight", "sidebarRightTabs", "uiWorkspace"];
+		// ─── Turn 尾部：卡片 HTML（状态栏）净化渲染 ────────────────────────────────
+		//
+		// 适配器在每条回复的 finish 块里带回放数据（这条回复在 StoryForge 存档里的位置 +
+		// 从正文里拿掉的 HTML 块数），DSH 原样存进会话。下面的会话事件定义把它发布成 Turn 级
+		// 数据；`conversation.chat.turnTail` 条目据此合批取展示数据，DOMPurify 净化后挂进
+		// Shadow DOM（卡的样式关在里面）。净化不了时显示文字版，取数失败时给重试。
+
+		const PROVIDER_ID = "storyforge";
+		const TURN_DATA_KEY = "storyforge";
+		const REPLAY_VERSION = 1;
+		/** 一次 `/display` 最多带的节点数（服务端上限 200）。 */
+		const DISPLAY_BATCH = 100;
+
+		/** 会话事件定义：storyforge provider 的回复 → 这一 Turn 的回放数据。 */
+		const storyforgeTurnDefinition = {
+			// 发布数据的 key 必须等于 kind，否则会话事件流整条报错、对话区空白（阶段 0 实测）。
+			kind: TURN_DATA_KEY,
+			match: (event) => {
+				if (event.type === "turn/start") return { id: String(event.data.turn), role: "start" };
+				if (event.type === "assistant/message" && event.data?.message?.source?.provider === PROVIDER_ID)
+					return { id: String(event.data.turn), role: "update" };
+				return null;
+			},
+			start: (_context, match) => ({ turn: match.event.data.turn }),
+			update: (context, match) => {
+				const message = match.event.data.message;
+				const ref = message.source?.replayState?.response?.storyforge;
+				return {
+					...(context.state ?? { turn: match.event.data.turn }),
+					ref: ref?.v === REPLAY_VERSION && typeof ref.conversationId === "string" ? ref : null,
+					messageId: message.id,
+				};
+			},
+			// 回复落地之前（只有 turn/start）不发布，避免半截数据。
+			buildLocationData: (context, scope, previous) => {
+				if (scope !== "turn" || !context.state?.messageId) return null;
+				if (previous?.kind === "turn" && previous.turn === context.state.turn && previous.value === context.state) return previous;
+				return { kind: "turn", turn: context.state.turn, key: TURN_DATA_KEY, value: context.state };
+			},
+		};
+
+		const noopSubscribe = () => () => {};
+
+		function useTurnData(turn) {
+			const source = turn?.data?.source?.(TURN_DATA_KEY);
+			return React.useSyncExternalStore(
+				source?.subscribe ?? noopSubscribe,
+				source?.getSnapshot ?? (() => turn?.data?.get?.(TURN_DATA_KEY)),
+			);
+		}
+
+		const refKey = (ref) => `${ref.conversationId}#${ref.nodeId ?? ""}#${ref.nodeIndex ?? ""}`;
+
+		/**
+		 * 一个会话的展示数据加载器：同一个宏任务里挂载的 Turn 尾部合成一次 `/display`。
+		 * 展示正则的深度随对话变长而变——出现位置更靠后的节点（又写了一轮）时代数加一，
+		 * 已挂载的尾部按新代数一起重取；重取期间先显示旧结果，不闪。
+		 */
+		function createDisplayStore(sessionId) {
+			/** key → { ref, mounted, inflight, result?: { generation, item?, error? } } */
+			const entries = new Map();
+			const listeners = new Set();
+			let generation = 0;
+			let latestIndex = null;
+			let timer = null;
+
+			const notify = () => {
+				for (const listener of listeners) listener();
+			};
+			const schedule = () => {
+				timer ??= setTimeout(flush, 0);
+			};
+			const due = (entry) => entry.mounted > 0 && !entry.inflight && entry.result?.generation !== generation;
+
+			function flush() {
+				timer = null;
+				const pending = [...entries].filter(([, entry]) => due(entry));
+				for (let i = 0; i < pending.length; i += DISPLAY_BATCH) {
+					const batch = pending.slice(i, i + DISPLAY_BATCH);
+					const requested = generation;
+					for (const [, entry] of batch) entry.inflight = true;
+					postJson("/display", { sessionId, refs: batch.map(([key, entry]) => ({ ...entry.ref, key })) })
+						.then(
+							(body) => {
+								for (const [key, entry] of batch) entry.result = { generation: requested, item: body.items?.[key] ?? null };
+							},
+							(error) => {
+								for (const [, entry] of batch) entry.result = { generation: requested, error: errorText(error) };
+							},
+						)
+						.finally(() => {
+							for (const [, entry] of batch) entry.inflight = false;
+							notify();
+							if ([...entries.values()].some(due)) schedule();
+						});
+				}
+			}
+
+			return {
+				subscribe(listener) {
+					listeners.add(listener);
+					return () => listeners.delete(listener);
+				},
+				result: (key) => entries.get(key)?.result,
+				register(key, ref) {
+					let entry = entries.get(key);
+					if (!entry) {
+						entry = { ref, mounted: 0, inflight: false, result: undefined };
+						entries.set(key, entry);
+					}
+					entry.mounted += 1;
+					if (Number.isInteger(ref.nodeIndex)) {
+						if (latestIndex !== null && ref.nodeIndex > latestIndex) generation += 1;
+						if (latestIndex === null || ref.nodeIndex > latestIndex) latestIndex = ref.nodeIndex;
+					}
+					schedule();
+					return () => {
+						entry.mounted -= 1;
+					};
+				},
+				retry(key) {
+					const entry = entries.get(key);
+					if (!entry) return;
+					entry.result = undefined;
+					schedule();
+					notify();
+				},
+			};
+		}
+
+		const displayStores = new Map();
+
+		function displayStore(sessionId) {
+			let store = displayStores.get(sessionId);
+			if (!store) {
+				store = createDisplayStore(sessionId);
+				displayStores.set(sessionId, store);
+			}
+			return store;
+		}
+
+		/** 与桌面 RichContent 同一份净化规则；返回 DOM 片段直接挂载，不再二次解析字符串。 */
+		const SANITIZE_CONFIG = Object.freeze({
+			USE_PROFILES: { html: true },
+			ALLOW_ARIA_ATTR: true,
+			ALLOW_DATA_ATTR: true,
+			FORBID_TAGS: ["script", "iframe", "object", "embed", "link", "meta", "base", "form", "input", "button", "textarea", "select", "option"],
+			FORBID_ATTR: [
+				"onabort", "onblur", "onchange", "onclick", "ondblclick", "onerror", "onfocus", "oninput", "onkeydown", "onkeypress",
+				"onkeyup", "onload", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onsubmit",
+			],
+			RETURN_DOM_FRAGMENT: true,
+		});
+
+		let purifyLoading = null;
+
+		/** 按需加载插件自带的 DOMPurify（同源路由，ES 模块）。失败后下次再试。 */
+		function loadPurify() {
+			if (!purifyLoading) {
+				purifyLoading = import(`${API_BASE}/vendor/purify.js`).then((module) => {
+					const purify = module.default;
+					if (!purify?.isSupported) throw new Error("DOMPurify 在这个浏览器里不可用");
+					// 卡里的链接在新标签页打开，不把 DSH 页面导航走。
+					purify.addHook("afterSanitizeAttributes", (node) => {
+						if (node.tagName === "A" && node.hasAttribute("href")) {
+							node.setAttribute("target", "_blank");
+							node.setAttribute("rel", "noopener noreferrer");
+						}
+					});
+					return purify;
+				});
+				purifyLoading.catch(() => {
+					purifyLoading = null;
+				});
+			}
+			return purifyLoading;
+		}
+
+		/** Shadow DOM 里的底样式：字色字号跟随 DSH，卡的样式只作用在这棵树里。 */
+		const CARD_BASE_STYLES = `
+:host { display: block; }
+.sf-block + .sf-block { margin-top: 8px; }
+.sf-block * { max-width: 100%; box-sizing: border-box; }
+.sf-block img { height: auto; }
+.sf-block table { border-collapse: collapse; }
+`;
+
+		/** 一组净化后的卡片 HTML 块。内容不变时不重挂（保住用户展开的 `<details>`）。 */
+		function CardBlocks({ blocks }) {
+			const hostRef = React.useRef(null);
+			const [failed, setFailed] = React.useState(false);
+			const content = JSON.stringify(blocks.map((block) => block.html));
+			React.useLayoutEffect(() => {
+				const host = hostRef.current;
+				if (!host) return undefined;
+				let cancelled = false;
+				loadPurify()
+					.then((purify) => {
+						if (cancelled) return;
+						const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
+						const style = document.createElement("style");
+						style.textContent = CARD_BASE_STYLES;
+						const rendered = blocks.map((block) => {
+							const wrapper = document.createElement("div");
+							wrapper.className = "sf-block";
+							wrapper.append(purify.sanitize(block.html, SANITIZE_CONFIG));
+							return wrapper;
+						});
+						if (!rendered.some((wrapper) => wrapper.textContent.trim() || wrapper.querySelector("img, svg, progress, meter"))) {
+							setFailed(true);
+							return;
+						}
+						root.replaceChildren(style, ...rendered);
+					})
+					.catch((error) => {
+						console.error("[storyforge] card html render failed", error);
+						if (!cancelled) setFailed(true);
+					});
+				return () => {
+					cancelled = true;
+				};
+				// 按内容比较：每次重取 blocks 都是新数组。
+			}, [content]);
+			if (failed) {
+				return h(
+					"div",
+					{ className: "sf-root sf-turn-tail sf-turn-text" },
+					blocks.map((block, index) => h("div", { key: index }, block.text)),
+				);
+			}
+			return h("div", { className: "sf-turn-tail", "data-sf-turn-tail": "" }, h("div", { ref: hostRef }));
+		}
+
+		/** `conversation.chat.turnTail` 条目：StoryForge 会话里有卡片 HTML 块的 Turn 才渲染。 */
+		function StoryForgeTurnTail(props) {
+			const sessionId = props.sfSessionId ?? props.sessionId;
+			const isStoryForge = useIsStoryForge(props, sessionId);
+			const data = useTurnData(props.turn);
+			const ref = isStoryForge && sessionId && data?.ref?.blocks > 0 ? data.ref : null;
+			const key = ref ? refKey(ref) : null;
+			const store = key ? displayStore(sessionId) : null;
+			React.useEffect(() => (store ? store.register(key, ref) : undefined), [store, key]);
+			const result = React.useSyncExternalStore(store?.subscribe ?? noopSubscribe, () => store?.result(key));
+			if (!store || !result) return null;
+			if (result.error) {
+				return h(
+					"div",
+					{ className: "sf-root sf-turn-tail sf-small sf-muted sf-turn-error" },
+					h("span", null, `状态栏没取到：${result.error}`),
+					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => store.retry(key) }, "重试"),
+				);
+			}
+			return result.item?.blocks?.length ? h(CardBlocks, { blocks: result.item.blocks }) : null;
+		}
+
+		const inject = ["slots", "sessions", "sidebarRight", "sidebarRightTabs", "uiWorkspace", "uiConversation"];
 
 		function apply(ctx) {
 			rootCtx = ctx;
@@ -1405,6 +1666,19 @@ window.__ModuleLoader__.load({
 						inject: (sessionId) => ({ sfSessionId: sessionId }),
 					},
 					HeaderAction,
+				),
+			);
+
+			// Turn 尾部：卡片 HTML。会话事件定义随插件生命周期登记、卸载时自动撤销。
+			ctx.uiConversation.events.register(storyforgeTurnDefinition);
+			ctx.slots.inject("conversation.chat.turnTail", () =>
+				ctx.slots.register(
+					{
+						name: "conversation.chat.turnTail",
+						id: "storyforge-card-html",
+						inject: (sessionId) => ({ sfSessionId: sessionId }),
+					},
+					StoryForgeTurnTail,
 				),
 			);
 
