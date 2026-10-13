@@ -51,9 +51,12 @@ crates/infra-*
 
 crates/harness-real-llm
   -> deterministic gates / real-model probes / M5 evidence
+
+crates/dsh-bridge（DSH 插件版 PoC）
+  -> stdio JSON-RPC sidecar：经 app-service 的 `*_for_host` 跑生产写作路径，模型调用反向交给 DSH
 ```
 
-当前 workspace 共 17 个 crate。`domain` 不依赖内部应用层；`app-*` 不依赖 `tauri-app`；`app-service` 不依赖 tauri，桌面端与非 Tauri 宿主共用它，进程级单例（数据目录、连接 / 预设存储、MVU runtime、后台运行时）由宿主在启动时钉住或安装。
+当前 workspace 共 18 个 crate（含 PoC 的 `dsh-bridge`）。`domain` 不依赖内部应用层；`app-*` 不依赖 `tauri-app`；`app-service` 不依赖 tauri，桌面端与非 Tauri 宿主共用它，进程级单例（数据目录、连接 / 预设存储、MVU runtime、后台运行时）由宿主在启动时钉住或安装。
 
 `crates/tauri-app/src/commands/<x>.rs` 只保留 `#[tauri::command]` 外壳（命令签名不变），DTO 与辅助函数在 `crates/app-service/src/services/<x>.rs`，外壳以 `pub use` 引入；tauri-app 根模块 `pub use storyforge_app_service::*`，原有 `crate::` 路径与 harness / 集成测试的 `storyforge_lib::` 路径不变。源码级门禁（`scripts/architecture/backend-baseline.mjs`、`lib_tests_backend.rs` gate3、命令层 JSON 直连扫描）同时扫描两个 crate 的 `src/`。
 

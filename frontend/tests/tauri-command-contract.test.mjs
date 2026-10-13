@@ -78,8 +78,9 @@ test('Gate 0 command registration matches the complete ordered snapshot', () => 
 })
 
 test('Gate 3 records the shrinking ambient SQLite branch surface', () => {
-  // 2026-10-12：宿主无关的应用服务抽成 crates/app-service，16 → 17。
-  assert.equal(baseline.workspace.crateCount, 17)
+  // 2026-10-12：宿主无关的应用服务抽成 crates/app-service，16 → 17；
+  // 再加 DSH 插件版 PoC 的 sidecar（crates/dsh-bridge），17 → 18。
+  assert.equal(baseline.workspace.crateCount, 18)
   assert.equal(baseline.sqlite.activeFlagReferences, 2)
   assert.equal(baseline.sqlite.facadeFlagReferences, 2)
   assert.equal(baseline.sqlite.applicationFlagReferences, 0)

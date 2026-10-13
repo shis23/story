@@ -1,0 +1,28 @@
+[package]
+name = "storyforge-dsh-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "DSH 插件版 PoC 的 sidecar：stdio JSON-RPC 驱动 StoryForge 生产写作路径，模型调用反向交给 DSH"
+
+[[bin]]
+name = "storyforge-dsh-bridge"
+path = "src/main.rs"
+
+[dependencies]
+storyforge-domain.workspace = true
+storyforge-infra-llm.workspace = true
+storyforge-infra-sqlite.workspace = true
+storyforge-app-logging.workspace = true
+storyforge-app-service.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "rt-multi-thread"] }

@@ -1,0 +1,22 @@
+{
+  "name": "dsh-plugin-storyforge",
+  "version": "0.0.0-poc",
+  "private": true,
+  "type": "module",
+  "description": "StoryForge 多 Agent 写作管线的 DSH 插件（PoC）",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./agent": "./lib/agent.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./storyforge.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
