@@ -107,6 +107,7 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 - character_id / instance_id / source_character_id：传角色名（不是 ID），系统会解析匹配
 - source 取值：witnessed / told_by_other / inferred（小写）
 - new_status 取值：pending / active / likely_completed / completed / abandoned（小写）
+- triggers：每条都写 kind；kind=event 时事件描述必须写在 description 字段（不要用 event / condition 等其他键名）；turn_reminder 填 at_turn（整数轮次）；story_time 填 target；manual 不带其他字段
 - broadcast：可选，"all"=广播全体，"组名"=广播该身份组，不填=单角色定向
 - propagation：可选，"open"=可正常传播，"private"=秘密/禁止外传；不填按 open
 - 如果某一项没有更新，输出空数组
@@ -329,9 +330,9 @@ pub fn register_postprocess_tools(registry: &mut ToolRegistry) {
                                                         "type": "string",
                                                         "enum": ["event", "turn_reminder", "story_time", "manual"]
                                                     },
-                                                    "description": {"type": "string"},
-                                                    "at_turn": {"type": "integer"},
-                                                    "target": {"type": "string"}
+                                                    "description": {"type": "string", "description": "kind=event 时必填：触发事件的描述，只能写在这个字段"},
+                                                    "at_turn": {"type": "integer", "description": "kind=turn_reminder 时必填：第几轮提醒"},
+                                                    "target": {"type": "string", "description": "kind=story_time 时必填：故事内时间点，如'第2年6月'"}
                                                 },
                                                 "required": ["kind"]
                                             }
