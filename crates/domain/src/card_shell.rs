@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 use crate::character::Character;
 use crate::preset::RegexScript;
 
+/// Hosts a card shell may load from or have the host fetch for it (the
+/// host-mediated fetch allowlist, also pinned into the shell document CSP).
+pub const DEFAULT_SHELL_HOSTS: &[&str] = &[
+    "testingcf.jsdelivr.net",
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "files.catbox.moe",
+    // The Destiny card's two map sources are served from this image CDN.
+    // Keep this explicit rather than allowing arbitrary image hosts.
+    "i.ibb.co",
+    // 卿卿卡的立绘/图鉴图床（CARD-SHELL-REVIEW L5）：不在白名单时壳内
+    // fetch() 硬失败且 <img> 只能直连网络（CSP 拦截、不缓存不代理）。
+    // 与 i.ibb.co 同理，点名主机而非放开任意图床。
+    "i.postimg.cc",
+    "raw.githubusercontent.com",
+    "github.com",
+    "gitee.com",
+];
+
 /// Shell surface kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -28,26 +28,13 @@ const LOCAL_PROTOCOL_ORIGIN: &str = "http://storyforge-cache.localhost";
 #[cfg(not(any(target_os = "windows", target_os = "android")))]
 const LOCAL_PROTOCOL_ORIGIN: &str = "storyforge-cache://localhost";
 
-/// Default allowlist hosts for test-card and common ST card CDNs.
+/// Default allowlist hosts for test-card and common ST card CDNs. The list
+/// lives in the domain crate so non-Tauri hosts (the DSH sidecar) share it.
 pub fn default_allowed_hosts() -> Vec<String> {
-    vec![
-        "testingcf.jsdelivr.net".into(),
-        "cdn.jsdelivr.net".into(),
-        "cdnjs.cloudflare.com".into(),
-        "fonts.googleapis.com".into(),
-        "fonts.gstatic.com".into(),
-        "files.catbox.moe".into(),
-        // The Destiny card's two map sources are served from this image CDN.
-        // Keep this explicit rather than allowing arbitrary image hosts.
-        "i.ibb.co".into(),
-        // 卿卿卡的立绘/图鉴图床（CARD-SHELL-REVIEW L5）：不在白名单时壳内
-        // fetch() 硬失败且 <img> 只能直连网络（CSP 拦截、不缓存不代理）。
-        // 与 i.ibb.co 同理，点名主机而非放开任意图床。
-        "i.postimg.cc".into(),
-        "raw.githubusercontent.com".into(),
-        "github.com".into(),
-        "gitee.com".into(),
-    ]
+    storyforge_domain::card_shell::DEFAULT_SHELL_HOSTS
+        .iter()
+        .map(|host| (*host).to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
