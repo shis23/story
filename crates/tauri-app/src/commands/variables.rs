@@ -185,6 +185,19 @@ pub fn set_campaign_variable(
     Ok(())
 }
 
+/// 写卡壳 TavernHelper 选择器桶（`__storyforge_card_shell_variables`，整体替换）。
+///
+/// 通用 `set_campaign_variable` 拒绝 `__` 内部段（T-06）；本命令只写这一个键，
+/// 校验桶形状与大小后经同一活动 Turn 屏障落盘。
+#[tauri::command]
+pub fn set_card_shell_variables(
+    campaign_id: String,
+    variables: serde_json::Value,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    set_card_shell_variables_for_backend(state.storage(), &Id::from_str(&campaign_id), variables)
+}
+
 /// 把临场角色升级为常驻（仅翻 is_temporary flag）
 #[tauri::command]
 pub fn promote_temporary_instance(

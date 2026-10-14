@@ -28,7 +28,7 @@ StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不�
 ## 技术栈
 
 - Rust workspace，18 个 crate（含 DSH 插件版 PoC 的 sidecar `dsh-bridge`）。
-- Tauri v2，178 个 command。
+- Tauri v2，179 个 command。
 - Vue 3 + Pinia + Vite + Tailwind v4。
 - OpenAI-compatible LLM API。
 - 默认 SQLite/WAL 存储；JSON 保留为显式回退与迁移/反向导出源。

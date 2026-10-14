@@ -40,8 +40,10 @@ test('Gate 0 command registration baseline is stable', () => {
   // 命令总数是产品契约（README/CLAUDE.md 的命令计数），保持硬编码。
   // T-15 决策为"保留 + 声明"；2026-10-11 嵌入模型设置新增 clear_embed_config /
   // get_memory_index_status / rebuild_memory_embeddings，175 → 178。
-  assert.equal(baseline.backend.commandAttributes, 178)
-  assert.equal(baseline.backend.registeredCommandCount, 178)
+  // 2026-10-14 卡壳选择器桶专用写入口 set_card_shell_variables（通用
+  // set_campaign_variable 按 T-06 拒绝 __ 内部键），178 → 179。
+  assert.equal(baseline.backend.commandAttributes, 179)
+  assert.equal(baseline.backend.registeredCommandCount, 179)
   // 说明：此处曾硬编码前端 `uniqueInvokeCount`（169→172）。该数字是扫描的
   // 中间产物、不是契约本身，且跨域并发增删 wrapper 时变动频繁（一次改动就
   // 会让断言必须跟着改）。真正的契约由下面两条不变量 + 上面的扫描回归锁

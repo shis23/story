@@ -159,6 +159,7 @@
   "set_campaign_variable",
   "set_campaign_world_info_enabled",
   "set_campaign_world_info_route",
+  "set_card_shell_variables",
   "set_character_variable",
   "set_plugin_enabled",
   "soft_delete_variant",

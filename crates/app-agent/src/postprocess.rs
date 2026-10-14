@@ -454,6 +454,15 @@ fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
     let variable_updates =
         parse_entries::<VariableUpdateDto>(dto.variable_updates, "variable_updates")
             .into_iter()
+            .filter(|v| {
+                // __storyforge* 由宿主管理（卡壳选择器桶等），模型不得覆盖；
+                // MVU JS 通道的同一守卫见 app-pipeline push_mvu_js_variable_updates。
+                let reserved = storyforge_domain::variables::is_reserved_variable_key(&v.key);
+                if reserved {
+                    warn!(target: "postprocess", "丢弃保留命名空间变量写入: {}", v.key);
+                }
+                !reserved
+            })
             .map(|v| VariableUpdate {
                 instance_id: v.instance_id.map(|s| Id::from_str(&s)),
                 key: v.key,
@@ -672,6 +681,18 @@ mod tests {
         assert_eq!(r.knowledge_updates.len(), 1);
         assert_eq!(r.variable_updates.len(), 2);
         assert_eq!(r.task_updates.len(), 1);
+    }
+
+    #[test]
+    fn reserved_variable_updates_are_dropped() {
+        let raw = r#"{"variable_updates": [
+          {"instance_id": null, "key": "__storyforge_card_shell_variables", "value": {}},
+          {"instance_id": null, "key": " __STORYFORGE_other", "value": 1},
+          {"instance_id": null, "key": "story_clock", "value": "第2天"}
+        ]}"#;
+        let r = parse_postprocess_from_response(&make_resp(raw, vec![]));
+        let keys: Vec<&str> = r.variable_updates.iter().map(|u| u.key.as_str()).collect();
+        assert_eq!(keys, vec!["story_clock"]);
     }
 
     #[test]

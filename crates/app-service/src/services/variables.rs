@@ -79,6 +79,9 @@ pub fn validate_campaign_variable_input(
 /// `PluginRegistry` 二次校验）不一致，属防御纵深缺口：经命令层可写入内部键，
 /// 而 `utils/mvuStatTree.js` 正是靠该前缀把内部键排除出 stat_data 树的。
 /// 这里复用 `validate_campaign_variable_input` 的键名规则做后端侧守卫。
+///
+/// 卡壳选择器桶 [`CARD_SHELL_VARIABLES_KEY`] 不经本守卫放行，而是走专用入口
+/// [`set_card_shell_variables_for_backend`]（只写该键、校验桶形状与大小）。
 pub fn validate_variable_write_key(key: &str) -> Result<(), TauriCommandError> {
     let valid = !key.is_empty()
         && key.len() <= 128
@@ -93,6 +96,93 @@ pub fn validate_variable_write_key(key: &str) -> Result<(), TauriCommandError> {
             "变量键名只能包含文字、数字、点、下划线或连字符，不能超过 128 字节或使用 __ 内部段",
         ))
     }
+}
+
+/// 卡壳 TavernHelper `setVariables` / `replaceVariables` 选择器桶所在的
+/// Campaign 变量键（镜像 `frontend/src/utils/cardShellVariableStore.js`）。
+pub const CARD_SHELL_VARIABLES_KEY: &str = "__storyforge_card_shell_variables";
+
+/// 整个桶对象序列化后的上限：每次写入都会改写整条 Campaign 记录。
+pub const CARD_SHELL_VARIABLES_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 选择器类型，镜像 `cardShellVariableStore.js` 的 `SUPPORTED_BUCKETS`。
+const CARD_SHELL_SELECTOR_TYPES: [&str; 7] = [
+    "message",
+    "character",
+    "local",
+    "chat",
+    "global",
+    "script",
+    "preset",
+];
+
+/// 选择器身份段长度上限，镜像前端 `selectorKey` 的 256 截断。
+const CARD_SHELL_SELECTOR_IDENTITY_MAX_CHARS: usize = 256;
+
+/// 卡壳选择器桶的形状校验：顶层是对象，每个键为 `<类型>:<身份>`，每个桶也是对象。
+///
+/// 与前端 `normalizeCardShellVariables` 的规范形一致；前端写入前总会先归一化，
+/// 所以合法写入不会被拒。
+pub fn validate_card_shell_variables(value: &serde_json::Value) -> Result<(), TauriCommandError> {
+    let Some(buckets) = value.as_object() else {
+        return Err(TauriCommandError::validation("卡壳变量必须是选择器桶对象"));
+    };
+    let size = serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if size > CARD_SHELL_VARIABLES_MAX_BYTES {
+        return Err(TauriCommandError::validation(format!(
+            "卡壳变量不能超过 {} KiB（当前 {} KiB）",
+            CARD_SHELL_VARIABLES_MAX_BYTES / 1024,
+            size.div_ceil(1024)
+        )));
+    }
+    for (key, bucket) in buckets {
+        let valid_key = key.split_once(':').is_some_and(|(kind, identity)| {
+            CARD_SHELL_SELECTOR_TYPES.contains(&kind)
+                && !identity.is_empty()
+                && identity.chars().count() <= CARD_SHELL_SELECTOR_IDENTITY_MAX_CHARS
+        });
+        let shown = || key.chars().take(64).collect::<String>();
+        if !valid_key {
+            return Err(TauriCommandError::validation(format!(
+                "卡壳变量桶键无效: {}",
+                shown()
+            )));
+        }
+        if !bucket.is_object() {
+            return Err(TauriCommandError::validation(format!(
+                "卡壳变量桶必须是对象: {}",
+                shown()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 卡壳选择器桶的专用写入口：只写 [`CARD_SHELL_VARIABLES_KEY`]。
+///
+/// 通用的 `set_campaign_variable` 经 [`validate_variable_write_key`] 拒绝 `__`
+/// 段（T-06），该守卫不放宽；桶写入在这里校验形状与大小后整体替换。
+/// 活动 Turn 屏障 + 读改写 + 写盘与其它变量写入相同（`mutate_idle_campaign`）。
+pub fn set_card_shell_variables_for_backend(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+    variables: serde_json::Value,
+) -> Result<(), TauriCommandError> {
+    validate_card_shell_variables(&variables)?;
+    let applied = storage
+        .mutate_idle_campaign(campaign_id, |campaign| {
+            campaign.set_variable(CARD_SHELL_VARIABLES_KEY, variables.clone(), 0);
+            Ok(())
+        })
+        .map_err(|error| TauriCommandError::storage(format!("保存卡壳变量失败: {error}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]

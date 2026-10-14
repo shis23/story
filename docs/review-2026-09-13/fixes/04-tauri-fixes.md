@@ -146,6 +146,15 @@ Lead 已裁定**本轮保留 + 声明、不删除**；风险（P0-2 未关闭前
   validate_variable_write_key(&key)?;                              // 归一化后再校验
   ```
 
+- **2026-10-14 回归修复**：本守卫同样拒绝卡壳选择器桶 `__storyforge_card_shell_variables`，
+  而 `CardShellHost.vue` 的 `persistShellSelectorVariables` 一直经 `set_campaign_variable` 写它，
+  于是桶从此落不了盘（壳只剩 iframe 内快照，控制台报 `[CardShell] variable persistence failed`）。
+  守卫不放宽；新增专用命令 `set_card_shell_variables`（`app-service` 的
+  `set_card_shell_variables_for_backend`：只写该键，校验 `<类型>:<身份>` 桶形状与 2 MiB 上限，
+  同一 `mutate_idle_campaign` 屏障），前端 wrapper `setCardShellVariables`。桶重新落盘后，
+  `__storyforge*` 键（`domain::variables::is_reserved_variable_key`）不进提示词注入、模板上下文、
+  后处理变量目录，后处理 LLM 写入同样丢弃，变量页不展示。
+
 ### T-07 `log_clear` 未知 kind 静默清空全部日志 → 已修复
 
 - **修法**：`crates/tauri-app/src/commands/diagnostics.rs` 的 `log_clear` 由返回 `()` 改为

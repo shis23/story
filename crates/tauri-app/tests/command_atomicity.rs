@@ -592,6 +592,203 @@ fn json_idle_instance_and_task_commands_rejected_atomically_with_active_turn() {
     let _ = dir;
 }
 
+// ─── 卡壳选择器桶：通用变量写入口拒绝内部键（T-06）────────────────────────
+
+const CARD_SHELL_BUCKET_KEY: &str = "__storyforge_card_shell_variables";
+
+fn card_shell_campaign(label: &str) -> (tempfile::TempDir, Arc<AppState>, Id) {
+    let dir = temp_dir(label);
+    let state = json_state(dir.path());
+    let card = make_card("card-1", false);
+    state.storage().save_card(card.clone()).unwrap();
+    let campaign = make_campaign(&card.id, label);
+    let campaign_id = campaign.id.clone();
+    state
+        .storage()
+        .create_campaign_with_instances(campaign)
+        .unwrap();
+    (dir, state, campaign_id)
+}
+
+#[test]
+fn json_card_shell_bucket_rejected_by_general_variable_setter() {
+    // CardShellHost.persistShellSelectorVariables 以前经 set_campaign_variable
+    // 写 __storyforge_card_shell_variables；T-06 的键名守卫拒绝 `__` 段，于是
+    // 桶永远落不了盘。通用入口必须继续拒绝（守卫不放宽），桶走专用入口。
+    let (dir, state, campaign_id) = card_shell_campaign("shell-general");
+    let error = storyforge_lib::set_campaign_variable(
+        campaign_id.as_str().to_string(),
+        CARD_SHELL_BUCKET_KEY.into(),
+        serde_json::json!({ "chat:current": { "hp": 3 } }),
+        None,
+        to_state(&state),
+    )
+    .expect_err("the general setter must keep rejecting the internal bucket key");
+    assert!(
+        matches!(
+            error,
+            storyforge_lib::error::TauriCommandError::Validation { .. }
+        ),
+        "error: {error:?}"
+    );
+    let after = state
+        .storage()
+        .get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap()
+        .campaign;
+    assert_eq!(after.get_variable(CARD_SHELL_BUCKET_KEY), None);
+    let on_disk = reload_campaigns(dir.path());
+    assert_eq!(on_disk[0].get_variable(CARD_SHELL_BUCKET_KEY), None);
+}
+
+#[test]
+fn json_card_shell_variables_persist_through_dedicated_command() {
+    // 前端 cardShellVariableStore.js 的键与后端常量必须是同一个字符串。
+    assert_eq!(
+        storyforge_lib::services::variables::CARD_SHELL_VARIABLES_KEY,
+        CARD_SHELL_BUCKET_KEY
+    );
+    let (dir, state, campaign_id) = card_shell_campaign("shell-dedicated");
+    let keys = |state: &Arc<AppState>| -> Vec<String> {
+        let campaign = state
+            .storage()
+            .get_campaign(&campaign_id)
+            .unwrap()
+            .unwrap()
+            .campaign;
+        let mut keys: Vec<String> = campaign.variables.into_iter().map(|v| v.key).collect();
+        keys.sort();
+        keys
+    };
+    let mut expected_keys = keys(&state);
+    expected_keys.push(CARD_SHELL_BUCKET_KEY.to_string());
+    expected_keys.sort();
+
+    let first = serde_json::json!({
+        "chat:current": { "hp": 3, "theme": "night" },
+        "message:7": { "mood": "calm" },
+    });
+    storyforge_lib::set_card_shell_variables(
+        campaign_id.as_str().to_string(),
+        first.clone(),
+        to_state(&state),
+    )
+    .expect("the dedicated bucket command must persist selector buckets");
+    // 只新增桶键，不碰其它变量；重开存储（模拟重启）后仍在。
+    assert_eq!(keys(&state), expected_keys);
+    let on_disk = reload_campaigns(dir.path());
+    assert_eq!(on_disk[0].get_variable(CARD_SHELL_BUCKET_KEY), Some(&first));
+
+    // 整体替换：前端每次发送的是读改写后的完整快照。
+    let second = serde_json::json!({ "chat:current": { "hp": 2 } });
+    storyforge_lib::set_card_shell_variables(
+        campaign_id.as_str().to_string(),
+        second.clone(),
+        to_state(&state),
+    )
+    .expect("a second bucket write must replace the snapshot");
+    let on_disk = reload_campaigns(dir.path());
+    assert_eq!(
+        on_disk[0].get_variable(CARD_SHELL_BUCKET_KEY),
+        Some(&second)
+    );
+    assert_eq!(keys(&state), expected_keys);
+}
+
+#[test]
+fn json_card_shell_variables_reject_malformed_or_oversized_payloads() {
+    let (dir, state, campaign_id) = card_shell_campaign("shell-invalid");
+    let max = storyforge_lib::services::variables::CARD_SHELL_VARIABLES_MAX_BYTES;
+    let mut long_identity = serde_json::Map::new();
+    long_identity.insert(
+        format!("message:{}", "9".repeat(257)),
+        serde_json::json!({}),
+    );
+    let cases = [
+        ("array", serde_json::json!([])),
+        ("string", serde_json::json!("chat:current")),
+        (
+            "unknown selector type",
+            serde_json::json!({ "stat_data:current": {} }),
+        ),
+        ("legacy type-only key", serde_json::json!({ "chat": {} })),
+        ("empty identity", serde_json::json!({ "chat:": {} })),
+        (
+            "identity too long",
+            serde_json::Value::Object(long_identity),
+        ),
+        (
+            "bucket is not an object",
+            serde_json::json!({ "chat:current": 3 }),
+        ),
+        (
+            "oversized",
+            serde_json::json!({ "global:current": { "blob": "x".repeat(max) } }),
+        ),
+    ];
+    for (label, payload) in cases {
+        let error = storyforge_lib::set_card_shell_variables(
+            campaign_id.as_str().to_string(),
+            payload,
+            to_state(&state),
+        )
+        .expect_err(label);
+        assert!(
+            matches!(
+                error,
+                storyforge_lib::error::TauriCommandError::Validation { .. }
+            ),
+            "{label}: {error:?}"
+        );
+    }
+    let on_disk = reload_campaigns(dir.path());
+    assert_eq!(on_disk[0].get_variable(CARD_SHELL_BUCKET_KEY), None);
+
+    // 未知 Campaign → not_found，不凭空建记录。
+    let error = storyforge_lib::set_card_shell_variables(
+        "camp-missing".into(),
+        serde_json::json!({ "chat:current": {} }),
+        to_state(&state),
+    )
+    .expect_err("unknown campaign");
+    assert!(
+        matches!(
+            error,
+            storyforge_lib::error::TauriCommandError::NotFound { .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn json_card_shell_variables_rejected_when_active_turn() {
+    // 与其它变量写入同一屏障：活动 Turn 存在时拒绝且不写入。
+    let (_dir, state, campaign_id) = card_shell_campaign("shell-active");
+    let conversation = state.conv_store.create(None, Some(campaign_id.clone()));
+    state
+        .storage()
+        .json_turn_store("seed active turn")
+        .unwrap()
+        .create_turn(active_turn_record(&campaign_id, &conversation.id))
+        .unwrap();
+
+    let error = storyforge_lib::set_card_shell_variables(
+        campaign_id.as_str().to_string(),
+        serde_json::json!({ "chat:current": { "hp": 3 } }),
+        to_state(&state),
+    )
+    .expect_err("bucket write must be rejected while an active turn exists");
+    assert!(error.to_string().contains("未完成的轮次"), "error: {error}");
+    let after = state
+        .storage()
+        .get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap()
+        .campaign;
+    assert_eq!(after.get_variable(CARD_SHELL_BUCKET_KEY), None);
+}
+
 // ─── 三.6：create / fork Campaign bundle 原子性 ────────────────────────────
 
 #[test]

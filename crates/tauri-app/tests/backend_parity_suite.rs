@@ -714,6 +714,36 @@ impl ParityDriver {
                 Err(e) => self.push(name, classify(&e), e.to_string()),
             }
         }
+        // 卡壳选择器桶：通用入口拒绝 __ 内部键（T-06），专用入口落盘。
+        match storyforge_lib::set_campaign_variable(
+            cid.as_str().to_string(),
+            "__storyforge_card_shell_variables".to_string(),
+            serde_json::json!({ "chat:current": { "hp": 3 } }),
+            Some(0),
+            tauri_state_for_test(&st),
+        ) {
+            Ok(()) => self.push("set_var_shell_bucket_general", "ok", "unexpected".into()),
+            Err(e) => self.push("set_var_shell_bucket_general", classify(&e), e.to_string()),
+        }
+        for (name, buckets) in [
+            (
+                "set_card_shell_variables",
+                serde_json::json!({ "chat:current": { "hp": 3 }, "message:7": { "mood": "calm" } }),
+            ),
+            (
+                "set_card_shell_variables_bad_key",
+                serde_json::json!({ "stat_data:current": {} }),
+            ),
+        ] {
+            match storyforge_lib::set_card_shell_variables(
+                cid.as_str().to_string(),
+                buckets,
+                tauri_state_for_test(&st),
+            ) {
+                Ok(()) => self.push(name, "ok", "ok".into()),
+                Err(e) => self.push(name, classify(&e), e.to_string()),
+            }
+        }
         match storyforge_lib::add_campaign_variable(
             cid.as_str().to_string(),
             "mood".to_string(),
@@ -2266,6 +2296,35 @@ async fn backend_parity_equivalent_domain_snapshots() {
     let sqlite_out = sqlite_driver.run(None).await;
 
     compare_phase_outputs(&json_out, &sqlite_out);
+
+    // 卡壳选择器桶：等价之外还要确认结果本身——通用入口拒绝、专用入口落盘。
+    for (name, kind) in [
+        ("set_var_shell_bucket_general", "validation"),
+        ("set_card_shell_variables", "ok"),
+        ("set_card_shell_variables_bad_key", "validation"),
+    ] {
+        let record = sqlite_out
+            .results
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing op {name}"));
+        assert_eq!(record.kind, kind, "{name}: {}", record.message);
+    }
+    let bucket_persisted = sqlite_out.snapshot_before_delete["campaigns"]
+        .as_array()
+        .is_some_and(|campaigns| {
+            campaigns.iter().any(|campaign| {
+                campaign["variables"].as_array().is_some_and(|variables| {
+                    variables
+                        .iter()
+                        .any(|v| v["key"] == "__storyforge_card_shell_variables")
+                })
+            })
+        });
+    assert!(
+        bucket_persisted,
+        "SQLite must persist the card-shell bucket"
+    );
 }
 
 // ─── 三.2 重启子进程入口 ────────────────────────────────────────────────

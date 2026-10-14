@@ -3216,6 +3216,10 @@ fn prompt_template_context_from_campaign_runtime(
     variables.insert("campaign.name".into(), runtime.campaign.name.clone());
     variables.insert("turn".into(), runtime.turn.to_string());
     for variable in &runtime.campaign.variables {
+        // __storyforge* 是宿主状态（卡壳选择器桶等），不进模板上下文。
+        if storyforge_domain::variables::is_reserved_variable_key(&variable.key) {
+            continue;
+        }
         insert_template_variable(&mut variables, &variable.key, &variable.value);
         insert_template_variable(
             &mut variables,
@@ -4141,7 +4145,7 @@ fn push_mvu_js_variable_updates(
 
 /// 保留命名空间判定：`__storyforge` 前缀，trim + ASCII 大小写不敏感（M-04）。
 fn is_reserved_mvu_key(key: &str) -> bool {
-    key.trim().to_ascii_lowercase().starts_with("__storyforge")
+    storyforge_domain::variables::is_reserved_variable_key(key)
 }
 
 /// W-25：实例作用域变量在 JS 快照里的别名键（`instance.<instance_id>.<key>`）。
@@ -9206,6 +9210,43 @@ mod tests {
             rendered,
             "林医生 谨慎的外科医生 hp=72 loc=旧医院 clock=Day 9 夜 weather=雨"
         );
+    }
+
+    #[test]
+    fn test_prompt_template_context_and_injection_skip_card_shell_bucket() {
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let mut campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
+        campaign.set_variable("weather", serde_json::json!("雨"), 3);
+        campaign.set_variable(
+            "__storyforge_card_shell_variables",
+            serde_json::json!({ "chat:current": { "note": "壳内状态" } }),
+            0,
+        );
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 3,
+        });
+        let template = prompt_template_context_from_campaign_runtime(&runtime)
+            .expect("campaign template context");
+        let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "w={{getvar::weather}} a={{getvar::__storyforge_card_shell_variables}} b={{getvar::campaign.__storyforge_card_shell_variables}}",
+            &template,
+        );
+        assert!(rendered.starts_with("w=雨 "), "{rendered}");
+        assert!(!rendered.contains("壳内状态"), "{rendered}");
+
+        let injected = storyforge_domain::variables::render_variables_for_injection(
+            &runtime.campaign.variables,
+            &[],
+        );
+        assert!(injected.contains("雨"));
+        assert!(!injected.contains("壳内状态"), "{injected}");
     }
 
     #[test]

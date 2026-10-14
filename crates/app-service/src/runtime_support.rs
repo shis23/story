@@ -1638,7 +1638,12 @@ pub fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
     for field in &runtime.campaign.variable_schema {
         insert_postprocess_schema_hint(&mut catalog, "campaign", "全局", field);
     }
-    for variable in &runtime.campaign.variables {
+    for variable in runtime
+        .campaign
+        .variables
+        .iter()
+        .filter(|v| !storyforge_domain::variables::is_reserved_variable_key(&v.key))
+    {
         catalog
             .entry(format!("campaign:{}", variable.key))
             .or_insert_with(|| {
