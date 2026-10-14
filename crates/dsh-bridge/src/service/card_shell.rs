@@ -4,9 +4,14 @@
 //! `inlineShellTriggers` 同口径：`.load(url)` 只认清单里的 URL，内联文档只认卡正则在原文里的
 //! 命中），并用同一份主机白名单代取远程资源、钉壳文档的 CSP。清单不带内联正文——消息里的
 //! 界面正文取自展示文本，插件不需要卡里的原始 HTML / JS。
+//!
+//! 壳自己的界面状态（TavernHelper 选择器桶）经 [`BridgeService::set_card_shell_variables`]
+//! 写回存档，与桌面 `set_card_shell_variables` 同一入口。
 
 use serde::Serialize;
+use serde_json::Value;
 
+use storyforge_app_service::services::variables::set_card_shell_variables_for_backend;
 use storyforge_app_service::startup_support::stored_info_to_character;
 use storyforge_domain::Id;
 use storyforge_domain::card_shell::{
@@ -83,6 +88,23 @@ impl BridgeService {
                 .map(|host| (*host).to_string())
                 .collect(),
         })
+    }
+
+    /// 整体替换存档的卡壳选择器桶（`__storyforge_card_shell_variables`）。插件按存档串行
+    /// 读改写后把整份快照交给这里；形状与 2 MiB 上限由 app-service 校验。占写作锁：
+    /// 写作进行中会排到这一轮收尾之后。
+    pub async fn set_card_shell_variables(
+        &self,
+        campaign_id: &str,
+        variables: Value,
+    ) -> Result<(), BridgeError> {
+        let _guard = self.acquire().await;
+        set_card_shell_variables_for_backend(
+            self.app.storage(),
+            &Id::from_str(campaign_id),
+            variables,
+        )?;
+        Ok(())
     }
 
     /// 存档所用角色卡的源角色 id（`StoredCharacter.id` 或导入时记下的 `source_character_id`）。

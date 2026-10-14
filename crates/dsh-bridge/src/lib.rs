@@ -22,13 +22,16 @@
 //!   campaign_id?}` → `{items: {key: NodeDisplay | null}}`（`campaign_id` 是 DSH 会话当前
 //!   对应的存档；只读，不占写作锁；解析规则见 `BridgeService::display_nodes`，一次最多
 //!   `MAX_DISPLAY_REFS` 条）
+//! - `card_shell.manifest {campaign_id}` → `CardShellInfo`（卡的壳清单与可代取主机；只读）
+//! - `card_shell.variables_set {campaign_id, variables}` → `{ok}`（整体替换存档的卡壳
+//!   选择器桶 `__storyforge_card_shell_variables`；形状与大小不对整份拒绝）
 //! - `mvu.status {campaign_id}` → `MvuStatus`（卡的 MVU 翻译、角色定义、实例与 Campaign
 //!   变量、待应用的变量定义；只读，不占写作锁）
 //! - `mvu.analyze {campaign_id}` → `MvuAnalyzed`（手动分析，调用一次底层模型）
 //! - `mvu.apply {campaign_id}` → `MvuStatus`（把翻译出的变量定义应用到卡内角色）
 //! - `variables.set {campaign_id, writes: [{scope: "campaign" | "instance", instance_id?,
 //!   key, value}]}` → `{results, status}`（逐条写，单条失败不影响其它条；一次最多
-//!   `MAX_VARIABLE_WRITES` 条）。后三个都先等上一轮收尾结束
+//!   `MAX_VARIABLE_WRITES` 条）。后三个与 `card_shell.variables_set` 都先等上一轮收尾结束
 //! - `bridge.shutdown {}` → `{}` 后退出
 //!
 //! sidecar → 插件：
@@ -231,6 +234,18 @@ pub async fn handle_request(
             encode(serde_json::to_value(
                 service.card_shell_manifest(&campaign_id).map_err(to_rpc)?,
             ))
+        }
+        "card_shell.variables_set" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let variables = params
+                .get("variables")
+                .cloned()
+                .ok_or_else(|| RpcError::new("invalid_params", "缺少参数 variables"))?;
+            service
+                .set_card_shell_variables(&campaign_id, variables)
+                .await
+                .map_err(to_rpc)?;
+            Ok(json!({ "ok": true }))
         }
         "mvu.status" => {
             let campaign_id = string_param(params, "campaign_id")?;

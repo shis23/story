@@ -523,3 +523,94 @@ async fn card_shell_manifest_lists_the_card_shells_and_display_keeps_the_source(
         .expect_err("不存在的存档");
     assert!(missing.to_string().contains("not_found"), "{missing}");
 }
+
+/// 卡壳自己的界面状态（选择器桶）写回存档：`mvu.status` 读得到，sidecar 重启后仍在。
+/// 形状不对的整份拒绝、存档里的旧值不动；通用 `variables.set` 照旧写不了这个内部键。
+#[tokio::test(flavor = "multi_thread")]
+async fn card_shell_variables_are_saved_and_survive_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("bridge-data");
+    let mut first = FakePlugin::spawn(&data_dir);
+    let created = create_campaign(&mut first, &write_shell_card(temp.path())).await;
+    let campaign = created["campaign_id"].as_str().unwrap().to_string();
+
+    let buckets = json!({ "chat:current": { "tab": "status", "theme": { "dark": true } } });
+    let saved = first
+        .request(
+            "card_shell.variables_set",
+            json!({ "campaign_id": campaign, "variables": buckets }),
+        )
+        .await
+        .expect("card_shell.variables_set");
+    assert_eq!(saved, json!({ "ok": true }));
+
+    for (variables, code) in [
+        (json!({ "chat": {} }), "validation"),
+        (json!({ "chat:current": 1 }), "validation"),
+        (json!([]), "validation"),
+    ] {
+        let refused = first
+            .request(
+                "card_shell.variables_set",
+                json!({ "campaign_id": campaign, "variables": variables }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused["code"], code, "{variables} -> {refused}");
+    }
+    let missing = first
+        .request(
+            "card_shell.variables_set",
+            json!({ "campaign_id": campaign }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing["code"], "invalid_params", "{missing}");
+    let gone = first
+        .request(
+            "card_shell.variables_set",
+            json!({ "campaign_id": "no-such-campaign", "variables": {} }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(gone["code"], "not_found", "{gone}");
+
+    let written = mvu(
+        &mut first,
+        "variables.set",
+        json!({ "campaign_id": campaign, "writes": [{
+            "scope": "campaign", "key": "__storyforge_card_shell_variables", "value": {}
+        }] }),
+    )
+    .await;
+    assert_eq!(written["results"][0]["ok"], false, "{written}");
+    assert_eq!(
+        variable(
+            &written["status"]["campaign_variables"],
+            "__storyforge_card_shell_variables"
+        ),
+        Some(&buckets)
+    );
+
+    first
+        .request("bridge.shutdown", json!({}))
+        .await
+        .expect("bridge.shutdown");
+    first.child.wait().await.unwrap();
+
+    let mut second = FakePlugin::spawn(&data_dir);
+    second.wait_notification("bridge.ready").await;
+    let status = mvu(
+        &mut second,
+        "mvu.status",
+        json!({ "campaign_id": campaign }),
+    )
+    .await;
+    assert_eq!(
+        variable(
+            &status["campaign_variables"],
+            "__storyforge_card_shell_variables"
+        ),
+        Some(&buckets)
+    );
+}

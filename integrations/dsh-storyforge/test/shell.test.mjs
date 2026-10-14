@@ -16,7 +16,7 @@ import {
   cacheName,
   createDocRegistry,
   createShellFetcher,
-  createShellVariableBuckets,
+  createShellVariableStore,
   findShellSegment,
   isTextResource,
   rewriteModuleScripts,
@@ -386,17 +386,124 @@ test('文本判定与缓存文件名和桌面同口径', () => {
 
 //#region 选择器变量桶
 
-test('变量桶：按存档隔离，replace / merge / patch 与桌面同语义', () => {
-  const buckets = createShellVariableBuckets()
-  assert.deepEqual(buckets.get('c1'), {})
-  buckets.apply('c1', { type: 'chat' }, { theme: 'dark', size: 2 }, 'replace')
-  buckets.apply('c1', { type: 'chat' }, { size: 3 }, 'merge')
-  assert.deepEqual(buckets.get('c1')['chat:current'], { theme: 'dark', size: 3 })
-  buckets.apply('c1', { type: 'chat' }, { sets: { lang: 'zh' }, deletes: ['theme'] }, 'patch')
-  assert.deepEqual(buckets.get('c1')['chat:current'], { size: 3, lang: 'zh' })
-  buckets.apply('c1', { type: 'chat' }, { only: true }, undefined)
-  assert.deepEqual(buckets.get('c1')['chat:current'], { only: true })
-  assert.deepEqual(buckets.get('c2'), {})
+/** 假的 sidecar 两端：`load` 读存档里的桶，`save` 记下写入；`gate` 可以把写入卡住。 */
+function fakeSave(initial = {}) {
+  const saved = new Map(Object.entries(initial))
+  const calls = { load: [], save: [] }
+  let gate = null
+  return {
+    saved,
+    calls,
+    hold() {
+      let release
+      gate = new Promise((done) => (release = done))
+      return () => {
+        gate = null
+        release()
+      }
+    },
+    load: async (campaignId) => {
+      calls.load.push(campaignId)
+      return saved.get(campaignId)
+    },
+    save: async (campaignId, variables) => {
+      calls.save.push([campaignId, structuredClone(variables)])
+      if (gate) await gate
+      saved.set(campaignId, structuredClone(variables))
+    },
+  }
+}
+
+const campaign = (id) => ({ key: `campaign:${id}`, campaignId: id })
+
+test('变量桶：replace / merge / patch 与桌面同语义，没关联存档的只在内存', async () => {
+  const sidecar = fakeSave()
+  const store = createShellVariableStore(sidecar)
+  const unlinked = { key: 'unlinked:s1', campaignId: null }
+  assert.deepEqual(await store.get(unlinked), {})
+  await store.apply(unlinked, { type: 'chat' }, { theme: 'dark', size: 2 }, 'replace')
+  await store.apply(unlinked, { type: 'chat' }, { size: 3 }, 'merge')
+  assert.deepEqual((await store.get(unlinked))['chat:current'], { theme: 'dark', size: 3 })
+  await store.apply(unlinked, { type: 'chat' }, { sets: { lang: 'zh' }, deletes: ['theme'] }, 'patch')
+  assert.deepEqual((await store.get(unlinked))['chat:current'], { size: 3, lang: 'zh' })
+  await store.apply(unlinked, { type: 'chat' }, { only: true }, undefined)
+  assert.deepEqual((await store.get(unlinked))['chat:current'], { only: true })
+  assert.deepEqual(await store.get({ key: 'unlinked:s2', campaignId: null }), {})
+  await store.flush()
+  assert.deepEqual(sidecar.calls, { load: [], save: [] })
+})
+
+test('变量桶：关联存档的从存档读（旧形状归一化）、写回存档，读只发生一次', async () => {
+  const sidecar = fakeSave({ c1: { chat: { theme: 'dark' }, 'bogus key': { x: 1 } } })
+  const store = createShellVariableStore(sidecar)
+  assert.deepEqual(await store.get(campaign('c1')), { 'chat:current': { theme: 'dark' } })
+  await store.apply(campaign('c1'), { type: 'global' }, { sets: { lang: 'zh' }, deletes: [] }, 'patch')
+  await store.flush()
+  assert.deepEqual(sidecar.saved.get('c1'), { 'chat:current': { theme: 'dark' }, 'global:current': { lang: 'zh' } })
+  assert.deepEqual(await store.get(campaign('c2')), {})
+  assert.deepEqual(sidecar.calls.load, ['c1', 'c2'])
+})
+
+test('变量桶：两个壳同时写不互相抹掉，落盘合并成最新快照', async () => {
+  const sidecar = fakeSave()
+  const store = createShellVariableStore(sidecar)
+  await store.apply(campaign('c1'), { type: 'chat' }, { sets: { a: 1 }, deletes: [] }, 'patch')
+  const release = sidecar.hold()
+  await store.apply(campaign('c1'), { type: 'chat' }, { sets: { b: 2 }, deletes: [] }, 'patch')
+  // 第二次写入卡在 sidecar（写作锁）时壳照常得到回复，后续写入只记一笔。
+  await Promise.all([
+    store.apply(campaign('c1'), { type: 'chat' }, { sets: { c: 3 }, deletes: [] }, 'patch'),
+    store.apply(campaign('c1'), { type: 'message', message_id: 7 }, { open: true }, 'replace'),
+  ])
+  assert.deepEqual(await store.get(campaign('c1')), { 'chat:current': { a: 1, b: 2, c: 3 }, 'message:7': { open: true } })
+  release()
+  await store.flush()
+  const snapshots = sidecar.calls.save.map(([, variables]) => variables)
+  // 第一次、卡住的第二次、放开后合并的一次（不合并会是 4 次）。
+  assert.equal(snapshots.length, 3)
+  assert.deepEqual(snapshots.at(-1), { 'chat:current': { a: 1, b: 2, c: 3 }, 'message:7': { open: true } })
+  assert.deepEqual(sidecar.saved.get('c1'), snapshots.at(-1))
+})
+
+test('变量桶：落盘失败记日志、下一次写入带整份快照重试；读失败不缓存', async () => {
+  const sidecar = fakeSave()
+  const lines = []
+  let failSave = true
+  let failLoad = true
+  const store = createShellVariableStore({
+    load: async (campaignId) => {
+      if (failLoad) throw new Error('sidecar 不可用')
+      return sidecar.load(campaignId)
+    },
+    save: async (campaignId, variables) => {
+      if (failSave) throw new Error('storage: 磁盘满')
+      return sidecar.save(campaignId, variables)
+    },
+    log: (line) => lines.push(line),
+  })
+  await assert.rejects(store.get(campaign('c1')), /sidecar 不可用/)
+  failLoad = false
+  await store.apply(campaign('c1'), { type: 'chat' }, { a: 1 }, 'replace')
+  await store.flush()
+  assert.match(lines.join(' | '), /card shell variables not saved: campaign=c1 storage: 磁盘满/)
+  assert.equal(sidecar.saved.has('c1'), false)
+  failSave = false
+  await store.apply(campaign('c1'), { type: 'chat' }, { b: 2 }, 'merge')
+  await store.flush()
+  assert.deepEqual(sidecar.saved.get('c1'), { 'chat:current': { a: 1, b: 2 } })
+})
+
+test('变量桶：整份超过上限拒绝写入，快照不变', async () => {
+  const sidecar = fakeSave()
+  const store = createShellVariableStore({ ...sidecar, maxBytes: 64 })
+  await store.apply(campaign('c1'), { type: 'chat' }, { a: 1 }, 'replace')
+  await assert.rejects(
+    store.apply(campaign('c1'), { type: 'chat' }, { big: 'x'.repeat(80) }, 'merge'),
+    (error) => error.status === 413,
+  )
+  assert.deepEqual(await store.get(campaign('c1')), { 'chat:current': { a: 1 } })
+  await store.flush()
+  assert.deepEqual(sidecar.saved.get('c1'), { 'chat:current': { a: 1 } })
 })
 
 //#endregion
