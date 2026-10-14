@@ -5,6 +5,10 @@
   "type": "module",
   "description": "StoryForge 多 Agent 写作管线的 DSH 插件（PoC）",
   "main": "lib/index.js",
+  "files": [
+    "lib/",
+    "storyforge.patch.yml"
+  ],
   "exports": {
     ".": "./lib/index.js",
     "./agent": "./lib/agent.js",

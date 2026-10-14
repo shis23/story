@@ -23,6 +23,7 @@ import { basename, dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { BridgeRpcError, createBridge } from './bridge.js'
+import { resolveBridgeBin } from './bridge-bin.js'
 import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
 import { splitForDsh } from './html.js'
 import { interactionTarget, panelModel, planInteraction, resolveVariableWrite, statusSections } from './mvu.js'
@@ -837,12 +838,6 @@ function displayQuery(ref) {
   if (ref.nodeIndex !== undefined && !(Number.isInteger(ref.nodeIndex) && ref.nodeIndex >= 0)) return null
   return { key: ref.key, conversation_id: ref.conversationId, node_id: ref.nodeId, node_index: ref.nodeIndex }
 }
-const DEFAULT_BRIDGE_BIN = resolve(
-  PLUGIN_ROOT,
-  '../../target/debug',
-  process.platform === 'win32' ? 'storyforge-dsh-bridge.exe' : 'storyforge-dsh-bridge',
-)
-
 export function apply(ctx, config) {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const dataDir = config?.dataDir || join(dshHome, 'storyforge')
@@ -962,8 +957,10 @@ export function apply(ctx, config) {
     }
   }
 
+  const bridgeBin = resolveBridgeBin({ configured: config?.bridgeBin, pluginRoot: PLUGIN_ROOT })
+  log(`bridge binary (${bridgeBin.source}): ${bridgeBin.path}`)
   const bridge = createBridge({
-    binPath: config?.bridgeBin || DEFAULT_BRIDGE_BIN,
+    binPath: bridgeBin.path,
     dataDir: config?.bridgeDataDir || join(dataDir, 'bridge-data'),
     logFile: join(dataDir, 'logs', 'bridge.log'),
     serveLlm: serveLogged,

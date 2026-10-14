@@ -14,6 +14,7 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 |---|---|
 | `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 与卡片界面取回 `/display`、净化库 `/vendor/purify.js`、卡片界面 `/shell/*`（挂载、壳文档、宿主代取、Mvu 只读数据、界面状态、确认后的变量写入、开场选择、世界书读写）与桌面模块打包 `/vendor/card-shell.js`、卡内状态 `/mvu`（读取 / 分析 / 应用变量定义 / 交互按钮）、调试） |
 | `lib/bridge.js` | sidecar 管理：懒启动、按行收发 JSON-RPC、执行 sidecar 发来的 `llm.stream`、转发管线事件 |
+| `lib/bridge-bin.js` | sidecar 可执行文件的查找顺序：配置 `bridgeBin` > 随插件装好的平台包 `dsh-plugin-storyforge-bridge-<platform>-<arch>` > 仓库 debug 产物 |
 | `lib/agent.js` | StoryForge 预设里的 agent 作用域插件：每次模型请求钉到 `storyforge/pipeline`；记录 agent 创建 / 分叉 |
 | `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板（故事信息 + 卡内状态：状态行、交互按钮）、会话头按钮、停靠条（兼登记本会话的输入框，交互按钮经它发下一轮提示）、模型锁、每轮回复下方的卡片 HTML 与卡片界面 iframe（`conversation.chat.turnTail` 槽；界面的桥请求、变量写入确认条）。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
 | `lib/html.js` | 卡片 HTML 块切分（与桌面 `splitRawHtmlBlocks` 同口径）：DSH 正文去掉完整块与卡片界面、块数与界面数写进 replayState，`/display` 返回的块附文字版 |
@@ -34,6 +35,8 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `test/html.test.mjs` | 块切分与桌面实现对拍、正文去块与兜底 |
 | `test/mvu.test.mjs` | 卡内状态各函数与桌面实现对拍、面板数据、交互写入目标 |
 | `test/shell.test.mjs` | 卡片界面：信任判定、壳文档注入顺序与 CSP、模块改写、模块前言与开场种子与桌面逐字相同、开场态判定与开场白指纹、一次性文档淘汰、宿主代取（白名单 / IP / 重定向 / 大小 / 缓存）、界面状态桶 |
+| `test/bridge-bin.test.mjs` | sidecar 可执行文件的查找顺序与平台包命名 |
+| `scripts/pack-bridge.mjs` | 本地打包：release 构建 sidecar，打出当前平台的平台包与插件本体两个 npm tarball（不发布） |
 | `test/vendor.test.mjs` | `lib/vendor/card-shell.mjs` 与桌面源码同步（重新打包逐字比对；没装 `frontend` 依赖时跳过） |
 
 插件配置（`storyforge.patch.yml` 里 `config` 下，均可省略；要改就在 profile 自己的补丁里覆盖）：
@@ -42,7 +45,7 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 |---|---|---|
 | `dataDir` | `$DSH_HOME/storyforge` | 会话映射（含已写轮数与最近一次收尾）、设置、收尾报告（`settles.json`）、日志 |
 | `cardsDir` | `<dataDir>/cards` | 「新建故事」可选的角色卡（`.png` / `.json`）；首页「导入角色卡…」也存到这里 |
-| `bridgeBin` | 仓库 `target/debug/storyforge-dsh-bridge(.exe)` | sidecar 可执行文件 |
+| `bridgeBin` | 平台包里的，没装平台包时用仓库 `target/debug/storyforge-dsh-bridge(.exe)` | sidecar 可执行文件；插件日志 `bridge binary (config / package / repo): …` 记着实际用的是哪个 |
 | `bridgeDataDir` | `<dataDir>/bridge-data` | StoryForge 存储，与桌面版数据完全分开。后端与桌面版同一套决议：默认 SQLite（`storyforge.sqlite3`）；早期 PoC 留下的 JSON 目录在 sidecar 下次启动时原地迁移（JSON 文件保留不删），迁移后再设 `STORYFORGE_STORAGE_BACKEND=json` 会拒绝启动。插件日志 `bridge ready: … storage=` 记着实际用的后端 |
 | `fakePipeline` | `false` | 用假管线代替 sidecar |
 | `debugEcho` | `false` | 额外注册调试回显 provider（仅调试：无凭据的临时实例里模拟普通会话） |
@@ -140,6 +143,22 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 - 调试：左侧栏「StoryForge」首页底部的「调试信息」（默认折叠）列出写作引擎进程状态、最近的适配器调用（会话、用途、模型、消息数、工具、
   跳过的注入消息）与 StoryForge 会话的生命周期事件；`/api/storyforge/debug/calls` 另含每次
   调用末尾几条消息的来源结构。
+
+## 本地打包（未发布）
+
+```bash
+node integrations/dsh-storyforge/scripts/pack-bridge.mjs
+```
+
+先 release 构建 sidecar，再在仓库 `target/dsh-dist/` 下打出两个 npm tarball：当前平台的平台包
+`dsh-plugin-storyforge-bridge-<platform>-<arch>`（只有 `bin/` 下的可执行文件，`os` / `cpu` 限定
+平台，版本跟插件一致）和插件本体（按 `package.json` 的 `files`，只含运行时文件）。两个一起装进
+同一个 `node_modules` 后，插件不用配置 `bridgeBin` 就能找到 sidecar。`--skip-build` 用现有的
+release 产物。
+
+还没有发布到任何仓库：包名、发布渠道、各平台的构建机都待定。插件 `package.json` 也还没把平台包
+列成 `optionalDependencies`（列了未发布的包，DSH 装插件时会解析失败）；发布时补上，做法同
+esbuild——包管理器按 `os` / `cpu` 只装当前平台那个。
 
 ## 已知限制
 
