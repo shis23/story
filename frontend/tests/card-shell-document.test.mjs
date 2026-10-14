@@ -143,6 +143,50 @@ test('replaces storage that the opaque sandbox origin refuses with an in-memory 
   assert.equal(openWindow.sessionStorage, real)
 })
 
+test('turns createChatMessages user messages into a composer draft and makes /trigger a no-op', async () => {
+  const script = createCardShellRuntimeCompatibilityScript()
+  const requests = []
+  const slash = new Map()
+  const shellWindow = {
+    TavernHelper: {},
+    registerSlashCommand: (name, callback) => slash.set(name, callback),
+    __sfShellAsk: async (type, payload) => {
+      if (type !== 'chat_draft') return {}
+      requests.push({ type, payload })
+      return { ok: true, drafted: true }
+    },
+  }
+  Function('window', script)(shellWindow)
+
+  assert.equal(shellWindow.TavernHelper.createChatMessages, shellWindow.createChatMessages)
+  assert.equal(await shellWindow.createChatMessages([{ role: 'user', message: '姓名：艾琳' }]), undefined)
+  await shellWindow.createChatMessages([{ message: '种族：精灵' }, { role: 'user', message: '  ' }])
+  assert.deepEqual(requests, [
+    { type: 'chat_draft', payload: { text: '姓名：艾琳' } },
+    { type: 'chat_draft', payload: { text: '姓名：艾琳\n\n种族：精灵' } },
+  ])
+
+  // /trigger 只清掉已交给输入框的片段，下一次 createChatMessages 重新起草。
+  assert.equal(slash.get('trigger')(), '')
+  await shellWindow.createChatMessages({ role: 'user', mes: '新的开局' })
+  assert.deepEqual(requests.at(-1), { type: 'chat_draft', payload: { text: '新的开局' } })
+
+  // 只收用户消息；空消息不打扰宿主。
+  await assert.rejects(
+    shellWindow.createChatMessages([{ role: 'assistant', message: '旁白' }]),
+    /only add user messages \(got assistant\)/,
+  )
+  const before = requests.length
+  await shellWindow.createChatMessages([])
+  assert.equal(requests.length, before)
+
+  // 卡或宿主已有实现时不覆盖。
+  const own = async () => 'own'
+  const ownWindow = { TavernHelper: {}, createChatMessages: own, __sfShellAsk: async () => null }
+  Function('window', script)(ownWindow)
+  assert.equal(ownWindow.createChatMessages, own)
+})
+
 test('maps selector variables and MVU writes to the shell persistence bridge', async () => {
   const script = createCardShellRuntimeCompatibilityScript({
     selectorVariables: {
