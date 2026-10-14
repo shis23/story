@@ -261,3 +261,37 @@ pub fn apply_campaign_world_info_to_tool_ctx(
         ctx.world_info = Some(std::sync::Arc::new(book.clone()));
     }
 }
+
+/// 列出本局世界书（Tauri `list_campaign_world_info` 与非 Tauri 宿主共用）：本局书还空着
+/// 时按卡模板惰性拷贝，并在它是活跃活动时刷新 tool_ctx。
+pub fn list_campaign_world_info_for_host(
+    state: &AppState,
+    campaign_id: &Id,
+) -> Result<CampaignWorldInfoDto, TauriCommandError> {
+    require_world_info_supported(state, "list campaign world info")?;
+    let book = crate::backend_workflows::load_campaign_world_info_for_backend(
+        state.storage(),
+        state,
+        campaign_id,
+    )
+    .map_err(TauriCommandError::storage)?;
+    apply_campaign_world_info_to_tool_ctx(state, campaign_id, &book);
+    Ok(book_to_campaign_world_info_dto(campaign_id, &book))
+}
+
+/// 只改本局世界书一条的启用状态（Tauri `set_campaign_world_info_enabled` 与非 Tauri
+/// 宿主共用）：不动正文、关键词与注入路由，卡壳核心选择器只拥有这一位。
+pub fn set_campaign_world_info_enabled_for_host(
+    state: &AppState,
+    campaign_id: &Id,
+    entry_index: usize,
+    enabled: bool,
+) -> Result<(), TauriCommandError> {
+    require_world_info_supported(state, "set campaign world info enabled")?;
+    let book = state
+        .storage()
+        .set_world_info_entry_enabled(campaign_id, entry_index, enabled)
+        .map_err(TauriCommandError::storage)?;
+    apply_campaign_world_info_to_tool_ctx(state, campaign_id, &book);
+    Ok(())
+}
