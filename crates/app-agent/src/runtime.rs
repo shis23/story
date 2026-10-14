@@ -825,10 +825,12 @@ pub async fn spawn_subagents(
                 }
             });
 
-            // 子 Agent 的完成探测：输出达到一定长度即视为完成（表演内容就是产出，
-            // 不需要像导演那样必须调工具）。避免 drift recovery 把已完成的输出拖到 max rounds。
+            // 子 Agent 的完成探测：表演文字本身就是产出（工具只用来查角色资料，没有终止
+            // 工具），不调工具、写出了非空白文字即完成。不设字数门槛：一句短台词（「滚。」）
+            // 也是完整表演，旧的「满 50 字」会把它当成跑偏，反复注入 reminder 直到
+            // max_tool_rounds，最后交回的常是"我已完成"一类说明而不是台词。
             let sub_probe: &(dyn Fn(&str) -> bool + Send + Sync) =
-                &|content: &str| content.chars().count() >= 50;
+                &|content: &str| !content.trim().is_empty();
             let result = sub_runtime
                 .run_tool_loop_with_layout(
                     &config,
@@ -2431,6 +2433,86 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "旧路径应成功: {:?}", results[0]);
+    }
+
+    fn short_subagent_task() -> SubagentTask {
+        SubagentTask {
+            character_id: "老兵".into(),
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "寡言的守门人".into(),
+                scene_brief: "城门口".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "回应来客".into(),
+            },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
+        }
+    }
+
+    fn text_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }
+    }
+
+    async fn run_scripted_subagent(
+        responses: Vec<ChatResponse>,
+    ) -> (Result<Performance, AgentError>, usize) {
+        let llm = Arc::new(SequentialLlmClient::new(responses));
+        let runtime = Arc::new(AgentRuntime::new(
+            llm.clone(),
+            Arc::new(ToolContext::empty()),
+        ));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut results = spawn_subagents(
+            vec![short_subagent_task()],
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            None,
+            4,
+            None,
+            None,
+            None,
+        )
+        .await;
+        (results.remove(0), llm.requests().len())
+    }
+
+    /// 一句短台词就是完整表演：一次调用即收，不注入 reminder、不追问到 max rounds。
+    #[tokio::test]
+    async fn short_subagent_performance_finishes_in_one_call() {
+        let (result, calls) = run_scripted_subagent(vec![text_response("「滚。」")]).await;
+        let performance = result.expect("短台词应直接作为表演返回");
+        assert_eq!(performance.full_text, "「滚。」");
+        assert_eq!(calls, 1, "短台词不应再触发追问");
+    }
+
+    /// 只有空白时仍按跑偏处理：再要一次，拿到正文后收。
+    #[tokio::test]
+    async fn blank_subagent_output_is_asked_again() {
+        let (result, calls) =
+            run_scripted_subagent(vec![text_response("  \n"), text_response("「走吧。」")]).await;
+        assert_eq!(result.expect("第二次应拿到表演").full_text, "「走吧。」");
+        assert_eq!(calls, 2);
     }
 
     /// W-01：归一函数必须与 with_temporaries_for 的 trim + 大小写不敏感语义一致。
