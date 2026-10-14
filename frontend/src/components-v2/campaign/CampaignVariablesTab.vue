@@ -93,11 +93,15 @@ async function load() {
       })),
     })))
     if (token !== loadToken) return
-    campaignVariables.value = (globals || []).map((variable) => ({
-      ...variable,
-      schemaLabel: globalSchemaByKey.get(variable.key)?.label || '',
-      schemaDescription: globalSchemaByKey.get(variable.key)?.description || '',
-    }))
+    // __storyforge* 是宿主管理的内部键（卡壳选择器桶等），后端也拒绝经
+    // set_campaign_variable 改写，这里不当作可编辑的全局变量展示。
+    campaignVariables.value = (globals || [])
+      .filter((variable) => !String(variable?.key || '').startsWith('__storyforge'))
+      .map((variable) => ({
+        ...variable,
+        schemaLabel: globalSchemaByKey.get(variable.key)?.label || '',
+        schemaDescription: globalSchemaByKey.get(variable.key)?.description || '',
+      }))
     instanceGroups.value = groups
   } catch (e) {
     if (token === loadToken) error.value = errorText(e)
