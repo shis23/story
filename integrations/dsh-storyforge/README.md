@@ -43,7 +43,7 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `dataDir` | `$DSH_HOME/storyforge` | 会话映射（含已写轮数与最近一次收尾）、设置、收尾报告（`settles.json`）、日志 |
 | `cardsDir` | `<dataDir>/cards` | 「新建故事」可选的角色卡（`.png` / `.json`）；首页「导入角色卡…」也存到这里 |
 | `bridgeBin` | 仓库 `target/debug/storyforge-dsh-bridge(.exe)` | sidecar 可执行文件 |
-| `bridgeDataDir` | `<dataDir>/bridge-data` | StoryForge 存储（JSON 后端），与桌面版数据完全分开 |
+| `bridgeDataDir` | `<dataDir>/bridge-data` | StoryForge 存储，与桌面版数据完全分开。后端与桌面版同一套决议：默认 SQLite（`storyforge.sqlite3`）；早期 PoC 留下的 JSON 目录在 sidecar 下次启动时原地迁移（JSON 文件保留不删），迁移后再设 `STORYFORGE_STORAGE_BACKEND=json` 会拒绝启动。插件日志 `bridge ready: … storage=` 记着实际用的后端 |
 | `fakePipeline` | `false` | 用假管线代替 sidecar |
 | `debugEcho` | `false` | 额外注册调试回显 provider（仅调试：无凭据的临时实例里模拟普通会话） |
 

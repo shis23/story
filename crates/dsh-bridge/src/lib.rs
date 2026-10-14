@@ -44,7 +44,7 @@
 //!
 //! sidecar → 插件：
 //! - 请求 `llm.stream {...}`（插件回若干 `llm.chunk` 通知 + 响应），通知 `llm.cancel {id}`
-//! - 通知 `bridge.ready` / `bridge.fatal`、`turn.event {campaign_id, event}`、
+//! - 通知 `bridge.ready {version, pid, data_dir, storage: "sqlite" | "json"}` / `bridge.fatal`、`turn.event {campaign_id, event}`、
 //!   `turn.settled {report}`
 
 pub mod llm;
@@ -59,12 +59,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use storyforge_app_service::AppState;
-use storyforge_app_service::storage_backend::StorageFacade;
+use storyforge_app_service::storage_backend::{self, StorageFacade};
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::generation::GenerationMode;
 use storyforge_domain::llm::RetryConfig;
 use storyforge_infra_llm::{LlmClient, RetryingClient};
-use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBackend};
 
 use crate::llm::{DshLlmClient, LlmBridgeState};
 use crate::rpc::{Incoming, Peer, RpcError};
@@ -72,7 +71,11 @@ use crate::service::card_shell::WorldInfoToggle;
 use crate::service::mvu::VariableWrite;
 use crate::service::{BridgeError, BridgeService, DisplayRef, SettleReport, TurnObserver};
 
-/// 在 sidecar 自己的数据目录上构造 JSON 后端的 AppState，并注入 DSH 模型客户端。
+/// 在 sidecar 自己的数据目录上构造 AppState，并注入 DSH 模型客户端。
+///
+/// 存储后端与桌面版 setup 同一套决议：默认 SQLite（旧 JSON 目录原地迁移，JSON 文件
+/// 保留不删；空目录直接初始化），`STORYFORGE_STORAGE_BACKEND=json` 显式回退 JSON。
+/// 数据目录与桌面版分开，进程级租约挡住并发迁移。
 pub fn build_app(
     data_dir: &Path,
     peer: Arc<Peer>,
@@ -80,10 +83,20 @@ pub fn build_app(
 ) -> Result<Arc<AppState>, String> {
     // 必须先于任何存储构造：否则全局连接 / 预设存储会解析到用户真实的数据目录。
     let data_dir = storyforge_app_service::pin_app_data_dir(data_dir)?;
-    let storage = StorageFacade::new(
-        data_dir.clone(),
-        PinnedBackend::new(StorageBackend::Json, BackendSource::Config),
+    let resolution = storage_backend::resolve_backend(&data_dir)
+        .map_err(|error| format!("存储后端决议失败: {error}"))?;
+    tracing::info!(
+        backend = resolution.diagnostics.backend,
+        source = resolution.diagnostics.source,
+        schema_version = ?resolution.diagnostics.schema_version,
+        cutover = resolution.cutover_performed,
+        "storage backend resolved"
     );
+    let storage = StorageFacade::new(data_dir.clone(), resolution.pinned.clone());
+    if let Some(db_path) = resolution.db_path.as_deref() {
+        storyforge_app_service::sqlite_runtime::activate(db_path)
+            .map_err(|error| format!("打开 SQLite 失败: {error}"))?;
+    }
     let app = Arc::new(AppState::new_with_backend(data_dir, Arc::new(storage))?);
     // 与生产连接同样的包装：重试（429/5xx/超时）+ 调用日志。
     let retrying = RetryingClient::new(
@@ -349,6 +362,11 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
             return Err(message);
         }
     };
+    let storage = if app.storage().is_sqlite() {
+        "sqlite"
+    } else {
+        "json"
+    };
     let service = Arc::new(BridgeService::new(app, data_dir.clone(), llm));
     let observer: Arc<dyn TurnObserver> = Arc::new(PeerObserver::new(peer.clone()));
     peer.notify(
@@ -357,9 +375,13 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
             "data_dir": data_dir.display().to_string(),
+            "storage": storage,
         }),
     );
-    tracing::info!("bridge ready, data_dir={}", data_dir.display());
+    tracing::info!(
+        "bridge ready, data_dir={}, storage={storage}",
+        data_dir.display()
+    );
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {

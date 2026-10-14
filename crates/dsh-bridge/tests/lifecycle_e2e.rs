@@ -877,3 +877,61 @@ async fn auto_route_escalation_waits_for_an_explicit_mode() {
     assert_eq!(output["generation_mode"], "continuation");
     assert_accepted(&plugin.wait_settled(1).await);
 }
+
+/// PoC 早期的 sidecar 用 JSON 存储：这样的数据目录重启后原地迁到 SQLite（JSON 文件
+/// 保留），存档、对话与已采纳轮次都在，接着写；迁移后显式要求 JSON 被拒绝（不回退）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_json_data_dir_migrates_to_sqlite_and_keeps_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("bridge-data");
+    let card = write_card(temp.path());
+    const JSON: &[(&str, &str)] = &[("STORYFORGE_STORAGE_BACKEND", "json")];
+
+    let mut first = FakePlugin::spawn_with_env(&data_dir, JSON);
+    let created = create_campaign(&mut first, &card).await;
+    let campaign_id = created["campaign_id"].as_str().unwrap().to_string();
+    run_turn(&mut first, &campaign_id, "我推开木屋的门。", 0)
+        .await
+        .expect("JSON 存储下的第一轮");
+    assert_accepted(&first.wait_settled(1).await);
+    first
+        .request("bridge.shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    first.child.wait().await.unwrap();
+    assert!(data_dir.join("conversations").is_dir());
+    assert!(!data_dir.join("storyforge.sqlite3").exists());
+
+    let mut second = FakePlugin::spawn(&data_dir);
+    let ready = second.wait_notification("bridge.ready").await;
+    assert_eq!(ready["storage"], "sqlite", "{ready}");
+    assert!(data_dir.join("storyforge.sqlite3").is_file());
+    assert!(
+        data_dir.join("conversations").is_dir(),
+        "迁移不删 JSON 文件"
+    );
+    // 已采纳的一轮随迁移过来：history_turns=1 与存档一致才会执行。
+    run_turn(&mut second, &campaign_id, "我向 Seraphina 道谢。", 1)
+        .await
+        .expect("迁移后的第二轮");
+    assert_accepted(&second.wait_settled(1).await);
+    let items = display(
+        &mut second,
+        json!({ "campaign_id": campaign_id, "refs": [{ "key": "opening", "node_index": 0 }] }),
+    )
+    .await;
+    assert_eq!(items["opening"]["node_count"], 5, "{items}");
+    second
+        .request("bridge.shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    second.child.wait().await.unwrap();
+
+    // 迁移后 SQLite 是权威：再显式要求 JSON 启动失败，不悄悄读旧文件。
+    let mut third = FakePlugin::spawn_with_env(&data_dir, JSON);
+    let fatal = third.wait_notification("bridge.fatal").await;
+    assert!(
+        fatal["message"].as_str().unwrap().contains("SQLite"),
+        "{fatal}"
+    );
+}

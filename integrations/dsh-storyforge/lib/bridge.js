@@ -137,6 +137,7 @@ export function createBridge({ binPath, dataDir, logFile, serveLlm, log }) {
       const unsubscribe = subscribe((method, params) => {
         if (method === 'bridge.ready') {
           readyInfo = params
+          log(`bridge ready: pid=${params?.pid} storage=${params?.storage ?? '?'}`)
           clearTimeout(timer)
           unsubscribe()
           resolve(params)

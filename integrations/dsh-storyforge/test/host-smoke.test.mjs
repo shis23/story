@@ -99,6 +99,28 @@ async function call(routes, path, init) {
   return response.json()
 }
 
+/**
+ * 收尾：卸载插件、等 sidecar 退出，再删临时目录。插件卸载本身不等 sidecar，而 Windows
+ * 上 SQLite 库文件被占用时删不掉（EPERM）。
+ */
+async function teardown(routes, dispose, root) {
+  const pid = await call(routes, '/status', { method: 'GET' })
+    .then((status) => status.bridge?.pid)
+    .catch(() => undefined)
+  await dispose()
+  await waitForExit(pid)
+  // 进程刚退出时杀毒 / 索引服务可能还短暂占着新建的库文件：EPERM / EBUSY 稍等重试。
+  for (let attempt = 1; ; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt >= 30 || !['EPERM', 'EBUSY'].includes(error?.code)) throw error
+      await new Promise((done) => setTimeout(done, 100))
+    }
+  }
+}
+
 async function collect(stream) {
   const chunks = []
   for await (const chunk of stream) chunks.push(chunk)
@@ -375,8 +397,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       /底层模型还没有配置 API Key[\s\S]*原始错误/,
     )
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 
@@ -501,8 +522,7 @@ test('mvu panel: analyze, apply and interaction buttons go through the sidecar',
     const hpAfter = rested.model.sections[0].rows.find((row) => row.element === 'hp_bar').value
     assert.equal(hpAfter, hpBefore + 10)
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 
@@ -688,8 +708,7 @@ test('card shells: tail parts, server-built documents, approval and the host fet
       await waitForExit(pid)
     }
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 
@@ -867,8 +886,7 @@ test('opening shells: mount before the first turn, switch the opening, toggle th
     const lateApply = await post('/shell/opening', { sessionId, bridgeSession: home.bridgeSession, swipe_id: 2, mes: RAIN_GREETING })
     assert.equal(lateApply.ok, false)
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 
@@ -960,6 +978,8 @@ test('role models: each call goes to the model chosen for its group', { skip: !e
       await new Promise((r) => setTimeout(r, 200))
     }
     assert.equal(status.settles.length, 1, JSON.stringify(status))
+    // sidecar 的数据目录是全新的：直接用 SQLite。
+    assert.equal(status.bridge.ready.storage, 'sqlite')
     // 调用表里每次调用的模型 = 本组指定的模型；没指定的组（角色识别）用底层模型。
     const expected = { 执笔: 'fake/strong', 编剧: 'fake/strong', 定稿: 'fake/strong', 摘要: 'fake/fast', 后处理: 'fake/fast', 纪要压缩: 'fake/fast' }
     const pipelineCalls = status.llmCalls.filter((entry) => entry.role !== '其它')
@@ -974,8 +994,7 @@ test('role models: each call goes to the model chosen for its group', { skip: !e
     const sentModels = new Set(llmCalls.map((options) => options.model))
     assert.ok(sentModels.has('strong') && sentModels.has('fast') && sentModels.has('writer'), [...sentModels].join('、'))
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 
@@ -1107,8 +1126,7 @@ test('auto route escalation: asks in the composer, then writes with the chosen m
     }
     assert.equal(status.settles.length, 1, JSON.stringify(status))
   } finally {
-    await dispose()
-    rmSync(root, { recursive: true, force: true })
+    await teardown(routes, dispose, root)
   }
 })
 

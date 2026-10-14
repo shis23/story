@@ -358,10 +358,22 @@ pub struct FakePlugin {
 
 impl FakePlugin {
     pub fn spawn(data_dir: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_storyforge-dsh-bridge"))
+        Self::spawn_with_env(data_dir, &[])
+    }
+
+    /// 带额外环境变量拉起（如 `STORYFORGE_STORAGE_BACKEND=json` 造旧版 JSON 目录）。
+    /// 显式清掉继承来的存储后端选择，测试不受开发机环境影响。
+    pub fn spawn_with_env(data_dir: &Path, envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_storyforge-dsh-bridge"));
+        command
             .arg("--data-dir")
             .arg(data_dir)
             .env("RUST_LOG", "warn")
+            .env_remove("STORYFORGE_STORAGE_BACKEND");
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -605,8 +617,8 @@ impl FakePlugin {
     }
 }
 
-/// 子 Agent 第 `part` 段表演的固定文本，带角色标记，便于检查分块归属。两段合起来
-/// 超过子 Agent 完成探测的 50 字门槛（不够长会被当成没写完而追问到轮次上限）。
+/// 子 Agent 第 `part` 段表演的固定文本，带角色标记，便于检查分块归属（两段交错发出，
+/// 合起来是这个角色的一次表演）。
 pub fn subagent_part(name: &str, part: usize) -> String {
     format!("〔{name}〕第{part}段表演：{name}望着炉火，慢慢说出自己的打算，语气平静而笃定。")
 }
