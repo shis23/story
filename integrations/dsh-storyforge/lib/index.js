@@ -31,7 +31,7 @@ import {
   buildShellDocument,
   createDocRegistry,
   createShellFetcher,
-  createShellVariableBuckets,
+  createShellVariableStore,
   findShellSegment,
   newBridgeSession,
   newShellPluginId,
@@ -40,7 +40,7 @@ import {
   shellTrust,
   tailParts,
 } from './shell.js'
-import { buildMvuStatDataTree } from './vendor/card-shell.mjs'
+import { CARD_SHELL_VARIABLES_KEY, buildMvuStatDataTree } from './vendor/card-shell.mjs'
 import { classifyCall } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
@@ -783,6 +783,7 @@ const CARD_SHELL_FILE = join(PLUGIN_ROOT, 'lib', 'vendor', 'card-shell.mjs')
 const MANIFEST_TTL_MS = 60_000
 /** 壳自己存的界面状态（选择器变量桶）单次写入上限。 */
 const MAX_SHELL_VARIABLES_BYTES = 256 * 1024
+const SHELL_VARIABLES_FLUSH_MS = 2_000
 /** 一次 `/display` 最多查的节点数（与 sidecar 的 MAX_DISPLAY_REFS 一致）。 */
 const MAX_DISPLAY_REFS = 200
 
@@ -884,7 +885,21 @@ export function apply(ctx, config) {
       }),
     'storyforge: bridge event log',
   )
-  ctx.effect(() => () => void bridge.stop(), 'storyforge: bridge process')
+  /** 卸载时先让卡壳界面状态写完再停 sidecar（最多等 SHELL_VARIABLES_FLUSH_MS）。 */
+  let flushShellVariables = async () => {}
+  ctx.effect(
+    () => () => {
+      let timer = null
+      const timeout = new Promise((done) => (timer = setTimeout(done, SHELL_VARIABLES_FLUSH_MS)))
+      void Promise.race([flushShellVariables(), timeout])
+        .catch(() => {})
+        .finally(() => {
+          clearTimeout(timer)
+          return bridge.stop()
+        })
+    },
+    'storyforge: bridge process',
+  )
 
   /** 收尾后把轮数与最近一次结果记到故事登记里（首页「我的故事」不必拉起 sidecar）。 */
   function recordStoryProgress(report) {
@@ -1119,7 +1134,15 @@ export function apply(ctx, config) {
   /** 白名单主机：清单里带的那份（与桌面同一常量）；代取前至少取过一次清单。 */
   let shellHosts = []
   const shellDocs = createDocRegistry()
-  const shellBuckets = createShellVariableBuckets()
+  const shellVariableStore = createShellVariableStore({
+    load: async (campaignId) => {
+      const status = await bridge.request('mvu.status', { campaign_id: campaignId })
+      return status.campaign_variables?.find((entry) => entry?.key === CARD_SHELL_VARIABLES_KEY)?.value
+    },
+    save: (campaignId, variables) => bridge.request('card_shell.variables_set', { campaign_id: campaignId, variables }),
+    log,
+  })
+  flushShellVariables = () => shellVariableStore.flush()
   const fetchShellResource = createShellFetcher({
     cacheDir: join(dataDir, 'card-shell-cache'),
     allowedHosts: () => shellHosts,
@@ -1201,7 +1224,7 @@ export function apply(ctx, config) {
         pageUrl,
         bridgeSession,
         pluginId,
-        selectorVariables: shellBuckets.get(campaignId),
+        selectorVariables: await shellVariableStore.get(shellVariableScope(session, body.sessionId)),
         mvuStatData,
         allowedHosts: manifest.allowed_hosts,
       }),
@@ -1230,15 +1253,28 @@ export function apply(ctx, config) {
     return { data: buildMvuStatDataTree(status.campaign_variables) }
   }
 
-  function shellVariables(body) {
+  /** 壳界面状态的作用域：关联了存档的会话按存档（写回存档），否则按会话只放内存。 */
+  function shellVariableScope(session, sessionId) {
+    return session.campaignId
+      ? { key: `campaign:${session.campaignId}`, campaignId: session.campaignId }
+      : { key: `unlinked:${sessionId}`, campaignId: null }
+  }
+
+  /** 壳的 `setVariables` / `replaceVariables`：先更新进程内快照就回复，落盘在后台合并进行。 */
+  async function shellVariables(body) {
     const session = storySession(body?.sessionId)
     const mode = body?.mode
     if (!['patch', 'merge', 'replace'].includes(mode)) throw httpError('mode 应为 patch / merge / replace', 400)
     const variables = body?.variables
     if (!variables || typeof variables !== 'object' || Array.isArray(variables)) throw httpError('variables 应为对象', 400)
     if (JSON.stringify(variables).length > MAX_SHELL_VARIABLES_BYTES) throw httpError('界面状态太大', 400)
-    shellBuckets.apply(session.campaignId ?? `unlinked:${body.sessionId}`, body?.selector, variables, mode)
-    return { persisted: false }
+    const scope = shellVariableScope(session, body.sessionId)
+    try {
+      await shellVariableStore.apply(scope, body?.selector, variables, mode)
+    } catch (error) {
+      throw httpError(String(error?.message ?? error), error?.status ?? 502)
+    }
+    return { persisted: scope.campaignId !== null }
   }
 
   /**

@@ -640,9 +640,9 @@ test('card shells: tail parts, server-built documents, approval and the host fet
     assert.equal(outside.ok, false)
     assert.match(outside.error, /allowlist/)
 
-    // 壳自己的界面状态：插件内存，下一次挂载时注入文档。
+    // 壳自己的界面状态：写回存档，下一次挂载时注入文档（重启后的情况见本测试末尾）。
     const saved = await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: { theme: 'night-sky' }, mode: 'replace' })
-    assert.deepEqual(saved, { ok: true, persisted: false })
+    assert.deepEqual(saved, { ok: true, persisted: true })
     assert.equal((await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: [], mode: 'replace' })).ok, false)
     assert.equal((await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: {}, mode: 'eval' })).ok, false)
     const reopened = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_STATUS_URL } })
@@ -663,8 +663,46 @@ test('card shells: tail parts, server-built documents, approval and the host fet
     const vendor = await routes.get('/api/storyforge/vendor/card-shell.js').fetch(new Request('http://localhost/api/storyforge/vendor/card-shell.js'))
     assert.match(vendor.headers.get('content-type'), /javascript/)
     assert.match(await vendor.text(), /createHostHandler/)
+
+    // 卸载插件（先等界面状态落盘再停 sidecar）后重新启用：同一个界面挂起来仍带着它。
+    const firstPid = (await call(routes, '/status', { method: 'GET' })).bridge.pid
+    await dispose()
+    await waitForExit(firstPid)
+    const again = fakeCtx(llmCalls)
+    apply(again.ctx, { dataDir, cardsDir })
+    try {
+      const reopenedAfterRestart = await call(again.routes, '/shell/open', {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ sessionId, ref, shell: { mode: 'load', url: SHELL_STATUS_URL } }),
+      })
+      assert.equal(reopenedAfterRestart.ok, true, reopenedAfterRestart.error)
+      const restartedDoc = await again.routes
+        .get('/api/storyforge/shell/doc')
+        .fetch(new Request(`http://localhost/api/storyforge/shell/doc?t=${encodeURIComponent(reopenedAfterRestart.token)}`))
+      assert.match(await restartedDoc.text(), /night-sky/)
+    } finally {
+      const pid = (await call(again.routes, '/status', { method: 'GET' })).bridge.pid
+      await again.dispose()
+      await waitForExit(pid)
+    }
   } finally {
     await dispose()
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+/** 等 sidecar 进程退出（插件卸载不等它，重启同一数据目录前要等）。 */
+async function waitForExit(pid, timeoutMs = 15_000) {
+  if (!pid) return
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return
+    }
+    await new Promise((done) => setTimeout(done, 100))
+  }
+  assert.fail(`sidecar ${pid} 没有退出`)
+}

@@ -25,6 +25,7 @@ import {
   createCardShellRuntimeCompatibilityScript,
   generateBridgeScript,
   mergeCardShellVariables,
+  normalizeCardShellVariables,
   patchCardShellVariables,
   rewriteCardShellTopBridgeAccess,
   segmentShellContent,
@@ -604,25 +605,91 @@ export function createShellFetcher({ cacheDir, allowedHosts, fetchImpl = fetch, 
 
 //#region 选择器变量桶（壳自己的 getVariables / setVariables）
 
+/** 整份桶的上限，与 app-service `CARD_SHELL_VARIABLES_MAX_BYTES` 相同（后端照样会拒）。 */
+export const CARD_SHELL_VARIABLES_MAX_BYTES = 2 * 1024 * 1024
+
 /**
- * 壳用 TavernHelper 变量接口存的界面状态。桌面写进 Campaign 变量
- * `__storyforge_card_shell_variables`；这里只放插件进程内存（按存档），不进存档、DSH
- * 重启即清空——壳之间、重新挂载之间能看到彼此写的值。
+ * 壳用 TavernHelper 变量接口存的界面状态。关联了存档的会话写回存档的 Campaign 变量
+ * `__storyforge_card_shell_variables`（与桌面同一个键、同一个后端入口
+ * `set_card_shell_variables`），DSH 重启后还在；没关联存档的会话只放进程内存。
+ *
+ * - 同一作用域的读改写串行（桌面 `enqueueCardShellVariableMutation` 同理：两个壳先后写，
+ *   后写的不会抹掉先写的键）。
+ * - 进程内快照是读写依据，回复壳不等落盘：sidecar 的写入要排在写作锁后面，一轮写作期间
+ *   壳里的操作不该卡住几十秒。
+ * - 落盘按作用域合并：上一次还没写完时只记一笔「还有更新」，写完再把最新快照写一次；
+ *   失败记日志，下一次写入会带着整份快照重试。
+ *
+ * `scope` 为 `{ key, campaignId }`：`campaignId` 为空时只在内存里。
+ *
+ * @param {{ load: (campaignId: string) => Promise<unknown>,
+ *   save: (campaignId: string, variables: object) => Promise<unknown>,
+ *   log?: (line: string) => void, maxBytes?: number }} options
  */
-export function createShellVariableBuckets() {
-  const buckets = new Map()
+export function createShellVariableStore({ load, save, log = () => {}, maxBytes = CARD_SHELL_VARIABLES_MAX_BYTES }) {
+  const snapshots = new Map()
+  const chains = new Map()
+  const saving = new Map()
+
+  function serial(key, task) {
+    const run = (chains.get(key) ?? Promise.resolve()).then(task)
+    const tail = run.catch(() => undefined)
+    chains.set(key, tail)
+    void tail.then(() => {
+      if (chains.get(key) === tail) chains.delete(key)
+    })
+    return run
+  }
+
+  async function current(scope) {
+    if (snapshots.has(scope.key)) return snapshots.get(scope.key)
+    const loaded = scope.campaignId ? normalizeCardShellVariables(await load(scope.campaignId)) : {}
+    snapshots.set(scope.key, loaded)
+    return loaded
+  }
+
+  function persist(scope) {
+    const pending = saving.get(scope.key)
+    if (pending) {
+      pending.dirty = true
+      return
+    }
+    const state = { dirty: true, done: null }
+    saving.set(scope.key, state)
+    state.done = (async () => {
+      while (state.dirty) {
+        state.dirty = false
+        try {
+          await save(scope.campaignId, snapshots.get(scope.key))
+        } catch (error) {
+          log(`card shell variables not saved: campaign=${scope.campaignId} ${error?.message ?? error}`)
+        }
+      }
+      saving.delete(scope.key)
+    })()
+  }
+
   return {
-    get: (campaignId) => buckets.get(campaignId) ?? {},
-    apply(campaignId, selector, variables, mode) {
-      const current = buckets.get(campaignId) ?? {}
-      const next =
-        mode === 'patch'
-          ? patchCardShellVariables(current, selector, variables)
-          : mode === 'merge'
-            ? mergeCardShellVariables(current, selector, variables)
-            : updateCardShellVariables(current, selector, variables)
-      buckets.set(campaignId, next)
-      return next
+    get: (scope) => serial(scope.key, () => current(scope)),
+    apply: (scope, selector, variables, mode) =>
+      serial(scope.key, async () => {
+        const snapshot = await current(scope)
+        const next =
+          mode === 'patch'
+            ? patchCardShellVariables(snapshot, selector, variables)
+            : mode === 'merge'
+              ? mergeCardShellVariables(snapshot, selector, variables)
+              : updateCardShellVariables(snapshot, selector, variables)
+        if (Buffer.byteLength(JSON.stringify(next), 'utf8') > maxBytes) {
+          throw Object.assign(new Error(`界面状态超过 ${maxBytes / 1024} KiB`), { status: 413 })
+        }
+        snapshots.set(scope.key, next)
+        if (scope.campaignId) persist(scope)
+        return next
+      }),
+    /** 等手上的落盘写完（含写的过程中又来的更新）。 */
+    async flush() {
+      while (saving.size > 0) await Promise.all([...saving.values()].map((state) => state.done))
     },
   }
 }
