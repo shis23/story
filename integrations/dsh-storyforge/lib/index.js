@@ -33,14 +33,26 @@ import {
   createShellFetcher,
   createShellVariableStore,
   findShellSegment,
+  isOpeningOpen,
   newBridgeSession,
   newShellPluginId,
+  openingContentHash,
   shellDocResponse,
   shellLabel,
   shellTrust,
+  shellWorldbookName,
   tailParts,
+  turnTailParts,
 } from './shell.js'
-import { CARD_SHELL_VARIABLES_KEY, buildMvuStatDataTree } from './vendor/card-shell.mjs'
+import {
+  CARD_SHELL_VARIABLES_KEY,
+  buildGreetingOptionsFromDetail,
+  buildMvuStatDataTree,
+  buildOpeningChatSeed,
+  mapCampaignWorldbookForTavernHelper,
+  resolveCampaignWorldbookEnabledUpdates,
+  resolveOpeningChatSelection,
+} from './vendor/card-shell.mjs'
 import { classifyCall } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
@@ -195,10 +207,12 @@ const REPLAY_VERSION = 1
  * `blocks` 是从正文里拿掉、交给 Turn 尾部渲染的 HTML 块数，`shells` 是卡片界面数（都为 0 时
  * 尾部不取数据；早于档 3 的回放数据没有 `shells`）。
  */
-function storyforgeReplay({ campaignId, conversationId, nodeId, nodeIndex, blocks, shells }) {
+function storyforgeReplay({ campaignId, conversationId, nodeId, nodeIndex, blocks, shells, contentHash }) {
   if (!conversationId) return undefined
   const ref = { v: REPLAY_VERSION, campaignId, conversationId, blocks }
   if (shells > 0) ref.shells = shells
+  // 开场轮：开场白原文的指纹，开场界面改写开场白后尾部据此补上新开场（`turnTailParts`）。
+  if (contentHash) ref.contentHash = contentHash
   if (nodeId) ref.nodeId = nodeId
   if (Number.isInteger(nodeIndex)) ref.nodeIndex = nodeIndex
   return { response: { storyforge: ref } }
@@ -662,6 +676,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
           nodeIndex: session?.openingNodeIndex ?? 0,
           blocks: split.blocks,
           shells: split.shells,
+          contentHash: openingContentHash(session?.opening),
         }),
       )
       return
@@ -784,6 +799,12 @@ const MANIFEST_TTL_MS = 60_000
 /** 壳自己存的界面状态（选择器变量桶）单次写入上限。 */
 const MAX_SHELL_VARIABLES_BYTES = 256 * 1024
 const SHELL_VARIABLES_FLUSH_MS = 2_000
+/** 记着的开场界面桥会话数（每挂一次开场界面一个）。 */
+const MAX_OPENING_SHELLS = 32
+/** 壳给的开场原文上限（卡的问候语之外的自定义开场）。 */
+const MAX_OPENING_CHARS = 200_000
+/** 壳一次 `updateWorldbookWith` 交回的条目数上限。 */
+const MAX_WORLDBOOK_ENTRIES = 2_000
 /** 一次 `/display` 最多查的节点数（与 sidecar 的 MAX_DISPLAY_REFS 一致）。 */
 const MAX_DISPLAY_REFS = 200
 
@@ -1121,9 +1142,12 @@ export function apply(ctx, config) {
     })
     // 有卡片界面时才问清单（分叉子会话第一次发送前没有自己的存档，用回放数据里记下的）。
     const trust = await shellTrustFor(session.campaignId ?? refs.find((ref) => typeof ref?.campaignId === 'string')?.campaignId)
+    const refsByKey = new Map(refs.map((ref) => [ref?.key, ref]))
     return Object.fromEntries(
       Object.entries(items ?? {}).map(([key, item]) => {
-        const parts = item ? tailParts(item.display_content, item.content, trust) : []
+        const parts = item
+          ? turnTailParts(item, refsByKey.get(key), trust, { openingOpen: isOpeningOpen(item, session.campaignId) })
+          : []
         return [key, parts.length > 0 ? { parts } : null]
       }),
     )
@@ -1177,7 +1201,8 @@ export function apply(ctx, config) {
 
   /**
    * 挂一个卡片界面：重新取这条回复的展示文本、找到界面、按清单复核信任（未登记的要浏览器
-   * 带上用户的确认），拼好壳文档登记成一次性路径。
+   * 带上用户的确认），拼好壳文档登记成一次性路径。可信的开场界面只在开场态挂，文档带开场
+   * 种子（卡的问候语），它的桥会话记进 `openingShells`，之后只认它改写开场白。
    */
   async function openShell(body) {
     const session = storySession(body?.sessionId)
@@ -1192,7 +1217,6 @@ export function apply(ctx, config) {
     if (!item) throw httpError('这条回复已经不在存档里了', 404)
     const segment = findShellSegment(item.display_content, wanted)
     if (!segment) throw httpError('这条回复里没有这个卡片界面（展示文本已经变了）', 409)
-    if (OPENING_KINDS.has(segment.kind)) throw httpError('开场界面在 DSH 里还不支持', 400)
     const manifest = await shellManifest(campaignId)
     const part = tailParts(item.display_content, item.content, shellTrust(manifest)).find(
       (candidate) =>
@@ -1202,6 +1226,10 @@ export function apply(ctx, config) {
     )
     const trusted = part?.trusted === true
     if (!trusted && body.approved !== true) throw httpError('这个卡片界面不在卡的清单里，需要先确认', 403)
+    const opening = trusted && OPENING_KINDS.has(segment.kind)
+    if (opening && !isOpeningOpen(item, session.campaignId)) {
+      throw httpError('故事已经开始，开场界面只在写第一轮之前可用', 409)
+    }
 
     let html = segment.html
     let pageUrl = null
@@ -1227,11 +1255,100 @@ export function apply(ctx, config) {
         selectorVariables: await shellVariableStore.get(shellVariableScope(session, body.sessionId)),
         mvuStatData,
         allowedHosts: manifest.allowed_hosts,
+        worldbookName: shellWorldbookName(session.campaignId),
+        openingChatSeed: opening
+          ? buildOpeningChatSeed(buildGreetingOptionsFromDetail(manifest), { name: manifest.campaign_name || 'Assistant' })
+          : null,
       }),
       allowedHosts: manifest.allowed_hosts,
     })
+    if (opening) rememberOpeningShell(bridgeSession, { sessionId: body.sessionId, campaignId: session.campaignId })
     log(`card shell opened: campaign=${campaignId} ${segment.mode} ${segment.kind}${trusted ? '' : ' (approved)'} ${segment.url ?? `@${segment.start}`}`)
-    return { token, bridgeSession, pluginId, kind: segment.kind, label: shellLabel(segment.kind), trusted }
+    return { token, bridgeSession, pluginId, kind: segment.kind, label: shellLabel(segment.kind), trusted, opening }
+  }
+
+  /** 挂过的开场界面：桥会话 → 故事与存档（只留最近的几个）。 */
+  const openingShells = new Map()
+  function rememberOpeningShell(bridgeSession, binding) {
+    openingShells.set(bridgeSession, binding)
+    for (const key of openingShells.keys()) {
+      if (openingShells.size <= MAX_OPENING_SHELLS) break
+      openingShells.delete(key)
+    }
+  }
+
+  /**
+   * 开场界面选定开场（卡切换 swipe 后调 `reloadCurrentChat`，桥发 `opening_chat_applied`）：
+   * 按卡的问候语解析选择（桌面 `resolveOpeningChatSelection`），经 sidecar 改写开场白，
+   * 并更新故事登记里的开场白（DSH 重新生成开场时用新的）。只认本故事挂过的开场界面。
+   */
+  async function shellOpening(body) {
+    const session = storySession(body?.sessionId)
+    const binding = openingShells.get(body?.bridgeSession)
+    if (!binding || binding.sessionId !== body.sessionId || binding.campaignId !== session.campaignId) {
+      throw httpError('这个界面不是本故事的开场界面', 403)
+    }
+    if (typeof body.mes === 'string' && body.mes.length > MAX_OPENING_CHARS) throw httpError('开场内容太长', 400)
+    const manifest = await shellManifest(session.campaignId)
+    const selection = resolveOpeningChatSelection(
+      { swipe_id: body.swipe_id, mes: typeof body.mes === 'string' ? body.mes : '' },
+      buildGreetingOptionsFromDetail(manifest),
+    )
+    if (!selection.content?.trim()) throw httpError('开场界面没有给出开场内容', 400)
+    let applied
+    try {
+      applied = await bridge.request('campaign.apply_opening', { campaign_id: session.campaignId, content: selection.content })
+    } catch (error) {
+      throw httpError(String(error?.message ?? error), error?.code === 'validation' ? 409 : 502)
+    }
+    const latest = sessions.get(body.sessionId)
+    if (latest) sessions.set(body.sessionId, { ...latest, opening: applied.content, openingDisplay: applied.display_content })
+    log(`opening applied: campaign=${session.campaignId} greeting=${selection.greetingIndex ?? 'custom'}`)
+    return { greetingIndex: selection.greetingIndex }
+  }
+
+  /** 壳的世界书请求只认本存档的书名（桌面 `assertShellWorldbookName`）。 */
+  function shellWorldbookCampaign(body) {
+    const session = storySession(body?.sessionId)
+    const expected = shellWorldbookName(session.campaignId)
+    if (!expected || body?.name !== expected) throw httpError('worldbook is not bound to the active StoryForge campaign', 400)
+    return session.campaignId
+  }
+
+  /** TavernHelper `getWorldbook`：本局世界书的条目名与启用状态（桌面同口径，不带正文）。 */
+  async function shellWorldbook(body) {
+    const campaignId = shellWorldbookCampaign(body)
+    const book = await bridge.request('world_info.list', { campaign_id: campaignId })
+    return { entries: mapCampaignWorldbookForTavernHelper(book) }
+  }
+
+  const worldbookChains = new Map()
+  /**
+   * TavernHelper `updateWorldbookWith`：按条目名对出要改启用状态的条目再写（只改启用状态）。
+   * 同一存档的读改写串行，两个界面先后切换不会基于过期快照（桌面 `enqueueCampaignWorldbookMutation`）。
+   */
+  function shellWorldbookUpdate(body) {
+    const campaignId = shellWorldbookCampaign(body)
+    const requested = body?.entries
+    if (!Array.isArray(requested) || requested.length > MAX_WORLDBOOK_ENTRIES) throw httpError('entries 应为条目数组', 400)
+    const run = (worldbookChains.get(campaignId) ?? Promise.resolve()).then(async () => {
+      const book = await bridge.request('world_info.list', { campaign_id: campaignId })
+      const updates = resolveCampaignWorldbookEnabledUpdates(book.entries, requested)
+      if (updates.length > 0) {
+        await bridge.request('world_info.set_enabled', {
+          campaign_id: campaignId,
+          updates: updates.map((update) => ({ entry_index: update.entryIndex, enabled: update.enabled })),
+        })
+        log(`card shell worldbook: campaign=${campaignId} ${updates.length} toggled`)
+      }
+      return { updated: updates.length }
+    })
+    const tail = run.catch(() => undefined)
+    worldbookChains.set(campaignId, tail)
+    void tail.then(() => {
+      if (worldbookChains.get(campaignId) === tail) worldbookChains.delete(campaignId)
+    })
+    return run
   }
 
   async function shellFetch(body) {
@@ -1623,6 +1740,9 @@ export function apply(ctx, config) {
     shellRoute('/mvu-data', shellMvuData),
     shellRoute('/variables', shellVariables),
     shellRoute('/var-write', shellVarWrite),
+    shellRoute('/opening', shellOpening),
+    shellRoute('/worldbook', shellWorldbook),
+    shellRoute('/worldbook-update', shellWorldbookUpdate),
     {
       // 壳文档：iframe 直接加载这个路径（同源导航带着 DSH 的登录 cookie）。CSP 响应头里的
       // sandbox 让它在任何打开方式下都是不透明源，读不到 DSH 的 cookie 与接口。

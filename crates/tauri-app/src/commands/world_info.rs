@@ -9,16 +9,7 @@ pub(crate) fn list_campaign_world_info(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignWorldInfoDto, TauriCommandError> {
-    require_world_info_supported(state.inner().as_ref(), "list campaign world info")?;
-    let id = Id::from_str(&campaign_id);
-    let book = crate::backend_workflows::load_campaign_world_info_for_backend(
-        state.storage(),
-        state.inner(),
-        &id,
-    )
-    .map_err(TauriCommandError::storage)?;
-    apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    Ok(book_to_campaign_world_info_dto(&id, &book))
+    list_campaign_world_info_for_host(state.inner(), &Id::from_str(&campaign_id))
 }
 
 #[tauri::command]
@@ -99,14 +90,12 @@ pub(crate) fn set_campaign_world_info_enabled(
     enabled: bool,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    require_world_info_supported(state.inner().as_ref(), "set campaign world info enabled")?;
-    let id = Id::from_str(&campaign_id);
-    let book = state
-        .storage()
-        .set_world_info_entry_enabled(&id, entry_index, enabled)
-        .map_err(TauriCommandError::storage)?;
-    apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
-    Ok(())
+    set_campaign_world_info_enabled_for_host(
+        state.inner(),
+        &Id::from_str(&campaign_id),
+        entry_index,
+        enabled,
+    )
 }
 
 #[tauri::command]

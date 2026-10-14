@@ -17,7 +17,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { isIP } from 'node:net'
 import path from 'node:path'
 
-import { renderableBlocks } from './html.js'
+import { SHELL_ONLY_BODY, renderableBlocks, splitForDsh } from './html.js'
 import {
   analyzeEsmModuleSource,
   createCardShellFetchProxyScript,
@@ -82,6 +82,42 @@ export function tailParts(display, source, trust) {
         ? { ...base, url: segment.url, trusted: trust.urls.has(segment.url) }
         : { ...base, start: segment.start, trusted: trustedStarts.has(segment.start) },
     )
+  }
+  return parts
+}
+
+/** 开场白原文的短指纹：记进开场轮的回放数据（`contentHash`），见 `turnTailParts`。 */
+export function openingContentHash(content) {
+  return typeof content === 'string' ? createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16) : null
+}
+
+/** TavernHelper `getCharWorldbookNames('current')` 报给壳的书名（与桌面相同）。 */
+export function shellWorldbookName(campaignId) {
+  return typeof campaignId === 'string' && campaignId ? `storyforge:campaign:${campaignId}` : ''
+}
+
+/**
+ * 还在开场态：这条回复是会话当前存档对话的开场白，且对话里只有它一个节点（sidecar
+ * `node_count`）。只有这时开场界面能挂、能改写开场白（桌面同样只在开局前显示序章壳）。
+ */
+export function isOpeningOpen(item, campaignId) {
+  return Boolean(campaignId) && item?.node_index === 0 && item?.node_count === 1 && item?.by_position !== true
+}
+
+/**
+ * 一条回复的尾部数据（`tailParts` 加上开场界面的状态）：
+ * - 可信的开场界面（首页 / 自定义开局）在开场态标 `opening: 'open'`（挂载、能改写开场白），
+ *   故事开始后标 `'closed'`（只显示说明）；不可信的照常要确认、当普通界面挂。
+ * - 开场轮的回放数据带 `contentHash`：存档里的开场白已被开场界面改写（指纹对不上）时，
+ *   在最前面补一段新开场的文字（DSH 正文里还是开局时的那份）。
+ */
+export function turnTailParts(item, ref, trust, { openingOpen = false } = {}) {
+  const parts = tailParts(item.display_content, item.content, trust).map((part) =>
+    part.type === 'shell' && part.trusted && OPENING_KINDS.has(part.kind) ? { ...part, opening: openingOpen ? 'open' : 'closed' } : part,
+  )
+  if (typeof ref?.contentHash === 'string' && ref.contentHash !== openingContentHash(item.content)) {
+    const { body } = splitForDsh(item.display_content)
+    if (body && body !== SHELL_ONLY_BODY) parts.unshift({ type: 'text', text: body })
   }
   return parts
 }
@@ -233,7 +269,69 @@ export function rewriteModuleScripts(html, pageUrl) {
   })
 }
 
-function bridgeScript(bridgeSession) {
+/**
+ * 开场界面要的 `SillyTavern.chat[0]`（带 swipes）与 `reloadCurrentChat` 钩子：卡切换 swipe 后
+ * 调 `reloadCurrentChat()`，钩子把选择经桥发给宿主（`opening_chat_applied`）。与桌面
+ * `CardShellHost.vue` 桥脚本里的同一段逐字相同（`test/shell.test.mjs` 比对），跑在桥脚本的
+ * IIFE 里、用它的 `ask`；种子为 null 时两个函数直接返回。
+ */
+export const OPENING_SEED_LINES = [
+  '  function seedOpeningChat(){',
+  '    if (!OPENING_CHAT_SEED || !window.SillyTavern) return;',
+  '    var chat = window.SillyTavern.chat;',
+  '    if (!Array.isArray(chat)) {',
+  '      chat = [];',
+  '      try { window.SillyTavern.chat = chat; } catch (eChat) {}',
+  '    }',
+  '    var seed = OPENING_CHAT_SEED;',
+  '    var entry = {',
+  "      name: seed.name || 'Assistant',",
+  '      is_user: false,',
+  '      is_name: true,',
+  "      mes: seed.mes || '',",
+  "      message: seed.message || seed.mes || '',",
+  "      swipe_id: (typeof seed.swipe_id === 'number') ? seed.swipe_id : -1,",
+  "      swipes: Array.isArray(seed.swipes) ? seed.swipes.slice() : [seed.mes || '']",
+  '    };',
+  '    if (chat.length === 0) chat.push(entry);',
+  '    else {',
+  '      // Preserve any host-hydrated chat body, but always ensure swipes exist so',
+  "      // Destiny's「开始旅程」can switch scenario instead of no-oping.",
+  '      var first = chat[0] || {};',
+  '      if (!Array.isArray(first.swipes) || !first.swipes.length) first.swipes = entry.swipes.slice();',
+  "      if (typeof first.swipe_id !== 'number') first.swipe_id = entry.swipe_id;",
+  '      if (!first.mes && entry.mes) first.mes = entry.mes;',
+  '      if (!first.message && entry.message) first.message = entry.message;',
+  '      chat[0] = first;',
+  '    }',
+  '  }',
+  '  function installOpeningReloadHook(){',
+  '    if (!OPENING_CHAT_SEED || !window.SillyTavern) return;',
+  '    if (window.SillyTavern.__sfOpeningReloadHooked) return;',
+  '    window.SillyTavern.__sfOpeningReloadHooked = true;',
+  "    var prevReload = typeof window.SillyTavern.reloadCurrentChat === 'function'",
+  '      ? window.SillyTavern.reloadCurrentChat.bind(window.SillyTavern)',
+  '      : null;',
+  '    window.SillyTavern.reloadCurrentChat = async function(){',
+  '      try {',
+  '        var first = (window.SillyTavern.chat && window.SillyTavern.chat[0]) || {};',
+  "        await ask('opening_chat_applied', {",
+  '          swipe_id: first.swipe_id,',
+  "          mes: first.mes || first.message || '',",
+  '          swipes: Array.isArray(first.swipes) ? first.swipes : []',
+  '        });',
+  '      } catch (err) {',
+  "        console.error('[CardShell] opening_chat_applied failed', err);",
+  '        throw err;',
+  '      }',
+  '      if (prevReload) return prevReload();',
+  '      return true;',
+  '    };',
+  '  }',
+  '  try { seedOpeningChat(); installOpeningReloadHook(); } catch (eSeed) {}',
+]
+
+function bridgeScript(bridgeSession, openingChatSeed = null) {
   return [
     '(function(){',
     "  'use strict';",
@@ -310,6 +408,8 @@ function bridgeScript(bridgeSession) {
     '  patch$();',
     '  new MutationObserver(function(){ patch$(); }).observe(document.documentElement, { childList: true, subtree: true });',
     '  var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);',
+    `  var OPENING_CHAT_SEED = ${scriptJson(openingChatSeed && typeof openingChatSeed === 'object' ? openingChatSeed : null)};`,
+    ...OPENING_SEED_LINES,
     '})();',
   ].join('\n')
 }
@@ -376,10 +476,24 @@ const RESIZE_REPORTER = [
 
 /**
  * 卡片 HTML → 可以直接交给 iframe 的壳文档。
+ * `worldbookName` 是 TavernHelper `getCharWorldbookNames('current')` 报的书名（桌面
+ * `storyforge:campaign:<id>`，没有存档为空串）；`openingChatSeed` 只给开场界面
+ * （`buildOpeningChatSeed` 的结果）。
  * @param {{html: string, pageUrl?: string|null, bridgeSession: string, pluginId: string,
- *   selectorVariables?: object, mvuStatData?: object, allowedHosts: string[]}} options
+ *   selectorVariables?: object, mvuStatData?: object, allowedHosts: string[],
+ *   worldbookName?: string, openingChatSeed?: object|null}} options
  */
-export function buildShellDocument({ html, pageUrl = null, bridgeSession, pluginId, selectorVariables = {}, mvuStatData = {}, allowedHosts }) {
+export function buildShellDocument({
+  html,
+  pageUrl = null,
+  bridgeSession,
+  pluginId,
+  selectorVariables = {},
+  mvuStatData = {},
+  allowedHosts,
+  worldbookName = '',
+  openingChatSeed = null,
+}) {
   const script = (code) => `<script>${code}</script>`
   let baseHref = ''
   if (pageUrl) {
@@ -393,8 +507,8 @@ export function buildShellDocument({ html, pageUrl = null, bridgeSession, plugin
     `<meta http-equiv="Content-Security-Policy" content="${shellCsp(allowedHosts).replace(/"/g, '&quot;')}">`,
     baseHref ? `<base href="${baseHref.replace(/"/g, '%22')}">` : '',
     generateBridgeScript(pluginId, '*'),
-    script(bridgeScript(bridgeSession)),
-    script(createCardShellRuntimeCompatibilityScript({ worldbookName: '', selectorVariables, mvuStatData })),
+    script(bridgeScript(bridgeSession, openingChatSeed)),
+    script(createCardShellRuntimeCompatibilityScript({ worldbookName, selectorVariables, mvuStatData })),
     ...PRELOAD_SCRIPTS.map((url) => `<script src="${url}"></script>`),
     script(preloadScript()),
     script(createCardShellFetchProxyScript()),

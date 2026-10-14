@@ -1717,6 +1717,8 @@ window.__ModuleLoader__.load({
 .sf-shell-frame { display: block; width: 100%; border: 0; background: transparent; }
 .sf-shell-note, .sf-shell-confirm { margin: 6px 0 2px; padding: 8px 10px; border-radius: var(--sf-radius-sm); display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .sf-shell-note { border: 1px dashed var(--sf-border-strong); color: var(--sf-fg2); }
+.sf-opening-text { display: grid; gap: 6px; }
+.sf-opening-body { white-space: pre-wrap; line-height: 1.7; }
 .sf-shell-confirm { background: color-mix(in srgb, var(--sf-warn) 12%, transparent); }
 .sf-shell-proposals { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--sf-border); background: color-mix(in srgb, var(--sf-warn) 8%, transparent); }
 .sf-shell-proposal { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1859,6 +1861,11 @@ window.__ModuleLoader__.load({
 					schedule();
 					notify();
 				},
+				/** 存档里的展示数据变了（开场界面改写了开场白）：已挂载的尾部按新代数重取。 */
+				refresh() {
+					generation += 1;
+					schedule();
+				},
 			};
 		}
 
@@ -1970,9 +1977,10 @@ window.__ModuleLoader__.load({
 		// 卡的界面（`$('body').load(url)` 状态栏、带脚本的内联 HTML）跑在 sandbox iframe 里，只给
 		// `allow-scripts`，永远不给 `allow-same-origin`。文档由服务端拼好、登记成一次性路径（响应头
 		// CSP 带 sandbox）；这里挂 iframe、应答壳的桥请求：代取远程资源（服务端按白名单）、读
-		// Campaign 变量树（只读）、存壳自己的界面状态（插件内存）、写变量（先成提案，用户点
-		// 「应用」才写，桌面 M4 同口径）。SillyTavern / TavernHelper API 请求交给桌面的
-		// `createHostHandler`，需要后端的方法一律报不支持（桌面上卡壳虚拟插件同样调不动后端）。
+		// Campaign 变量树（只读）、存壳自己的界面状态（写回存档）、写变量（先成提案，用户点
+		// 「应用」才写，桌面 M4 同口径）、读世界书条目与切换启用状态、开场界面选定开场。
+		// SillyTavern / TavernHelper API 请求交给桌面的 `createHostHandler`，需要后端的方法一律
+		// 报不支持（桌面上卡壳虚拟插件同样调不动后端）。
 
 		const SHELL_OPENING_KINDS = new Set(["opening_home", "opening_custom"]);
 		const SHELL_DEFAULT_HEIGHT = { status: 120, message_html: 280 };
@@ -1983,8 +1991,7 @@ window.__ModuleLoader__.load({
 		/** 桌面卡壳虚拟插件的权限（`CardShellHost.vue`）。 */
 		const SHELL_PLUGIN_PERMISSIONS = ["ReadVariables", "WriteVariables", "ReadMemory", "ReadCharacter", "ModifyPrompt", "Generate"];
 		const SHELL_UNSUPPORTED = {
-			campaign_worldbook_update: "DSH 的卡片界面不能改世界书",
-			opening_chat_applied: "DSH 的卡片界面不支持开场选择",
+			opening_chat_applied: "只有开局前的开场界面能选择开场",
 		};
 
 		let cardShellLoading = null;
@@ -2044,8 +2051,11 @@ window.__ModuleLoader__.load({
 			return next.length > MAX_SHELL_PROPOSALS ? next.slice(next.length - MAX_SHELL_PROPOSALS) : next;
 		}
 
-		/** 壳的桥请求 → 宿主动作。抛错会作为 error 回给壳。 */
-		async function answerShellRequest(sessionId, type, payload) {
+		/**
+		 * 壳的桥请求 → 宿主动作。抛错会作为 error 回给壳。`opened` 是服务端挂载时的回执（开场
+		 * 界面带 `opening` 与桥会话），`onOpeningApplied` 在开场白改写后刷新尾部。
+		 */
+		async function answerShellRequest(sessionId, type, payload, { opened, onOpeningApplied } = {}) {
 			switch (type) {
 				case "fetch_text": {
 					const { resource } = await postJson("/shell/fetch", { sessionId, url: payload.url });
@@ -2067,14 +2077,25 @@ window.__ModuleLoader__.load({
 					await postJson("/shell/variables", { sessionId, selector: payload.selector, variables: payload.variables, mode: payload.mode });
 					return { ok: true };
 				case "campaign_worldbook_get":
-					return [];
+					return (await postJson("/shell/worldbook", { sessionId, name: payload.name })).entries;
+				case "campaign_worldbook_update": {
+					const { updated } = await postJson("/shell/worldbook-update", { sessionId, name: payload.name, entries: payload.entries });
+					return { updated };
+				}
+				case "opening_chat_applied": {
+					if (!opened?.opening) break;
+					await postJson("/shell/opening", { sessionId, bridgeSession: opened.bridgeSession, swipe_id: payload.swipe_id, mes: payload.mes });
+					onOpeningApplied?.();
+					return { ok: true };
+				}
 				default:
 					throw new Error(SHELL_UNSUPPORTED[type] ?? `unknown bridge type: ${type}`);
 			}
+			throw new Error(SHELL_UNSUPPORTED[type] ?? `unknown bridge type: ${type}`);
 		}
 
-		/** 一个挂好的卡片界面：iframe + 状态行 + 变量提案确认条。 */
-		function ShellFrame({ sessionId, turnRef, part, approved }) {
+		/** 一个挂好的卡片界面：iframe + 状态行 + 变量提案确认条。开场界面按视口定高（桌面同口径）。 */
+		function ShellFrame({ sessionId, turnRef, part, approved, onOpeningApplied }) {
 			const frameRef = React.useRef(null);
 			const [attempt, setAttempt] = React.useState(0);
 			const [opened, setOpened] = React.useState(null);
@@ -2122,6 +2143,7 @@ window.__ModuleLoader__.load({
 					if (!module.isCardShellBridgeMessageForSession(event, opened.bridgeSession)) return;
 					const payload = data.payload || {};
 					if (data.type === "shell_resize") {
+						if (opened.opening) return;
 						const next = Math.min(SHELL_MAX_HEIGHT, Math.max(SHELL_MIN_HEIGHT, Math.ceil(Number(payload.height) || 0)));
 						setHeight((current) => (Math.abs(current - next) > 2 ? next : current));
 						return;
@@ -2140,14 +2162,14 @@ window.__ModuleLoader__.load({
 							event.source.postMessage({ __sf_shell_bridge_res: data.id, result, error: failure || null }, "*");
 						} catch (_) {}
 					};
-					answerShellRequest(sessionId, data.type, payload).then(
+					answerShellRequest(sessionId, data.type, payload, { opened, onOpeningApplied }).then(
 						(result) => reply(result, null),
 						(e) => reply(null, errorText(e)),
 					);
 				};
 				window.addEventListener("message", onMessage);
 				return () => window.removeEventListener("message", onMessage);
-			}, [opened, sessionId]);
+			}, [opened, sessionId, onOpeningApplied]);
 
 			const applyProposal = (proposal) => {
 				setApplying(proposal.id);
@@ -2166,6 +2188,9 @@ window.__ModuleLoader__.load({
 			};
 
 			const label = opened?.label ?? part.label;
+			const frameHeight = opened?.opening
+				? Number.parseInt(opened.module.getOpeningShellPresentation(window.innerHeight).height, 10)
+				: height;
 			return h(
 				"div",
 				{ className: "sf-root sf-shell", "data-sf-shell": part.kind },
@@ -2188,7 +2213,7 @@ window.__ModuleLoader__.load({
 							referrerPolicy: "no-referrer",
 							loading: "lazy",
 							title: label,
-							style: { height },
+							style: { height: frameHeight },
 						})
 					: null,
 				proposals.length > 0
@@ -2225,17 +2250,18 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 一条回复里的一个卡片界面：开场界面不挂（DSH 里还不支持）；不在卡清单里的先确认；
-		 * 较早轮次的状态栏界面默认收起（每轮都有一份，全挂太重），最新一轮的直接挂。
+		 * 一条回复里的一个卡片界面：卡清单里的开场界面只在开局前挂（之后只留说明）；不在卡
+		 * 清单里的先确认；较早轮次的状态栏界面默认收起（每轮都有一份，全挂太重），最新一轮的
+		 * 直接挂。
 		 */
-		function ShellPart({ sessionId, turnRef, part, latest }) {
+		function ShellPart({ sessionId, turnRef, part, latest, onOpeningApplied }) {
 			const [approved, setApproved] = React.useState(false);
 			const [expanded, setExpanded] = React.useState(false);
-			if (SHELL_OPENING_KINDS.has(part.kind)) {
+			if (SHELL_OPENING_KINDS.has(part.kind) && part.opening === "closed") {
 				return h(
 					"div",
 					{ className: "sf-root sf-shell-note sf-small", "data-sf-shell": part.kind },
-					`这条回复带着卡的${part.label}（开场设置），DSH 里还不支持，开场白的文字在正文里。`,
+					`这条回复带着卡的${part.label}（开场设置）。故事已经开始，开场界面只在写第一轮之前可用。`,
 				);
 			}
 			if (!part.trusted && !approved) {
@@ -2256,7 +2282,17 @@ window.__ModuleLoader__.load({
 					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setExpanded(true) }, "展开"),
 				);
 			}
-			return h(ShellFrame, { sessionId, turnRef, part, approved });
+			return h(ShellFrame, { sessionId, turnRef, part, approved, onOpeningApplied });
+		}
+
+		/** 开场界面改写了开场白：DSH 正文里还是开局时的那份，新开场的文字补在尾部。 */
+		function OpeningText({ text }) {
+			return h(
+				"div",
+				{ className: "sf-root sf-turn-tail sf-opening-text" },
+				h("div", { className: "sf-small sf-muted" }, "开场（按开场界面的选择）"),
+				h("div", { className: "sf-opening-body" }, text),
+			);
 		}
 
 		/** `conversation.chat.turnTail` 条目：StoryForge 会话里有卡片 HTML 块或卡片界面的 Turn 才渲染。 */
@@ -2285,15 +2321,18 @@ window.__ModuleLoader__.load({
 				React.Fragment,
 				null,
 				parts.map((part, index) =>
-					part.type === "html"
-						? h(CardBlocks, { key: `html:${index}`, blocks: part.blocks })
-						: h(ShellPart, {
-								key: part.mode === "load" ? `load:${part.url}` : `inline:${part.start}`,
-								sessionId,
-								turnRef: ref,
-								part,
-								latest,
-							}),
+					part.type === "text"
+						? h(OpeningText, { key: `text:${index}`, text: part.text })
+						: part.type === "html"
+							? h(CardBlocks, { key: `html:${index}`, blocks: part.blocks })
+							: h(ShellPart, {
+									key: part.mode === "load" ? `load:${part.url}` : `inline:${part.start}`,
+									sessionId,
+									turnRef: ref,
+									part,
+									latest,
+									onOpeningApplied: store.refresh,
+								}),
 				),
 			);
 		}

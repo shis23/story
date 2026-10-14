@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import { apply } from '../lib/index.js'
 import { notifyFork } from '../lib/shared.js'
-import { cacheName } from '../lib/shell.js'
+import { cacheName, openingContentHash } from '../lib/shell.js'
 import { pngCard } from './support/png.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -216,6 +216,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       nodeId: created.campaign.opening_node_id,
       nodeIndex: 0,
       blocks: 1,
+      contentHash: openingContentHash(FIRST_MES),
     })
 
     const callsBeforeTurn = llmCalls.length
@@ -686,6 +687,185 @@ test('card shells: tail parts, server-built documents, approval and the host fet
       await again.dispose()
       await waitForExit(pid)
     }
+  } finally {
+    await dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+const SHELL_HOME_URL = 'https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/home/index.html'
+const SHELL_CUSTOM_URL = 'https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/custom_start/index.html'
+const HOME_GREETING = '【首页】'
+const CUSTOM_GREETING = '<customized>自定义开局</customized>'
+const RAIN_GREETING = '雨夜，{{char}}正在擦拭酒杯。'
+
+function lore(id, comment, key, enabled) {
+  return {
+    id,
+    keys: [key],
+    secondary_keys: [],
+    comment,
+    content: `${comment} 的设定正文。`,
+    constant: false,
+    selective: true,
+    insertion_order: 100,
+    enabled,
+    position: 'before_char',
+    extensions: {},
+  }
+}
+
+test('opening shells: mount before the first turn, switch the opening, toggle the worldbook, close afterwards', { skip: !existsSync(bin) && `sidecar not built: ${bin}`, timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sf-dsh-opening-'))
+  const cardsDir = join(root, 'cards')
+  const dataDir = join(root, 'data')
+  mkdirSync(cardsDir)
+  const glue = (url) => `<body><script>$('body').load('${url}')</script></body>`
+  writeFileSync(
+    join(cardsDir, 'opening.json'),
+    JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Seraphina',
+        description: '守护森林的女法师。',
+        personality: '温柔',
+        scenario: '旅人在森林里迷路。',
+        first_mes: HOME_GREETING,
+        mes_example: '',
+        alternate_greetings: [CUSTOM_GREETING, RAIN_GREETING],
+        tags: [],
+        creator: 'host-smoke',
+        character_version: '1',
+        character_book: {
+          name: '命定之书',
+          entries: [lore(0, '命定系统-魔法', '魔法', true), lore(1, '命定系统-科技', '科技', false)],
+        },
+        extensions: {
+          regex_scripts: [
+            shellRegex('home-shell', '首页', HOME_GREETING, glue(SHELL_HOME_URL)),
+            shellRegex('custom-shell', '自定义开局', '<customized>[\\s\\S]*?</customized>', glue(SHELL_CUSTOM_URL)),
+          ],
+        },
+      },
+    }),
+  )
+  seedShellCache(dataDir, SHELL_HOME_URL, '<!doctype html><html><head><title>home</title></head><body>首页</body></html>')
+  seedShellCache(dataDir, SHELL_CUSTOM_URL, '<!doctype html><html><head><title>custom</title></head><body>自定义开局</body></html>')
+  const llmCalls = []
+  const { ctx, adapters, routes, dispose } = fakeCtx(llmCalls)
+  const post = (path, body) => call(routes, path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) })
+  const getDoc = async (token) =>
+    (await routes.get('/api/storyforge/shell/doc').fetch(new Request(`http://localhost/api/storyforge/shell/doc?t=${encodeURIComponent(token)}`))).text()
+  try {
+    apply(ctx, { dataDir, cardsDir })
+    assert.equal((await post('/settings', { provider: 'fake', model: 'writer', toolMode: 'native' })).ok, true)
+    const created = await post('/sessions', { card: 'opening.json' })
+    assert.equal(created.ok, true, created.error)
+    const { sessionId } = created
+    const campaignId = created.campaign.campaign_id
+    const worldbook = `storyforge:campaign:${campaignId}`
+
+    // 开场轮的回放数据记下开场白指纹；开局前首页界面标 open。
+    const opening = userMessage('（开始新故事）', 'storyforge')
+    const openingChunks = await collect(adapters.get('storyforge').stream({ sessionId, messages: [opening] }))
+    const ref = openingChunks.at(-1).replayState?.response?.storyforge
+    assert.equal(ref.contentHash, openingContentHash(HOME_GREETING), JSON.stringify(ref))
+    const tail = async () => {
+      const shown = await post('/display', { sessionId, refs: [{ key: 'opening', ...ref }] })
+      assert.equal(shown.ok, true, shown.error)
+      return shown.items.opening.parts
+    }
+    const before = await tail()
+    assert.deepEqual(
+      before.map((part) => [part.type, part.kind, part.trusted, part.opening]),
+      [['shell', 'opening_home', true, 'open']],
+    )
+
+    // 挂首页：文档带开场种子（卡的问候语）与本局世界书名。
+    const home = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_HOME_URL } })
+    assert.equal(home.ok, true, home.error)
+    assert.equal(home.opening, true)
+    const homeDoc = await getDoc(home.token)
+    assert.match(homeDoc, /<title>home<\/title>/)
+    const seed = JSON.parse(homeDoc.match(/var OPENING_CHAT_SEED = (\{.*?\});\n/)[1])
+    assert.equal(seed.swipes.length, 3)
+    assert.equal(seed.swipes[0], HOME_GREETING)
+    assert.ok(homeDoc.includes(worldbook))
+
+    // 世界书：只认本局书名；读出条目名与启用状态，按名切换启用。
+    const book = await post('/shell/worldbook', { sessionId, name: worldbook })
+    assert.equal(book.ok, true, book.error)
+    const enabledOf = (entries, name) => entries.find((entry) => entry.name === name)?.enabled
+    assert.equal(enabledOf(book.entries, '命定系统-魔法'), true)
+    assert.equal(enabledOf(book.entries, '命定系统-科技'), false)
+    assert.equal((await post('/shell/worldbook', { sessionId, name: 'storyforge:campaign:other' })).ok, false)
+    const toggled = await post('/shell/worldbook-update', {
+      sessionId,
+      name: worldbook,
+      entries: [
+        { name: '命定系统-魔法', enabled: false },
+        { name: '命定系统-科技', enabled: true },
+        { name: '不存在的条目', enabled: true },
+      ],
+    })
+    assert.equal(toggled.ok, true, toggled.error)
+    assert.equal(toggled.updated, 2)
+    const after = (await post('/shell/worldbook', { sessionId, name: worldbook })).entries
+    assert.equal(enabledOf(after, '命定系统-魔法'), false)
+    assert.equal(enabledOf(after, '命定系统-科技'), true)
+    assert.equal((await post('/shell/worldbook-update', { sessionId, name: worldbook, entries: {} })).ok, false)
+
+    // 选开场：只认本故事挂过的开场界面的桥会话。
+    const forged = await post('/shell/opening', { sessionId, bridgeSession: 'sfshell:forged', swipe_id: 2, mes: RAIN_GREETING })
+    assert.equal(forged.ok, false)
+    assert.match(forged.error, /不是本故事的开场界面/)
+    const rain = await post('/shell/opening', { sessionId, bridgeSession: home.bridgeSession, swipe_id: 2, mes: RAIN_GREETING })
+    assert.equal(rain.ok, true, rain.error)
+    assert.equal(rain.greetingIndex, 2)
+    // 存档里的开场白变了：尾部补上新开场的正文（宏已展开），首页界面随原开场白一起不在了。
+    const rainParts = await tail()
+    assert.equal(rainParts.length, 1, JSON.stringify(rainParts))
+    assert.equal(rainParts[0].type, 'text')
+    assert.match(rainParts[0].text, /^雨夜，Seraphina正在擦拭酒杯。$/)
+
+    // 还在开场态：同一个界面可以再选；只有界面的开场不补正文。
+    const custom = await post('/shell/opening', { sessionId, bridgeSession: home.bridgeSession, swipe_id: 1, mes: CUSTOM_GREETING })
+    assert.equal(custom.ok, true, custom.error)
+    const customParts = await tail()
+    assert.deepEqual(
+      customParts.map((part) => [part.type, part.kind, part.opening]),
+      [['shell', 'opening_custom', 'open']],
+    )
+    const customShell = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_CUSTOM_URL } })
+    assert.equal(customShell.ok, true, customShell.error)
+    assert.match(await getDoc(customShell.token), /<title>custom<\/title>/)
+
+    // 写过一轮：开场界面关闭（尾部只留说明），挂载与改写开场白都拒绝。
+    const messages = [
+      opening,
+      { id: crypto.randomUUID(), role: 'assistant', content: [{ type: 'text', text: '（开场界面）' }], source: { kind: 'model', provider: 'storyforge', model: 'pipeline' } },
+      userMessage('我推开木屋的门。', 'user'),
+    ]
+    const chunks = await collect(adapters.get('storyforge').stream({ sessionId, messages, signal: new AbortController().signal }))
+    assert.equal(chunks.at(-1).type, 'finish')
+    let status
+    for (let i = 0; i < 100; i++) {
+      status = await call(routes, '/status')
+      if (status.settles.length > 0) break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    assert.equal(status.settles.length, 1, JSON.stringify(status))
+    const closedParts = await tail()
+    assert.deepEqual(
+      closedParts.map((part) => [part.type, part.kind, part.opening]),
+      [['shell', 'opening_custom', 'closed']],
+    )
+    const late = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_CUSTOM_URL } })
+    assert.equal(late.ok, false)
+    assert.match(late.error, /故事已经开始/)
+    const lateApply = await post('/shell/opening', { sessionId, bridgeSession: home.bridgeSession, swipe_id: 2, mes: RAIN_GREETING })
+    assert.equal(lateApply.ok, false)
   } finally {
     await dispose()
     rmSync(root, { recursive: true, force: true })
