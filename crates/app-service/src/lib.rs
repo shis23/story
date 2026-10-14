@@ -80,7 +80,9 @@ pub use services::campaigns::{
 pub use services::cards::CardSummaryDto;
 pub use services::characters::{CharacterSummary, import_character_for_host};
 pub use services::turns::accept_variant_async;
-pub use services::writing::{StartWritingRequest, start_writing_for_host};
+pub use services::writing::{
+    StartWritingRequest, route_generation_for_host, start_writing_for_host,
+};
 
 pub type PromptHookPendingMap =
     Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<PromptHookReply>>>>;

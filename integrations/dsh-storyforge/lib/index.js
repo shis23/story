@@ -53,6 +53,13 @@ import {
   resolveCampaignWorldbookEnabledUpdates,
   resolveOpeningChatSelection,
 } from './vendor/card-shell.mjs'
+import {
+  CONFIRM_GENERATION_MODE,
+  GENERATION_MODE_LABELS,
+  confirmEscalation,
+  describeChosenMode,
+  describeEscalation,
+} from './escalation.js'
 import { classifyCall, ROLE_GROUPS, roleGroup } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
@@ -568,6 +575,11 @@ function describeEvent(event) {
         : `\n【质量门】${event.error_count} 个错误，${event.warning_count} 个提醒${event.warnings?.length ? `：${event.warnings.join('；')}` : ''}\n`
     case 'Error':
       return `\n【错误】${event.message}\n`
+    // 插件自己的进度（不是管线事件）：自动路由升档确认。
+    case 'ConfirmGenerationMode':
+      return describeEscalation(event.data)
+    case 'GenerationModeChosen':
+      return describeChosenMode(event.mode)
     default:
       return null
   }
@@ -623,7 +635,7 @@ function abortError(signal) {
  * StoryForge 会话的一次模型调用：开场返回卡的开场白；用户行动交给 sidecar 跑一轮，
  * 管线进度流进思考块，成文（质量门 / autofix 之后的最终正文）作为回复正文。
  */
-function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
+function createPipelineStream({ sessions, bridge, runOptions, onTurnRan, askUser }) {
   /**
    * 分叉出的子会话第一次写作时，把它映射到来源存档的分支（StoryForge 只支持从最新
    * 一轮分叉；从更早的位置分叉会被 sidecar 以 out_of_sync 拒绝并说明原因）。
@@ -717,16 +729,25 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
     const { toolMode, generationMode } = runOptions()
+    const runTurn = (mode) =>
+      bridge.request('turn.run', {
+        campaign_id: campaignId,
+        intent,
+        generation_mode: mode,
+        history_turns: historyTurns,
+      })
     bridge
       .request('bridge.configure', { tool_mode: toolMode })
-      .then(() =>
-        bridge.request('turn.run', {
-          campaign_id: campaignId,
-          intent,
-          generation_mode: generationMode === 'auto' ? undefined : generationMode,
-          history_turns: historyTurns,
-        }),
-      )
+      .then(() => runTurn(generationMode === 'auto' ? undefined : generationMode))
+      .catch(async (error) => {
+        // 自动路由要升到高成本档：本轮还没开始，问过用户再带显式模式重发。
+        if (error?.code !== CONFIRM_GENERATION_MODE) throw error
+        queue.push({ type: 'ConfirmGenerationMode', data: error.data })
+        const mode = await confirmEscalation(error.data, (question) => askUser?.(options.sessionId, question, signal) ?? null)
+        log(`generation mode confirmed: campaign=${campaignId} suggested=${error.data?.mode} chosen=${mode}`)
+        queue.push({ type: 'GenerationModeChosen', mode })
+        return runTurn(mode)
+      })
       .then(
         (result) => {
           onTurnRan?.(campaignId, historyTurns + 1)
@@ -783,14 +804,6 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
 const MAX_TURN_EVENTS = 200
 const MAX_SETTLE_REPORTS = 20
 const MAX_LLM_LOG = 100
-/** 生成模式（auto = StoryForge 自动路由；其余显式选择，不再二次确认）。 */
-const GENERATION_MODE_LABELS = {
-  auto: '自动路由',
-  continuation: '续写（单次执笔）',
-  duet: '双人戏',
-  big_scene: '群像（并行子 Agent）',
-  sequential_crew: '群像（顺序子 Agent）',
-}
 /** 工具协议：原生 function calling，或 StoryForge 的文本降级（模型不支持工具时）。 */
 const TOOL_MODE_LABELS = { native: '原生工具调用', text_fallback: '文本降级' }
 const CARD_EXTENSIONS = new Set(['.png', '.json'])
@@ -851,6 +864,17 @@ export function apply(ctx, config) {
     toolMode: TOOL_MODE_LABELS[settings.get('toolMode')] ? settings.get('toolMode') : 'native',
     generationMode: GENERATION_MODE_LABELS[settings.get('generationMode')] ? settings.get('generationMode') : 'auto',
   })
+  /**
+   * 在会话的 DSH 界面上问用户（输入框处的选项，与 plan-mode 审阅同一通道）。问题挂在
+   * 这个会话的 agent 上，界面才知道显示在哪；没有 userQuestions 服务或会话不在运行时
+   * 返回 null。
+   */
+  const askUser = (sessionId, question, signal) => {
+    const service = ctx.get?.('userQuestions')
+    const agent = sessionId ? ctx.agents.get?.(sessionId) : undefined
+    if (!service || !agent) return null
+    return service.ask({ agent, questions: [question], signal })
+  }
   /** 按角色组单独指定的模型（只留合法条目）；没指定的组用底层模型。 */
   const roleModels = () => {
     const stored = settings.get('roleModels')
@@ -966,7 +990,13 @@ export function apply(ctx, config) {
       contextWindow: CONTEXT_WINDOW,
       streamImpl: fake
         ? fakePipelineStream
-        : createPipelineStream({ sessions, bridge, runOptions, onTurnRan: (campaignId, turns) => pendingTurns.set(campaignId, turns) }),
+        : createPipelineStream({
+            sessions,
+            bridge,
+            runOptions,
+            onTurnRan: (campaignId, turns) => pendingTurns.set(campaignId, turns),
+            askUser,
+          }),
       callLog,
     }),
   )

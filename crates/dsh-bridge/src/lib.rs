@@ -15,7 +15,9 @@
 //! - `campaign.fork {campaign_id, history_turns, name?}` → `CampaignForked`（只从最新一轮）
 //! - `turn.run {campaign_id, intent, generation_mode?, history_turns?}` → `TurnOutput`
 //!   （成文即返回；`generation_mode` 取 `continuation` / `duet` / `big_scene` /
-//!   `sequential_crew`，省略走自动路由；`history_turns` 与存档不一致时报 `out_of_sync`）
+//!   `sequential_crew`，省略走自动路由；`history_turns` 与存档不一致时报 `out_of_sync`；
+//!   自动路由要升到高成本档时报 `confirm_generation_mode`，本轮不开始，错误的
+//!   `data = {mode, reason, estimate, continuation_estimate}`，问过用户后带显式模式重发）
 //! - `turn.cancel {campaign_id?}` → `{cancelled}`（只取消前台：排队中的写作请求放弃，
 //!   正在成文的一轮中止；收尾照常完成。省略 `campaign_id` 时不区分存档）
 //! - `conversation.display {refs: [{key, conversation_id?, node_id?, node_index?}],
@@ -133,7 +135,10 @@ impl TurnObserver for PeerObserver {
 }
 
 fn to_rpc(error: BridgeError) -> RpcError {
-    RpcError::new(error.code, error.message)
+    RpcError {
+        data: error.data,
+        ..RpcError::new(error.code, error.message)
+    }
 }
 
 fn string_param(params: &Value, key: &str) -> Result<String, RpcError> {

@@ -1034,6 +1034,55 @@ pub struct StartWritingRequest {
     pub generation_mode: Option<storyforge_domain::generation::GenerationMode>,
 }
 
+/// 自动路由预检用的写作上下文：角色 / 世界书取 tool_ctx 快照，Campaign 数据经
+/// `fill_campaign_context_async` 填入。此时还没写入开场白或用户意图。
+async fn routing_context(
+    app: &Arc<AppState>,
+    tool_snapshot: &storyforge_app_agent::ToolContext,
+    conversation_id: Option<&str>,
+) -> Result<WritingContext, TauriCommandError> {
+    let mut ctx = WritingContext {
+        characters: tool_snapshot.characters.clone(),
+        world_info: tool_snapshot.world_info.clone(),
+        conversation_id: conversation_id.map(Id::from_str).unwrap_or_default(),
+        campaign_id: None,
+        turn: 0,
+        pending_tasks: vec![],
+        story_clock: String::new(),
+        profile: None,
+        modules: vec![],
+        regex_scripts: vec![],
+        campaign_runtime: None,
+        agent_profile_config: None,
+        recent_summaries: vec![],
+        chronicle_prompt_catalog: vec![],
+        far_memory_hits: vec![],
+        template_random_seed: None,
+        context_epoch: None,
+        chronicle_revision: 0,
+    };
+    fill_campaign_context_async(&mut ctx, app).await?;
+    Ok(ctx)
+}
+
+/// 只跑 `start_writing` 的自动路由预检，不写任何东西。
+///
+/// Tauri 前端总是显式选生成模式；非 Tauri 宿主（DSH sidecar）用自动路由时先调它，
+/// `requires_cost_confirmation` 为 true 就先问用户，再把选定的模式作为显式
+/// `generation_mode` 开写。与 `start_writing_for_host` 用同一份上下文与路由规则。
+pub async fn route_generation_for_host(
+    app: &Arc<AppState>,
+    intent: &str,
+    conversation_id: Option<&str>,
+    generation_mode: Option<storyforge_domain::generation::GenerationMode>,
+) -> Result<storyforge_domain::generation::GenerationRouteDecision, TauriCommandError> {
+    let tool_snapshot = app.snapshot_tool_ctx();
+    let ctx = routing_context(app, &tool_snapshot, conversation_id).await?;
+    Ok(storyforge_domain::generation::route_generation_mode(
+        &generation_route_signals(intent, &ctx, generation_mode),
+    ))
+}
+
 /// `start_writing` 命令的本体。Tauri 命令与非 Tauri 宿主（DSH sidecar）共用这一份实现。
 ///
 /// 事件经 `event_tx` 推送；成文后后台后处理仍持有它的克隆，所有克隆释放
@@ -1062,31 +1111,7 @@ pub async fn start_writing_for_host(
 
     // 在写入开场白/用户意图之前完成自动路由预检。自动升到昂贵群像档时
     // fail closed，调用方须把建议模式作为显式 generation_mode 重试。
-    let provisional_conversation_id = conversation_id
-        .as_deref()
-        .map(Id::from_str)
-        .unwrap_or_default();
-    let mut ctx = WritingContext {
-        characters: tool_snapshot.characters.clone(),
-        world_info: tool_snapshot.world_info.clone(),
-        conversation_id: provisional_conversation_id,
-        campaign_id: None,
-        turn: 0,
-        pending_tasks: vec![],
-        story_clock: String::new(),
-        profile: None,
-        modules: vec![],
-        regex_scripts: vec![],
-        campaign_runtime: None,
-        agent_profile_config: None,
-        recent_summaries: vec![],
-        chronicle_prompt_catalog: vec![],
-        far_memory_hits: vec![],
-        template_random_seed: None,
-        context_epoch: None,
-        chronicle_revision: 0,
-    };
-    fill_campaign_context_async(&mut ctx, &app).await?;
+    let mut ctx = routing_context(&app, &tool_snapshot, conversation_id.as_deref()).await?;
     let route_decision = storyforge_domain::generation::route_generation_mode(
         &generation_route_signals(&intent, &ctx, generation_mode),
     );

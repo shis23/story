@@ -341,6 +341,8 @@ pub struct FakePlugin {
     pub held: Vec<Value>,
     /// 覆盖导演的回答（Plan JSON）；None 时用 MockLlmClient 的默认脚本。
     pub director_plan: Option<String>,
+    /// 覆盖角色识别的回答（角色定义 JSON 数组）；None 时用 MockLlmClient 的默认脚本。
+    pub extracted_characters: Option<String>,
     /// 覆盖 MVU 分析的回答（MvuTranslation JSON）；None 时用 MockLlmClient 的默认脚本。
     pub mvu_translation: Option<String>,
     /// 收到的 MVU 分析请求数。
@@ -383,6 +385,7 @@ impl FakePlugin {
             hold_llm: false,
             held: Vec::new(),
             director_plan: None,
+            extracted_characters: None,
             mvu_translation: None,
             mvu_requests: 0,
             subagent_barrier: 0,
@@ -467,6 +470,12 @@ impl FakePlugin {
             && system_text(request).contains("写作导演")
         {
             response.content = plan.clone();
+            response.tool_calls.clear();
+        }
+        if let Some(characters) = &self.extracted_characters
+            && system_text(request).contains("卡内角色识别")
+        {
+            response.content = characters.clone();
             response.tool_calls.clear();
         }
         if all_text(request).contains("卡内状态栏分析") {
