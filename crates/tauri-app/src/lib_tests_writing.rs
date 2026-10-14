@@ -513,6 +513,12 @@ fn test_postprocess_variable_keys_include_runtime_custom_schema_and_values() {
         serde_json::json!("red"),
         2,
     ));
+    // 卡壳选择器桶是宿主状态，不能出现在后处理可写变量目录里。
+    campaign.variables.push(VariableValue::new(
+        "__storyforge_card_shell_variables",
+        serde_json::json!({ "chat:current": {} }),
+        0,
+    ));
 
     let mut schema = default_character_variables();
     schema.push(VariableField {
@@ -572,6 +578,10 @@ fn test_postprocess_variable_keys_include_runtime_custom_schema_and_values() {
             .filter(|key| key.starts_with("hp（角色/"))
             .count(),
         1
+    );
+    assert!(
+        keys.iter().all(|key| !key.contains("__storyforge")),
+        "reserved keys leaked into the postprocess catalog: {keys:?}"
     );
 }
 

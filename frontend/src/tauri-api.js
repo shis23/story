@@ -1330,6 +1330,16 @@ export async function setCampaignVariable(campaignId, key, value) {
   }
 }
 
+/**
+ * 整体替换卡壳选择器桶（`__storyforge_card_shell_variables`）。
+ * 通用 setCampaignVariable 在后端拒绝 `__` 内部键，桶只能走这个专用命令。
+ */
+export async function setCardShellVariables(campaignId, variables) {
+  if (isTauri()) {
+    return await invoke('set_card_shell_variables', { campaignId, variables })
+  }
+}
+
 /** 临场角色升级为常驻 */
 export async function promoteTemporaryInstance(campaignId, instanceId) {
   if (isTauri()) {

@@ -394,6 +394,17 @@ fn infer_scalar_type(val: &serde_json::Value) -> VariableType {
     }
 }
 
+/// StoryForge 内部保留的变量命名空间前缀（卡壳选择器桶等宿主状态）。
+pub const RESERVED_VARIABLE_PREFIX: &str = "__storyforge";
+
+/// `__storyforge*` 内部键（trim + ASCII 大小写不敏感）：由宿主管理，
+/// 不进提示词与模板上下文，也不接受模型（后处理 / MVU JS）写入。
+pub fn is_reserved_variable_key(key: &str) -> bool {
+    key.trim()
+        .to_ascii_lowercase()
+        .starts_with(RESERVED_VARIABLE_PREFIX)
+}
+
 // ─── 注入渲染（cache 友好：拼成文本放末尾 user message）──────────────────
 
 /// 渲染变量为注入文本（供导演/编剧/子 Agent 末尾 user message 使用）
@@ -412,6 +423,10 @@ pub fn render_variables_for_injection(
     characters: &[(&str, &[VariableValue])], // (角色名, 该角色的变量)
 ) -> String {
     let mut out = String::new();
+    let campaign_vars: Vec<&VariableValue> = campaign_vars
+        .iter()
+        .filter(|v| !is_reserved_variable_key(&v.key))
+        .collect();
 
     // 全局变量（story_clock 等单独提出来更显眼）
     if !campaign_vars.is_empty() {
@@ -567,6 +582,39 @@ mod tests {
         assert!(out.contains("林医生"));
         assert!(out.contains("生命 80"));
         assert!(out.contains("状态 受伤"));
+    }
+
+    #[test]
+    fn render_variables_for_injection_skips_reserved_keys() {
+        // 卡壳选择器桶是宿主状态，不进提示词；只剩内部键时连标题也不出。
+        let bucket = VariableValue::new(
+            "__storyforge_card_shell_variables",
+            serde_json::json!({ "chat:current": { "secret": "壳内状态" } }),
+            0,
+        );
+        let only_internal = render_variables_for_injection(std::slice::from_ref(&bucket), &[]);
+        assert_eq!(only_internal, "");
+
+        let mixed = vec![
+            VariableValue::new("weather", serde_json::json!("雨"), 5),
+            bucket,
+            VariableValue::new(" __StoryForge_other", serde_json::json!(1), 0),
+        ];
+        let out = render_variables_for_injection(&mixed, &[]);
+        assert!(out.contains("雨"));
+        assert!(!out.contains("壳内状态"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("__storyforge"), "{out}");
+    }
+
+    #[test]
+    fn reserved_variable_key_matches_storyforge_namespace_only() {
+        assert!(is_reserved_variable_key(
+            "__storyforge_card_shell_variables"
+        ));
+        assert!(is_reserved_variable_key("  __STORYFORGE_x"));
+        assert!(!is_reserved_variable_key("_storyforge"));
+        assert!(!is_reserved_variable_key("__other"));
+        assert!(!is_reserved_variable_key("stat.__storyforge"));
     }
 
     // ─── MVU 探测测试 ──────────────────────────────────────────────────────

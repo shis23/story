@@ -44,7 +44,7 @@ pub use commands::cards::{delete_card, get_card, list_cards};
 pub use commands::memory::{abandon_task, complete_task, create_task};
 pub use commands::variables::{
     add_campaign_variable, promote_temporary_instance, set_campaign_variable,
-    set_character_variable, sync_campaign_variable_schema,
+    set_card_shell_variables, set_character_variable, sync_campaign_variable_schema,
 };
 #[cfg(test)]
 use playthrough_lifecycle::delete_campaign_playthrough_in_store;
@@ -471,6 +471,7 @@ pub fn run() {
             add_campaign_variable,
             sync_campaign_variable_schema,
             set_campaign_variable,
+            set_card_shell_variables,
             promote_temporary_instance,
             // P2 后处理产出查询 / 任务管理
             list_character_knowledge,

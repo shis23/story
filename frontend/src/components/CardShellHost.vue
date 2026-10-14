@@ -46,7 +46,7 @@ import {
   cardShellListAllowedHosts,
   getCampaignVariables,
   listCampaignWorldInfo,
-  setCampaignVariable,
+  setCardShellVariables,
   setCampaignWorldInfoEnabled,
 } from '../tauri-api.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
@@ -78,7 +78,6 @@ import {
   createCardShellMapReadyFallbackScript,
 } from '../utils/cardShellFetchProxy.js'
 import {
-  CARD_SHELL_VARIABLES_KEY,
   enqueueCardShellVariableMutation,
   mergeCardShellVariables,
   patchCardShellVariables,
@@ -364,7 +363,8 @@ async function persistShellSelectorVariables(selector, variables, mode = 'replac
       : mode === 'merge'
         ? mergeCardShellVariables(current, selector, variables)
         : updateCardShellVariables(current, selector, variables)
-    await setCampaignVariable(props.campaignId, CARD_SHELL_VARIABLES_KEY, updated)
+    // 桶键是 __ 内部键，通用 set_campaign_variable 会拒绝（T-06），走专用命令。
+    await setCardShellVariables(props.campaignId, updated)
     return updated
   })
   shellSelectorVariables = next

@@ -151,4 +151,26 @@ describe('CampaignVariablesTab', () => {
     expect(wrapper.text()).toContain('故事时间')
     expect(wrapper.get('[aria-label="全局变量 story_clock"]').element.value).toBe('清晨')
   })
+
+  it('hides host-managed __storyforge variables such as the card shell buckets', async () => {
+    const defaultInvoke = invoke.getMockImplementation()
+    invoke.mockImplementation((command, args) => {
+      if (command === 'get_campaign_variables') {
+        return Promise.resolve([
+          { key: 'story_clock', value: '清晨' },
+          { key: '__storyforge_card_shell_variables', value: { 'chat:current': { hp: 3 } } },
+        ])
+      }
+      return defaultInvoke(command, args)
+    })
+
+    const wrapper = mount(CampaignVariablesTab, {
+      props: { campaignId: 'campaign-1' },
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[aria-label="全局变量 story_clock"]').element.value).toBe('清晨')
+    expect(wrapper.text()).not.toContain('__storyforge')
+    expect(wrapper.find('[aria-label="全局变量 __storyforge_card_shell_variables"]').exists()).toBe(false)
+  })
 })
