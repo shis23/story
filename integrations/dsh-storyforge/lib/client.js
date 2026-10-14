@@ -488,6 +488,20 @@ window.__ModuleLoader__.load({
 		};
 
 		/**
+		 * 卡片界面的 createChatMessages：只把文字填进输入框，用户看过再点发送，卡片自己开不了
+		 * 一轮。输入框里已有别的草稿时不覆盖（同一段文字重填不算冲突）。
+		 */
+		function draftViaComposer(sessionId, text) {
+			const composer = composers.get(sessionId);
+			if (!composer) return "no-composer";
+			const before = composer.read();
+			if (before.phase !== "plain") return "busy";
+			if (before.draft.trim() && before.draft.trim() !== text.trim()) return "draft";
+			composer.actions.setDraft(text);
+			return "drafted";
+		}
+
+		/**
 		 * 面板数据：挂载、换会话、本存档有新的收尾（后处理写回变量）时重取。
 		 * `refreshKey` 由调用方拼（存档 id + 最近一次收尾时间 + 轮数）。
 		 */
@@ -1787,16 +1801,29 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * 一个会话的展示数据加载器：同一个宏任务里挂载的 Turn 尾部合成一次 `/display`。
-		 * 展示正则的深度随对话变长而变——出现位置更靠后的节点（又写了一轮）时代数加一，
-		 * 已挂载的尾部按新代数一起重取；重取期间先显示旧结果，不闪。
+		 * 展示正则的深度随对话变长而变——出现位置更靠后的节点（又写了一轮，纯文字轮也算）时
+		 * 代数加一，已挂载的尾部按新代数一起重取；重取期间先显示旧结果，不闪。开场界面靠这次
+		 * 重取在写过一轮后关掉。
 		 */
 		function createDisplayStore(sessionId) {
 			/** key → { ref, mounted, inflight, result?: { generation, item?, error? } } */
 			const entries = new Map();
 			const listeners = new Set();
 			let generation = 0;
+			/** 有展示数据的尾部里最靠后的节点（决定状态栏界面是否直接挂）。 */
 			let latestIndex = null;
+			/** 见过的最靠后节点，含没有展示数据的纯文字轮（决定代数）。 */
+			let newestIndex = null;
 			let timer = null;
+
+			/** 记下一个节点位置；比见过的都靠后时代数加一并返回 true。 */
+			const see = (nodeIndex) => {
+				if (!Number.isInteger(nodeIndex)) return false;
+				const newer = newestIndex !== null && nodeIndex > newestIndex;
+				if (newestIndex === null || nodeIndex > newestIndex) newestIndex = nodeIndex;
+				if (newer) generation += 1;
+				return newer;
+			};
 
 			const notify = () => {
 				for (const listener of listeners) listener();
@@ -1845,14 +1872,16 @@ window.__ModuleLoader__.load({
 						entries.set(key, entry);
 					}
 					entry.mounted += 1;
-					if (Number.isInteger(ref.nodeIndex)) {
-						if (latestIndex !== null && ref.nodeIndex > latestIndex) generation += 1;
-						if (latestIndex === null || ref.nodeIndex > latestIndex) latestIndex = ref.nodeIndex;
-					}
+					see(ref.nodeIndex);
+					if (Number.isInteger(ref.nodeIndex) && (latestIndex === null || ref.nodeIndex > latestIndex)) latestIndex = ref.nodeIndex;
 					schedule();
 					return () => {
 						entry.mounted -= 1;
 					};
+				},
+				/** 没有展示数据的一轮（纯文字）：不取数据，只推进代数，让较早的尾部按新深度重取。 */
+				observe(nodeIndex) {
+					if (see(nodeIndex)) schedule();
 				},
 				retry(key) {
 					const entry = entries.get(key);
@@ -2053,10 +2082,19 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * 壳的桥请求 → 宿主动作。抛错会作为 error 回给壳。`opened` 是服务端挂载时的回执（开场
-		 * 界面带 `opening` 与桥会话），`onOpeningApplied` 在开场白改写后刷新尾部。
+		 * 界面带 `opening` 与桥会话），`onOpeningApplied` 在开场白改写后刷新尾部，`onDrafted`
+		 * 在卡片把消息填进输入框后提示用户。
 		 */
-		async function answerShellRequest(sessionId, type, payload, { opened, onOpeningApplied } = {}) {
+		async function answerShellRequest(sessionId, type, payload, { opened, onOpeningApplied, onDrafted } = {}) {
 			switch (type) {
+				case "chat_draft": {
+					const text = typeof payload.text === "string" ? payload.text : "";
+					if (!text.trim()) throw new Error("没有要填入的内容");
+					const outcome = draftViaComposer(sessionId, text);
+					if (outcome !== "drafted") throw new Error(`没填进输入框：${MVU_NOT_SENT[outcome] ?? outcome}`);
+					onDrafted?.();
+					return { ok: true, drafted: true };
+				}
 				case "fetch_text": {
 					const { resource } = await postJson("/shell/fetch", { sessionId, url: payload.url });
 					if (resource.body_text == null) throw new Error(`not text: ${payload.url}`);
@@ -2162,7 +2200,8 @@ window.__ModuleLoader__.load({
 							event.source.postMessage({ __sf_shell_bridge_res: data.id, result, error: failure || null }, "*");
 						} catch (_) {}
 					};
-					answerShellRequest(sessionId, data.type, payload, { opened, onOpeningApplied }).then(
+					const onDrafted = () => setNotice(`${opened.label ?? part.label}把一段消息填进了输入框，看过后点发送。`);
+					answerShellRequest(sessionId, data.type, payload, { opened, onOpeningApplied, onDrafted }).then(
 						(result) => reply(result, null),
 						(e) => reply(null, errorText(e)),
 					);
@@ -2304,6 +2343,10 @@ window.__ModuleLoader__.load({
 			const key = ref ? refKey(ref) : null;
 			const store = key ? displayStore(sessionId) : null;
 			React.useEffect(() => (store ? store.register(key, ref) : undefined), [store, key]);
+			const plainIndex = isStoryForge && sessionId && !ref && Number.isInteger(data?.ref?.nodeIndex) ? data.ref.nodeIndex : null;
+			React.useEffect(() => {
+				if (plainIndex !== null) displayStore(sessionId).observe(plainIndex);
+			}, [sessionId, plainIndex]);
 			const result = React.useSyncExternalStore(store?.subscribe ?? noopSubscribe, () => store?.result(key));
 			if (!store || !result) return null;
 			if (result.error) {
