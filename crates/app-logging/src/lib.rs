@@ -61,6 +61,12 @@ pub struct LlmCallDetail {
     pub request_payload: String,
     /// 完整回复
     pub response_text: String,
+    /// 回复里的原生 tool call（函数名 + 原始参数）。
+    ///
+    /// 走原生工具调用的轮次 `response_text` 往往为空，参数只在这里；
+    /// 旧日志行没有该字段，按空列表回填。
+    #[serde(default)]
+    pub response_tool_calls: Vec<LlmToolCallRecord>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     /// A2：缓存命中 token（prompt 前缀缓存复用）
@@ -73,6 +79,36 @@ pub struct LlmCallDetail {
     pub error: Option<String>,
 }
 
+/// 日志里的一次原生 tool call。
+///
+/// 不直接复用 domain 的 `ToolCall`：落盘格式与之解耦，domain 类型日后改形状
+/// 也不会让历史 jsonl 行回填失败。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmToolCallRecord {
+    pub id: String,
+    pub name: String,
+    /// 模型给出的原始参数（JSON 字符串，不做解析，坏 JSON 也原样保留）
+    pub arguments: String,
+}
+
+impl From<&storyforge_domain::llm::ToolCall> for LlmToolCallRecord {
+    fn from(call: &storyforge_domain::llm::ToolCall) -> Self {
+        Self {
+            id: call.id.clone(),
+            name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
+        }
+    }
+}
+
+/// 脱敏后的 tool call：只留函数名和参数长度
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmToolCallRedacted {
+    pub name: String,
+    /// 参数替换为 <content N chars>
+    pub arguments_redacted: String,
+}
+
 /// 脱敏后的 LLM 调用详情（导出 bundle 用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallDetailRedacted {
@@ -83,6 +119,8 @@ pub struct LlmCallDetailRedacted {
     /// 正文替换为 <content N chars>
     pub request_payload_redacted: String,
     pub response_text_redacted: String,
+    #[serde(default)]
+    pub response_tool_calls_redacted: Vec<LlmToolCallRedacted>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     #[serde(default)]
@@ -103,6 +141,14 @@ impl LlmCallDetail {
             agent_role: self.agent_role.clone(),
             request_payload_redacted: format!("<content {} chars>", self.request_payload.len()),
             response_text_redacted: format!("<content {} chars>", self.response_text.len()),
+            response_tool_calls_redacted: self
+                .response_tool_calls
+                .iter()
+                .map(|call| LlmToolCallRedacted {
+                    name: call.name.clone(),
+                    arguments_redacted: format!("<content {} chars>", call.arguments.len()),
+                })
+                .collect(),
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             cached_tokens: self.cached_tokens,
@@ -654,6 +700,7 @@ mod tests {
             agent_role: None,
             request_payload: "很长的prompt...".into(),
             response_text: "很长的回复...".into(),
+            response_tool_calls: vec![],
             prompt_tokens: 100,
             completion_tokens: 50,
             cached_tokens: 0,
@@ -665,6 +712,81 @@ mod tests {
         assert!(redacted.request_payload_redacted.contains("chars"));
         assert!(redacted.response_text_redacted.contains("chars"));
         assert_eq!(redacted.prompt_tokens, 100);
+    }
+
+    /// tool-call 参数同属模型输出正文：脱敏视图只留函数名和参数长度。
+    #[test]
+    fn test_llm_detail_redact_hides_tool_call_arguments() {
+        let secret_args = r#"{"kind":"event","summary":"脱敏哨兵-正文不得外泄"}"#;
+        let detail = LlmCallDetail {
+            connection_name: "Gemini".into(),
+            model: "gemini-3.8-flash-high".into(),
+            profile_id: None,
+            agent_role: None,
+            request_payload: "[]".into(),
+            response_text: String::new(),
+            response_tool_calls: vec![LlmToolCallRecord {
+                id: "call_1".into(),
+                name: "emit_postprocess".into(),
+                arguments: secret_args.into(),
+            }],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            latency_ms: 100,
+            error: None,
+        };
+
+        let redacted = detail.redact();
+        assert_eq!(
+            redacted.response_tool_calls_redacted,
+            vec![LlmToolCallRedacted {
+                name: "emit_postprocess".into(),
+                arguments_redacted: format!("<content {} chars>", secret_args.len()),
+            }]
+        );
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("脱敏哨兵"), "脱敏视图泄露了参数原文: {json}");
+        assert!(!json.contains("\"kind\""), "脱敏视图泄露了参数键名: {json}");
+
+        // 导出 bundle 走同一脱敏路径
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_export_tool_calls_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = LogStore::new(dir.clone());
+        let mut entry = make_entry(LogKind::LlmCall, LogLevel::Info, "llm call");
+        entry.llm_detail = Some(detail);
+        store.push(entry);
+
+        let opts = ExportOptions {
+            redact_content: true,
+            ..Default::default()
+        };
+        let bundle = export_bundle(&store, &opts).unwrap();
+        let bundle_json = serde_json::to_string(&bundle).unwrap();
+        assert!(bundle_json.contains("emit_postprocess"));
+        assert!(
+            !bundle_json.contains("脱敏哨兵"),
+            "脱敏 bundle 泄露了参数原文"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新增字段前落盘的 LLM 调用行（没有 `response_tool_calls`）必须照常回填。
+    #[test]
+    fn test_legacy_llm_entry_without_tool_calls_deserializes() {
+        let legacy_line = r#"{"id":"legacy-1","kind":"LlmCall","level":"Info","timestamp":"2026-10-14T08:00:00Z","message":"LLM old 完成","fields":{},"llm_detail":{"connection_name":"old","model":"m","profile_id":null,"agent_role":null,"request_payload":"[]","response_text":"","prompt_tokens":1,"completion_tokens":2,"latency_ms":3,"error":null}}"#;
+        let entry: LogEntry = serde_json::from_str(legacy_line).unwrap();
+        let detail = entry.llm_detail.unwrap();
+        assert!(detail.response_tool_calls.is_empty());
+        assert_eq!(detail.completion_tokens, 2);
+
+        let legacy_redacted = r#"{"connection_name":"old","model":"m","profile_id":null,"agent_role":null,"request_payload_redacted":"<content 2 chars>","response_text_redacted":"<content 0 chars>","prompt_tokens":1,"completion_tokens":2,"latency_ms":3,"error":null}"#;
+        let redacted: LlmCallDetailRedacted = serde_json::from_str(legacy_redacted).unwrap();
+        assert!(redacted.response_tool_calls_redacted.is_empty());
     }
 
     #[test]

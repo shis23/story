@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmError, StreamChunk};
 use storyforge_infra_llm::LlmClient;
 
-use crate::{LlmCallDetail, LogEntry, LogKind, LogLevel, LogStore};
+use crate::{LlmCallDetail, LlmToolCallRecord, LogEntry, LogKind, LogLevel, LogStore};
 
 /// LLM 调用拦截器（记录每次调用到 LogStore）
 pub struct LlmInterceptor {
@@ -58,6 +58,10 @@ impl LlmInterceptor {
                 (String::new(), 0, 0, 0, 0)
             };
 
+        let response_tool_calls = resp
+            .map(|r| r.tool_calls.iter().map(LlmToolCallRecord::from).collect())
+            .unwrap_or_default();
+
         let detail = LlmCallDetail {
             connection_name: self.connection_name.clone(),
             model: req.model.clone(),
@@ -65,6 +69,7 @@ impl LlmInterceptor {
             agent_role: None,
             request_payload,
             response_text,
+            response_tool_calls,
             prompt_tokens,
             completion_tokens,
             cached_tokens,
@@ -152,5 +157,115 @@ impl LlmClient for LlmInterceptor {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::llm::{ChatMessage, FunctionCall, SamplingParams, ToolCall};
+
+    use crate::LogFilter;
+
+    /// 只回原生 tool call、正文为空的客户端（模拟后处理 `emit_postprocess` 轮次）
+    struct ToolCallOnlyClient {
+        arguments: String,
+    }
+
+    impl ToolCallOnlyClient {
+        fn response(&self) -> ChatResponse {
+            ChatResponse {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_pp_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "emit_postprocess".into(),
+                        arguments: self.arguments.clone(),
+                    },
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallOnlyClient {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            Ok(self.response())
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            _tx: mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            Ok(self.response())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_tool_calls_are_logged_and_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_interceptor_tool_calls_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(LogStore::new(dir.clone()));
+        // 模型漏了 description 的那种 trigger：原样记录，不做解析
+        let arguments = r#"{"kind":"event","desc":"雨夜来客"}"#.to_string();
+        let interceptor = LlmInterceptor::new(
+            Arc::new(ToolCallOnlyClient {
+                arguments: arguments.clone(),
+            }),
+            Arc::clone(&store),
+            "test-conn".into(),
+        );
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: None,
+            params: SamplingParams::default(),
+            model: "gemini-3.8-flash-high".into(),
+        };
+
+        interceptor.chat(&req).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        interceptor.chat_stream(&req, tx, cancel_rx).await.unwrap();
+
+        let expected = vec![LlmToolCallRecord {
+            id: "call_pp_1".into(),
+            name: "emit_postprocess".into(),
+            arguments: arguments.clone(),
+        }];
+        let entries = store.query(&LogFilter {
+            kind: Some(LogKind::LlmCall),
+            ..Default::default()
+        });
+        assert_eq!(entries.len(), 2, "chat 与 chat_stream 各记一条");
+        for entry in &entries {
+            let detail = entry.llm_detail.as_ref().unwrap();
+            assert!(detail.response_text.is_empty());
+            assert_eq!(detail.response_tool_calls, expected);
+        }
+
+        // 落盘的 jsonl 也要带上参数原文，跨会话回填后仍可查
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let content = std::fs::read_to_string(dir.join(format!("{date}.jsonl"))).unwrap();
+        let persisted: Vec<LogEntry> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(persisted.len(), 2);
+        for entry in &persisted {
+            assert_eq!(
+                entry.llm_detail.as_ref().unwrap().response_tool_calls,
+                expected
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
