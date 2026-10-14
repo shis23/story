@@ -635,7 +635,7 @@ function abortError(signal) {
  * StoryForge 会话的一次模型调用：开场返回卡的开场白；用户行动交给 sidecar 跑一轮，
  * 管线进度流进思考块，成文（质量门 / autofix 之后的最终正文）作为回复正文。
  */
-function createPipelineStream({ sessions, bridge, runOptions, onTurnRan, askUser }) {
+function createPipelineStream({ sessions, bridge, runOptions, onTurnRan, askUser, liveTitle }) {
   /**
    * 分叉出的子会话第一次写作时，把它映射到来源存档的分支（StoryForge 只支持从最新
    * 一轮分叉；从更早的位置分叉会被 sidecar 以 out_of_sync 拒绝并说明原因）。
@@ -645,13 +645,16 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan, askUser
     if (!parent?.campaignId) {
       throw new Error('分叉来源会话还没有关联 StoryForge 存档，无法建立分支。')
     }
+    // 存档分支用子会话此刻在 DSH 里的标题（分叉后用户可能已经改过名）。
+    const title = liveTitle?.(sessionId) ?? session.title
     const forked = await bridge.request('campaign.fork', {
       campaign_id: parent.campaignId,
       history_turns: historyTurns,
-      name: session.title,
+      name: title,
     })
     sessions.set(sessionId, {
       ...session,
+      title,
       campaignId: forked.campaign_id,
       conversationId: forked.conversation_id,
       cardName: parent.cardName,
@@ -875,6 +878,41 @@ export function apply(ctx, config) {
     if (!service || !agent) return null
     return service.ask({ agent, questions: [question], signal })
   }
+  /** 会话在 DSH 侧栏显示的当前标题（含用户改名）；会话不在内存或读不到时为 undefined。 */
+  const liveTitle = (sessionId) => {
+    try {
+      const session = ctx.agents.get?.(sessionId)?.session
+      const title = session ? ctx.sessionTitle.get?.(session)?.title : undefined
+      return typeof title === 'string' && title.trim() ? title : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * DSH 里已归档的 StoryForge 会话。归档状态以 DSH 为准（它不通知插件，读注册表的归档集）；
+   * 存档本身没有归档概念，归档 / 取消归档都不动存档。
+   */
+  const archivedStories = () => {
+    let ids
+    try {
+      ids = ctx.workspaceRegistry.archivedSessionIds ?? []
+    } catch {
+      return []
+    }
+    return ids.filter((id) => sessions.get(id) !== undefined)
+  }
+  /**
+   * 登记里的标题跟上 DSH（用户改名、分叉后的「来源标题 (1)」）：只看内存里的会话，标题有变才
+   * 落盘。DSH 的标题是截断过的，与登记标题截断后相同就保留登记里的完整标题。
+   */
+  const syncStoredTitles = () => {
+    for (const [id, story] of Object.entries(sessions.all())) {
+      const title = liveTitle(id)
+      if (title && title !== story.title && title !== fitSessionTitle(story.title)) {
+        sessions.set(id, { ...story, title })
+      }
+    }
+  }
   /** 按角色组单独指定的模型（只留合法条目）；没指定的组用底层模型。 */
   const roleModels = () => {
     const stored = settings.get('roleModels')
@@ -996,6 +1034,7 @@ export function apply(ctx, config) {
             runOptions,
             onTurnRan: (campaignId, turns) => pendingTurns.set(campaignId, turns),
             askUser,
+            liveTitle,
           }),
       callLog,
     }),
@@ -1017,13 +1056,16 @@ export function apply(ctx, config) {
   }
 
   // 分叉子会话继承预设：agent 作用域插件发现后在这里补映射（P3 对应到 Campaign 分支）。
+  // 子会话的标题归 DSH：它的客户端在分叉后把子会话改名为「来源标题 (1)」（这个通知早于
+  // 那次改名），所以这里只登记占位标题；首页显示 DSH 的标题，第一次发送时存档分支取子会话
+  // 那时的标题（mapFork）。已登记的子会话（DSH 重启后重新创建 agent）不动。
   ctx.effect(
     () =>
       setForkObserver((childId, parentId) => {
         if (sessions.get(childId)) return
-        const parent = sessions.get(parentId)
+        const parentTitle = liveTitle(parentId) ?? sessions.get(parentId)?.title
         sessions.set(childId, {
-          title: parent ? `${parent.title}（分叉）` : '分叉的故事',
+          title: parentTitle ? `${parentTitle}（分叉）` : '分叉的故事',
           createdAt: new Date().toISOString(),
           forkedFrom: parentId,
         })
@@ -1651,6 +1693,25 @@ export function apply(ctx, config) {
       },
     },
     {
+      // 首页「取消归档」：只放行插件登记过的故事，不替 DSH 恢复别的会话。
+      path: `${API_BASE}/sessions/unarchive`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const body = await request.json().catch(() => ({}))
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
+        if (!sessionId || sessions.get(sessionId) === undefined) return failure('这不是 StoryForge 故事的会话', 404)
+        try {
+          await ctx.workspaceRegistry.unarchiveSession(sessionId)
+          log(`story unarchived: ${sessionId}`)
+          return json({ ok: true, archived: archivedStories() })
+        } catch (error) {
+          log(`unarchive failed: ${sessionId}: ${error?.message ?? error}`)
+          return failure(error)
+        }
+      },
+    },
+    {
       path: `${API_BASE}/cards`,
       methods: ['GET'],
       requestBody: 'buffered',
@@ -1755,6 +1816,7 @@ export function apply(ctx, config) {
       methods: ['GET'],
       requestBody: 'buffered',
       fetch: async () => {
+        syncStoredTitles()
         const info = bridge.info()
         let status = null
         let statusError = null
@@ -1775,6 +1837,7 @@ export function apply(ctx, config) {
           ...runOptions(),
           settles: settleReports,
           sessions: sessions.all(),
+          archived: archivedStories(),
           events: turnEvents.slice(0, 50),
           llmCalls: llmLog.slice(0, 50),
           llmCallCount: llmSeq,
