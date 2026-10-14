@@ -51,6 +51,10 @@ function fakeModel(calls, models = ['writer']) {
 
 function fakeCtx(llmCalls) {
   const titles = []
+  /** DSH 侧栏里的会话标题（只有内存里的会话有）：会话 id → 标题。 */
+  const liveTitles = new Map()
+  /** DSH 注册表的归档集。 */
+  const archived = []
   const adapters = new Map()
   const routes = new Map()
   const disposers = []
@@ -82,13 +86,24 @@ function fakeCtx(llmCalls) {
     },
     workspaceRegistry: {
       create: async (path) => ({ path, attachSession: async () => {}, detachSession: async () => {} }),
+      get archivedSessionIds() {
+        return [...archived]
+      },
+      unarchiveSession: async (id) => {
+        const index = archived.indexOf(id)
+        if (index >= 0) archived.splice(index, 1)
+      },
     },
     agents: {
       create: async () => ({ agent: { session: {}, followup: () => {} }, dispose: async () => {} }),
+      get: (id) => (liveTitles.has(id) ? { session: { id } } : undefined),
     },
-    sessionTitle: { rename: (_session, title) => titles.push(title) },
+    sessionTitle: {
+      rename: (_session, title) => titles.push(title),
+      get: (session) => (liveTitles.has(session?.id) ? { title: liveTitles.get(session.id) } : undefined),
+    },
   }
-  return { ctx, adapters, routes, titles, dispose: () => Promise.all(disposers.map((d) => d())) }
+  return { ctx, adapters, routes, titles, liveTitles, archived, dispose: () => Promise.all(disposers.map((d) => d())) }
 }
 
 async function call(routes, path, init) {
@@ -159,7 +174,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     }),
   )
   const llmCalls = []
-  const { ctx, adapters, routes, titles, dispose } = fakeCtx(llmCalls)
+  const { ctx, adapters, routes, titles, liveTitles, archived, dispose } = fakeCtx(llmCalls)
   try {
     apply(ctx, { dataDir: join(root, 'data'), cardsDir })
     const adapter = adapters.get('storyforge')
@@ -322,7 +337,12 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       ...messages,
       { id: crypto.randomUUID(), role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', provider: 'storyforge', model: 'pipeline' } },
     ]
+    // 子会话的标题归 DSH：来源会话在侧栏改过名时占位标题取改后的名字；DSH 客户端随后把子会话
+    // 改名为「来源标题 (1)」，第一次发送时存档分支取子会话那时的标题。
+    liveTitles.set(sessionId, '炉火边')
     notifyFork('session-child', sessionId)
+    assert.equal((await call(routes, '/sessions')).sessions['session-child'].title, '炉火边（分叉）')
+    liveTitles.set('session-child', '炉火边 (1)')
     // 子会话第一次发送前还没有存档：卡内状态面板给出说明，不报错。
     const unlinked = await call(routes, '/mvu', {
       method: 'POST',
@@ -337,6 +357,24 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     const mapped = (await call(routes, '/sessions')).sessions['session-child']
     assert.ok(mapped.campaignId && mapped.campaignId !== created.campaign.campaign_id, JSON.stringify(mapped))
     assert.equal(mapped.forkTurns, 1)
+    assert.equal(mapped.title, '炉火边 (1)', '存档分支用子会话在 DSH 里的标题')
+    // 之后在 DSH 里改名：首页刷新状态时登记标题跟上。
+    liveTitles.set('session-child', '另一条路')
+    await call(routes, '/status')
+    assert.equal((await call(routes, '/sessions')).sessions['session-child'].title, '另一条路')
+
+    // 在 DSH 里归档：状态只报 StoryForge 故事；「取消归档」只放行插件登记过的故事。
+    archived.push('session-child', 'someone-else')
+    assert.deepEqual((await call(routes, '/status')).archived, ['session-child'])
+    const unarchive = (id) =>
+      call(routes, '/sessions/unarchive', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ sessionId: id }) })
+    const foreign = await unarchive('someone-else')
+    assert.equal(foreign.ok, false)
+    assert.deepEqual(archived, ['session-child', 'someone-else'])
+    const restored = await unarchive('session-child')
+    assert.equal(restored.ok, true, restored.error)
+    assert.deepEqual(restored.archived, [])
+    assert.deepEqual(archived, ['someone-else'])
     // 分叉后继承的开场白：sidecar 按位置到分支存档的对话里取（来源对话不在也一样）。
     const viaFork = await call(routes, '/display', {
       method: 'POST',
@@ -392,6 +430,10 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     assert.match(story.extractionErrorDetail, /MISSING_CREDENTIAL/)
     // 给 DSH 的标题预先截断，分叉时 DSH 追加的 " (1)" 不会被 80 字节上限截成半个括号。
     assert.ok(titles.at(-1).endsWith('…') && Buffer.byteLength(`${titles.at(-1)} (1)`) <= 80, titles.at(-1))
+    // DSH 里是截断后的标题：刷新状态时不拿它覆盖登记里的完整标题。
+    liveTitles.set(unconfigured.sessionId, titles.at(-1))
+    await call(routes, '/status')
+    assert.equal((await call(routes, '/sessions')).sessions[unconfigured.sessionId].title, longTitle)
     await assert.rejects(
       collect(adapter.stream({ sessionId: unconfigured.sessionId, messages: [opening, userMessage('你好。', 'user')] })),
       /底层模型还没有配置 API Key[\s\S]*原始错误/,

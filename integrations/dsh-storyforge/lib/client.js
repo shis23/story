@@ -219,6 +219,9 @@ window.__ModuleLoader__.load({
 		function buildStories(status, snapshot) {
 			const registry = status?.sessions ?? {};
 			const settles = status?.settles ?? [];
+			// DSH 已归档的故事（服务端读注册表的归档集，3 秒刷新一次）。已归档的会话仍在 DSH 的会话
+			// 列表快照里（只是不在侧栏分组里显示），所以不能拿"列表里没有"来判断。
+			const archivedIds = new Set(status?.archived ?? []);
 			// 会话列表还没加载（空）时不判"缺失"，免得一闪而过全部标成不在列表。
 			const loaded = Boolean(snapshot?.byId) && Object.keys(snapshot.byId).length > 0;
 			const stories = Object.entries(registry).map(([id, story]) => {
@@ -232,12 +235,14 @@ window.__ModuleLoader__.load({
 					Date.parse(last?.at ?? "") || 0,
 					Date.parse(story.createdAt ?? "") || 0,
 				);
+				const archived = archivedIds.has(id);
 				return {
 					id,
 					...story,
 					displayTitle: summary?.displayTitle || story.title || id,
 					running: Boolean(summary?.running),
-					missing: loaded && !summary,
+					archived,
+					missing: loaded && !summary && !archived,
 					last,
 					activity,
 				};
@@ -1301,13 +1306,39 @@ window.__ModuleLoader__.load({
 		}
 
 		function StoriesCard(props) {
-			const { stories, status } = props;
-			const linkedStories = stories.filter((story) => story.linked);
-			const unlinked = stories.filter((story) => !story.linked);
-			const [shown, toggle] = useCollapsed(linkedStories, 8);
+			const { stories: listed, status, onError } = props;
 			const [showUnlinked, setShowUnlinked] = React.useState(false);
+			const [showArchived, setShowArchived] = React.useState(false);
+			const [restoring, setRestoring] = React.useState(null);
+			// 刚取消归档的故事：状态要到下一次刷新才更新，这之前先按已恢复显示。标记只对登记时的那份
+			// 归档集有效，归档集一变（刷新到了，或又归档了别的）就作废。
+			const archivedKey = (status?.archived ?? []).join("\n");
+			const latestArchivedKey = React.useRef(archivedKey);
+			latestArchivedKey.current = archivedKey;
+			const [restored, setRestored] = React.useState(() => ({ key: null, ids: new Set() }));
+			const restoredIds = restored.key === archivedKey ? restored.ids : null;
+			const stories = listed.map((story) => (story.archived && restoredIds?.has(story.id) ? { ...story, archived: false } : story));
+			// 已归档的故事单独收在最后：DSH 不让打开已归档会话，存档本身不受归档影响。
+			const archivedStories = stories.filter((story) => story.archived);
+			const linkedStories = stories.filter((story) => story.linked && !story.archived);
+			const unlinked = stories.filter((story) => !story.linked && !story.archived);
+			const [shown, toggle] = useCollapsed(linkedStories, 8);
 			const busyCampaign = status?.status?.busy ? status.status.active_campaign : null;
 			const byId = Object.fromEntries(stories.map((story) => [story.id, story]));
+			const unarchive = async (story) => {
+				setRestoring(story.id);
+				try {
+					await postJson("/sessions/unarchive", { sessionId: story.id });
+					setRestored((current) => {
+						const key = latestArchivedKey.current;
+						return { key, ids: new Set(current.key === key ? current.ids : []).add(story.id) };
+					});
+				} catch (e) {
+					onError?.(`取消归档失败：${errorText(e)}`);
+				} finally {
+					setRestoring(null);
+				}
+			};
 			const renderStory = (story) => {
 				const meta = [];
 				if (story.turns != null) meta.push(story.turns === 0 ? "还没开始写" : `已写 ${story.turns} 轮`);
@@ -1321,24 +1352,28 @@ window.__ModuleLoader__.load({
 					? h(Badge, { tone: "run" }, "写作中")
 					: story.campaignId && busyCampaign === story.campaignId
 						? h(Badge, { tone: "run" }, "后台收尾中")
-						: story.missing
-							? h(Badge, { tone: "idle", title: "DSH 会话列表里没有它（可能已归档）" }, "不在会话列表")
-							: story.last && h(AcceptBadge, { report: story.last });
-				// 整行可点（键盘 Enter / 空格同样打开）；DSH 列表里已没有的会话不可打开。
+						: story.archived
+							? h(Badge, { tone: "idle", title: "在 DSH 里归档了；存档不受影响，取消归档后回到会话列表" }, "已归档")
+							: story.missing
+								? h(Badge, { tone: "idle", title: "DSH 会话列表里没有它" }, "不在会话列表")
+								: story.last && h(AcceptBadge, { report: story.last });
+				// 整行可点（键盘 Enter / 空格同样打开）；已归档或 DSH 列表里已没有的会话不可打开。
+				const closed = story.missing || story.archived;
 				const open = () => {
-					if (!story.missing) openSession(story.id);
+					if (!closed) openSession(story.id);
 				};
 				return h(
 					"div",
 					{
 						key: story.id,
-						className: `sf-story${story.campaignId ? "" : " sf-story-dim"}${story.missing ? " sf-story-missing" : ""}`,
-						role: "button",
-						tabIndex: story.missing ? -1 : 0,
-						"aria-disabled": story.missing || undefined,
+						className: `sf-story${story.campaignId ? "" : " sf-story-dim"}${closed ? " sf-story-missing" : ""}`,
+						// 已归档的行里只有「取消归档」一个按钮可操作，行本身不当按钮。
+						role: story.archived ? undefined : "button",
+						tabIndex: closed ? -1 : 0,
+						"aria-disabled": (!story.archived && story.missing) || undefined,
 						onClick: open,
 						onKeyDown: (e) => {
-							if (e.key !== "Enter" && e.key !== " ") return;
+							if (closed || (e.key !== "Enter" && e.key !== " ")) return;
 							e.preventDefault();
 							open();
 						},
@@ -1359,7 +1394,21 @@ window.__ModuleLoader__.load({
 								formatShortTime(story.activity),
 							),
 						state,
-						!story.missing && h("span", { className: "sf-chevron", "aria-hidden": "true" }, "›"),
+						story.archived &&
+							h(
+								"button",
+								{
+									type: "button",
+									className: "sf-btn sf-btn-sm",
+									disabled: restoring === story.id,
+									onClick: (e) => {
+										e.stopPropagation();
+										void unarchive(story);
+									},
+								},
+								restoring === story.id ? "恢复中…" : "取消归档",
+							),
+						!closed && h("span", { className: "sf-chevron", "aria-hidden": "true" }, "›"),
 					),
 				);
 			};
@@ -1367,7 +1416,7 @@ window.__ModuleLoader__.load({
 				Card,
 				{ title: "我的故事", sub: linkedStories.length ? `${linkedStories.length} 个` : undefined },
 				linkedStories.length === 0
-					? h("div", { className: "sf-empty" }, "还没有故事。选一张角色卡新建一个。")
+					? h("div", { className: "sf-empty" }, archivedStories.length ? "没有未归档的故事。" : "还没有故事。选一张角色卡新建一个。")
 					: h("div", { className: "sf-stories" }, shown.map(renderStory)),
 				toggle,
 				unlinked.length > 0 &&
@@ -1377,6 +1426,13 @@ window.__ModuleLoader__.load({
 						showUnlinked ? "收起未关联存档的会话" : `显示 ${unlinked.length} 个未关联存档的会话`,
 					),
 				showUnlinked && h("div", { className: "sf-stories sf-gap-top" }, unlinked.map(renderStory)),
+				archivedStories.length > 0 &&
+					h(
+						"button",
+						{ type: "button", className: "sf-btn sf-btn-sm sf-more", onClick: () => setShowArchived((value) => !value) },
+						showArchived ? "收起已归档的故事" : `显示 ${archivedStories.length} 个已归档的故事`,
+					),
+				showArchived && h("div", { className: "sf-stories sf-gap-top" }, archivedStories.map(renderStory)),
 			);
 		}
 
@@ -1646,7 +1702,7 @@ window.__ModuleLoader__.load({
 								onChange: (patch) => setModels((current) => ({ ...current, ...patch })),
 							}),
 					),
-					h(StoriesCard, { stories, status }),
+					h(StoriesCard, { stories, status, onError: setError }),
 					h(SettlesCard, { settles: status?.settles ?? [], titles }),
 					h(LlmCallsCard, { calls: status?.llmCalls ?? [], total: status?.llmCallCount ?? 0 }),
 					h(DebugDetails, { status, titles }),
