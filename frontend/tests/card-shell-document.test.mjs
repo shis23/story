@@ -110,6 +110,39 @@ test('provides diagnostic compatibility globals so a card reports unavailable fe
   assert.equal(await shellWindow.waitGlobalInitialized('Mvu'), shellWindow.Mvu)
 })
 
+test('replaces storage that the opaque sandbox origin refuses with an in-memory Storage', () => {
+  const script = createCardShellRuntimeCompatibilityScript()
+  const denied = () => {
+    throw new Error("Failed to read the 'localStorage' property from 'Window': The document is sandboxed")
+  }
+  const shellWindow = { __sfShellAsk: async () => null }
+  Object.defineProperty(shellWindow, 'localStorage', { get: denied, configurable: true })
+  Object.defineProperty(shellWindow, 'sessionStorage', { get: denied, configurable: true })
+  Function('window', script)(shellWindow)
+
+  const storage = shellWindow.localStorage
+  assert.equal(storage.getItem('draft'), null)
+  storage.setItem('draft', 42)
+  storage.setItem('step', 'custom')
+  assert.equal(storage.getItem('draft'), '42')
+  assert.equal(storage.length, 2)
+  assert.equal(storage.key(1), 'step')
+  assert.equal(storage.key(2), null)
+  storage.removeItem('draft')
+  assert.equal(storage.length, 1)
+  storage.clear()
+  assert.equal(storage.length, 0)
+  assert.notEqual(shellWindow.sessionStorage, storage)
+  assert.equal(shellWindow.sessionStorage.getItem('draft'), null)
+
+  // A usable storage (non-sandboxed preview) is left alone.
+  const real = { getItem: () => 'kept' }
+  const openWindow = { __sfShellAsk: async () => null, localStorage: real, sessionStorage: real }
+  Function('window', script)(openWindow)
+  assert.equal(openWindow.localStorage, real)
+  assert.equal(openWindow.sessionStorage, real)
+})
+
 test('maps selector variables and MVU writes to the shell persistence bridge', async () => {
   const script = createCardShellRuntimeCompatibilityScript({
     selectorVariables: {

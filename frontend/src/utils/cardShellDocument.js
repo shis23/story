@@ -57,6 +57,28 @@ export function createCardShellRuntimeCompatibilityScript(options = {}) {
     '    }',
     '    return window.__sfShellAsk(type, payload || {});',
     '  }',
+    // The opaque sandbox origin makes reading `localStorage` / `sessionStorage`
+    // throw a SecurityError, which aborts card modules that cache UI drafts there
+    // (Destiny's custom-start shell). Swap in a per-document in-memory Storage so
+    // the card runs; nothing is shared with the host or kept across reloads.
+    '  function memoryStorage(){',
+    '    var data = new Map();',
+    '    var api = {',
+    '      key: function(index){ var keys = Array.from(data.keys()); return index >= 0 && index < keys.length ? keys[index] : null; },',
+    '      getItem: function(key){ key = String(key); return data.has(key) ? data.get(key) : null; },',
+    '      setItem: function(key, value){ data.set(String(key), String(value)); },',
+    '      removeItem: function(key){ data.delete(String(key)); },',
+    '      clear: function(){ data.clear(); }',
+    '    };',
+    '    Object.defineProperty(api, "length", { get: function(){ return data.size; } });',
+    '    return api;',
+    '  }',
+    '  ["localStorage", "sessionStorage"].forEach(function(name){',
+    '    var usable = false;',
+    '    try { usable = !!window[name]; } catch (_) { usable = false; }',
+    '    if (usable) return;',
+    '    try { Object.defineProperty(window, name, { value: memoryStorage(), configurable: true, writable: true }); } catch (_) {}',
+    '  });',
     '  var helper = window.TavernHelper || window.tavernHelper || {};',
     '  window.TavernHelper = helper;',
     '  window.tavernHelper = helper;',

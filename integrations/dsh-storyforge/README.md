@@ -190,8 +190,10 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
     界面的桥会话，别的界面或伪造的请求被拒。DSH 正文里还是开局时的那份开场白，存档里的开场白变了
     时尾部最前面补一段新开场的文字（新开场只有界面时不补）。不在清单里的开场界面照常要确认，当
     普通界面挂，不能改开场。
-  - 运行环境：jQuery 3.7.1、lodash 4.17.21、Vue 3.5.13、EJS 3.1.10 从 cdnjs / jsdelivr 预加载，
-    Zod 4 异步加载，所以界面要能访问这些 CDN。卡里的内联模块脚本在 iframe 里转 blob 运行，相对
+  - 运行环境：jQuery 3.7.1、lodash 4.17.21、Vue 3.5.13、Vue Router 4.5.1、EJS 3.1.10 从 cdnjs /
+    jsdelivr 预加载，Zod 4 异步加载，所以界面要能访问这些 CDN。界面是不透明源，读真正的
+    `localStorage` / `sessionStorage` 会报错，所以换成每份文档自己的内存版（不与 DSH 共享，重新
+    加载后清空）。卡里的内联模块脚本在 iframe 里转 blob 运行，相对
     import 按页面地址改成绝对地址。`$.fn.load` / `$.getScript` 与卡的远程资源经插件服务端代取：
     只取白名单主机、不取 IP、手动跟随重定向且每一跳复核、单个 40 MB、30 秒超时；取到的资源缓存在
     `<dataDir>/card-shell-cache`，首取即冻结（与桌面相同，想更新就删掉这个目录）。
@@ -205,7 +207,8 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
     按条目名切换启用（只认本局书名 `storyforge:campaign:<存档 id>`，不读正文、不改其它字段）；同一
     存档的读改写串行，与桌面同口径。写作进行中切换要等这一轮收尾。
   - 不支持：需要 StoryForge 后端的 SillyTavern / 酒馆助手接口（生成、读写消息等，包括自定义开局
-    界面提交时用的 `createChatMessages` 与 `/trigger`，桌面版同样不支持），界面里调用会报错。
+    界面最后「踏上旅程」用的 `createChatMessages` 与 `/trigger`，桌面版同样不支持），界面里调用会
+    报错。命定之诗的自定义开局因此能填写、能存预设，但点「踏上旅程」没有反应（卡自己吞掉了错误）。
   - 本功能之前写下的回复不显示卡片界面。内置浏览器面板一类会拦截子 frame 的环境里 iframe 是空白。
 - 卡内状态面板（MVU 原生渲染，与桌面版写作页的状态面板同口径）：
   - 分析是手动的（桌面版同样不自动跑），每次调用一次底层模型，大卡要几十秒。分析结果存在 sidecar

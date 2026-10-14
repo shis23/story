@@ -173,6 +173,8 @@ const PRELOAD_SCRIPTS = [
   'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js',
   'https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js',
+  // 酒馆助手的界面环境把 VueRouter 放在全局；命定之诗的自定义开局在模块顶层就读它。
+  'https://cdn.jsdelivr.net/npm/vue-router@4.5.1/dist/vue-router.global.prod.js',
   'https://cdn.jsdelivr.net/npm/ejs@3.1.10/ejs.min.js',
 ]
 const ZOD_URLS = ['https://testingcf.jsdelivr.net/npm/zod@4.4.3/+esm', 'https://cdn.jsdelivr.net/npm/zod@4.4.3/+esm']

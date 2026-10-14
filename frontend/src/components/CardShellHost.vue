@@ -662,6 +662,10 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, op
     "    if (!window.Vue) {",
     "      await classic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });",
     "    }",
+    // TavernHelper frames expose VueRouter as a global; Destiny's custom-start shell reads it at module top level.
+    "    if (!window.VueRouter) {",
+    "      try { await classic('https://cdn.jsdelivr.net/npm/vue-router@4.5.1/dist/vue-router.global.prod.js', function(){ return !!window.VueRouter; }); } catch (e) { console.warn(e); }",
+    "    }",
     "    if (!window.ejs || typeof window.ejs.render !== 'function') {",
     "      await classic('https://cdn.jsdelivr.net/npm/ejs@3.1.10/ejs.min.js', function(){ return !!window.ejs && typeof window.ejs.render === 'function'; });",
     "    }",
