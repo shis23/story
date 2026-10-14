@@ -42,6 +42,7 @@ use storyforge_domain::preset::RegexScript;
 
 use crate::llm::{LlmBridgeState, UsageTotals};
 
+pub mod card_shell;
 pub mod mvu;
 
 /// 本层的事件出口（stdio 外壳把它们变成通知）。
@@ -132,6 +133,9 @@ pub struct NodeDisplay {
     pub node_index: usize,
     /// 展示正则之后的文本（深度按节点在对话里的当前位置算，每轮都可能变）。
     pub display_content: String,
+    /// 展示正则之前的原文。内联卡片界面要逐个对上卡正则在原文里的命中才自动挂载
+    /// （桌面 `trustedInlineShellDocStarts` 同口径）。
+    pub content: String,
     /// 回放数据记的是别的对话（分叉继承的轮次），按位置从会话当前存档的对话里取的。
     pub by_position: bool,
 }
@@ -752,7 +756,8 @@ fn locate_display(
         }
     };
     let node = conversation.nodes.get(index)?;
-    if node.active()?.role != Role::Assistant {
+    let active = node.active()?;
+    if active.role != Role::Assistant {
         return None;
     }
     Some(NodeDisplay {
@@ -760,6 +765,7 @@ fn locate_display(
         node_id: node.id.to_string(),
         node_index: index,
         display_content: node_display_content(conversation, index, scripts)?,
+        content: active.content.clone(),
         by_position,
     })
 }
