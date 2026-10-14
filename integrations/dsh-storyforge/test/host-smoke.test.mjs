@@ -299,6 +299,13 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       { id: crypto.randomUUID(), role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', provider: 'storyforge', model: 'pipeline' } },
     ]
     notifyFork('session-child', sessionId)
+    // 子会话第一次发送前还没有存档：卡内状态面板给出说明，不报错。
+    const unlinked = await call(routes, '/mvu', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId: 'session-child' }),
+    })
+    assert.deepEqual(unlinked.model, { state: 'none', reason: 'unlinked' })
     const childChunks = await collect(
       adapter.stream({ sessionId: 'session-child', messages: [...history, userMessage('我和她一起出发。', 'user')] }),
     )
@@ -365,6 +372,132 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       collect(adapter.stream({ sessionId: unconfigured.sessionId, messages: [opening, userMessage('你好。', 'user')] })),
       /底层模型还没有配置 API Key[\s\S]*原始错误/,
     )
+  } finally {
+    await dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** 假分析结果：一个血条、一个交互按钮（加血 + 下一轮提示）、一个要原卡脚本的兜底片段。 */
+const MVU_TRANSLATION = {
+  variable_schema: [
+    { key: 'hp', label: '生命值', value_type: 'int', default: 100 },
+    { key: '金币', label: '金币', value_type: 'int', default: 5 },
+  ],
+  ui_bindings: [{ element: 'hp_bar', variable_key: 'hp', display: { kind: 'bar', max: 100 } }],
+  update_rules: ['受伤时 hp 减少伤害值'],
+  interactions: [
+    {
+      element_label: '休息',
+      actions: [
+        { kind: 'modify_variable', key: 'hp', value_expr: '+10' },
+        { kind: 'trigger_next_turn', hint: '我在炉火边休息片刻' },
+      ],
+    },
+  ],
+  fallback_fragments: [{ description: '开场动画', js_snippet: 'playIntro()', reason: '需要 DOM' }],
+  routing: { kind: 'native' },
+  analysis_confidence: 0.9,
+  notes: [],
+}
+
+/** MVU 分析器走终止工具 `emit_mvu_translation`；其它调用照常回固定正文。 */
+function mvuModel(calls) {
+  const prose = fakeModel(calls)
+  return async function* stream(options) {
+    if (!options.system?.includes('卡内状态栏分析')) {
+      yield* prose(options)
+      return
+    }
+    calls.push(options)
+    assert.ok(options.tools?.some((tool) => tool.name === 'emit_mvu_translation'))
+    const block = { type: 'tool-call', id: 'call-mvu', name: 'emit_mvu_translation', arguments: JSON.stringify(MVU_TRANSLATION) }
+    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    yield { type: 'block-end', index: 0, block }
+    yield { type: 'usage', usage: { inputTokens: 30, outputTokens: 40 } }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+  }
+}
+
+test('mvu panel: analyze, apply and interaction buttons go through the sidecar', { skip: !existsSync(bin) && `sidecar not built: ${bin}`, timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sf-dsh-mvu-'))
+  const cardsDir = join(root, 'cards')
+  mkdirSync(cardsDir)
+  writeFileSync(
+    join(cardsDir, 'mvu.json'),
+    JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Seraphina',
+        description: '守护森林的女法师。',
+        personality: '温柔',
+        scenario: '旅人在森林里迷路。',
+        first_mes: OPENING,
+        mes_example: '',
+        alternate_greetings: [],
+        tags: [],
+        creator: 'host-smoke',
+        character_version: '1',
+        extensions: { stat_data: { hp: 80 } },
+      },
+    }),
+  )
+  const llmCalls = []
+  const { ctx, routes, dispose } = fakeCtx(llmCalls)
+  ctx.llm.stream = mvuModel(llmCalls)
+  const post = (path, body) => call(routes, path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) })
+  try {
+    apply(ctx, { dataDir: join(root, 'data'), cardsDir })
+    assert.equal((await post('/settings', { provider: 'fake', model: 'writer', toolMode: 'native' })).ok, true)
+    const created = await post('/sessions', { card: 'mvu.json' })
+    assert.equal(created.ok, true, created.error)
+    const { sessionId } = created
+
+    // 不是故事会话：404；还没分析：提示手动分析（D44 不自动跑）。
+    const unknown = await post('/mvu', { sessionId: 'nope' })
+    assert.equal(unknown.ok, false)
+    const before = await post('/mvu', { sessionId })
+    assert.equal(before.ok, true, before.error)
+    assert.equal(before.model.state, 'unanalyzed')
+    assert.equal(before.model.cardName, 'Seraphina')
+
+    const callsBefore = llmCalls.length
+    const analyzed = await post('/mvu/analyze', { sessionId })
+    assert.equal(analyzed.ok, true, analyzed.error)
+    assert.equal(llmCalls.length, callsBefore + 1, '分析只调用一次底层模型')
+    assert.equal(analyzed.empty, false)
+    assert.equal(analyzed.error, null)
+    assert.ok(analyzed.usage.calls >= 1, JSON.stringify(analyzed.usage))
+    const ready = analyzed.model
+    assert.equal(ready.state, 'ready')
+    assert.deepEqual(ready.interactions, [{ index: 0, label: '休息' }])
+    assert.deepEqual(ready.fallbacks, [{ description: '开场动画', reason: '需要 DOM' }])
+    assert.ok(ready.pendingApply.some((pending) => pending.added.includes('金币')), JSON.stringify(ready.pendingApply))
+    const status = await call(routes, '/status')
+    assert.ok(status.llmCalls.some((entry) => entry.role === 'MVU 分析'), '调用表认得出分析器')
+
+    const applied = await post('/mvu/apply', { sessionId })
+    assert.equal(applied.ok, true, applied.error)
+    assert.deepEqual(applied.model.pendingApply, [])
+    const hpRow = () => applied.model.sections[0]?.rows.find((row) => row.element === 'hp_bar')
+    assert.equal(hpRow()?.kind, 'bar', JSON.stringify(applied.model))
+    const hpBefore = hpRow().value
+
+    // 交互：参数不对 400；按钮文字与当前翻译对不上 409（面板过期）；对上了按最新变量写入。
+    const bad = await post('/mvu/interact', { sessionId, index: -1, label: '休息' })
+    assert.equal(bad.ok, false)
+    assert.match(bad.error, /index/)
+    const stale = await post('/mvu/interact', { sessionId, index: 0, label: '攻击' })
+    assert.equal(stale.ok, false)
+    assert.match(stale.error, /刷新面板/)
+    const rested = await post('/mvu/interact', { sessionId, index: 0, label: '休息' })
+    assert.equal(rested.ok, true, rested.error)
+    assert.equal(rested.failed, 0, JSON.stringify(rested.results))
+    assert.deepEqual(rested.results.map((result) => [result.ok, result.scope, result.key]), [[true, 'instance', 'hp']])
+    assert.deepEqual(rested.hints, ['我在炉火边休息片刻'])
+    const hpAfter = rested.model.sections[0].rows.find((row) => row.element === 'hp_bar').value
+    assert.equal(hpAfter, hpBefore + 10)
   } finally {
     await dispose()
     rmSync(root, { recursive: true, force: true })

@@ -93,6 +93,54 @@ pub fn write_status_card(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// MVU 卡：扩展里带 `stat_data`（字段级 schema），分析器因此会调用模型而不是直接降级。
+pub fn write_mvu_card(dir: &Path) -> std::path::PathBuf {
+    let card = json!({
+        "spec": "chara_card_v2",
+        "spec_version": "2.0",
+        "data": {
+            "name": "Seraphina",
+            "description": "守护森林的女法师，温柔而警惕。",
+            "personality": "温柔、警惕",
+            "scenario": "旅人在森林里迷路，被 Seraphina 救回木屋。",
+            "first_mes": OPENING,
+            "mes_example": "",
+            "alternate_greetings": [],
+            "tags": [],
+            "creator": "dsh-bridge-test",
+            "character_version": "1",
+            "extensions": { "stat_data": { "hp": 80 } }
+        }
+    });
+    let path = dir.join("mvu-card.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+    path
+}
+
+/// MVU 分析的脚本化回答：两个变量、一条血条绑定、一个「休息」交互（加血 + 触发下一轮）。
+pub const MVU_TRANSLATION: &str = r#"{
+  "variable_schema": [
+    {"key": "hp", "label": "生命值", "value_type": "int", "default": 100},
+    {"key": "金币", "label": "金币", "value_type": "int", "default": 5}
+  ],
+  "ui_bindings": [
+    {"element": "hp_bar", "variable_key": "hp", "display": {"kind": "bar", "max": 100}}
+  ],
+  "update_rules": ["受伤时 hp 减少伤害值"],
+  "interactions": [
+    {"element_label": "休息", "actions": [
+      {"kind": "modify_variable", "key": "hp", "value_expr": "+10"},
+      {"kind": "trigger_next_turn", "hint": "我在炉火边休息片刻"}
+    ]}
+  ],
+  "fallback_fragments": [
+    {"description": "开场动画", "js_snippet": "playIntro()", "reason": "需要 DOM"}
+  ],
+  "routing": {"kind": "native"},
+  "analysis_confidence": 0.9,
+  "notes": []
+}"#;
+
 /// 协议参数 → ChatRequest（`llm::call_params` 的逆映射）。
 pub fn chat_request(params: &Value) -> ChatRequest {
     let messages = params["messages"]
@@ -169,6 +217,10 @@ pub struct FakePlugin {
     pub held: Vec<Value>,
     /// 覆盖导演的回答（Plan JSON）；None 时用 MockLlmClient 的默认脚本。
     pub director_plan: Option<String>,
+    /// 覆盖 MVU 分析的回答（MvuTranslation JSON）；None 时用 MockLlmClient 的默认脚本。
+    pub mvu_translation: Option<String>,
+    /// 收到的 MVU 分析请求数。
+    pub mvu_requests: usize,
     /// 大于 0 时把子 Agent 的 `llm.stream`（系统提示词含「你是角色 X。」）攒到这么多个
     /// 同时在途再一起应答：分块交错发、结果倒序回，证明并行且按 id 路由不串流。
     pub subagent_barrier: usize,
@@ -207,6 +259,8 @@ impl FakePlugin {
             hold_llm: false,
             held: Vec::new(),
             director_plan: None,
+            mvu_translation: None,
+            mvu_requests: 0,
             subagent_barrier: 0,
             held_subagents: Vec::new(),
             max_in_flight_subagents: 0,
@@ -290,6 +344,22 @@ impl FakePlugin {
         {
             response.content = plan.clone();
             response.tool_calls.clear();
+        }
+        if all_text(request).contains("卡内状态栏分析") {
+            self.mvu_requests += 1;
+            // 与真实模型一样调用收尾工具提交（文本回答会被分析器追问到轮次上限）。
+            if let Some(translation) = &self.mvu_translation {
+                response.content.clear();
+                response.tool_calls = vec![ToolCall {
+                    id: format!("call-mvu-{}", self.mvu_requests),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "emit_mvu_translation".into(),
+                        arguments: translation.clone(),
+                    },
+                }];
+                response.finish_reason = Some("tool_calls".into());
+            }
         }
         if !response.content.is_empty() {
             self.send(json!({
@@ -414,6 +484,17 @@ fn system_text(request: &Value) -> String {
         .into_iter()
         .flatten()
         .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 全部消息正文拼起来（按关键字认请求用）。
+fn all_text(request: &Value) -> String {
+    request["params"]["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter_map(|message| message["content"].as_str())
         .collect::<Vec<_>>()
         .join("\n")

@@ -7,7 +7,7 @@ import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { renderableBlocks, splitForDsh, splitRawHtmlBlocks } from '../lib/html.js'
+import { renderableBlocks, splitForDsh, splitRawHtmlBlocks, withoutScripts } from '../lib/html.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const desktopFormat = resolve(here, '../../../frontend/src/utils/formatContent.js')
@@ -59,6 +59,18 @@ test('splitForDsh drops rendered blocks from the body and counts them', () => {
   // 没有完整块：照旧整段转文字（未闭合的块、数据标签都留在正文里）。
   assert.deepEqual(splitForDsh('开头<div>没闭合'), { body: '开头\n没闭合', blocks: 0 })
   assert.deepEqual(splitForDsh(undefined), { body: '', blocks: 0 })
+})
+
+test('script bodies never turn into blocks or body text', () => {
+  // MVU 状态栏：脚本在字符串字面量里拼 div。脚本整段去掉，只剩静态占位块。
+  const script = `<script>\nfunction render(s) {\n  el.innerHTML = '<div class="row">体力 <div class="bar"><i></i></div> ' + s.体力 + '/100</div>';\n}\n</script>`
+  const display = `她让开身子。\n<div id="mvu-status">加载中…</div>\n${script}`
+  assert.deepEqual(splitForDsh(display), { body: '她让开身子。', blocks: 1 })
+  assert.deepEqual(renderableBlocks(display), [{ html: '<div id="mvu-status">加载中…</div>', text: '加载中…' }])
+  // 只有脚本、没有块：正文照旧（readableText 本来就去脚本）。
+  assert.deepEqual(splitForDsh(`她坐下。\n${script}`), { body: '她坐下。', blocks: 0 })
+  // 未闭合的 script 不动（与桌面切分一致）。
+  assert.equal(withoutScripts('a<script>b'), 'a<script>b')
 })
 
 test('splitForDsh keeps a reply that is only blocks as text so the body is never empty', () => {

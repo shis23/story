@@ -95,6 +95,57 @@ pub fn validate_variable_write_key(key: &str) -> Result<(), TauriCommandError> {
     }
 }
 
+/// 改角色实例变量（Tauri `set_character_variable` 与非 Tauri 宿主共用）。
+///
+/// 三.5：活动 Turn 屏障 + 读改写 + 写盘在**同一原子单元**内完成
+/// （JSON：turns 锁守卫内 candidate→persist→swap；SQLite：单 UoW 事务）。
+/// T-06：后端侧键名守卫（__ 内部段 / 字符集 / 长度），前端守卫不是安全边界。
+pub fn set_character_variable_for_host(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+    instance_id: &Id,
+    key: &str,
+    value: serde_json::Value,
+    turn: u32,
+) -> Result<(), TauriCommandError> {
+    validate_variable_write_key(key)?;
+    let applied = storage
+        .mutate_idle_instance(campaign_id, instance_id, |inst| {
+            inst.set_variable(key, value.clone(), turn);
+            Ok(())
+        })
+        .map_err(|e| TauriCommandError::storage(format!("更新角色变量失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 instance {instance_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// 改 Campaign 全局变量（Tauri `set_campaign_variable` 与非 Tauri 宿主共用；屏障与守卫同上）。
+pub fn set_campaign_variable_for_host(
+    storage: &crate::storage_backend::StorageFacade,
+    campaign_id: &Id,
+    key: &str,
+    value: serde_json::Value,
+    turn: u32,
+) -> Result<(), TauriCommandError> {
+    validate_variable_write_key(key)?;
+    let applied = storage
+        .mutate_idle_campaign(campaign_id, |camp| {
+            camp.set_variable(key, value.clone(), turn);
+            Ok(())
+        })
+        .map_err(|e| TauriCommandError::storage(format!("更新 Campaign 变量失败: {e}")))?;
+    if applied.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign {campaign_id}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CampaignVariableSchemaSyncDto {
     pub added: usize,

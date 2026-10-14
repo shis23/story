@@ -42,6 +42,8 @@ use storyforge_domain::preset::RegexScript;
 
 use crate::llm::{LlmBridgeState, UsageTotals};
 
+pub mod mvu;
+
 /// 本层的事件出口（stdio 外壳把它们变成通知）。
 pub trait TurnObserver: Send + Sync {
     /// 管线事件，包括成文之后后台后处理的事件。

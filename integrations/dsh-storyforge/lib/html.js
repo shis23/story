@@ -50,11 +50,20 @@ export function splitRawHtmlBlocks(text) {
 }
 
 /**
+ * 去掉完整的 `<script>` 元素。档 1 不执行脚本（DOMPurify 也会去掉），而 MVU 状态栏一类卡
+ * 会在脚本的字符串字面量里拼 `<div>…</div>`——不先去掉，块切分会把这些片段当成顶层块，
+ * 尾部渲染出 `' + s.体力 + '` 一类碎片。未闭合的 `<script>` 原样保留。
+ */
+export function withoutScripts(display) {
+  return String(display || '').replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+}
+
+/**
  * 展示文本 → 要渲染的 HTML 块（附文字版，浏览器半边净化失败时显示）。
  * @returns {Array<{html:string, text:string}>}
  */
 export function renderableBlocks(display) {
-  return splitRawHtmlBlocks(display)
+  return splitRawHtmlBlocks(withoutScripts(display))
     .filter((segment) => segment.type === 'html')
     .map((segment) => ({ html: segment.content, text: readableText(segment.content) }))
 }
@@ -66,7 +75,7 @@ export function renderableBlocks(display) {
  * @returns {{body: string, blocks: number}}
  */
 export function splitForDsh(display) {
-  const segments = splitRawHtmlBlocks(display)
+  const segments = splitRawHtmlBlocks(withoutScripts(display))
   const blocks = segments.filter((segment) => segment.type === 'html').length
   if (blocks === 0) return { body: readableText(display), blocks: 0 }
   const prose = segments

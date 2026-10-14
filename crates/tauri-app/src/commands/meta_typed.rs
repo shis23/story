@@ -117,65 +117,7 @@ pub(crate) async fn meta_analyze_mvu_card(
     source_character_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<MvuTranslationDetailDto, TauriCommandError> {
-    use storyforge_app_agent::AgentRuntime;
-
-    state
-        .storage()
-        .require_supported(BackendCapability::MvuTranslation, "analyze MVU card")
-        .map_err(TauriCommandError::validation)?;
-
-    // #22：分析与持久化两个后端都支持——SQLite 活跃时写 mvu_translations 表。
-
-    // 取原 Character
-    let character = {
-        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
-        ctx.characters
-            .iter()
-            .find(|c| c.id.as_str() == source_character_id)
-            .map(|c| (*c).clone())
-    }
-    .ok_or_else(|| TauriCommandError::not_found(format!("找不到角色卡 {source_character_id}")))?;
-
-    // 启发式打分（纯 Rust，先跑，给 LLM 当判据）
-    let complexity = storyforge_app_meta::score_card_complexity(&character);
-    let complexity_json = to_json_value(&complexity, "MVU complexity")?;
-    tracing::info!(
-        "卡「{}」MVU 启发式分类: {:?}",
-        character.name,
-        complexity.classification
-    );
-
-    // 跑 LLM 五合一分析
-    let llm = state.require_active_llm()?;
-    let tool_ctx = state.snapshot_tool_ctx();
-    let runtime = AgentRuntime::new(llm, tool_ctx);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-
-    let translation = storyforge_app_meta::analyze_mvu_card(&runtime, &character, cancel_rx)
-        .await
-        .map_err(|e| TauriCommandError::validation(format!("MVU 分析失败: {e}")))?;
-
-    // 持久化（后端分流：SQLite → mvu_translations 表；否则 JSON CampaignStore）
-    let analyzed_at = chrono::Utc::now().to_rfc3339();
-    let stored = campaign_store::StoredMvuTranslation {
-        source_character_id: character.id.clone(),
-        character_name: character.name.clone(),
-        translation: translation.clone(),
-        analyzed_at: analyzed_at.clone(),
-    };
-    let storage = state.storage().clone();
-    tokio::task::spawn_blocking(move || storage.save_mvu(&stored))
-        .await
-        .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
-        .map_err(TauriCommandError::storage)?;
-
-    Ok(MvuTranslationDetailDto {
-        source_character_id: character.id.as_str().to_string(),
-        character_name: character.name.clone(),
-        analyzed_at,
-        translation,
-        complexity: complexity_json,
-    })
+    analyze_mvu_card_for_host(state.inner().as_ref(), &source_character_id).await
 }
 
 /// Tauri command: 列所有已分析的 MVU 翻译

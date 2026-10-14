@@ -486,12 +486,14 @@ pub fn register_mvu_tools(registry: &mut ToolRegistry) {
             "输出 MVU 五合一翻译结果（MvuTranslation JSON）。",
             serde_json::json!({
                 "type": "object",
+                // 对象数组必须声明 items：不声明时 Gemini 原生工具调用把元素写成 JSON 字符串
+                // （2026-10-14 DSH 插件实测），解析端另有兜底。
                 "properties": {
-                    "variable_schema": {"type": "array"},
-                    "ui_bindings": {"type": "array"},
+                    "variable_schema": {"type": "array", "items": {"type": "object"}},
+                    "ui_bindings": {"type": "array", "items": {"type": "object"}},
                     "update_rules": {"type": "array", "items": {"type": "string"}},
-                    "interactions": {"type": "array"},
-                    "fallback_fragments": {"type": "array"},
+                    "interactions": {"type": "array", "items": {"type": "object"}},
+                    "fallback_fragments": {"type": "array", "items": {"type": "object"}},
                     "routing": {"type": "object"},
                     "analysis_confidence": {"type": "number"},
                     "notes": {"type": "array", "items": {"type": "string"}}

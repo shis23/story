@@ -8,7 +8,9 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use support::{FakePlugin, STATUS_OPENING, write_card, write_status_card};
+use support::{
+    FakePlugin, MVU_TRANSLATION, STATUS_OPENING, write_card, write_mvu_card, write_status_card,
+};
 
 async fn create_campaign(plugin: &mut FakePlugin, card: &Path) -> Value {
     plugin.wait_notification("bridge.ready").await;
@@ -268,4 +270,180 @@ async fn display_follows_recorded_nodes_across_turns_and_forks() {
         .await
         .unwrap_err();
     assert_eq!(refused["code"], "invalid_params", "{refused}");
+}
+
+async fn mvu(plugin: &mut FakePlugin, method: &str, params: Value) -> Value {
+    plugin.request(method, params).await.expect(method)
+}
+
+fn variable<'a>(variables: &'a Value, key: &str) -> Option<&'a Value> {
+    variables
+        .as_array()?
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .map(|entry| &entry["value"])
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mvu_panel_analyzes_applies_and_writes_variables_behind_the_settle() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("bridge-data");
+    let mut plugin = FakePlugin::spawn(&data_dir);
+    plugin.mvu_translation = Some(MVU_TRANSLATION.to_string());
+
+    // 纯数据卡（没有 JS、没有 MVU 数据）：分析器直接降级，不调用模型，结果标为空。
+    let plain = create_campaign(&mut plugin, &write_card(temp.path())).await;
+    let plain_id = plain["campaign_id"].as_str().unwrap();
+    let before = plugin.llm_calls;
+    let analyzed = mvu(
+        &mut plugin,
+        "mvu.analyze",
+        json!({ "campaign_id": plain_id }),
+    )
+    .await;
+    assert_eq!(analyzed["empty"], true, "{analyzed}");
+    assert_eq!(plugin.llm_calls, before, "纯数据卡不该调用模型");
+    assert_eq!(plugin.mvu_requests, 0);
+
+    // MVU 卡：分析前没有翻译。
+    let created = plugin
+        .request(
+            "campaign.create",
+            json!({ "card_path": write_mvu_card(temp.path()) }),
+        )
+        .await
+        .expect("campaign.create");
+    let campaign_id = created["campaign_id"].as_str().unwrap().to_string();
+    let target = json!({ "campaign_id": campaign_id });
+    let status = mvu(&mut plugin, "mvu.status", target.clone()).await;
+    assert!(status["translation"].is_null(), "{status}");
+    assert_eq!(status["pending_apply"], json!([]));
+    assert_eq!(status["card_name"], "Seraphina");
+    let instances = status["instances"].as_array().unwrap();
+    assert!(!instances.is_empty(), "{status}");
+    assert!(!status["definitions"].as_array().unwrap().is_empty());
+    let instance_id = instances[0]["id"].as_str().unwrap().to_string();
+
+    // 手动分析：调用一次模型，翻译入库；兜底片段不带原始 JS；变量定义待应用。
+    let analyzed = mvu(&mut plugin, "mvu.analyze", target.clone()).await;
+    assert_eq!(plugin.mvu_requests, 1);
+    assert_eq!(analyzed["empty"], false, "{analyzed}");
+    assert!(
+        analyzed["usage"]["calls"].as_u64().unwrap() >= 1,
+        "{analyzed}"
+    );
+    let translation = &analyzed["status"]["translation"];
+    assert_eq!(translation["ui_bindings"][0]["variable_key"], "hp");
+    assert_eq!(translation["interactions"][0]["element_label"], "休息");
+    assert_eq!(
+        translation["fallback_fragments"],
+        json!([{ "description": "开场动画", "reason": "需要 DOM" }])
+    );
+    assert!(!analyzed.to_string().contains("playIntro"));
+    assert!(analyzed["status"]["analyzed_at"].is_string());
+    let pending = analyzed["status"]["pending_apply"].as_array().unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|entry| entry["added"].as_array().unwrap().contains(&json!("金币"))),
+        "{pending:?}"
+    );
+
+    // 应用：变量定义进卡内角色，已有实例补上默认值。
+    let applied = mvu(&mut plugin, "mvu.apply", target.clone()).await;
+    assert_eq!(applied["pending_apply"], json!([]), "{applied}");
+    let backfilled = applied["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["id"] == instance_id.as_str())
+        .unwrap();
+    assert_eq!(
+        variable(&backfilled["variables"], "金币"),
+        Some(&json!(5)),
+        "{backfilled}"
+    );
+
+    // 写一轮；成文后立即写变量——写入排在后台收尾之后执行，不撞活动 Turn 屏障。
+    let output = run_turn(&mut plugin, &campaign_id, "我推开木屋的门。", 0)
+        .await
+        .expect("turn.run");
+    assert_eq!(output["campaign_id"], campaign_id.as_str());
+    let settled_before = plugin.settled.len();
+    let written = mvu(
+        &mut plugin,
+        "variables.set",
+        json!({
+            "campaign_id": campaign_id,
+            "writes": [
+                { "scope": "instance", "instance_id": instance_id, "key": "hp", "value": 90 },
+                { "scope": "campaign", "key": "story_clock", "value": "第3天" },
+                { "scope": "campaign", "key": "__storyforge_card_shell_variables", "value": 1 },
+                { "scope": "instance", "instance_id": "no-such-instance", "key": "hp", "value": 1 },
+                { "scope": "instance", "key": "hp", "value": 1 },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        plugin.settled.len(),
+        settled_before + 1,
+        "写变量应在收尾之后返回"
+    );
+    assert_accepted(plugin.settled.last().unwrap());
+    let results = written["results"].as_array().unwrap();
+    let oks: Vec<bool> = results
+        .iter()
+        .map(|result| result["ok"].as_bool().unwrap())
+        .collect();
+    assert_eq!(oks, [true, true, false, false, false], "{results:?}");
+    assert!(
+        results[2]["error"].as_str().unwrap().contains("__ 内部段"),
+        "{results:?}"
+    );
+    assert!(
+        results[3]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no-such-instance"),
+        "{results:?}"
+    );
+    let status = &written["status"];
+    let instance = status["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["id"] == instance_id.as_str())
+        .unwrap();
+    assert_eq!(variable(&instance["variables"], "hp"), Some(&json!(90)));
+    assert_eq!(
+        variable(&status["campaign_variables"], "story_clock"),
+        Some(&json!("第3天"))
+    );
+
+    // 写入数量上限与参数校验。
+    let too_many: Vec<Value> = (0..33)
+        .map(|i| json!({ "scope": "campaign", "key": format!("k{i}"), "value": i }))
+        .collect();
+    let refused = plugin
+        .request(
+            "variables.set",
+            json!({ "campaign_id": campaign_id, "writes": too_many }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused["code"], "invalid_params", "{refused}");
+    let refused = plugin
+        .request(
+            "variables.set",
+            json!({ "campaign_id": campaign_id, "writes": [{ "scope": "global", "key": "k", "value": 1 }] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused["code"], "invalid_params", "{refused}");
+    let missing = plugin
+        .request("mvu.status", json!({ "campaign_id": "no-such-campaign" }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing["code"], "not_found", "{missing}");
 }

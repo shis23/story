@@ -22,6 +22,13 @@
 //!   campaign_id?}` → `{items: {key: NodeDisplay | null}}`（`campaign_id` 是 DSH 会话当前
 //!   对应的存档；只读，不占写作锁；解析规则见 `BridgeService::display_nodes`，一次最多
 //!   `MAX_DISPLAY_REFS` 条）
+//! - `mvu.status {campaign_id}` → `MvuStatus`（卡的 MVU 翻译、角色定义、实例与 Campaign
+//!   变量、待应用的变量定义；只读，不占写作锁）
+//! - `mvu.analyze {campaign_id}` → `MvuAnalyzed`（手动分析，调用一次底层模型）
+//! - `mvu.apply {campaign_id}` → `MvuStatus`（把翻译出的变量定义应用到卡内角色）
+//! - `variables.set {campaign_id, writes: [{scope: "campaign" | "instance", instance_id?,
+//!   key, value}]}` → `{results, status}`（逐条写，单条失败不影响其它条；一次最多
+//!   `MAX_VARIABLE_WRITES` 条）。后三个都先等上一轮收尾结束
 //! - `bridge.shutdown {}` → `{}` 后退出
 //!
 //! sidecar → 插件：
@@ -50,6 +57,7 @@ use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBack
 
 use crate::llm::{DshLlmClient, LlmBridgeState};
 use crate::rpc::{Incoming, Peer, RpcError};
+use crate::service::mvu::VariableWrite;
 use crate::service::{BridgeError, BridgeService, DisplayRef, SettleReport, TurnObserver};
 
 /// 在 sidecar 自己的数据目录上构造 JSON 后端的 AppState，并注入 DSH 模型客户端。
@@ -217,6 +225,36 @@ pub async fn handle_request(
             let campaign_id = params.get("campaign_id").and_then(Value::as_str);
             let items = service.display_nodes(&refs, campaign_id).map_err(to_rpc)?;
             encode(serde_json::to_value(items).map(|items| json!({ "items": items })))
+        }
+        "mvu.status" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            encode(serde_json::to_value(
+                service.mvu_status(&campaign_id).map_err(to_rpc)?,
+            ))
+        }
+        "mvu.analyze" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let analyzed = service.analyze_mvu(&campaign_id).await.map_err(to_rpc)?;
+            encode(serde_json::to_value(analyzed))
+        }
+        "mvu.apply" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let status = service.apply_mvu(&campaign_id).await.map_err(to_rpc)?;
+            encode(serde_json::to_value(status))
+        }
+        "variables.set" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let writes: Vec<VariableWrite> = match params.get("writes") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    RpcError::new("invalid_params", format!("writes 无效: {error}"))
+                })?,
+            };
+            let written = service
+                .write_variables(&campaign_id, &writes)
+                .await
+                .map_err(to_rpc)?;
+            encode(serde_json::to_value(written))
         }
         other => Err(RpcError::new("unknown_method", format!("未知方法 {other}"))),
     }
