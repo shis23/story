@@ -53,7 +53,7 @@ import {
   resolveCampaignWorldbookEnabledUpdates,
   resolveOpeningChatSelection,
 } from './vendor/card-shell.mjs'
-import { classifyCall } from './roles.js'
+import { classifyCall, ROLE_GROUPS, roleGroup } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
 import {
@@ -381,6 +381,11 @@ function createJsonStore(file) {
 //#region 模型调用（sidecar → 插件 → ctx.llm.stream）
 
 const MAX_REPLAY_ENTRIES = 200
+
+/** `{ provider, model }` 两项都是非空字符串。 */
+function isModelTarget(value) {
+  return typeof value?.provider === 'string' && value.provider !== '' && typeof value?.model === 'string' && value.model !== ''
+}
 
 /**
  * 工具循环里带推理的模型（如 DeepSeek 思考模式）要求把上一步的推理原样带回；
@@ -846,14 +851,27 @@ export function apply(ctx, config) {
     toolMode: TOOL_MODE_LABELS[settings.get('toolMode')] ? settings.get('toolMode') : 'native',
     generationMode: GENERATION_MODE_LABELS[settings.get('generationMode')] ? settings.get('generationMode') : 'auto',
   })
+  /** 按角色组单独指定的模型（只留合法条目）；没指定的组用底层模型。 */
+  const roleModels = () => {
+    const stored = settings.get('roleModels')
+    const result = {}
+    for (const group of Object.keys(ROLE_GROUPS)) {
+      const value = stored?.[group]
+      if (isModelTarget(value)) result[group] = { provider: value.provider, model: value.model }
+    }
+    return result
+  }
+  /** 一次调用用哪个模型：按系统提示词的身份句归组，本组指定了就用指定的。 */
+  const targetFor = (role) => roleModels()[roleGroup(role)] ?? settings.get('model')
 
   async function serveLogged(params, io) {
-    const target = settings.get('model')
+    const role = classifyCall(params?.messages)
+    const target = targetFor(role)
     const entry = {
       seq: ++llmSeq,
       at: new Date().toISOString(),
       model: target ? `${target.provider}/${target.model}` : null,
-      role: classifyCall(params?.messages),
+      role,
       messages: params?.messages?.length ?? 0,
       tools: params?.tools?.length ?? 0,
       status: 'running',
@@ -1625,9 +1643,12 @@ export function apply(ctx, config) {
       path: `${API_BASE}/models/test`,
       methods: ['POST'],
       requestBody: 'buffered',
-      fetch: async () => {
-        const target = settings.get('model')
-        if (!target?.provider || !target?.model) return failure('先选底层模型', 400)
+      fetch: async (request) => {
+        const body = await request.json().catch(() => ({}))
+        const group = typeof body?.group === 'string' ? body.group : null
+        if (group && !ROLE_GROUPS[group]) return failure(`未知角色组 ${group}`, 400)
+        const target = group ? roleModels()[group] : settings.get('model')
+        if (!target?.provider || !target?.model) return failure(group ? '这一组跟随底层模型' : '先选底层模型', 400)
         const result = await testModel(target)
         log(`model test ${target.provider}/${target.model}: ${result.ok ? `ok ${result.ms}ms` : result.detail}`)
         return json({ ...result, ok: true, passed: result.ok, model: `${target.provider}/${target.model}` })
@@ -1642,6 +1663,8 @@ export function apply(ctx, config) {
           return json({
             ok: true,
             selected: settings.get('model') ?? null,
+            roleModels: roleModels(),
+            roleGroups: ROLE_GROUPS,
             ...runOptions(),
             generationModes: GENERATION_MODE_LABELS,
             toolModes: TOOL_MODE_LABELS,
@@ -1675,6 +1698,24 @@ export function apply(ctx, config) {
           if (!provider || !model || provider === PROVIDER) return failure('需要 provider 与 model', 400)
           settings.set('model', { provider, model })
           log(`underlying model set: ${provider}/${model}`)
+        }
+        if (body?.roleModels !== undefined) {
+          // `{ 组: { provider, model } | null }`：null 表示这一组改回跟随底层模型。先整体校验再写。
+          const patch = body.roleModels
+          if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return failure('roleModels 应为对象', 400)
+          const next = roleModels()
+          for (const [group, value] of Object.entries(patch)) {
+            if (!ROLE_GROUPS[group]) return failure(`未知角色组 ${group}`, 400)
+            if (value === null) {
+              delete next[group]
+              continue
+            }
+            if (!isModelTarget(value) || value.provider === PROVIDER) return failure('需要 provider 与 model', 400)
+            next[group] = { provider: value.provider, model: value.model }
+          }
+          settings.set('roleModels', next)
+          const described = Object.entries(next).map(([group, target]) => `${group}=${target.provider}/${target.model}`)
+          log(`role models set: ${described.join(', ') || '(all follow the underlying model)'}`)
         }
         return json({ ok: true, settings: settings.all() })
       },

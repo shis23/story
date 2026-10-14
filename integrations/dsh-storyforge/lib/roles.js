@@ -21,6 +21,39 @@ const IDENTITIES = [
 const ACTOR = '你是角色 '
 const CREW = /你是顺序剧组演员 ([^，,。\s]+)/
 
+/** 识别所依赖的全部身份句（`test/roles.test.mjs` 逐条核对 Rust 提示词源码里还在）。 */
+export const IDENTITY_SENTENCES = Object.freeze([...IDENTITIES.map(([phrase]) => phrase), ACTOR, '你是顺序剧组演员 '])
+
+/**
+ * 可以单独指定模型的调用分组（首页「按角色指定模型」）。没指定的组和认不出的调用
+ * （`其它`，如消息归档）都用底层模型。
+ */
+export const ROLE_GROUPS = Object.freeze({
+  director: Object.freeze({ label: '导演', hint: '规划本轮场景、派角色出场' }),
+  actor: Object.freeze({ label: '角色表演', hint: '每个出场角色各一次' }),
+  prose: Object.freeze({ label: '成文', hint: '执笔、编剧、对手戏定稿' }),
+  settle: Object.freeze({ label: '后台收尾', hint: '摘要、后处理、纪要压缩' }),
+  analysis: Object.freeze({ label: '导入与分析', hint: '角色识别、卡内状态分析' }),
+})
+
+const GROUP_OF_LABEL = Object.freeze({
+  导演: 'director',
+  执笔: 'prose',
+  编剧: 'prose',
+  定稿: 'prose',
+  摘要: 'settle',
+  后处理: 'settle',
+  纪要压缩: 'settle',
+  角色识别: 'analysis',
+  'MVU 分析': 'analysis',
+})
+
+/** `classifyCall` 的标签 → 分组 id；不属于任何分组时返回 null。 */
+export function roleGroup(label) {
+  if (label === '角色' || (typeof label === 'string' && label.startsWith('角色 · '))) return 'actor'
+  return GROUP_OF_LABEL[label] ?? null
+}
+
 /** 消息列表（协议形状 `{ role, content }`）里所有 system 文本。 */
 function systemText(messages) {
   return (messages ?? [])
