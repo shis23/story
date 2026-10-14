@@ -30,11 +30,11 @@ const STATUS_BAR = '<details><summary>状态</summary><ul><li>体力：80</li></
 const FIRST_MES = `${OPENING}\n${STATUS_BAR}`
 const JSON_HEADERS = { 'content-type': 'application/json' }
 
-function fakeModel(calls) {
+function fakeModel(calls, models = ['writer']) {
   return async function* stream(options) {
     calls.push(options)
     assert.equal(options.provider, 'fake')
-    assert.equal(options.model, 'writer')
+    assert.ok(models.includes(options.model), `unexpected model ${options.model}`)
     for (const message of options.messages) {
       if (message.role === 'assistant') assert.equal(message.source?.kind, 'model')
       if (message.role === 'tool') assert.ok(message.toolCallId)
@@ -866,6 +866,113 @@ test('opening shells: mount before the first turn, switch the opening, toggle th
     assert.match(late.error, /故事已经开始/)
     const lateApply = await post('/shell/opening', { sessionId, bridgeSession: home.bridgeSession, swipe_id: 2, mes: RAIN_GREETING })
     assert.equal(lateApply.ok, false)
+  } finally {
+    await dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('role models: each call goes to the model chosen for its group', { skip: !existsSync(bin) && `sidecar not built: ${bin}`, timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sf-dsh-roles-'))
+  const cardsDir = join(root, 'cards')
+  mkdirSync(cardsDir)
+  writeFileSync(
+    join(cardsDir, 'seraphina.json'),
+    JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Seraphina',
+        description: '守护森林的女法师。',
+        personality: '温柔',
+        scenario: '旅人在森林里迷路。',
+        first_mes: OPENING,
+        mes_example: '',
+        alternate_greetings: [],
+        tags: [],
+        creator: 'host-smoke',
+        character_version: '1',
+        extensions: {},
+      },
+    }),
+  )
+  const llmCalls = []
+  const { ctx, adapters, routes, dispose } = fakeCtx(llmCalls)
+  ctx.llm.stream = fakeModel(llmCalls, ['writer', 'strong', 'fast'])
+  const post = (path, body) => call(routes, path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) })
+  const strong = { provider: 'fake', model: 'strong' }
+  const fast = { provider: 'fake', model: 'fast' }
+  try {
+    apply(ctx, { dataDir: join(root, 'data'), cardsDir })
+    assert.equal((await post('/settings', { provider: 'fake', model: 'writer', toolMode: 'native' })).ok, true)
+
+    // 未知分组、缺字段、指向 StoryForge 自己、整份不是对象：拒绝，且一条都不写（含同批合法的）。
+    for (const roleModels of [
+      { narrator: strong },
+      { prose: { provider: 'fake' } },
+      { prose: { provider: 'storyforge', model: 'pipeline' } },
+      ['prose'],
+      { prose: strong, bogus: null },
+    ]) {
+      assert.equal((await post('/settings', { roleModels })).ok, false, JSON.stringify(roleModels))
+    }
+    assert.deepEqual((await call(routes, '/models')).roleModels, {})
+
+    assert.equal((await post('/settings', { roleModels: { prose: strong, settle: fast, director: fast } })).ok, true)
+    // null = 这一组改回跟随底层模型，其它组不动。
+    const cleared = await post('/settings', { roleModels: { director: null } })
+    assert.deepEqual(cleared.settings.roleModels, { prose: strong, settle: fast })
+    const models = await call(routes, '/models')
+    assert.deepEqual(models.roleModels, { prose: strong, settle: fast })
+    assert.deepEqual(Object.keys(models.roleGroups), ['director', 'actor', 'prose', 'settle', 'analysis'])
+
+    // 测试连接按组：指定了的测指定模型，跟随底层模型的组与未知组报错。
+    const probe = await post('/models/test', { group: 'prose' })
+    assert.equal(probe.passed, true, JSON.stringify(probe))
+    assert.equal(probe.model, 'fake/strong')
+    assert.equal((await post('/models/test', { group: 'director' })).ok, false)
+    assert.equal((await post('/models/test', { group: 'nope' })).ok, false)
+    assert.equal((await post('/models/test', {})).model, 'fake/writer')
+
+    const created = await post('/sessions', { card: 'seraphina.json' })
+    assert.equal(created.ok, true, created.error)
+    const { sessionId } = created
+    const adapter = adapters.get('storyforge')
+    const opening = userMessage('（开始新故事）', 'storyforge')
+    await collect(adapter.stream({ sessionId, messages: [opening] }))
+    const chunks = await collect(
+      adapter.stream({
+        sessionId,
+        messages: [
+          opening,
+          { id: crypto.randomUUID(), role: 'assistant', content: [{ type: 'text', text: OPENING }], source: { kind: 'model', provider: 'storyforge', model: 'pipeline' } },
+          userMessage('我推开木屋的门。', 'user'),
+        ],
+        signal: new AbortController().signal,
+      }),
+    )
+    assert.equal(chunks.at(-1).type, 'finish')
+
+    let status
+    for (let i = 0; i < 100; i++) {
+      status = await call(routes, '/status')
+      if (status.settles.length > 0) break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    assert.equal(status.settles.length, 1, JSON.stringify(status))
+    // 调用表里每次调用的模型 = 本组指定的模型；没指定的组（角色识别）用底层模型。
+    const expected = { 执笔: 'fake/strong', 编剧: 'fake/strong', 定稿: 'fake/strong', 摘要: 'fake/fast', 后处理: 'fake/fast', 纪要压缩: 'fake/fast' }
+    const pipelineCalls = status.llmCalls.filter((entry) => entry.role !== '其它')
+    assert.ok(pipelineCalls.length >= 3, JSON.stringify(status.llmCalls))
+    for (const entry of pipelineCalls) {
+      assert.equal(entry.status, 'ok', JSON.stringify(entry))
+      assert.equal(entry.model, expected[entry.role] ?? 'fake/writer', `${entry.role} → ${entry.model}`)
+    }
+    const roles = new Set(pipelineCalls.map((entry) => entry.role))
+    assert.ok(roles.has('执笔') && roles.has('后处理') && roles.has('角色识别'), [...roles].join('、'))
+    // 实际发给 DSH 的请求与调用表一致。
+    const sentModels = new Set(llmCalls.map((options) => options.model))
+    assert.ok(sentModels.has('strong') && sentModels.has('fast') && sentModels.has('writer'), [...sentModels].join('、'))
   } finally {
     await dispose()
     rmSync(root, { recursive: true, force: true })

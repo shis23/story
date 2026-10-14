@@ -21,14 +21,14 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `lib/vendor/card-shell.mjs` | 生成文件：`shell/entry.mjs` 列出的桌面前端模块（卡壳切分与信任判定、桥接脚本、兼容层、ST API 宿主处理器、变量桶、Mvu 变量树、开场种子与开场选择解析、世界书条目映射、开场界面定高）经 esbuild 打成一个 ES 模块；服务端直接 import，浏览器半边经 `/vendor/card-shell.js` 加载。桌面源码改了要重新生成：`node integrations/dsh-storyforge/scripts/build-vendor.mjs`（用 `frontend/node_modules` 里的 esbuild） |
 | `lib/vendor/purify.es.mjs` | DOMPurify 3.4.12（上游双许可 Apache-2.0 / MPL-2.0；同目录 `DOMPURIFY-LICENSE` 是 npm 包自带的许可全文），取自 `frontend/node_modules`，只去掉了 source map 注释行；随插件分发，浏览器半边按需加载 |
 | `lib/mvu.js` | 卡内状态（MVU 原生渲染）：桌面 `mvuKey` / `mvuStatusBarModel` / `campaignMvuStatusBar` / `mvuInteractions` / `shellVariableOutbox` 的逻辑逐字移植（键记法、状态行取值、分节、交互解释、写入作用域），加上面板数据与交互计划的装配 |
-| `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……） |
+| `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……），并归入可单独指定模型的五组 |
 | `lib/shared.js` | 常量与进程内共享状态（生命周期事件、分叉回调） |
 | `lib/cards.js` | 角色卡：从 PNG（`ccv3` / `chara`）或 JSON 读卡名；导入时的文件名清洗与同名编号 |
 | `lib/text.js` | 面向用户的文字：会话标题按 DSH 的 80 字节上限预先截断、开场白 HTML 转可读文字、底层模型错误转成可操作的提示 |
 | `storyforge.patch.yml` | bundle 补丁（`package.json` 的 `dsh.bundle.patch`，装插件后每次启动自动叠加）：激活宿主插件 + 新增 `storyforge` 预设（只有 persona，无工具） |
-| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入；卡内状态的分析 / 应用 / 交互按钮；卡片界面的尾部数据、壳文档与响应头、未登记界面的确认、宿主代取、界面状态（含卸载重启后仍在）与变量写入；开场界面的开场种子、世界书读写、选开场（伪造会话被拒）与写过一轮后关闭 |
+| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入；卡内状态的分析 / 应用 / 交互按钮；卡片界面的尾部数据、壳文档与响应头、未登记界面的确认、宿主代取、界面状态（含卸载重启后仍在）与变量写入；开场界面的开场种子、世界书读写、选开场（伪造会话被拒）与写过一轮后关闭；按角色指定模型（设置校验、按组测试连接、每次调用走本组模型） |
 | `test/helpers.test.mjs` | 卡名解析、文件名清洗、标题截断、开场白转换、错误提示 |
-| `test/roles.test.mjs` | 管线角色识别 |
+| `test/roles.test.mjs` | 管线角色识别与分组；身份句逐条核对 Rust 提示词源码（改了措辞先红，不静默退回底层模型） |
 | `test/html.test.mjs` | 块切分与桌面实现对拍、正文去块与兜底 |
 | `test/mvu.test.mjs` | 卡内状态各函数与桌面实现对拍、面板数据、交互写入目标 |
 | `test/shell.test.mjs` | 卡片界面：信任判定、壳文档注入顺序与 CSP、模块改写、模块前言与开场种子与桌面逐字相同、开场态判定与开场白指纹、一次性文档淘汰、宿主代取（白名单 / IP / 重定向 / 大小 / 缓存）、界面状态桶 |
@@ -86,8 +86,13 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 5. 打开输出里的 `dsh web: http://127.0.0.1:<端口>/?token=…` 链接。先在 DSH 设置里配好
    至少一个模型服务商（凭据由你在界面里填，插件不读任何凭据文件），再到左侧栏
    「StoryForge」首页：
-   - 选「底层模型」：导演、角色、执笔、后处理都用它。点「测试连接」发一条很短的请求，确认
+   - 选「底层模型」：没单独指定模型的角色都用它。点「测试连接」发一条很短的请求，确认
      密钥与网络可用（没配密钥时直接提示去哪里配）；
+   - 可选「按角色指定模型」：导演、角色表演、成文（执笔 / 编剧 / 对手戏定稿）、后台收尾
+     （摘要 / 后处理 / 纪要压缩）、导入与分析（角色识别 / 卡内状态分析）各自可以换成别的
+     模型，比如导演和后台收尾用快模型、成文用强模型；每组可以单独测试连接。插件按系统提示词
+     里的身份句判断一次调用属于哪组，认不出的调用（如消息归档）用底层模型；首页「底层模型
+     调用」表的「模型」列是每次实际用的模型。工具协议对所有模型生效，选的模型都要支持它；
    - 「生成模式」默认自动路由；也可以显式选续写 / 双人戏 / 群像（并行或顺序子 Agent）。
      「工具协议」默认原生工具调用，模型不支持 function calling 时选「文本降级」（与
      StoryForge 连接的 TextFallback 同一套实现）；

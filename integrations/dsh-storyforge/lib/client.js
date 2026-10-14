@@ -1082,9 +1082,53 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/** 「测试连接」：结果跟着要测的模型走，换模型就清掉。`group` 为空时测底层模型。 */
+		function ModelProbe({ group, target, disabled }) {
+			const targetKey = target ? `${target.provider}/${target.model}` : "";
+			const [probe, setProbe] = React.useState(null);
+			const testing = probe?.running === true;
+			const elapsed = useElapsed(testing);
+			React.useEffect(() => setProbe(null), [targetKey]);
+			const run = async () => {
+				setProbe({ running: true });
+				try {
+					const result = await postJson("/models/test", group ? { group } : {});
+					setProbe({ key: targetKey, ...result });
+				} catch (e) {
+					setProbe({ key: targetKey, passed: false, error: errorText(e) });
+				}
+			};
+			const line = testing
+				? h("span", { className: "sf-muted sf-small" }, `正在请求 ${targetKey}… ${elapsed} 秒`)
+				: probe?.key === targetKey &&
+					(probe.passed
+						? h("span", { className: "sf-probe-ok sf-small" }, `连接正常 · ${(probe.ms / 1000).toFixed(1)} 秒`)
+						: h("span", { className: "sf-probe-err sf-small", title: probe.detail ?? "" }, probe.error));
+			return h(
+				React.Fragment,
+				null,
+				h(
+					"button",
+					{
+						type: "button",
+						className: "sf-btn sf-btn-sm",
+						disabled: disabled || testing,
+						title: "用这个模型发一条很短的请求，确认密钥与网络可用",
+						onClick: () => void run(),
+					},
+					"测试连接",
+				),
+				line,
+			);
+		}
+
 		function SettingsCard(props) {
 			const { models, onChange, onError } = props;
 			const [saved, setSaved] = React.useState(null);
+			const roleCount = Object.keys(models?.roleModels ?? {}).length;
+			// 用户没手动展开 / 收起过时，有已指定的组就展开（模型列表是异步加载的）。
+			const [rolesToggled, setRolesOpen] = React.useState(null);
+			const rolesOpen = rolesToggled ?? roleCount > 0;
 			React.useEffect(() => {
 				if (!saved) return undefined;
 				const timer = setTimeout(() => setSaved(null), 1600);
@@ -1110,33 +1154,49 @@ window.__ModuleLoader__.load({
 				}
 			};
 
+			const indexOf = (target) =>
+				target ? choices.findIndex((choice) => choice.provider === target.provider && choice.model === target.model) : -1;
 			const selected = models?.selected;
-			const selectedIndex = selected
-				? choices.findIndex((choice) => choice.provider === selected.provider && choice.model === selected.model)
-				: -1;
+			const selectedIndex = indexOf(selected);
 
-			/** 「测试连接」：结果跟着当前选中的模型走，换模型就清掉。 */
-			const selectedKey = selected ? `${selected.provider}/${selected.model}` : "";
-			const [probe, setProbe] = React.useState(null);
-			const testing = probe?.running === true;
-			const probeElapsed = useElapsed(testing);
-			React.useEffect(() => setProbe(null), [selectedKey]);
-			const runProbe = async () => {
-				setProbe({ running: true });
-				try {
-					const result = await postJson("/models/test", {});
-					setProbe({ key: selectedKey, ...result });
-				} catch (e) {
-					setProbe({ key: selectedKey, passed: false, error: errorText(e) });
-				}
+			/**
+			 * 模型下拉框：选项按服务商分组，value 是 `choices` 的序号。`target` 不在列表里时显示
+			 * 「已不可用」；`followLabel` 给出时第一项是「跟随底层模型」（value 为空串）。
+			 */
+			const modelSelect = ({ id, target, followLabel, onPick }) => {
+				const index = indexOf(target);
+				let optionIndex = 0;
+				const missing = target && index < 0 ? `${target.provider}/${target.model}（已不可用）` : null;
+				return h(
+					"select",
+					{
+						id,
+						className: "sf-input",
+						value: index >= 0 ? String(index) : missing ? "missing" : "",
+						onChange: (e) => {
+							if (e.target.value === "") onPick(null);
+							else if (choices[Number(e.target.value)]) onPick(choices[Number(e.target.value)]);
+						},
+					},
+					followLabel
+						? h("option", { value: "" }, followLabel)
+						: h("option", { value: "", disabled: true }, "选择底层模型…"),
+					missing && h("option", { value: "missing", disabled: true }, missing),
+					(models.providers ?? []).map((provider) =>
+						h(
+							"optgroup",
+							{ key: provider.provider, label: provider.error ? `${provider.name}（${provider.error}）` : provider.name },
+							provider.models.map((model) => h("option", { key: model.id, value: String(optionIndex++) }, model.name)),
+						),
+					),
+				);
 			};
-			const probeLine = testing
-				? h("span", { className: "sf-muted sf-small" }, `正在请求 ${selectedKey}… ${probeElapsed} 秒`)
-				: probe?.key === selectedKey &&
-					(probe.passed
-						? h("span", { className: "sf-probe-ok sf-small" }, `连接正常 · ${(probe.ms / 1000).toFixed(1)} 秒`)
-						: h("span", { className: "sf-probe-err sf-small", title: probe.detail ?? "" }, probe.error));
-			let optionIndex = 0;
+			const pickRoleModel = (group, choice) => {
+				const next = { ...(models.roleModels ?? {}) };
+				if (choice) next[group] = choice;
+				else delete next[group];
+				void save(`role:${group}`, { roleModels: { [group]: choice } }, { roleModels: next });
+			};
 			const savedMark = (field) => saved === field && h("span", { className: "sf-saved" }, "已保存");
 			const field = (id, label, control, hint, key) => [
 				h("label", { key: `${id}-l`, htmlFor: id }, label),
@@ -1160,49 +1220,65 @@ window.__ModuleLoader__.load({
 					field(
 						"sf-model",
 						"底层模型",
-						h(
-							"select",
-							{
-								id: "sf-model",
-								className: "sf-input",
-								value: selectedIndex >= 0 ? String(selectedIndex) : "",
-								onChange: (e) => {
-									const choice = choices[Number(e.target.value)];
-									if (choice) void save("model", choice, { selected: choice });
-								},
+						modelSelect({
+							id: "sf-model",
+							target: selected,
+							onPick: (choice) => {
+								if (choice) void save("model", choice, { selected: choice });
 							},
-							h(
-								"option",
-								{ value: "", disabled: true },
-								selected && selectedIndex < 0 ? `${selected.provider}/${selected.model}（已不可用）` : "选择底层模型…",
-							),
-							(models.providers ?? []).map((provider) =>
-								h(
-									"optgroup",
-									{ key: provider.provider, label: provider.error ? `${provider.name}（${provider.error}）` : provider.name },
-									provider.models.map((model) => h("option", { key: model.id, value: String(optionIndex++) }, model.name)),
-								),
-							),
-						),
-						"导演、角色、编剧、后处理共用；不影响 DSH 其它会话的模型",
+						}),
+						"没单独指定模型的角色都用它；不影响 DSH 其它会话的模型",
 						"model",
 					),
 					h("div", { key: "sf-probe-l" }),
 					h(
 						"div",
 						{ key: "sf-probe-c", className: "sf-field sf-probe" },
+						h(ModelProbe, { target: selected, disabled: !selected || selectedIndex < 0 }),
+					),
+					h(
+						"details",
+						{
+							key: "sf-roles",
+							className: "sf-roles",
+							open: rolesOpen,
+							onToggle: (e) => setRolesOpen(e.currentTarget.open),
+						},
 						h(
-							"button",
-							{
-								type: "button",
-								className: "sf-btn sf-btn-sm",
-								disabled: !selected || selectedIndex < 0 || testing,
-								title: "用选中的模型发一条很短的请求，确认密钥与网络可用",
-								onClick: () => void runProbe(),
-							},
-							"测试连接",
+							"summary",
+							null,
+							"按角色指定模型",
+							h("span", { className: "sf-muted sf-small" }, roleCount > 0 ? `（${roleCount} 组已指定）` : "（可选，默认都跟随底层模型）"),
 						),
-						probeLine,
+						h(
+							"div",
+							{ className: "sf-form" },
+							Object.entries(models.roleGroups ?? {}).flatMap(([group, info]) => {
+								const target = models.roleModels?.[group] ?? null;
+								return field(
+									`sf-role-${group}`,
+									info.label,
+									h(
+										React.Fragment,
+										null,
+										modelSelect({
+											id: `sf-role-${group}`,
+											target,
+											followLabel: "跟随底层模型",
+											onPick: (choice) => pickRoleModel(group, choice),
+										}),
+										target && h(ModelProbe, { group, target, disabled: indexOf(target) < 0 }),
+									),
+									info.hint,
+									`role:${group}`,
+								);
+							}),
+						),
+						h(
+							"div",
+							{ className: "sf-hint sf-roles-note" },
+							"按系统提示词识别调用属于哪个角色；认不出的调用（如消息归档）用底层模型。工具协议对所有模型生效，选的模型都要支持它。",
+						),
 					),
 					field(
 						"sf-mode",
@@ -1658,6 +1734,14 @@ window.__ModuleLoader__.load({
 .sf-notice-ok { background: color-mix(in srgb, var(--sf-ok) 10%, transparent); }
 .sf-notice-warn { background: color-mix(in srgb, var(--sf-warn) 14%, transparent); }
 .sf-probe { margin-top: -4px; flex-wrap: wrap; }
+.sf-roles { grid-column: 1 / -1; }
+.sf-roles > summary { cursor: pointer; color: var(--sf-fg2); list-style: none; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.sf-roles > summary::-webkit-details-marker { display: none; }
+.sf-roles > summary::before { content: "▸"; display: inline-block; color: var(--sf-fg3); transition: transform 0.15s; }
+.sf-roles[open] > summary::before { transform: rotate(90deg); }
+.sf-roles > .sf-form { margin: 10px 0 0 4px; padding-left: 12px; border-left: 2px solid var(--sf-border); }
+.sf-roles .sf-field { flex-wrap: wrap; }
+.sf-roles > .sf-roles-note { margin: 8px 0 0 4px; }
 .sf-probe-ok { color: var(--sf-ok); }
 .sf-probe-err { color: var(--sf-err); overflow-wrap: anywhere; }
 .sf-muted { color: var(--sf-fg3); }
