@@ -46,6 +46,7 @@
 - 2026-10-14 MVU 分析器修复（桌面与 DSH 共用 `storyforge-app-meta`）：`emit_mvu_translation` 工具 schema 的对象数组补上 `items`，解析端把写成 JSON 字符串的数组元素解码回对象。此前经 DSH 用 gemini 原生工具调用时，模型把每个元素编码成字符串，分析静默降级成只有变量字段（DSH 插件档 2 验收中发现）；解析失败的日志现在带上工具参数的解析错误与开头。
 - 2026-10-14 卡壳内联文档信任配对修复（桌面前端 `trustedInlineShellDocStarts`，DSH 插件经打包共用）：此前按出现顺序配对时，状态栏 `.load` 胶水里的 `<body><script>$('body').load(…)</script></body>` 也被当成内联文档、占掉卡正则的一次命中，同一条消息里排在它后面的合法内联界面因此退到确认卡（只会少放行、不会多放行）。现在按 `segmentShellContent` 认领出的内联段配对；`frontend/tests/card-shell-display.test.mjs` 补了回归断言（DSH 插件档 3 验收中发现）。
 - 门禁：合并后的 main（`93f9f9a`）于 2026-10-13 完整运行 11 步 `scripts/verify-release.ps1` 通过——secret 扫描、Pester 五套 208 项、fmt、严格 Clippy、Rust 2260 通过/0 失败/33 忽略、前端 535+161+9+28+2=735 项、生产构建；日志 `artifacts/gate-2026-10-13/gate-run.log`（含 `GATE_EXIT_CODE=0`）。其后只改文档的提交未重跑门禁。
+- 2026-10-14 DSH 插件卡片渲染档 2（MVU 面板，`a26e881`）与档 3（卡片界面 iframe，`4626dc3`）合入 main：合入前在与合并结果相同的树上完整运行 11 步 `scripts/verify-release.ps1` 通过——secret 扫描、Pester 五套 208 项、fmt、严格 Clippy、Rust 2264 通过/0 失败/33 忽略、前端 535+161+9+28+2=735 项、生产构建；日志 `artifacts/gate-2026-10-14-t3/gate-run.log`（含 `GATE_EXIT_CODE=0`）。DSH 插件自己的 `node --test` 49 项不在门禁内，合入前单独运行通过。
 - 未覆盖：main@`93f9f9a` 尚无 GitHub 远端构建；未发新版本，版本号仍为 0.1.2。Windows 原生真实模型写作、Android 真机、第三方插件通道等真机验收没有在 10 月改动后重跑，上表对应各行仍是 2026-09-06 的结论。
 
 三轮完整 11 步门禁均通过且计数完全一致（secret 扫描、Pester 四套 198 项、fmt、严格 Clippy、Rust 1980 通过/0 失败/33 忽略、前端 504+119+9+28+2=662 项、生产构建全部通过）：
