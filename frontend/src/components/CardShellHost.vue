@@ -9,7 +9,7 @@
     :style="hostStyle"
   >
     <div
-      v-if="statusLine && (showStatusLine || error)"
+      v-if="statusLine && (showStatusLine || error || draftNotice)"
       class="shrink-0 px-2 py-1 text-[11px] border-b border-line"
       :class="error ? 'text-err bg-err/10' : 'text-ink-soft bg-surface-2/50'"
     >
@@ -72,6 +72,7 @@ import {
   resolveCampaignWorldbookEnabledUpdates,
 } from '../utils/cardShellWorldbook.js'
 import { normalizeShellHeight } from '../utils/cardShellPresentation.js'
+import { offerShellChatDraft, SHELL_DRAFT_NOT_FILLED } from '../utils/shellChatDraft.js'
 import { buildMvuStatDataTree } from '../utils/mvuStatTree.js'
 import {
   createCardShellFetchProxyScript,
@@ -220,8 +221,12 @@ const iframeStyle = computed(() => {
   }
 })
 
+// 卡片界面把一段用户消息填进了写作输入框（createChatMessages）时的提示。
+const draftNotice = ref('')
+
 const statusLine = computed(() => {
   if (error.value) return `壳加载失败：${error.value}`
+  if (draftNotice.value) return draftNotice.value
   if (loading.value) return `宿主代持加载中… ${props.label || props.url || ''}`.trim()
   if (loadedUrl.value) return `已加载 ${props.label || loadedUrl.value}`
   return ''
@@ -800,6 +805,7 @@ async function loadShell() {
   const bridgeSession = nextBridgeSession()
   activeBridgeSession = bridgeSession
   error.value = null
+  draftNotice.value = ''
   measuredHeight.value = null
   inlineModuleSources.clear()
   loadedUrl.value = null
@@ -975,6 +981,14 @@ async function onBridgeMessage(ev) {
         swipes: Array.isArray(payload.swipes) ? payload.swipes : [],
       })
       reply({ ok: true })
+      return
+    }
+    if (type === 'chat_draft') {
+      // createChatMessages：只填进写作输入框，用户看过再发送（卡片界面不能自己开一轮）。
+      const outcome = offerShellChatDraft(payload.text)
+      if (outcome !== 'drafted') throw new Error(SHELL_DRAFT_NOT_FILLED[outcome] || outcome)
+      draftNotice.value = `${props.label || '卡片界面'}把一段消息填进了写作输入框，看过后点发送`
+      reply({ ok: true, drafted: true })
       return
     }
     if (type === 'mvu_status') {

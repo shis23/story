@@ -181,7 +181,14 @@ pub fn register_character_extractor_tools(registry: &mut ToolRegistry) {
                 "required": ["characters"]
             }),
         ),
-        |args, _ctx| Box::pin(async move { Ok(args) }),
+        // 终止工具只有成功才结束循环：参数解析不了就报错回给模型重写，不带着坏参数收尾。
+        |args, _ctx| {
+            Box::pin(async move {
+                crate::character_extractor::parse_emit_characters_args(&args)
+                    .map_err(crate::tools::ToolError::BadArgs)?;
+                Ok(args)
+            })
+        },
     );
 }
 
@@ -232,5 +239,34 @@ mod tests {
         assert!(msg.contains("冷静"));
         assert!(msg.contains("你好"));
         assert!(msg.contains("嗨"));
+    }
+
+    /// 终止工具 emit_characters 收到解析不了的参数要报错（模型下一轮重写），不能原样收尾。
+    #[tokio::test]
+    async fn test_emit_characters_rejects_unparseable_arguments() {
+        let mut registry = ToolRegistry::new();
+        register_character_extractor_tools(&mut registry);
+        let ctx = std::sync::Arc::new(crate::tools::ToolContext::empty());
+
+        let error = registry
+            .dispatch(
+                "emit_characters",
+                serde_json::json!({ "characters": [{ "persona_prompt": "没有名字" }] }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::tools::ToolError::BadArgs(ref reason) if reason.contains("characters[0]")),
+            "{error}"
+        );
+
+        let args =
+            serde_json::json!({ "characters": [{ "name": "艾琳", "persona_prompt": null }] });
+        let echoed = registry
+            .dispatch("emit_characters", args.clone(), ctx)
+            .await
+            .unwrap();
+        assert_eq!(echoed, args);
     }
 }

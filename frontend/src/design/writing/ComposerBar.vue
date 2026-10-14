@@ -5,9 +5,10 @@
  * 结构：生成模式 + 写作意图 + 发送/停止键。
  * 不展示只会预填文本的伪快捷能力，所有意图由用户直接输入。
  */
-import { ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ArrowUp, Square } from '@lucide/vue'
 import { generationModeCatalog } from '../../utils/generationModes.js'
+import { registerShellDraftTarget } from '../../utils/shellChatDraft.js'
 
 const props = defineProps({
   writing: { type: Boolean, default: false },
@@ -31,6 +32,31 @@ function submit() {
   emit('start-writing', intent.value)
   intent.value = ''
 }
+
+function resizeTextarea() {
+  const el = textareaRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+
+// 卡片界面（createChatMessages）只往这里填草稿，用户看过再发送；不覆盖用户自己的输入。
+function fillFromShell(text) {
+  if (props.disabled || props.writing) return 'busy'
+  if (intent.value.trim() && intent.value !== text) return 'draft'
+  intent.value = text
+  nextTick(() => {
+    resizeTextarea()
+    textareaRef.value?.focus()
+  })
+  return 'drafted'
+}
+
+let unregisterShellDraft = null
+onMounted(() => {
+  unregisterShellDraft = registerShellDraftTarget(fillFromShell)
+})
+onBeforeUnmount(() => unregisterShellDraft?.())
 
 function onKeydown(event) {
   // 1) 组合态（含旧 IME 的 229 伪键）一律放行给输入法，绝不提交、不 preventDefault
@@ -86,7 +112,7 @@ function onKeydown(event) {
         @keydown="onKeydown"
         @compositionstart="composing = true"
         @compositionend="composing = false"
-        @input="$event.target.style.height='auto'; $event.target.style.height=$event.target.scrollHeight+'px'"
+        @input="resizeTextarea"
       ></textarea>
 
       <button
