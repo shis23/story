@@ -349,8 +349,9 @@ struct NewTaskDto {
 }
 
 /// 触发条件宽松解析。模型常把它写成纯字符串（`"triggers": ["三个月期限到达"]`）、
-/// 单个值，或漏写 `kind`；这些都是事件描述，按 `event` 收下。认不出的单条跳过并
-/// warn，不再让整条新任务（新埋的伏笔）因为一个触发条件被丢掉。
+/// 单个值，或漏写 `kind`；这些都是事件描述，按 `event` 收下。`event` 的描述放错键
+/// （`event` / `condition` / `text` …）也收下。认不出的单条跳过并 warn，不再让整条
+/// 新任务（新埋的伏笔）因为一个触发条件被丢掉。
 fn lenient_triggers<'de, D>(deserializer: D) -> Result<Vec<TaskTrigger>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -372,10 +373,14 @@ fn trigger_from_value(value: serde_json::Value) -> Option<TaskTrigger> {
     };
     match value {
         serde_json::Value::String(text) => event(&text),
-        serde_json::Value::Object(map) if !map.contains_key("kind") => map
-            .get("description")
-            .and_then(|d| d.as_str())
-            .and_then(event),
+        serde_json::Value::Object(map) if is_event_object(&map) => {
+            let trigger = event_text(&map).and_then(event);
+            if trigger.is_none() {
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                warn!(target: "postprocess", "event trigger 没有描述文本，已跳过该条: keys={keys:?}");
+            }
+            trigger
+        }
         other => match serde_json::from_value::<TaskTrigger>(other) {
             Ok(trigger) => Some(trigger),
             Err(error) => {
@@ -384,6 +389,41 @@ fn trigger_from_value(value: serde_json::Value) -> Option<TaskTrigger> {
             }
         },
     }
+}
+
+/// 漏写 `kind`，或 `kind` 是 `event`（容忍大小写/空白）。其余 kind 走严格解析。
+fn is_event_object(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match map.get("kind") {
+        None => true,
+        Some(kind) => kind
+            .as_str()
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case("event")),
+    }
+}
+
+/// 模型（gemini）会把事件描述写在 `description` 以外的键上。
+const EVENT_TEXT_KEYS: &[&str] = &[
+    "description",
+    "event",
+    "condition",
+    "text",
+    "trigger",
+    "value",
+];
+
+/// 事件描述：先按常见键名找，找不到再取除 `kind` 外第一个非空字符串（Map 按键名排序，结果确定）。
+fn event_text(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    fn non_empty(value: &serde_json::Value) -> Option<&str> {
+        value.as_str().filter(|s| !s.trim().is_empty())
+    }
+    EVENT_TEXT_KEYS
+        .iter()
+        .find_map(|key| map.get(*key).and_then(non_empty))
+        .or_else(|| {
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "kind")
+                .find_map(|(_, value)| non_empty(value))
+        })
 }
 
 /// W-10：广播目标归一（trim + 大小写不敏感）；"all"/"全体"/"所有人" → All。
@@ -661,6 +701,91 @@ mod tests {
                 vec![TaskTrigger::TurnReminder { at_turn: 30 }, event("期限到达")],
             ]
         );
+    }
+
+    /// 真模型（gemini）写了 `kind: "event"`，描述却放在别的键上：照样收下，不再
+    /// 报 missing field `description` 丢掉触发条件。
+    #[test]
+    fn event_trigger_with_description_under_another_key_is_kept() {
+        use serde_json::json;
+
+        let event = |d: &str| {
+            Some(TaskTrigger::Event {
+                description: d.into(),
+            })
+        };
+        let cases = [
+            (
+                json!({"kind": "event", "event": "期限到达"}),
+                event("期限到达"),
+            ),
+            (
+                json!({"kind": "event", "condition": "老王回村"}),
+                event("老王回村"),
+            ),
+            (
+                json!({"kind": "event", "text": "钥匙到手"}),
+                event("钥匙到手"),
+            ),
+            (
+                json!({"kind": "event", "trigger": "真相揭穿"}),
+                event("真相揭穿"),
+            ),
+            (
+                json!({"kind": "event", "value": "暴雨来临"}),
+                event("暴雨来临"),
+            ),
+            // 常见键名都不在时，取第一个非空字符串
+            (
+                json!({"kind": "event", "when": " 月圆之夜 "}),
+                event("月圆之夜"),
+            ),
+            // description 优先；空白的 description 不算数
+            (
+                json!({"kind": "event", "description": "正解", "condition": "次选"}),
+                event("正解"),
+            ),
+            (
+                json!({"kind": "event", "description": "  ", "condition": "次选"}),
+                event("次选"),
+            ),
+            (
+                json!({"kind": " Event ", "description": "大小写"}),
+                event("大小写"),
+            ),
+            (json!({"condition": "漏写 kind"}), event("漏写 kind")),
+            // 没有任何描述文本：跳过
+            (json!({"kind": "event"}), None),
+            (json!({"kind": "event", "note": " ", "at_turn": 3}), None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(trigger_from_value(value.clone()), expected, "{value}");
+        }
+    }
+
+    /// 只有 event 宽松；其余 kind 仍按严格结构解析，字段缺了就跳过，不会被当成事件。
+    #[test]
+    fn non_event_triggers_stay_strict() {
+        use serde_json::json;
+
+        let cases = [
+            (
+                json!({"kind": "story_time", "target": "第2年6月"}),
+                Some(TaskTrigger::StoryTime {
+                    target: "第2年6月".into(),
+                }),
+            ),
+            (json!({"kind": "manual"}), Some(TaskTrigger::Manual)),
+            (
+                json!({"kind": "turn_reminder", "description": "第30轮"}),
+                None,
+            ),
+            (json!({"kind": "story_time", "condition": "第2年6月"}), None),
+            (json!({"kind": 1, "description": "kind 不是字符串"}), None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(trigger_from_value(value.clone()), expected, "{value}");
+        }
     }
 
     #[test]
