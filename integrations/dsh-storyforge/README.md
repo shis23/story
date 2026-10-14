@@ -12,13 +12,13 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 
 | 文件 | 作用 |
 |---|---|
-| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 与卡片界面取回 `/display`、净化库 `/vendor/purify.js`、卡片界面 `/shell/*`（挂载、壳文档、宿主代取、Mvu 只读数据、界面状态、确认后的变量写入）与桌面模块打包 `/vendor/card-shell.js`、卡内状态 `/mvu`（读取 / 分析 / 应用变量定义 / 交互按钮）、调试） |
+| `lib/index.js` | 宿主半边：注册 provider `storyforge`（真实管线适配器，或假管线）、可选的调试回显 provider、`/api/storyforge/*` 受保护路由（新建故事、角色卡列表与导入、底层模型选择与测试连接、sidecar 状态、卡片 HTML 与卡片界面取回 `/display`、净化库 `/vendor/purify.js`、卡片界面 `/shell/*`（挂载、壳文档、宿主代取、Mvu 只读数据、界面状态、确认后的变量写入、开场选择、世界书读写）与桌面模块打包 `/vendor/card-shell.js`、卡内状态 `/mvu`（读取 / 分析 / 应用变量定义 / 交互按钮）、调试） |
 | `lib/bridge.js` | sidecar 管理：懒启动、按行收发 JSON-RPC、执行 sidecar 发来的 `llm.stream`、转发管线事件 |
 | `lib/agent.js` | StoryForge 预设里的 agent 作用域插件：每次模型请求钉到 `storyforge/pipeline`；记录 agent 创建 / 分叉 |
 | `lib/client.js` | 浏览器半边：左侧栏「StoryForge」首页（新建故事、管线设置、我的故事、最近的收尾、底层模型调用、折叠的调试信息）；StoryForge 会话里的视图标签、右栏面板（故事信息 + 卡内状态：状态行、交互按钮）、会话头按钮、停靠条（兼登记本会话的输入框，交互按钮经它发下一轮提示）、模型锁、每轮回复下方的卡片 HTML 与卡片界面 iframe（`conversation.chat.turnTail` 槽；界面的桥请求、变量写入确认条）。颜色与圆角取 DSH 主题变量，跟随亮 / 暗主题 |
 | `lib/html.js` | 卡片 HTML 块切分（与桌面 `splitRawHtmlBlocks` 同口径）：DSH 正文去掉完整块与卡片界面、块数与界面数写进 replayState，`/display` 返回的块附文字版 |
 | `lib/shell.js` | 卡片界面（卡壳）服务端：按卡清单判定信任、拼壳文档（注入桌面的桥接 / 兼容层脚本，模块转 blob 运行、常用库从 CDN 预加载）、一次性文档路径与 CSP 响应头、白名单宿主代取（磁盘缓存）、壳自己的界面状态（写回存档，按存档串行合并） |
-| `lib/vendor/card-shell.mjs` | 生成文件：`shell/entry.mjs` 列出的桌面前端模块（卡壳切分与信任判定、桥接脚本、兼容层、ST API 宿主处理器、变量桶、Mvu 变量树）经 esbuild 打成一个 ES 模块；服务端直接 import，浏览器半边经 `/vendor/card-shell.js` 加载。桌面源码改了要重新生成：`node integrations/dsh-storyforge/scripts/build-vendor.mjs`（用 `frontend/node_modules` 里的 esbuild） |
+| `lib/vendor/card-shell.mjs` | 生成文件：`shell/entry.mjs` 列出的桌面前端模块（卡壳切分与信任判定、桥接脚本、兼容层、ST API 宿主处理器、变量桶、Mvu 变量树、开场种子与开场选择解析、世界书条目映射、开场界面定高）经 esbuild 打成一个 ES 模块；服务端直接 import，浏览器半边经 `/vendor/card-shell.js` 加载。桌面源码改了要重新生成：`node integrations/dsh-storyforge/scripts/build-vendor.mjs`（用 `frontend/node_modules` 里的 esbuild） |
 | `lib/vendor/purify.es.mjs` | DOMPurify 3.4.12（上游双许可 Apache-2.0 / MPL-2.0；同目录 `DOMPURIFY-LICENSE` 是 npm 包自带的许可全文），取自 `frontend/node_modules`，只去掉了 source map 注释行；随插件分发，浏览器半边按需加载 |
 | `lib/mvu.js` | 卡内状态（MVU 原生渲染）：桌面 `mvuKey` / `mvuStatusBarModel` / `campaignMvuStatusBar` / `mvuInteractions` / `shellVariableOutbox` 的逻辑逐字移植（键记法、状态行取值、分节、交互解释、写入作用域），加上面板数据与交互计划的装配 |
 | `lib/roles.js` | 按系统提示词里的身份句给每次底层调用标管线角色（导演、角色 · 名字、执笔、后处理……） |
@@ -26,12 +26,12 @@ sidecar 跑的是与 Tauri 命令同一份生产代码：导演 / 角色 / 执�
 | `lib/cards.js` | 角色卡：从 PNG（`ccv3` / `chara`）或 JSON 读卡名；导入时的文件名清洗与同名编号 |
 | `lib/text.js` | 面向用户的文字：会话标题按 DSH 的 80 字节上限预先截断、开场白 HTML 转可读文字、底层模型错误转成可操作的提示 |
 | `storyforge.patch.yml` | bundle 补丁（`package.json` 的 `dsh.bundle.patch`，装插件后每次启动自动叠加）：激活宿主插件 + 新增 `storyforge` 预设（只有 persona，无工具） |
-| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入；卡内状态的分析 / 应用 / 交互按钮；卡片界面的尾部数据、壳文档与响应头、未登记界面的确认、宿主代取、界面状态（含卸载重启后仍在）与变量写入 |
+| `test/host-smoke.test.mjs` | 宿主半边冒烟：假 DSH ctx + 假底层模型驱动真实 sidecar 跑一轮；角色卡导入；卡内状态的分析 / 应用 / 交互按钮；卡片界面的尾部数据、壳文档与响应头、未登记界面的确认、宿主代取、界面状态（含卸载重启后仍在）与变量写入；开场界面的开场种子、世界书读写、选开场（伪造会话被拒）与写过一轮后关闭 |
 | `test/helpers.test.mjs` | 卡名解析、文件名清洗、标题截断、开场白转换、错误提示 |
 | `test/roles.test.mjs` | 管线角色识别 |
 | `test/html.test.mjs` | 块切分与桌面实现对拍、正文去块与兜底 |
 | `test/mvu.test.mjs` | 卡内状态各函数与桌面实现对拍、面板数据、交互写入目标 |
-| `test/shell.test.mjs` | 卡片界面：信任判定、壳文档注入顺序与 CSP、模块改写、模块前言与桌面逐字相同、一次性文档淘汰、宿主代取（白名单 / IP / 重定向 / 大小 / 缓存）、界面状态桶 |
+| `test/shell.test.mjs` | 卡片界面：信任判定、壳文档注入顺序与 CSP、模块改写、模块前言与开场种子与桌面逐字相同、开场态判定与开场白指纹、一次性文档淘汰、宿主代取（白名单 / IP / 重定向 / 大小 / 缓存）、界面状态桶 |
 | `test/vendor.test.mjs` | `lib/vendor/card-shell.mjs` 与桌面源码同步（重新打包逐字比对；没装 `frontend` 依赖时跳过） |
 
 插件配置（`storyforge.patch.yml` 里 `config` 下，均可省略；要改就在 profile 自己的补丁里覆盖）：
@@ -182,8 +182,14 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
     常量：jsdelivr、cdnjs、Google Fonts、catbox、imgbb、postimg、GitHub、Gitee）。
   - 信任：只有卡清单里登记过的 `.load` URL、命中卡正则的内联文档自动挂载（与桌面相同）；其余显示
     确认卡，点「信任并挂载本次」才挂，刷新页面后重新确认。
-  - 每轮都带状态栏的卡只展开最新一轮的界面，较早的默认收起、点「展开」再挂。开场界面（首页、
-    自定义开局）还不支持，只显示说明；开场白的文字照常在正文里。
+  - 每轮都带状态栏的卡只展开最新一轮的界面，较早的默认收起、点「展开」再挂。
+  - 开场界面（首页、自定义开局；卡清单里登记过的才算）挂在开场白这一轮下方，按窗口高度定高（与
+    桌面相同的规则）。只在开局前可用：会话已关联存档、对话里只有开场白一个节点；写过一轮后只留
+    一行说明，服务端也拒绝再挂。界面里切换开场（卡调 `reloadCurrentChat`）时按卡的问候语解析选择，
+    经 sidecar 改写存档里的开场白（桌面 `apply_campaign_opening` 同一入口）；只认插件挂过的开场
+    界面的桥会话，别的界面或伪造的请求被拒。DSH 正文里还是开局时的那份开场白，存档里的开场白变了
+    时尾部最前面补一段新开场的文字（新开场只有界面时不补）。不在清单里的开场界面照常要确认，当
+    普通界面挂，不能改开场。
   - 运行环境：jQuery 3.7.1、lodash 4.17.21、Vue 3.5.13、EJS 3.1.10 从 cdnjs / jsdelivr 预加载，
     Zod 4 异步加载，所以界面要能访问这些 CDN。卡里的内联模块脚本在 iframe 里转 blob 运行，相对
     import 按页面地址改成绝对地址。`$.fn.load` / `$.getScript` 与卡的远程资源经插件服务端代取：
@@ -195,8 +201,11 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
     排在这一轮收尾之后，插件卸载时最多等 2 秒）。落盘失败只记日志，下一次写入带整份重试。还没
     关联存档的会话只放插件内存。界面请求写存档变量时先在界面下方列成提案，点「应用」才写，
     写入目标与键名守卫同卡内状态面板的交互按钮；写入失败时提案保留。
-  - 不支持：改世界书、开场选择、需要 StoryForge 后端的 SillyTavern / 酒馆助手接口（生成、读写
-    消息等），界面里调用会报错。
+  - 世界书：界面经酒馆助手 `getWorldbook` / `updateWorldbookWith` 读本局世界书的条目名与启用状态、
+    按条目名切换启用（只认本局书名 `storyforge:campaign:<存档 id>`，不读正文、不改其它字段）；同一
+    存档的读改写串行，与桌面同口径。写作进行中切换要等这一轮收尾。
+  - 不支持：需要 StoryForge 后端的 SillyTavern / 酒馆助手接口（生成、读写消息等，包括自定义开局
+    界面提交时用的 `createChatMessages` 与 `/trigger`，桌面版同样不支持），界面里调用会报错。
   - 本功能之前写下的回复不显示卡片界面。内置浏览器面板一类会拦截子 frame 的环境里 iframe 是空白。
 - 卡内状态面板（MVU 原生渲染，与桌面版写作页的状态面板同口径）：
   - 分析是手动的（桌面版同样不自动跑），每次调用一次底层模型，大卡要几十秒。分析结果存在 sidecar

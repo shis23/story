@@ -1,7 +1,8 @@
-// 卡片界面（档 3）：信任判定、壳文档拼装、一次性文档路径、宿主代取、选择器变量桶。
+// 卡片界面（档 3）：信任判定、壳文档拼装、开场界面、一次性文档路径、宿主代取、选择器变量桶。
 // 运行：node --test integrations/dsh-storyforge/test/*.test.mjs
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { SHELL_ONLY_BODY, splitForDsh } from '../lib/html.js'
 import {
   CARD_SHELL_MODULE_PREAMBLE,
+  OPENING_SEED_LINES,
   absolutizeModuleImports,
   buildShellDocument,
   cacheName,
@@ -18,13 +20,17 @@ import {
   createShellFetcher,
   createShellVariableStore,
   findShellSegment,
+  isOpeningOpen,
   isTextResource,
+  openingContentHash,
   rewriteModuleScripts,
   shellCsp,
   shellDocResponse,
   shellLabel,
   shellTrust,
+  shellWorldbookName,
   tailParts,
+  turnTailParts,
 } from '../lib/shell.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -224,6 +230,105 @@ test('壳文档：嵌入的 JSON 不能闭合 script', () => {
   assert.equal(doc.includes('</script><script>alert(1)'), false)
   assert.match(doc, /\\u003c\/script\\u003e/)
   assert.equal(doc.includes('\u2028'), false)
+})
+
+//#endregion
+
+//#region 开场界面
+
+const HOME_URL = 'https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/home/index.html'
+const HOME_LOAD = `\`\`\`\n<body><script>$('body').load('${HOME_URL}')</script></body>\n\`\`\``
+const OPENING_MANIFEST = {
+  ...MANIFEST,
+  shells: [...MANIFEST.shells, { kind: 'opening_home', source: 'remote_url', url: HOME_URL, label: '首页', trigger: '/【首页】/' }],
+}
+
+test('开场种子与桌面 CardShellHost.vue 逐行相同', () => {
+  const source = readFileSync(desktopHost, 'utf8').replace(/\r\n/g, '\n').split('\n')
+  const from = source.findIndex((line) => line.includes('"  function seedOpeningChat(){",'))
+  const to = source.findIndex((line) => line.includes('"  try { seedOpeningChat(); installOpeningReloadHook(); } catch (eSeed) {}",'))
+  assert.ok(from > 0 && to > from, '桌面开场种子的写法变了，更新这条测试')
+  const lines = source.slice(from, to + 1).map((line) => {
+    const match = line.match(/^\s*("(?:[^"\\]|\\.)*"),?\s*$/)
+    assert.ok(match, `不是单行字符串：${line}`)
+    return JSON.parse(match[1])
+  })
+  assert.deepEqual(OPENING_SEED_LINES, lines)
+})
+
+test('壳文档：开场种子与世界书名进文档；不给时种子为 null、书名为空', () => {
+  const seed = { name: '命定之诗', mes: '【首页】', message: '【首页】', swipe_id: 0, swipes: ['【首页】', '雨夜'] }
+  const doc = shellDoc('<p>x</p>', { openingChatSeed: seed, worldbookName: shellWorldbookName('camp-1') })
+  assert.ok(doc.includes(`var OPENING_CHAT_SEED = ${JSON.stringify(seed)};`))
+  assert.ok(doc.includes('storyforge:campaign:camp-1'))
+  assert.ok(doc.includes("await ask('opening_chat_applied', {"))
+  // 种子在宿主桥里（`ask` 同一作用域），排在兼容层之前。
+  assert.ok(doc.indexOf('var OPENING_CHAT_SEED') > doc.indexOf('var BRIDGE_SESSION'))
+
+  const plain = shellDoc('<p>x</p>')
+  assert.ok(plain.includes('var OPENING_CHAT_SEED = null;'))
+  assert.equal(plain.includes('storyforge:campaign:'), false)
+  assert.equal(shellWorldbookName(''), '')
+  assert.equal(shellWorldbookName(null), '')
+})
+
+test('isOpeningOpen：关联存档、首节点、对话只有一个节点、不是按位置取的', () => {
+  const item = { node_index: 0, node_count: 1 }
+  assert.equal(isOpeningOpen(item, 'camp-1'), true)
+  assert.equal(isOpeningOpen(item, null), false)
+  assert.equal(isOpeningOpen({ ...item, node_count: 3 }, 'camp-1'), false)
+  assert.equal(isOpeningOpen({ ...item, node_index: 2 }, 'camp-1'), false)
+  assert.equal(isOpeningOpen({ ...item, by_position: true }, 'camp-1'), false)
+  assert.equal(isOpeningOpen({ node_index: 0 }, 'camp-1'), false)
+  assert.equal(isOpeningOpen(undefined, 'camp-1'), false)
+})
+
+test('openingContentHash：sha256 前 16 位十六进制；非字符串为 null', () => {
+  assert.equal(openingContentHash('【首页】'), createHash('sha256').update('【首页】', 'utf8').digest('hex').slice(0, 16))
+  assert.match(openingContentHash(''), /^[0-9a-f]{16}$/)
+  assert.notEqual(openingContentHash('a'), openingContentHash('b'))
+  assert.equal(openingContentHash(null), null)
+})
+
+test('turnTailParts：可信开场界面按开场态标 open / closed，不可信的与其它界面不标', () => {
+  const content = '【首页】'
+  const display = `${HOME_LOAD}\n\n${FENCED_LOAD}\n\n$('body').load('https://files.catbox.moe/home/index.html')`
+  const item = { content, display_content: display, node_index: 0, node_count: 1 }
+  const trust = shellTrust(OPENING_MANIFEST)
+
+  const open = turnTailParts(item, {}, trust, { openingOpen: true })
+  assert.deepEqual(
+    open.map((part) => [part.kind, part.trusted, part.opening]),
+    [
+      ['opening_home', true, 'open'],
+      ['status', true, undefined],
+      ['opening_home', false, undefined],
+    ],
+  )
+  const closed = turnTailParts(item, {}, trust)
+  assert.equal(closed[0].opening, 'closed')
+  assert.equal('opening' in closed[1], false)
+})
+
+test('turnTailParts：开场白被改写（指纹对不上）时在最前补新开场正文', () => {
+  const trust = shellTrust(OPENING_MANIFEST)
+  const original = { content: '【首页】', display_content: HOME_LOAD, node_index: 0, node_count: 1 }
+  const ref = { contentHash: openingContentHash(original.content) }
+  // 没改：不补；回放数据没有指纹（不是开场轮）：不补。
+  assert.equal(turnTailParts(original, ref, trust, { openingOpen: true })[0].type, 'shell')
+  const rain = { content: '雨夜，她推开酒馆的门。', display_content: '雨夜，她推开酒馆的门。', node_index: 0, node_count: 1 }
+  assert.deepEqual(turnTailParts(rain, {}, trust), [])
+  assert.deepEqual(turnTailParts(rain, ref, trust), [{ type: 'text', text: '雨夜，她推开酒馆的门。' }])
+
+  // 新开场带状态栏：正文在前、界面照常。
+  const withShell = { ...rain, display_content: `雨夜。\n\n${FENCED_LOAD}` }
+  const parts = turnTailParts(withShell, ref, trust)
+  assert.deepEqual(parts[0], { type: 'text', text: '雨夜。' })
+  assert.equal(parts[1].kind, 'status')
+
+  // 新开场只有界面：不补占位文字。
+  const shellOnly = { ...rain, content: '<customized>x</customized>', display_content: FENCED_LOAD }
+  assert.equal(turnTailParts(shellOnly, ref, trust).some((part) => part.type === 'text'), false)
 })
 
 //#endregion

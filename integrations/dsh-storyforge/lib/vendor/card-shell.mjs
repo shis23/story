@@ -2483,22 +2483,141 @@ function analyzeEsmModuleSource(source) {
     imports
   };
 }
+
+// frontend/src/utils/cardShellOpeningChat.js
+function buildOpeningChatSwipes(greetingOptions = []) {
+  if (!Array.isArray(greetingOptions)) return [];
+  const swipes = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const option of greetingOptions) {
+    const content = typeof option === "string" ? option : option?.content;
+    const text = String(content || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    swipes.push(String(content));
+  }
+  return swipes;
+}
+function buildOpeningChatSeed(greetingOptions = [], options = {}) {
+  const swipes = buildOpeningChatSwipes(greetingOptions);
+  const name = String(options.name || "Assistant");
+  const selected = Number(options.selectedIndex);
+  const fallbackMes = swipes[Number.isFinite(selected) && selected >= 0 ? selected : 0] || "";
+  return {
+    name,
+    is_user: false,
+    is_name: true,
+    mes: fallbackMes,
+    message: fallbackMes,
+    // Force the first「开始旅程」click to take the swipe-switch branch.
+    swipe_id: -1,
+    swipes: swipes.length ? swipes : [fallbackMes || ""]
+  };
+}
+function resolveOpeningChatSelection(payload = {}, greetingOptions = []) {
+  const swipes = buildOpeningChatSwipes(greetingOptions);
+  const rawSwipe = payload?.swipe_id;
+  const swipeId = rawSwipe === null || rawSwipe === void 0 || rawSwipe === "" ? null : Number(rawSwipe);
+  const mes = typeof payload?.mes === "string" ? payload.mes : "";
+  if (Number.isFinite(swipeId) && swipeId >= 0 && swipeId < swipes.length) {
+    return {
+      greetingIndex: swipeId,
+      content: swipes[swipeId]
+    };
+  }
+  if (mes) {
+    const byContent = swipes.findIndex((swipe) => swipe === mes);
+    if (byContent >= 0) {
+      return { greetingIndex: byContent, content: swipes[byContent] };
+    }
+    return { greetingIndex: null, content: mes };
+  }
+  return { greetingIndex: null, content: swipes[0] || "" };
+}
+
+// frontend/src/utils/campaignGreetingOptions.js
+function buildGreetingOptionsFromDetail(detail) {
+  if (!detail) return [];
+  const options = [];
+  const seen = /* @__PURE__ */ new Set();
+  const addOption = (label, content) => {
+    if (!content || !content.trim() || seen.has(content)) return;
+    seen.add(content);
+    options.push({ label, content });
+  };
+  addOption("默认", detail.first_mes);
+  const alternates = Array.isArray(detail.alternate_greetings) ? detail.alternate_greetings : [];
+  alternates.forEach((content, index) => {
+    addOption(`备选 ${index + 1}`, content);
+  });
+  return options;
+}
+
+// frontend/src/utils/cardShellWorldbook.js
+function entryName(entry) {
+  const name = String(entry?.name || "").trim();
+  if (name) return name;
+  const firstKey = Array.isArray(entry?.keys) ? entry.keys.find((key) => String(key || "").trim()) : null;
+  if (firstKey) return String(firstKey).trim();
+  return `world-info-${Number(entry?.index) || 0}`;
+}
+function mapCampaignWorldbookForTavernHelper(worldbook) {
+  return Array.isArray(worldbook?.entries) ? worldbook.entries.map((entry) => ({
+    index: Number(entry?.index) || 0,
+    name: entryName(entry),
+    enabled: !entry?.disabled
+  })) : [];
+}
+function resolveCampaignWorldbookEnabledUpdates(currentEntries, requestedEntries) {
+  const requestedByName = new Map(
+    (Array.isArray(requestedEntries) ? requestedEntries : []).filter((entry) => entry?.name != null).map((entry) => [String(entry.name), Boolean(entry.enabled)])
+  );
+  return (Array.isArray(currentEntries) ? currentEntries : []).flatMap((entry) => {
+    const requestedEnabled = requestedByName.get(entryName(entry));
+    if (requestedEnabled === void 0 || requestedEnabled === !entry?.disabled) return [];
+    return [{ entryIndex: Number(entry?.index) || 0, enabled: requestedEnabled }];
+  });
+}
+
+// frontend/src/utils/cardShellPresentation.js
+function getOpeningShellPresentation(viewportHeight = defaultViewportHeight()) {
+  const raw = Number(viewportHeight);
+  const vh = Number.isFinite(raw) && raw > 0 ? raw : 900;
+  const heightPx = Math.max(520, Math.min(900, Math.round(vh - 160)));
+  return {
+    height: `${heightPx}px`,
+    autoHeight: false
+  };
+}
+function defaultViewportHeight() {
+  try {
+    if (typeof window !== "undefined" && window.innerHeight) return window.innerHeight;
+  } catch (_) {
+  }
+  return 900;
+}
 export {
   CARD_SHELL_VARIABLES_KEY,
   MSG_REQUEST,
   MSG_RESPONSE,
   analyzeEsmModuleSource,
+  buildGreetingOptionsFromDetail,
   buildMvuStatDataTree,
+  buildOpeningChatSeed,
   classifyShellUrl,
   createCardShellFetchProxyScript,
   createCardShellMapReadyFallbackScript,
   createCardShellRuntimeCompatibilityScript,
   createHostHandler,
   generateBridgeScript,
+  getOpeningShellPresentation,
   isCardShellBridgeMessageForSession,
+  mapCampaignWorldbookForTavernHelper,
   mergeCardShellVariables,
   normalizeCardShellVariables,
   patchCardShellVariables,
+  resolveCampaignWorldbookEnabledUpdates,
+  resolveOpeningChatSelection,
   rewriteCardShellTopBridgeAccess,
   segmentShellContent,
   trustedInlineShellDocStarts,
