@@ -323,16 +323,14 @@ export function trustedInlineShellDocStarts(displayContent, sourceContent, trigg
   if (!matchedStarts.length) return trusted
   matchedStarts.sort((a, b) => a - b)
 
-  // 与 segmentShellContent 的 INLINE_DOC_RE 完全一致（含「必须带 script」的
-  // 判定），否则 ordinal 配对会错位。
-  const inlineDocRe =
-    /<!DOCTYPE\s+html[\s\S]*?<\/html\s*>|<html[\s>][\s\S]*?<\/html\s*>|<body[\s>][\s\S]*?<\/body\s*>/gi
+  // 按 segmentShellContent 认领出的内联段配对（与挂载用的是同一份切分），否则
+  // ordinal 配对会错位：`.load` 胶水里的 `<body><script>$('body').load(…)</script></body>`
+  // 也长得像内联文档，但它归 load 段，不能占掉一次命中。
   let index = 0
-  let match
-  while ((match = inlineDocRe.exec(displayText)) !== null) {
-    if (!/<script[\s>]/i.test(match[0])) continue
+  for (const segment of segmentShellContent(displayText)) {
+    if (segment.type !== 'shell' || segment.mode !== 'inline') continue
     if (index >= matchedStarts.length) break
-    trusted.add(match.index)
+    trusted.add(segment.start)
     index += 1
   }
   return trusted

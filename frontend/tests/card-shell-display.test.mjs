@@ -181,6 +181,20 @@ test('trustedInlineShellDocStarts backs each inline doc with its own trigger hit
     trustDocs(oneHitTwoDocs, '【修炼界面】只出现一次', TRIGGERS).size,
     1,
   )
+
+  // 状态栏的 `.load` 胶水（围栏里的 <body><script>$('body').load(…)</script></body>）
+  // 归 load 段，不是内联文档：排在前面也不能占掉内联文档的命中。
+  const glue = `\`\`\`html\n<body><script>$('body').load('${STATUS}')</script></body>\n\`\`\``
+  const withGlue = `叙事。\n${glue}\n${first}`
+  assert.deepEqual(
+    [...trustDocs(withGlue, '<StatusPlaceHolderImpl/>\n【修炼界面】开场', TRIGGERS)],
+    [withGlue.indexOf('<body class="a"')],
+  )
+  const bareGlue = `叙事。\n<body><script>$('body').load('${STATUS}')</script></body>\n${first}`
+  assert.deepEqual(
+    [...trustDocs(bareGlue, '【修炼界面】开场', TRIGGERS)],
+    [bareGlue.indexOf('<body class="a"')],
+  )
 })
 
 // ─── segmentShellContent（原地渲染分段器）───────────────────────────────
