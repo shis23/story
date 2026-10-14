@@ -93,6 +93,61 @@ pub fn write_status_card(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// 卡片界面卡：开场白里两个占位，卡正则把一个换成 `$('body').load(状态栏 URL)`，
+/// 另一个换成带脚本的内联 HTML 文档。
+pub const SHELL_OPENING: &str = "木屋里很暖和。\n<StatusPlaceHolderImpl/>\n<sf-inline/>";
+pub const SHELL_STATUS_URL: &str =
+    "https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/status/index.html";
+pub const SHELL_INLINE_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><div id=\"sf-inline\">加载中</div><script>document.getElementById('sf-inline').textContent = '内联界面已运行';</script></body></html>";
+
+fn shell_regex(id: &str, name: &str, find: &str, replace: &str) -> Value {
+    json!({
+        "id": id,
+        "scriptName": name,
+        "findRegex": find,
+        "replaceString": replace,
+        "placement": [2],
+        "disabled": false,
+        "markdownOnly": true,
+        "promptOnly": false,
+        "runOnEdit": true,
+        "substituteRegex": 0,
+        "trimStrings": [],
+        "minDepth": null,
+        "maxDepth": null
+    })
+}
+
+pub fn write_shell_card(dir: &Path) -> std::path::PathBuf {
+    let load_glue =
+        format!("```html\n<body><script>$('body').load('{SHELL_STATUS_URL}')</script></body>\n```");
+    let card = json!({
+        "spec": "chara_card_v2",
+        "spec_version": "2.0",
+        "data": {
+            "name": "Seraphina",
+            "description": "守护森林的女法师，温柔而警惕。",
+            "personality": "温柔、警惕",
+            "scenario": "旅人在森林里迷路，被 Seraphina 救回木屋。",
+            "first_mes": SHELL_OPENING,
+            "mes_example": "",
+            "alternate_greetings": [],
+            "tags": [],
+            "creator": "dsh-bridge-test",
+            "character_version": "1",
+            "extensions": {
+                "regex_scripts": [
+                    shell_regex("status-shell", "状态栏界面", "<StatusPlaceHolderImpl/>", &load_glue),
+                    shell_regex("inline-shell", "内联界面", "<sf-inline/>", SHELL_INLINE_HTML),
+                ]
+            }
+        }
+    });
+    let path = dir.join("shell-card.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+    path
+}
+
 /// MVU 卡：扩展里带 `stat_data`（字段级 schema），分析器因此会调用模型而不是直接降级。
 pub fn write_mvu_card(dir: &Path) -> std::path::PathBuf {
     let card = json!({

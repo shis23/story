@@ -24,8 +24,23 @@ import { fileURLToPath } from 'node:url'
 
 import { BridgeRpcError, createBridge } from './bridge.js'
 import { MAX_CARD_BYTES, nextFreeName, readCardName, sanitizeCardFileName } from './cards.js'
-import { renderableBlocks, splitForDsh } from './html.js'
-import { panelModel, planInteraction } from './mvu.js'
+import { splitForDsh } from './html.js'
+import { interactionTarget, panelModel, planInteraction, resolveVariableWrite, statusSections } from './mvu.js'
+import {
+  OPENING_KINDS,
+  buildShellDocument,
+  createDocRegistry,
+  createShellFetcher,
+  createShellVariableBuckets,
+  findShellSegment,
+  newBridgeSession,
+  newShellPluginId,
+  shellDocResponse,
+  shellLabel,
+  shellTrust,
+  tailParts,
+} from './shell.js'
+import { buildMvuStatDataTree } from './vendor/card-shell.mjs'
 import { classifyCall } from './roles.js'
 import { fitSessionTitle, friendlyError, llmHint } from './text.js'
 
@@ -177,11 +192,13 @@ const REPLAY_VERSION = 1
 /**
  * 这条回复在 StoryForge 存档里的位置，写进 DSH 回放数据；浏览器半边把它发布成 Turn 级
  * 数据，Turn 尾部据此取展示文本。`nodeIndex` 供分叉后兜底（分叉换了节点 id、顺序不变）；
- * `blocks` 是从正文里拿掉、交给 Turn 尾部渲染的 HTML 块数（0 时尾部不取数据）。
+ * `blocks` 是从正文里拿掉、交给 Turn 尾部渲染的 HTML 块数，`shells` 是卡片界面数（都为 0 时
+ * 尾部不取数据；早于档 3 的回放数据没有 `shells`）。
  */
-function storyforgeReplay({ campaignId, conversationId, nodeId, nodeIndex, blocks }) {
+function storyforgeReplay({ campaignId, conversationId, nodeId, nodeIndex, blocks, shells }) {
   if (!conversationId) return undefined
   const ref = { v: REPLAY_VERSION, campaignId, conversationId, blocks }
+  if (shells > 0) ref.shells = shells
   if (nodeId) ref.nodeId = nodeId
   if (Number.isInteger(nodeIndex)) ref.nodeIndex = nodeIndex
   return { response: { storyforge: ref } }
@@ -644,6 +661,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
           // 早于 openingNodeIndex 的会话：开场白总是对话的第一个节点。
           nodeIndex: session?.openingNodeIndex ?? 0,
           blocks: split.blocks,
+          shells: split.shells,
         }),
       )
       return
@@ -720,7 +738,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
       reasoning += summary
       yield { type: 'reasoning-delta', index: 0, text: summary }
       yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: reasoning } }
-      // 正文用展示正则之后的文本，去掉 Turn 尾部会渲染的 HTML 块。
+      // 正文用展示正则之后的文本，去掉 Turn 尾部会渲染的 HTML 块与卡片界面。
       const split = splitForDsh(result?.display ?? result?.text)
       const text = split.body
       yield* streamBlock(1, 'text', text, signal, 64, 0)
@@ -730,6 +748,7 @@ function createPipelineStream({ sessions, bridge, runOptions, onTurnRan }) {
         nodeId: result?.node_id,
         nodeIndex: result?.node_index,
         blocks: split.blocks,
+        shells: split.shells,
       })
       yield* result?.usage ? finishWithUsage(toDshUsage(result.usage), replay) : finishStop(text.length, replay)
     } finally {
@@ -758,6 +777,12 @@ const CARD_EXTENSIONS = new Set(['.png', '.json'])
 const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /** 浏览器半边净化卡片 HTML 用的 DOMPurify（ES 模块，经 `/vendor/purify.js` 动态 import）。 */
 const PURIFY_FILE = join(PLUGIN_ROOT, 'lib', 'vendor', 'purify.es.mjs')
+/** 桌面卡片界面模块的打包（浏览器半边用其中的 `createHostHandler`，经 `/vendor/card-shell.js`）。 */
+const CARD_SHELL_FILE = join(PLUGIN_ROOT, 'lib', 'vendor', 'card-shell.mjs')
+/** 壳清单缓存时长：同一张卡在会话里不会变，只省掉每次取展示数据都问 sidecar。 */
+const MANIFEST_TTL_MS = 60_000
+/** 壳自己存的界面状态（选择器变量桶）单次写入上限。 */
+const MAX_SHELL_VARIABLES_BYTES = 256 * 1024
 /** 一次 `/display` 最多查的节点数（与 sidecar 的 MAX_DISPLAY_REFS 一致）。 */
 const MAX_DISPLAY_REFS = 200
 
@@ -1079,13 +1104,164 @@ export function apply(ctx, config) {
       refs: queries,
       campaign_id: session.campaignId,
     })
+    // 有卡片界面时才问清单（分叉子会话第一次发送前没有自己的存档，用回放数据里记下的）。
+    const trust = await shellTrustFor(session.campaignId ?? refs.find((ref) => typeof ref?.campaignId === 'string')?.campaignId)
     return Object.fromEntries(
       Object.entries(items ?? {}).map(([key, item]) => {
-        const blocks = item ? renderableBlocks(item.display_content) : []
-        return [key, blocks.length > 0 ? { blocks } : null]
+        const parts = item ? tailParts(item.display_content, item.content, trust) : []
+        return [key, parts.length > 0 ? { parts } : null]
       }),
     )
   }
+
+  //#region 卡片界面（档 3，见 ./shell.js）
+  const manifests = new Map()
+  /** 白名单主机：清单里带的那份（与桌面同一常量）；代取前至少取过一次清单。 */
+  let shellHosts = []
+  const shellDocs = createDocRegistry()
+  const shellBuckets = createShellVariableBuckets()
+  const fetchShellResource = createShellFetcher({
+    cacheDir: join(dataDir, 'card-shell-cache'),
+    allowedHosts: () => shellHosts,
+  })
+
+  async function shellManifest(campaignId) {
+    const hit = manifests.get(campaignId)
+    if (hit && Date.now() - hit.at < MANIFEST_TTL_MS) return hit.manifest
+    const manifest = await bridge.request('card_shell.manifest', { campaign_id: campaignId })
+    manifests.set(campaignId, { at: Date.now(), manifest })
+    if (Array.isArray(manifest.allowed_hosts)) shellHosts = manifest.allowed_hosts
+    return manifest
+  }
+
+  /** 取不到清单时一律不信任（界面要用户确认才挂），不让展示数据整批失败。 */
+  async function shellTrustFor(campaignId) {
+    if (typeof campaignId !== 'string' || !campaignId) return shellTrust(null)
+    try {
+      return shellTrust(await shellManifest(campaignId))
+    } catch (error) {
+      log(`card shell manifest failed: campaign=${campaignId} ${error?.message ?? error}`)
+      return shellTrust(null)
+    }
+  }
+
+  function storySession(sessionId) {
+    const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined
+    if (!session) throw httpError('不是 StoryForge 故事会话', 404)
+    if (fake) throw httpError('假管线没有卡片界面', 400)
+    return session
+  }
+
+  /**
+   * 挂一个卡片界面：重新取这条回复的展示文本、找到界面、按清单复核信任（未登记的要浏览器
+   * 带上用户的确认），拼好壳文档登记成一次性路径。
+   */
+  async function openShell(body) {
+    const session = storySession(body?.sessionId)
+    const query = displayQuery({ ...body?.ref, key: 'shell' })
+    if (!query) throw httpError('ref 无效', 400)
+    const wanted = body?.shell
+    if (wanted?.mode !== 'load' && wanted?.mode !== 'inline') throw httpError('shell.mode 应为 load 或 inline', 400)
+    const campaignId = session.campaignId ?? body.ref.campaignId
+    if (typeof campaignId !== 'string' || !campaignId) throw httpError('这个会话还没有关联存档', 400)
+    const { items } = await bridge.request('conversation.display', { refs: [query], campaign_id: session.campaignId })
+    const item = items?.shell
+    if (!item) throw httpError('这条回复已经不在存档里了', 404)
+    const segment = findShellSegment(item.display_content, wanted)
+    if (!segment) throw httpError('这条回复里没有这个卡片界面（展示文本已经变了）', 409)
+    if (OPENING_KINDS.has(segment.kind)) throw httpError('开场界面在 DSH 里还不支持', 400)
+    const manifest = await shellManifest(campaignId)
+    const part = tailParts(item.display_content, item.content, shellTrust(manifest)).find(
+      (candidate) =>
+        candidate.type === 'shell' &&
+        candidate.mode === segment.mode &&
+        (segment.mode === 'load' ? candidate.url === segment.url : candidate.start === segment.start),
+    )
+    const trusted = part?.trusted === true
+    if (!trusted && body.approved !== true) throw httpError('这个卡片界面不在卡的清单里，需要先确认', 403)
+
+    let html = segment.html
+    let pageUrl = null
+    if (segment.mode === 'load') {
+      const fetched = await fetchShellResource(segment.url)
+      if (fetched.body_text == null) throw httpError(`远程界面不是文本 HTML：${fetched.content_type}`, 502)
+      html = fetched.body_text
+      pageUrl = segment.url
+    }
+    let mvuStatData = {}
+    if (session.campaignId) {
+      const status = await bridge.request('mvu.status', { campaign_id: session.campaignId })
+      mvuStatData = buildMvuStatDataTree(status.campaign_variables)
+    }
+    const bridgeSession = newBridgeSession()
+    const pluginId = newShellPluginId()
+    const token = shellDocs.put({
+      html: buildShellDocument({
+        html,
+        pageUrl,
+        bridgeSession,
+        pluginId,
+        selectorVariables: shellBuckets.get(campaignId),
+        mvuStatData,
+        allowedHosts: manifest.allowed_hosts,
+      }),
+      allowedHosts: manifest.allowed_hosts,
+    })
+    log(`card shell opened: campaign=${campaignId} ${segment.mode} ${segment.kind}${trusted ? '' : ' (approved)'} ${segment.url ?? `@${segment.start}`}`)
+    return { token, bridgeSession, pluginId, kind: segment.kind, label: shellLabel(segment.kind), trusted }
+  }
+
+  async function shellFetch(body) {
+    const session = storySession(body?.sessionId)
+    const campaignId = session.campaignId ?? body?.campaignId
+    if (shellHosts.length === 0 && typeof campaignId === 'string') await shellManifest(campaignId)
+    try {
+      return { resource: await fetchShellResource(body?.url) }
+    } catch (error) {
+      throw httpError(String(error?.message ?? error), error?.status ?? 502)
+    }
+  }
+
+  /** 壳的 Mvu 只读底座：Campaign 变量树（桌面 `mvu_data_get` 同口径）。 */
+  async function shellMvuData(body) {
+    const session = storySession(body?.sessionId)
+    if (!session.campaignId) return { data: {} }
+    const status = await bridge.request('mvu.status', { campaign_id: session.campaignId })
+    return { data: buildMvuStatDataTree(status.campaign_variables) }
+  }
+
+  function shellVariables(body) {
+    const session = storySession(body?.sessionId)
+    const mode = body?.mode
+    if (!['patch', 'merge', 'replace'].includes(mode)) throw httpError('mode 应为 patch / merge / replace', 400)
+    const variables = body?.variables
+    if (!variables || typeof variables !== 'object' || Array.isArray(variables)) throw httpError('variables 应为对象', 400)
+    if (JSON.stringify(variables).length > MAX_SHELL_VARIABLES_BYTES) throw httpError('界面状态太大', 400)
+    shellBuckets.apply(session.campaignId ?? `unlinked:${body.sessionId}`, body?.selector, variables, mode)
+    return { persisted: false }
+  }
+
+  /**
+   * 用户在确认条上点「应用」的变量写入（桌面 M4：壳发起的写入先成提案）。作用域与桌面
+   * `persistShellProposal` 相同：卡绑定实例恰一个（或整局只有一个实例）时可用 `inst:` 前缀
+   * 写它，其余写 Campaign。
+   */
+  async function shellVarWrite(body) {
+    const campaignId = mvuCampaign(body?.sessionId)
+    if (fake || !campaignId) throw httpError('这个会话还没有关联存档', 400)
+    const status = await bridge.request('mvu.status', { campaign_id: campaignId })
+    const target = interactionTarget(status, statusSections(status))
+    const resolved = resolveVariableWrite({ instanceId: target.instanceId, key: body?.key, value: body?.value })
+    if (!resolved.ok) return { result: { ok: false, scope: resolved.scope, key: resolved.key, error: resolved.error } }
+    const written = await bridge.request('variables.set', {
+      campaign_id: campaignId,
+      writes: [{ scope: resolved.scope, instance_id: resolved.instanceId ?? undefined, key: resolved.key, value: resolved.value }],
+    })
+    const result = written.results[0]
+    log(`card shell variable write: campaign=${campaignId} ${result.scope} ${result.key} ok=${result.ok}`)
+    return { result: { ok: result.ok, scope: result.scope, key: result.key, error: result.error ?? null } }
+  }
+  //#endregion
 
   /** MVU 面板对应的存档：本会话已关联存档时返回 id，否则返回 null（分叉子会话第一次发送前）。 */
   function mvuCampaign(sessionId) {
@@ -1189,7 +1365,23 @@ export function apply(ctx, config) {
     },
   })
 
+  const shellRoute = (suffix, handler) => ({
+    path: `${API_BASE}/shell${suffix}`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const body = await request.json().catch(() => ({}))
+      try {
+        return json({ ok: true, ...(await handler(body)) })
+      } catch (error) {
+        log(`shell${suffix} failed: ${error?.message ?? error}`)
+        return failure(error, error?.status ?? 500)
+      }
+    },
+  })
+
   let purifySource = null
+  let cardShellSource = null
 
   const json = (body, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -1390,6 +1582,39 @@ export function apply(ctx, config) {
       }
       return mvuInteract(body.sessionId, body.index, body.label)
     }),
+    shellRoute('/open', openShell),
+    shellRoute('/fetch', shellFetch),
+    shellRoute('/mvu-data', shellMvuData),
+    shellRoute('/variables', shellVariables),
+    shellRoute('/var-write', shellVarWrite),
+    {
+      // 壳文档：iframe 直接加载这个路径（同源导航带着 DSH 的登录 cookie）。CSP 响应头里的
+      // sandbox 让它在任何打开方式下都是不透明源，读不到 DSH 的 cookie 与接口。
+      path: `${API_BASE}/shell/doc`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const doc = shellDocs.get(new URL(request.url).searchParams.get('t'))
+        if (!doc) {
+          return new Response('卡片界面已过期，刷新页面后重新打开。', {
+            status: 404,
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+          })
+        }
+        return shellDocResponse(doc)
+      },
+    },
+    {
+      path: `${API_BASE}/vendor/card-shell.js`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        cardShellSource ??= readFileSync(CARD_SHELL_FILE, 'utf8')
+        return new Response(cardShellSource, {
+          headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'private, max-age=3600' },
+        })
+      },
+    },
     {
       path: `${API_BASE}/vendor/purify.js`,
       methods: ['GET'],

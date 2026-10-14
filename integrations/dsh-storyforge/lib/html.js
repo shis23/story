@@ -8,6 +8,7 @@
  */
 
 import { readableText } from './text.js'
+import { segmentShellContent } from './vendor/card-shell.mjs'
 
 const RAW_HTML_BLOCK_OPEN_RE = /<(details|div|table|ul|ol|blockquote)(?=[\s>/])[^>]*>/gi
 
@@ -68,21 +69,32 @@ export function renderableBlocks(display) {
     .map((segment) => ({ html: segment.content, text: readableText(segment.content) }))
 }
 
+/** 整条回复只有卡片界面时的正文（DSH 不收空回复）。 */
+export const SHELL_ONLY_BODY = '（卡片界面，显示在这条回复下方。）'
+
 /**
- * 展示文本 → DSH 正文与交给 Turn 尾部渲染的块数：正文去掉这些块后转成可读文字。
+ * 展示文本 → DSH 正文与交给 Turn 尾部渲染的块数、卡片界面数：正文去掉卡片界面
+ * （`.load(url)` 胶水、带脚本的内联文档，桌面 `segmentShellContent` 切分）与 HTML 块后
+ * 转成可读文字。没有卡片界面时与只切块完全一致。
  * 整条回复全是块时退回整段文字版、块数记 0（正文不能为空：空回复在 DSH 历史里
- * 不算一轮，下一轮会错位；文字版已在正文里，尾部不再重复）。
- * @returns {{body: string, blocks: number}}
+ * 不算一轮，下一轮会错位；文字版已在正文里，尾部不再重复）。全是卡片界面时正文用
+ * 一句占位（界面的脚本胶水没有可读文字）。
+ * @returns {{body: string, blocks: number, shells: number}}
  */
 export function splitForDsh(display) {
-  const segments = splitRawHtmlBlocks(withoutScripts(display))
+  const pieces = segmentShellContent(display)
+  const shells = pieces.filter((piece) => piece.type === 'shell').length
+  const text = shells === 0 ? String(display || '') : pieces.map((piece) => piece.content ?? '').filter(Boolean).join('\n\n')
+  const segments = splitRawHtmlBlocks(withoutScripts(text))
   const blocks = segments.filter((segment) => segment.type === 'html').length
-  if (blocks === 0) return { body: readableText(display), blocks: 0 }
+  if (blocks === 0 && shells === 0) return { body: readableText(display), blocks: 0, shells: 0 }
   const prose = segments
     .filter((segment) => segment.type === 'text')
     .map((segment) => segment.content)
     .join('\n\n')
   // 切走块后剩下的正文可能只剩卡壳占位（`<StatusPlaceHolderImpl/>`），照样按 HTML 去标签。
   const body = readableText(prose, { html: true })
-  return body ? { body, blocks } : { body: readableText(display), blocks: 0 }
+  if (body) return { body, blocks, shells }
+  if (shells === 0) return { body: readableText(display), blocks: 0, shells: 0 }
+  return { body: SHELL_ONLY_BODY, blocks, shells }
 }

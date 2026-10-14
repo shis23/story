@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import { apply } from '../lib/index.js'
 import { notifyFork } from '../lib/shared.js'
+import { cacheName } from '../lib/shell.js'
 import { pngCard } from './support/png.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -279,7 +280,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
     })
     assert.equal(shown.ok, true, shown.error)
     assert.deepEqual(shown.items, {
-      opening: { blocks: [{ html: STATUS_BAR, text: '状态\n\n- 体力：80' }] },
+      opening: { parts: [{ type: 'html', blocks: [{ html: STATUS_BAR, text: '状态\n\n- 体力：80' }] }] },
       turn: null,
     })
     const notArray = await call(routes, '/display', { method: 'POST', headers: JSON_HEADERS, body: '{"refs":1}' })
@@ -319,7 +320,7 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       headers: JSON_HEADERS,
       body: JSON.stringify({ sessionId: 'session-child', refs: [{ key: 'opening', conversationId: 'gone', nodeIndex: 0 }] }),
     })
-    assert.equal(viaFork.items.opening?.blocks[0].html, STATUS_BAR, JSON.stringify(viaFork))
+    assert.equal(viaFork.items.opening?.parts[0].blocks[0].html, STATUS_BAR, JSON.stringify(viaFork))
     const parentChunks = await collect(
       adapter.stream({ sessionId, messages: [...history, userMessage('我留在木屋里。', 'user')] }),
     )
@@ -498,6 +499,170 @@ test('mvu panel: analyze, apply and interaction buttons go through the sidecar',
     assert.deepEqual(rested.hints, ['我在炉火边休息片刻'])
     const hpAfter = rested.model.sections[0].rows.find((row) => row.element === 'hp_bar').value
     assert.equal(hpAfter, hpBefore + 10)
+  } finally {
+    await dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+const SHELL_STATUS_URL = 'https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/status/index.html'
+/** 卡清单里没有的远程界面（开场白直接写的 `.load`，不经卡正则）。 */
+const SHELL_UNLISTED_URL = 'https://files.catbox.moe/unlisted.html'
+const SHELL_INLINE_HTML =
+  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><div id=\"sf-inline\">加载中</div><script>document.getElementById('sf-inline').textContent = '内联界面已运行';</script></body></html>"
+const SHELL_STATUS_PAGE =
+  "<!doctype html><html><head><title>status page</title></head><body><div id=\"s\"></div><script type=\"module\">import mount from './mount.js'; mount();</script></body></html>"
+
+function shellRegex(id, name, find, replace) {
+  return { id, scriptName: name, findRegex: find, replaceString: replace, placement: [2], disabled: false, markdownOnly: true, promptOnly: false, runOnEdit: true }
+}
+
+/** 预置宿主代取的磁盘缓存：测试不发外部请求（首取即冻结，与桌面相同）。 */
+function seedShellCache(dataDir, url, body) {
+  const dir = join(dataDir, 'card-shell-cache')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, cacheName(url)), body)
+  writeFileSync(join(dir, `${cacheName(url)}.meta.json`), JSON.stringify({ url, content_type: 'text/html' }))
+}
+
+test('card shells: tail parts, server-built documents, approval and the host fetch', { skip: !existsSync(bin) && `sidecar not built: ${bin}`, timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sf-dsh-shell-'))
+  const cardsDir = join(root, 'cards')
+  const dataDir = join(root, 'data')
+  mkdirSync(cardsDir)
+  const loadGlue = `\`\`\`html\n<body><script>$('body').load('${SHELL_STATUS_URL}')</script></body>\n\`\`\``
+  writeFileSync(
+    join(cardsDir, 'shell.json'),
+    JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Seraphina',
+        description: '守护森林的女法师。',
+        personality: '温柔',
+        scenario: '旅人在森林里迷路。',
+        first_mes: `木屋里很暖和。\n<StatusPlaceHolderImpl/>\n<sf-inline/>\n$('body').load('${SHELL_UNLISTED_URL}')`,
+        mes_example: '',
+        alternate_greetings: [],
+        tags: [],
+        creator: 'host-smoke',
+        character_version: '1',
+        extensions: {
+          regex_scripts: [
+            shellRegex('status-shell', '状态栏界面', '<StatusPlaceHolderImpl/>', loadGlue),
+            shellRegex('inline-shell', '内联界面', '<sf-inline/>', SHELL_INLINE_HTML),
+          ],
+        },
+      },
+    }),
+  )
+  seedShellCache(dataDir, SHELL_STATUS_URL, SHELL_STATUS_PAGE)
+  seedShellCache(dataDir, SHELL_UNLISTED_URL, '<p id="unlisted">别处的页面</p>')
+  const llmCalls = []
+  const { ctx, adapters, routes, dispose } = fakeCtx(llmCalls)
+  const post = (path, body) => call(routes, path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) })
+  const getDoc = (token) =>
+    routes.get('/api/storyforge/shell/doc').fetch(new Request(`http://localhost/api/storyforge/shell/doc?t=${encodeURIComponent(token)}`))
+  try {
+    apply(ctx, { dataDir, cardsDir })
+    assert.equal((await post('/settings', { provider: 'fake', model: 'writer', toolMode: 'native' })).ok, true)
+    const created = await post('/sessions', { card: 'shell.json' })
+    assert.equal(created.ok, true, created.error)
+    const { sessionId } = created
+
+    // 开场白：界面不进 DSH 正文，回放数据记下界面数。
+    const openingChunks = await collect(adapters.get('storyforge').stream({ sessionId, messages: [userMessage('（开始新故事）', 'storyforge')] }))
+    assert.equal(openingChunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), '木屋里很暖和。')
+    const ref = openingChunks.at(-1).replayState?.response?.storyforge
+    assert.equal(ref.shells, 3, JSON.stringify(ref))
+    assert.equal(ref.blocks, 0)
+
+    // 尾部：卡清单里的 `.load` 与命中卡正则的内联文档自动挂，开场白里直接写的 URL 要确认。
+    const shown = await post('/display', { sessionId, refs: [{ key: 'opening', ...ref }] })
+    assert.equal(shown.ok, true, shown.error)
+    const parts = shown.items.opening.parts
+    assert.deepEqual(
+      parts.map((part) => [part.type, part.mode, part.kind, part.url ?? 'inline', part.trusted]),
+      [
+        ['shell', 'load', 'status', SHELL_STATUS_URL, true],
+        ['shell', 'inline', 'message_html', 'inline', true],
+        ['shell', 'load', 'message_html', SHELL_UNLISTED_URL, false],
+      ],
+    )
+    assert.equal(parts[0].label, '状态栏界面')
+    assert.equal('html' in parts[1], false, '展示数据不带界面正文')
+
+    // 挂清单里的状态栏：服务端取页面（这里命中预置缓存）、拼壳文档、登记一次性路径。
+    const opened = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_STATUS_URL } })
+    assert.equal(opened.ok, true, opened.error)
+    assert.equal(opened.kind, 'status')
+    assert.equal(opened.trusted, true)
+    assert.match(opened.bridgeSession, /^sfshell:/)
+    assert.match(opened.pluginId, /^card-shell-/)
+    const doc = await getDoc(opened.token)
+    assert.equal(doc.status, 200)
+    assert.match(doc.headers.get('content-security-policy'), /^sandbox allow-scripts; default-src 'none';.*https:\/\/testingcf\.jsdelivr\.net/)
+    assert.equal(doc.headers.get('cache-control'), 'no-store')
+    const docHtml = await doc.text()
+    assert.match(docHtml, /<title>status page<\/title>/)
+    assert.ok(docHtml.includes(JSON.stringify(opened.bridgeSession)), '桥接会话写进文档')
+    assert.match(docHtml, /import mount from 'https:\/\/testingcf\.jsdelivr\.net\/gh\/storyforge-test\/shell@1\.0\.0\/dist\/status\/mount\.js'/)
+    assert.match(docHtml, /data-sf-module="m1"/)
+    // 同一个 token 可以重复取（卡调 location.reload()）；不认识的 token 404。
+    assert.equal((await getDoc(opened.token)).status, 200)
+    assert.equal((await getDoc('nope')).status, 404)
+
+    // 内联文档按起点定位，正文由服务端从存档重新取。
+    const inline = await post('/shell/open', { sessionId, ref, shell: { mode: 'inline', start: parts[1].start } })
+    assert.equal(inline.ok, true, inline.error)
+    assert.match(await (await getDoc(inline.token)).text(), /内联界面已运行/)
+
+    // 不在清单里的：没有用户确认 403，确认后照常挂；存档里没有的界面 409（浏览器不能指定任意 URL）。
+    const unapproved = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_UNLISTED_URL } })
+    assert.equal(unapproved.ok, false)
+    assert.match(unapproved.error, /需要先确认/)
+    const approved = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_UNLISTED_URL }, approved: true })
+    assert.equal(approved.ok, true, approved.error)
+    assert.equal(approved.trusted, false)
+    assert.match(await (await getDoc(approved.token)).text(), /别处的页面/)
+    const forged = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: 'https://files.catbox.moe/other.html' }, approved: true })
+    assert.equal(forged.ok, false)
+    assert.match(forged.error, /没有这个卡片界面/)
+    assert.equal((await post('/shell/open', { sessionId, ref, shell: { mode: 'eval' } })).ok, false)
+    assert.equal((await post('/shell/open', { sessionId: 'nope', ref, shell: { mode: 'load', url: SHELL_STATUS_URL } })).ok, false)
+
+    // 宿主代取：白名单内的走缓存；白名单外的拒绝。
+    const fetched = await post('/shell/fetch', { sessionId, url: SHELL_STATUS_URL })
+    assert.equal(fetched.ok, true, fetched.error)
+    assert.equal(fetched.resource.from_cache, true)
+    assert.equal(fetched.resource.body_text, SHELL_STATUS_PAGE)
+    const outside = await post('/shell/fetch', { sessionId, url: 'https://evil.example/x.js' })
+    assert.equal(outside.ok, false)
+    assert.match(outside.error, /allowlist/)
+
+    // 壳自己的界面状态：插件内存，下一次挂载时注入文档。
+    const saved = await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: { theme: 'night-sky' }, mode: 'replace' })
+    assert.deepEqual(saved, { ok: true, persisted: false })
+    assert.equal((await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: [], mode: 'replace' })).ok, false)
+    assert.equal((await post('/shell/variables', { sessionId, selector: { type: 'chat' }, variables: {}, mode: 'eval' })).ok, false)
+    const reopened = await post('/shell/open', { sessionId, ref, shell: { mode: 'load', url: SHELL_STATUS_URL } })
+    assert.match(await (await getDoc(reopened.token)).text(), /night-sky/)
+
+    // Mvu 只读底座与用户确认后的变量写入。
+    const mvuData = await post('/shell/mvu-data', { sessionId })
+    assert.equal(mvuData.ok, true, mvuData.error)
+    assert.equal(typeof mvuData.data, 'object')
+    const written = await post('/shell/var-write', { sessionId, key: '好感', value: 42 })
+    assert.equal(written.ok, true, written.error)
+    assert.deepEqual(written.result, { ok: true, scope: 'campaign', key: '好感', error: null })
+    const reserved = await post('/shell/var-write', { sessionId, key: '__storyforge_card_shell_variables', value: {} })
+    assert.equal(reserved.result.ok, false)
+    assert.ok(Object.hasOwn((await post('/shell/mvu-data', { sessionId })).data, '好感'))
+
+    // 浏览器半边用的桌面模块打包。
+    const vendor = await routes.get('/api/storyforge/vendor/card-shell.js').fetch(new Request('http://localhost/api/storyforge/vendor/card-shell.js'))
+    assert.match(vendor.headers.get('content-type'), /javascript/)
+    assert.match(await vendor.text(), /createHostHandler/)
   } finally {
     await dispose()
     rmSync(root, { recursive: true, force: true })

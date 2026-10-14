@@ -1711,6 +1711,15 @@ window.__ModuleLoader__.load({
 .sf-turn-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--sf-fg2); font-size: 13px; }
 .sf-turn-text > div + div { margin-top: 6px; }
 .sf-turn-error { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sf-shell { margin: 6px 0 2px; border: 1px solid var(--sf-border); border-radius: var(--sf-radius-sm); overflow: hidden; }
+.sf-shell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 4px 8px; border-bottom: 1px solid var(--sf-border); }
+.sf-shell-head .sf-probe-err { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-shell-frame { display: block; width: 100%; border: 0; background: transparent; }
+.sf-shell-note, .sf-shell-confirm { margin: 6px 0 2px; padding: 8px 10px; border-radius: var(--sf-radius-sm); display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.sf-shell-note { border: 1px dashed var(--sf-border-strong); color: var(--sf-fg2); }
+.sf-shell-confirm { background: color-mix(in srgb, var(--sf-warn) 12%, transparent); }
+.sf-shell-proposals { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--sf-border); background: color-mix(in srgb, var(--sf-warn) 8%, transparent); }
+.sf-shell-proposal { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 640px) {
 	.sf-home-inner { padding: 16px 14px 32px; }
 	.sf-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1825,6 +1834,8 @@ window.__ModuleLoader__.load({
 					return () => listeners.delete(listener);
 				},
 				result: (key) => entries.get(key)?.result,
+				/** 已挂载的尾部里位置最靠后的节点（最新一轮）。 */
+				latestIndex: () => latestIndex,
 				register(key, ref) {
 					let entry = entries.get(key);
 					if (!entry) {
@@ -1954,12 +1965,306 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "sf-turn-tail", "data-sf-turn-tail": "" }, h("div", { ref: hostRef }));
 		}
 
-		/** `conversation.chat.turnTail` 条目：StoryForge 会话里有卡片 HTML 块的 Turn 才渲染。 */
+		// ─── Turn 尾部：卡片界面（档 3）──────────────────────────────────────────────
+		//
+		// 卡的界面（`$('body').load(url)` 状态栏、带脚本的内联 HTML）跑在 sandbox iframe 里，只给
+		// `allow-scripts`，永远不给 `allow-same-origin`。文档由服务端拼好、登记成一次性路径（响应头
+		// CSP 带 sandbox）；这里挂 iframe、应答壳的桥请求：代取远程资源（服务端按白名单）、读
+		// Campaign 变量树（只读）、存壳自己的界面状态（插件内存）、写变量（先成提案，用户点
+		// 「应用」才写，桌面 M4 同口径）。SillyTavern / TavernHelper API 请求交给桌面的
+		// `createHostHandler`，需要后端的方法一律报不支持（桌面上卡壳虚拟插件同样调不动后端）。
+
+		const SHELL_OPENING_KINDS = new Set(["opening_home", "opening_custom"]);
+		const SHELL_DEFAULT_HEIGHT = { status: 120, message_html: 280 };
+		const SHELL_MIN_HEIGHT = 60;
+		/** 内容按视口高度排版的界面会把报上来的高度越撑越大，到这里为止。 */
+		const SHELL_MAX_HEIGHT = 1200;
+		const MAX_SHELL_PROPOSALS = 50;
+		/** 桌面卡壳虚拟插件的权限（`CardShellHost.vue`）。 */
+		const SHELL_PLUGIN_PERMISSIONS = ["ReadVariables", "WriteVariables", "ReadMemory", "ReadCharacter", "ModifyPrompt", "Generate"];
+		const SHELL_UNSUPPORTED = {
+			campaign_worldbook_update: "DSH 的卡片界面不能改世界书",
+			opening_chat_applied: "DSH 的卡片界面不支持开场选择",
+		};
+
+		let cardShellLoading = null;
+
+		/** 按需加载桌面卡片界面模块的打包（同源路由，ES 模块）。失败后下次再试。 */
+		function loadCardShellModule() {
+			if (!cardShellLoading) {
+				cardShellLoading = import(`${API_BASE}/vendor/card-shell.js`);
+				cardShellLoading.catch(() => {
+					cardShellLoading = null;
+				});
+			}
+			return cardShellLoading;
+		}
+
+		/** 消息来自这个壳或壳里嵌套的子 iframe：沿 parent 链找壳窗口（桌面 L3 同口径，不信消息里的字段）。 */
+		function fromShellWindow(source, shellWindow) {
+			if (!source || !shellWindow) return false;
+			try {
+				let w = source;
+				for (let i = 0; w && i < 10; i++) {
+					if (w === shellWindow) return true;
+					if (w === w.parent) break;
+					w = w.parent;
+				}
+			} catch (_) {}
+			return false;
+		}
+
+		function textToDataUrl(text, contentType) {
+			const bytes = new TextEncoder().encode(text);
+			let binary = "";
+			for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+			return `data:${contentType || "text/plain"};base64,${btoa(binary)}`;
+		}
+
+		function previewShellValue(value, max = 60) {
+			let text;
+			if (value === undefined || value === null) text = "null";
+			else if (typeof value === "string") text = value;
+			else {
+				try {
+					text = JSON.stringify(value);
+				} catch {
+					text = String(value);
+				}
+			}
+			return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+		}
+
+		/** 同一个键只留最新一条提案；壳刷不同的键时丢最旧的（桌面 `upsertShellVariableProposal`）。 */
+		function upsertProposal(list, payload) {
+			const key = String(payload?.key || "").trim();
+			if (!key) return list;
+			const next = list.filter((proposal) => proposal.key !== key);
+			next.push({ id: `${key}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`, key, value: payload?.value });
+			return next.length > MAX_SHELL_PROPOSALS ? next.slice(next.length - MAX_SHELL_PROPOSALS) : next;
+		}
+
+		/** 壳的桥请求 → 宿主动作。抛错会作为 error 回给壳。 */
+		async function answerShellRequest(sessionId, type, payload) {
+			switch (type) {
+				case "fetch_text": {
+					const { resource } = await postJson("/shell/fetch", { sessionId, url: payload.url });
+					if (resource.body_text == null) throw new Error(`not text: ${payload.url}`);
+					return resource.body_text;
+				}
+				case "fetch_data_url": {
+					const { resource } = await postJson("/shell/fetch", { sessionId, url: payload.url });
+					const contentType = resource.content_type || "application/octet-stream";
+					if (resource.body_base64 != null) return `data:${contentType};base64,${resource.body_base64}`;
+					if (resource.body_text != null) return textToDataUrl(resource.body_text, contentType);
+					throw new Error("empty");
+				}
+				case "mvu_status":
+					return { ready: true, runtime: "StoryForge DSH（只读）" };
+				case "mvu_data_get":
+					return (await postJson("/shell/mvu-data", { sessionId })).data;
+				case "shell_variables_set":
+					await postJson("/shell/variables", { sessionId, selector: payload.selector, variables: payload.variables, mode: payload.mode });
+					return { ok: true };
+				case "campaign_worldbook_get":
+					return [];
+				default:
+					throw new Error(SHELL_UNSUPPORTED[type] ?? `unknown bridge type: ${type}`);
+			}
+		}
+
+		/** 一个挂好的卡片界面：iframe + 状态行 + 变量提案确认条。 */
+		function ShellFrame({ sessionId, turnRef, part, approved }) {
+			const frameRef = React.useRef(null);
+			const [attempt, setAttempt] = React.useState(0);
+			const [opened, setOpened] = React.useState(null);
+			const [error, setError] = React.useState(null);
+			const [runtimeError, setRuntimeError] = React.useState(null);
+			const [height, setHeight] = React.useState(SHELL_DEFAULT_HEIGHT[part.kind] ?? SHELL_DEFAULT_HEIGHT.message_html);
+			const [proposals, setProposals] = React.useState([]);
+			const [applying, setApplying] = React.useState(null);
+			const [notice, setNotice] = React.useState(null);
+			const shell = part.mode === "load" ? { mode: "load", url: part.url } : { mode: "inline", start: part.start };
+			const identity = JSON.stringify([sessionId, turnRef, shell, approved === true, attempt]);
+
+			React.useEffect(() => {
+				let alive = true;
+				setOpened(null);
+				setError(null);
+				setRuntimeError(null);
+				Promise.all([loadCardShellModule(), postJson("/shell/open", { sessionId, ref: turnRef, shell, approved: approved === true })]).then(
+					([module, body]) => alive && setOpened({ ...body, module }),
+					(e) => alive && setError(errorText(e)),
+				);
+				return () => {
+					alive = false;
+				};
+			}, [identity]);
+
+			React.useEffect(() => {
+				if (!opened) return undefined;
+				const { module } = opened;
+				const shellWindow = () => frameRef.current?.contentWindow;
+				const stHandler = module.createHostHandler(
+					{ id: opened.pluginId, permissions: SHELL_PLUGIN_PERMISSIONS },
+					async (command) => {
+						throw new Error(`DSH 的卡片界面不能调用 ${command}`);
+					},
+					{ isTrustedSource: (event) => fromShellWindow(event?.source, shellWindow()) },
+				);
+				const onMessage = (event) => {
+					if (!fromShellWindow(event.source, shellWindow())) return;
+					const data = event.data;
+					if (data?.type === module.MSG_REQUEST && data.pluginId === opened.pluginId) {
+						void stHandler(event);
+						return;
+					}
+					if (!module.isCardShellBridgeMessageForSession(event, opened.bridgeSession)) return;
+					const payload = data.payload || {};
+					if (data.type === "shell_resize") {
+						const next = Math.min(SHELL_MAX_HEIGHT, Math.max(SHELL_MIN_HEIGHT, Math.ceil(Number(payload.height) || 0)));
+						setHeight((current) => (Math.abs(current - next) > 2 ? next : current));
+						return;
+					}
+					if (data.type === "var_write") {
+						setProposals((list) => upsertProposal(list, payload));
+						return;
+					}
+					if (data.type === "shell_runtime") {
+						if (payload.kind === "module_error" || payload.kind === "preload_error") setRuntimeError(String(payload.detail || payload.kind));
+						return;
+					}
+					if (!data.id) return;
+					const reply = (result, failure) => {
+						try {
+							event.source.postMessage({ __sf_shell_bridge_res: data.id, result, error: failure || null }, "*");
+						} catch (_) {}
+					};
+					answerShellRequest(sessionId, data.type, payload).then(
+						(result) => reply(result, null),
+						(e) => reply(null, errorText(e)),
+					);
+				};
+				window.addEventListener("message", onMessage);
+				return () => window.removeEventListener("message", onMessage);
+			}, [opened, sessionId]);
+
+			const applyProposal = (proposal) => {
+				setApplying(proposal.id);
+				setNotice(null);
+				postJson("/shell/var-write", { sessionId, key: proposal.key, value: proposal.value })
+					.then(
+						({ result }) => {
+							if (result.ok) {
+								setProposals((list) => list.filter((item) => item.id !== proposal.id));
+								setNotice(`已写入「${result.key}」`);
+							} else setNotice(`「${proposal.key}」没写进去（提案保留）：${result.error}`);
+						},
+						(e) => setNotice(`「${proposal.key}」没写进去（提案保留）：${errorText(e)}`),
+					)
+					.finally(() => setApplying(null));
+			};
+
+			const label = opened?.label ?? part.label;
+			return h(
+				"div",
+				{ className: "sf-root sf-shell", "data-sf-shell": part.kind },
+				h(
+					"div",
+					{ className: "sf-shell-head sf-small sf-muted" },
+					h("span", null, label),
+					!opened && !error ? h("span", null, "加载中…") : null,
+					error ? h("span", { className: "sf-probe-err", title: error }, `打不开：${error}`) : null,
+					runtimeError ? h("span", { className: "sf-probe-err", title: runtimeError }, `界面脚本出错：${runtimeError}`) : null,
+					h("span", { className: "sf-spacer" }),
+					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setAttempt((n) => n + 1) }, "重新加载"),
+				),
+				opened
+					? h("iframe", {
+							ref: frameRef,
+							className: "sf-shell-frame",
+							src: `${API_BASE}/shell/doc?t=${encodeURIComponent(opened.token)}`,
+							sandbox: "allow-scripts",
+							referrerPolicy: "no-referrer",
+							loading: "lazy",
+							title: label,
+							style: { height },
+						})
+					: null,
+				proposals.length > 0
+					? h(
+							"div",
+							{ className: "sf-shell-proposals sf-small" },
+							h("div", null, "卡片界面请求修改变量（点「应用」才会写进存档）："),
+							proposals.map((proposal) =>
+								h(
+									"div",
+									{ key: proposal.id, className: "sf-shell-proposal" },
+									h("span", { className: "sf-mono" }, `${proposal.key} → ${previewShellValue(proposal.value)}`),
+									h(
+										"button",
+										{ type: "button", className: "sf-btn sf-btn-sm", disabled: applying !== null, onClick: () => applyProposal(proposal) },
+										applying === proposal.id ? "写入中…" : "应用",
+									),
+									h(
+										"button",
+										{
+											type: "button",
+											className: "sf-btn sf-btn-sm",
+											disabled: applying !== null,
+											onClick: () => setProposals((list) => list.filter((item) => item.id !== proposal.id)),
+										},
+										"忽略",
+									),
+								),
+							),
+						)
+					: null,
+				notice ? h("div", { className: "sf-small sf-muted", style: { padding: "4px 8px" } }, notice) : null,
+			);
+		}
+
+		/**
+		 * 一条回复里的一个卡片界面：开场界面不挂（DSH 里还不支持）；不在卡清单里的先确认；
+		 * 较早轮次的状态栏界面默认收起（每轮都有一份，全挂太重），最新一轮的直接挂。
+		 */
+		function ShellPart({ sessionId, turnRef, part, latest }) {
+			const [approved, setApproved] = React.useState(false);
+			const [expanded, setExpanded] = React.useState(false);
+			if (SHELL_OPENING_KINDS.has(part.kind)) {
+				return h(
+					"div",
+					{ className: "sf-root sf-shell-note sf-small", "data-sf-shell": part.kind },
+					`这条回复带着卡的${part.label}（开场设置），DSH 里还不支持，开场白的文字在正文里。`,
+				);
+			}
+			if (!part.trusted && !approved) {
+				return h(
+					"div",
+					{ className: "sf-root sf-shell-confirm sf-small", "data-sf-shell-confirm": "" },
+					part.mode === "load"
+						? h(React.Fragment, null, h("div", null, "这条回复要挂一个不在本卡清单里的界面页面："), h("code", { className: "sf-mono" }, part.url))
+						: h("div", null, "这条回复带着可执行的内联界面，但它没对上本卡的正则触发器（可能是模型自己写出来的）。"),
+					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setApproved(true) }, "信任并挂载本次"),
+				);
+			}
+			if (part.kind === "status" && !latest && !expanded) {
+				return h(
+					"div",
+					{ className: "sf-root sf-shell-note sf-small" },
+					h("div", null, `${part.label}（较早的一轮，默认收起）`),
+					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => setExpanded(true) }, "展开"),
+				);
+			}
+			return h(ShellFrame, { sessionId, turnRef, part, approved });
+		}
+
+		/** `conversation.chat.turnTail` 条目：StoryForge 会话里有卡片 HTML 块或卡片界面的 Turn 才渲染。 */
 		function StoryForgeTurnTail(props) {
 			const sessionId = props.sfSessionId ?? props.sessionId;
 			const isStoryForge = useIsStoryForge(props, sessionId);
 			const data = useTurnData(props.turn);
-			const ref = isStoryForge && sessionId && data?.ref?.blocks > 0 ? data.ref : null;
+			const ref = isStoryForge && sessionId && (data?.ref?.blocks > 0 || data?.ref?.shells > 0) ? data.ref : null;
 			const key = ref ? refKey(ref) : null;
 			const store = key ? displayStore(sessionId) : null;
 			React.useEffect(() => (store ? store.register(key, ref) : undefined), [store, key]);
@@ -1973,7 +2278,24 @@ window.__ModuleLoader__.load({
 					h("button", { type: "button", className: "sf-btn sf-btn-sm", onClick: () => store.retry(key) }, "重试"),
 				);
 			}
-			return result.item?.blocks?.length ? h(CardBlocks, { blocks: result.item.blocks }) : null;
+			const parts = result.item?.parts ?? [];
+			if (parts.length === 0) return null;
+			const latest = Number.isInteger(ref.nodeIndex) && ref.nodeIndex === store.latestIndex();
+			return h(
+				React.Fragment,
+				null,
+				parts.map((part, index) =>
+					part.type === "html"
+						? h(CardBlocks, { key: `html:${index}`, blocks: part.blocks })
+						: h(ShellPart, {
+								key: part.mode === "load" ? `load:${part.url}` : `inline:${part.start}`,
+								sessionId,
+								turnRef: ref,
+								part,
+								latest,
+							}),
+				),
+			);
 		}
 
 		const inject = ["slots", "sessions", "sidebarRight", "sidebarRightTabs", "uiWorkspace", "uiConversation"];

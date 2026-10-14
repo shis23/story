@@ -226,6 +226,12 @@ pub async fn handle_request(
             let items = service.display_nodes(&refs, campaign_id).map_err(to_rpc)?;
             encode(serde_json::to_value(items).map(|items| json!({ "items": items })))
         }
+        "card_shell.manifest" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            encode(serde_json::to_value(
+                service.card_shell_manifest(&campaign_id).map_err(to_rpc)?,
+            ))
+        }
         "mvu.status" => {
             let campaign_id = string_param(params, "campaign_id")?;
             encode(serde_json::to_value(

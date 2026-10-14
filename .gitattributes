@@ -2,3 +2,5 @@
 *.sh text eol=lf
 # Keep embedded migration SQL identical across future Windows/Linux checkouts.
 crates/infra-sqlite/migrations/*.sql text eol=lf
+# DSH 插件的打包产物：与重新打包的结果逐字比对（test/vendor.test.mjs），换行不随平台变。
+integrations/dsh-storyforge/lib/vendor/card-shell.mjs text eol=lf

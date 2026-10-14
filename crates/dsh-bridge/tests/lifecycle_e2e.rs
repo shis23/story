@@ -9,7 +9,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use support::{
-    FakePlugin, MVU_TRANSLATION, STATUS_OPENING, write_card, write_mvu_card, write_status_card,
+    FakePlugin, MVU_TRANSLATION, SHELL_INLINE_HTML, SHELL_OPENING, SHELL_STATUS_URL,
+    STATUS_OPENING, write_card, write_mvu_card, write_shell_card, write_status_card,
 };
 
 async fn create_campaign(plugin: &mut FakePlugin, card: &Path) -> Value {
@@ -446,4 +447,79 @@ async fn mvu_panel_analyzes_applies_and_writes_variables_behind_the_settle() {
         .await
         .unwrap_err();
     assert_eq!(missing["code"], "not_found", "{missing}");
+}
+
+/// 卡片界面清单：`.load(url)` 状态栏壳带 URL，内联壳只带触发正则（不带正文）；主机白名单
+/// 与桌面同一份。展示数据同时给原文，插件按原文里的命中给内联文档背书。
+#[tokio::test(flavor = "multi_thread")]
+async fn card_shell_manifest_lists_the_card_shells_and_display_keeps_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut plugin = FakePlugin::spawn(&temp.path().join("bridge-data"));
+    let created = create_campaign(&mut plugin, &write_shell_card(temp.path())).await;
+    let campaign = created["campaign_id"].as_str().unwrap().to_string();
+
+    let manifest = plugin
+        .request("card_shell.manifest", json!({ "campaign_id": campaign }))
+        .await
+        .expect("card_shell.manifest");
+    assert_eq!(manifest["campaign_id"], campaign);
+    let shells = manifest["shells"].as_array().unwrap();
+    let status = shells
+        .iter()
+        .find(|shell| shell["source"] == "remote_url")
+        .unwrap_or_else(|| panic!("{manifest}"));
+    assert_eq!(status["kind"], "status_bar");
+    assert_eq!(status["url"], SHELL_STATUS_URL);
+    assert_eq!(status["label"], "状态栏界面");
+    let inline = shells
+        .iter()
+        .find(|shell| shell["source"] == "inline_html")
+        .unwrap_or_else(|| panic!("{manifest}"));
+    assert_eq!(inline["kind"], "message_html");
+    assert_eq!(inline["trigger"], "<sf-inline/>");
+    assert!(inline.get("url").is_none(), "{inline}");
+    assert!(
+        !manifest.to_string().contains("内联界面已运行"),
+        "清单不带内联正文"
+    );
+    assert!(
+        manifest["remote_urls"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(SHELL_STATUS_URL))
+    );
+    let hosts = manifest["allowed_hosts"].as_array().unwrap();
+    assert!(
+        hosts.contains(&json!("testingcf.jsdelivr.net")),
+        "{manifest}"
+    );
+    assert!(hosts.contains(&json!("i.postimg.cc")), "{manifest}");
+
+    let items = display(
+        &mut plugin,
+        json!({ "campaign_id": campaign, "refs": [{
+            "key": "opening",
+            "conversation_id": created["conversation_id"],
+            "node_id": created["opening_node_id"],
+            "node_index": 0
+        }] }),
+    )
+    .await;
+    let opening = &items["opening"];
+    assert_eq!(opening["content"], SHELL_OPENING);
+    let shown = opening["display_content"].as_str().unwrap();
+    assert!(
+        shown.contains(&format!("$('body').load('{SHELL_STATUS_URL}')")),
+        "{shown}"
+    );
+    assert!(shown.contains(SHELL_INLINE_HTML), "{shown}");
+
+    let missing = plugin
+        .request(
+            "card_shell.manifest",
+            json!({ "campaign_id": "no-such-campaign" }),
+        )
+        .await
+        .expect_err("不存在的存档");
+    assert!(missing.to_string().contains("not_found"), "{missing}");
 }
