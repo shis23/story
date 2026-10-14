@@ -17,6 +17,7 @@ async fn sidecar_runs_production_turns_with_models_served_by_the_plugin() {
 
     let ready = plugin.wait_notification("bridge.ready").await;
     assert_eq!(ready["data_dir"], data_dir.display().to_string());
+    assert_eq!(ready["storage"], "sqlite");
 
     // 导卡 → 角色识别（走插件模型）→ 开档，开场白来自卡的 first_mes。
     let created = plugin
@@ -147,9 +148,10 @@ async fn sidecar_runs_production_turns_with_models_served_by_the_plugin() {
         plugin.settled[2]["node_id"]
     );
 
-    // 隔离：调用日志与存储都落在 sidecar 自己的数据目录。
+    // 隔离：调用日志与存储都落在 sidecar 自己的数据目录；全新目录直接用 SQLite。
     assert!(data_dir.join("logs").is_dir());
-    assert!(data_dir.join("conversations").is_dir());
+    assert!(data_dir.join("storyforge.sqlite3").is_file());
+    assert!(!data_dir.join("conversations").exists());
 
     let unknown = plugin.request("nope", json!({})).await.unwrap_err();
     assert_eq!(unknown["code"], "unknown_method");

@@ -4017,7 +4017,6 @@ dependencies = [
  "storyforge-app-service",
  "storyforge-domain",
  "storyforge-infra-llm",
- "storyforge-infra-sqlite",
  "tempfile",
  "tokio",
  "tracing",

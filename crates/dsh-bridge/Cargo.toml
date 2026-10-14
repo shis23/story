@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 storyforge-domain.workspace = true
 storyforge-infra-llm.workspace = true
-storyforge-infra-sqlite.workspace = true
 storyforge-app-logging.workspace = true
 storyforge-app-service.workspace = true
 async-trait.workspace = true
