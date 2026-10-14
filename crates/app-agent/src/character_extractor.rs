@@ -105,23 +105,92 @@ pub fn attach_definitions_to_card(
 
 // ─── 5 层兜底解析（参考 app-pipeline::parse_plan_from_response）──────────
 
+/// 模型常把可选字段写成 `null`、把单条背景写成字符串；这些都按缺省处理，不让整份结果作废。
 #[derive(Debug, serde::Deserialize)]
 struct CharacterDefDto {
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     persona_prompt: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     behavior_rules: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "backstory_lines")]
     base_backstory: Vec<String>,
     #[serde(default)]
     group: Option<String>,
-    #[serde(default = "default_role_type_str")]
+    #[serde(
+        default = "default_role_type_str",
+        deserialize_with = "role_type_or_default"
+    )]
     role_type: String,
 }
 
 fn default_role_type_str() -> String {
     "supporting".to_string()
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+fn role_type_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(default_role_type_str))
+}
+
+fn backstory_lines<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::Deserialize;
+    use serde_json::Value;
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(line)) if line.trim().is_empty() => Ok(Vec::new()),
+        Some(Value::String(line)) => Ok(vec![line]),
+        Some(Value::Array(items)) => Ok(items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::Null => None,
+                Value::String(line) => Some(line),
+                other => Some(other.to_string()),
+            })
+            .collect()),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "base_backstory 应为字符串数组，实际是 {other}"
+        ))),
+    }
+}
+
+/// 解析失败时错误里带上的工具参数开头字数（排查用，整份参数可能很长）。
+const EMIT_ARGS_HEAD_CHARS: usize = 300;
+
+/// `emit_characters` 的参数 → 角色定义。工具处理器（参数不合格时报错让模型重写）与响应
+/// 解析层 1 共用同一套规则；`characters` 被二次编码成 JSON 字符串时先解开。
+pub(crate) fn parse_emit_characters_args(
+    args: &serde_json::Value,
+) -> Result<Vec<CharacterDefinition>, String> {
+    let characters = args
+        .get("characters")
+        .ok_or_else(|| "缺少 characters 字段".to_string())?;
+    let decoded;
+    let characters = match characters {
+        serde_json::Value::String(raw) => {
+            decoded = serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|e| format!("characters 是字符串但不是 JSON（{e}）"))?;
+            &decoded
+        }
+        other => other,
+    };
+    let items = characters
+        .as_array()
+        .ok_or_else(|| "characters 应为角色对象数组".to_string())?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::from_value::<CharacterDefDto>(item.clone())
+                .map(dto_to_definition)
+                .map_err(|e| format!("characters[{index}] 不是合法的角色（{e}）"))
+        })
+        .collect()
 }
 
 fn parse_role_type(s: &str) -> storyforge_domain::character::RoleType {
@@ -156,19 +225,27 @@ pub fn parse_character_definitions_from_response(
 ) -> Result<Vec<CharacterDefinition>, ExtractError> {
     let mut explicit_empty: Option<Vec<CharacterDefinition>> = None;
     // 层 1：emit_characters 工具调用（arguments 是 JSON 字符串）
+    let mut tool_failures: Vec<String> = Vec::new();
     for tc in &resp.tool_calls {
-        if tc.function.name == "emit_characters"
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-            && let Some(arr) = args.get("characters")
-            && let Ok(defs) = serde_json::from_value::<Vec<CharacterDefDto>>(arr.clone())
-        {
-            let parsed: Vec<CharacterDefinition> =
-                defs.into_iter().map(dto_to_definition).collect();
-            if parsed.is_empty() {
+        if tc.function.name != "emit_characters" {
+            continue;
+        }
+        let parsed = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            .map_err(|e| format!("参数不是 JSON（{e}）"))
+            .and_then(|args| parse_emit_characters_args(&args));
+        match parsed {
+            Ok(parsed) if parsed.is_empty() => {
                 explicit_empty.get_or_insert(parsed);
-            } else {
-                return Ok(parsed);
             }
+            Ok(parsed) => return Ok(parsed),
+            Err(reason) => tool_failures.push(format!(
+                "{reason}；参数前 {EMIT_ARGS_HEAD_CHARS} 字: {}",
+                tc.function
+                    .arguments
+                    .chars()
+                    .take(EMIT_ARGS_HEAD_CHARS)
+                    .collect::<String>()
+            )),
         }
     }
 
@@ -188,8 +265,21 @@ pub fn parse_character_definitions_from_response(
         return Ok(empty);
     }
 
+    // 排查时最要紧的是模型实际交回了什么：工具参数（或调了哪些别的工具）+ 正文开头。
+    let tools = if !tool_failures.is_empty() {
+        format!("emit_characters 参数不合格：{}", tool_failures.join(" | "))
+    } else if resp.tool_calls.is_empty() {
+        "没有工具调用".to_string()
+    } else {
+        let names: Vec<&str> = resp
+            .tool_calls
+            .iter()
+            .map(|tc| tc.function.name.as_str())
+            .collect();
+        format!("没有 emit_characters 调用（调用了 {}）", names.join("、"))
+    };
     Err(ExtractError::Parse(format!(
-        "5 层兜底全miss；content 前 200 字: {}",
+        "{tools}；content 前 200 字: {}",
         content.chars().take(200).collect::<String>()
     )))
 }
@@ -427,6 +517,76 @@ pub mod tests {
     fn test_parse_failure_returns_error() {
         let resp = make_resp("完全不是 JSON 的乱七八糟文本", vec![]);
         assert!(parse_character_definitions_from_response(&resp).is_err());
+    }
+
+    fn tool_call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call_{name}"),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    /// 可选字段写成 null、背景写成单个字符串、characters 被二次编码，都按缺省解析。
+    #[test]
+    fn test_parse_layer1_tolerates_nulls_and_double_encoding() {
+        let inner = r#"[{"name":"艾琳","persona_prompt":null,"behavior_rules":null,"base_backstory":"北境出身","role_type":null,"group":null},{"name":"老兵","persona_prompt":"守门人","base_backstory":[null,"断过腿",3]}]"#;
+        let args = serde_json::json!({ "characters": inner }).to_string();
+        let resp = make_resp("", vec![tool_call("emit_characters", &args)]);
+        let defs = parse_character_definitions_from_response(&resp).unwrap();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "艾琳");
+        assert_eq!(defs[0].persona_prompt, "");
+        assert_eq!(defs[0].base_backstory, vec!["北境出身".to_string()]);
+        assert_eq!(defs[0].role_type, RoleType::Supporting);
+        assert_eq!(
+            defs[1].base_backstory,
+            vec!["断过腿".to_string(), "3".to_string()]
+        );
+    }
+
+    /// 解析失败时错误里要有模型实际交回的工具参数与原因，不能只剩"全 miss"。
+    #[test]
+    fn test_parse_failure_reports_emit_arguments() {
+        let args = r#"{"characters":[{"persona_prompt":"没有名字"}]}"#;
+        let resp = make_resp("", vec![tool_call("emit_characters", args)]);
+        let error = parse_character_definitions_from_response(&resp)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("characters[0]"), "{error}");
+        assert!(error.contains("name"), "{error}");
+        assert!(error.contains("没有名字"), "参数开头应进错误: {error}");
+
+        let resp = make_resp("", vec![tool_call("emit_characters", "{\"characters\":")]);
+        let error = parse_character_definitions_from_response(&resp)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("参数不是 JSON"), "{error}");
+
+        let resp = make_resp("", vec![tool_call("emit_plan", "{}")]);
+        let error = parse_character_definitions_from_response(&resp)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("调用了 emit_plan"), "{error}");
+    }
+
+    #[test]
+    fn test_parse_failure_truncates_long_arguments() {
+        let filler = "长".repeat(2000);
+        let args = format!(r#"{{"characters":"{filler}"}}"#);
+        let resp = make_resp("", vec![tool_call("emit_characters", &args)]);
+        let error = parse_character_definitions_from_response(&resp)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("characters 是字符串但不是 JSON"), "{error}");
+        assert!(
+            error.chars().count() < 600,
+            "参数只留开头: {}",
+            error.chars().count()
+        );
     }
 
     /// W-23：数组扫描必须止于配平的 `]`；数组之后的解释对象不得当角色。
