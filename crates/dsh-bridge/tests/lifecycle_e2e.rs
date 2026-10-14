@@ -9,8 +9,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use support::{
-    FakePlugin, MVU_TRANSLATION, SHELL_INLINE_HTML, SHELL_OPENING, SHELL_STATUS_URL,
-    STATUS_OPENING, write_card, write_mvu_card, write_shell_card, write_status_card,
+    CUSTOM_GREETING, FakePlugin, HOME_GREETING, MVU_TRANSLATION, RAIN_GREETING, SHELL_CUSTOM_URL,
+    SHELL_HOME_URL, SHELL_INLINE_HTML, SHELL_OPENING, SHELL_STATUS_URL, STATUS_OPENING, write_card,
+    write_mvu_card, write_opening_card, write_shell_card, write_status_card,
 };
 
 async fn create_campaign(plugin: &mut FakePlugin, card: &Path) -> Value {
@@ -612,5 +613,195 @@ async fn card_shell_variables_are_saved_and_survive_a_restart() {
             "__storyforge_card_shell_variables"
         ),
         Some(&buckets)
+    );
+}
+
+fn world_entry<'a>(book: &'a Value, name: &str) -> &'a Value {
+    book["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("{name} 不在世界书里: {book}"))
+}
+
+/// 开场界面：清单带问候语与存档名；开场态（对话只有开场白）时可以改写开场白、切换世界书
+/// 条目的启用状态；写过一轮之后拒绝改写开场白。
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_shells_switch_the_opening_and_toggle_world_info_before_the_first_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut plugin = FakePlugin::spawn(&temp.path().join("bridge-data"));
+    let created = create_campaign(&mut plugin, &write_opening_card(temp.path())).await;
+    let campaign = created["campaign_id"].as_str().unwrap().to_string();
+    assert_eq!(created["opening"], HOME_GREETING);
+
+    let manifest = plugin
+        .request("card_shell.manifest", json!({ "campaign_id": campaign }))
+        .await
+        .expect("card_shell.manifest");
+    assert_eq!(manifest["first_mes"], HOME_GREETING);
+    assert_eq!(
+        manifest["alternate_greetings"],
+        json!([CUSTOM_GREETING, RAIN_GREETING])
+    );
+    assert!(
+        !manifest["campaign_name"].as_str().unwrap().is_empty(),
+        "{manifest}"
+    );
+    let kinds: Vec<_> = manifest["shells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|shell| (shell["kind"].clone(), shell["url"].clone()))
+        .collect();
+    assert!(
+        kinds.contains(&(json!("opening_home"), json!(SHELL_HOME_URL))),
+        "{manifest}"
+    );
+    assert!(
+        kinds.contains(&(json!("opening_custom"), json!(SHELL_CUSTOM_URL))),
+        "{manifest}"
+    );
+
+    let opening_ref = json!({
+        "key": "opening",
+        "conversation_id": created["conversation_id"],
+        "node_id": created["opening_node_id"],
+        "node_index": 0
+    });
+    let items = display(
+        &mut plugin,
+        json!({ "campaign_id": campaign, "refs": [opening_ref] }),
+    )
+    .await;
+    assert_eq!(items["opening"]["node_count"], 1);
+    assert!(
+        items["opening"]["display_content"]
+            .as_str()
+            .unwrap()
+            .contains(SHELL_HOME_URL),
+        "{items}"
+    );
+
+    // 世界书：首页按条目名切换启用状态。
+    let book = plugin
+        .request("world_info.list", json!({ "campaign_id": campaign }))
+        .await
+        .expect("world_info.list");
+    let magic = world_entry(&book, "命定系统-魔法").clone();
+    let tech = world_entry(&book, "命定系统-科技").clone();
+    assert_eq!(magic["disabled"], false, "{book}");
+    assert_eq!(tech["disabled"], true, "{book}");
+    let toggled = plugin
+        .request(
+            "world_info.set_enabled",
+            json!({ "campaign_id": campaign, "updates": [
+                { "entry_index": magic["index"], "enabled": false },
+                { "entry_index": tech["index"], "enabled": true }
+            ] }),
+        )
+        .await
+        .expect("world_info.set_enabled");
+    assert_eq!(toggled, json!({ "updated": 2 }));
+    let book = plugin
+        .request("world_info.list", json!({ "campaign_id": campaign }))
+        .await
+        .unwrap();
+    assert_eq!(world_entry(&book, "命定系统-魔法")["disabled"], true);
+    assert_eq!(world_entry(&book, "命定系统-科技")["disabled"], false);
+    assert_eq!(world_entry(&book, "森林")["disabled"], false);
+    let out_of_range = plugin
+        .request(
+            "world_info.set_enabled",
+            json!({ "campaign_id": campaign, "updates": [{ "entry_index": 99, "enabled": true }] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(out_of_range["code"], "storage", "{out_of_range}");
+    let too_many: Vec<Value> = (0..501)
+        .map(|_| json!({ "entry_index": 0, "enabled": true }))
+        .collect();
+    let refused = plugin
+        .request(
+            "world_info.set_enabled",
+            json!({ "campaign_id": campaign, "updates": too_many }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused["code"], "invalid_params", "{refused}");
+
+    // 开场：首页选了普通问候 → 开场白改写（身份宏展开），对话仍只有开场白。
+    let applied = plugin
+        .request(
+            "campaign.apply_opening",
+            json!({ "campaign_id": campaign, "content": RAIN_GREETING }),
+        )
+        .await
+        .expect("campaign.apply_opening");
+    assert_eq!(applied["node_id"], created["opening_node_id"]);
+    let content = applied["content"].as_str().unwrap();
+    assert!(content.starts_with("雨夜"), "{applied}");
+    assert!(content.contains("Seraphina"), "{applied}");
+    assert!(!content.contains("{{char}}"), "{applied}");
+    // 选自定义开局：展示正则把它换成自定义开局界面。
+    let applied = plugin
+        .request(
+            "campaign.apply_opening",
+            json!({ "campaign_id": campaign, "content": CUSTOM_GREETING }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        applied["display_content"]
+            .as_str()
+            .unwrap()
+            .contains(SHELL_CUSTOM_URL),
+        "{applied}"
+    );
+    let items = display(
+        &mut plugin,
+        json!({ "campaign_id": campaign, "refs": [opening_ref] }),
+    )
+    .await;
+    assert_eq!(items["opening"]["content"], CUSTOM_GREETING);
+    assert_eq!(items["opening"]["node_count"], 1);
+    let blank = plugin
+        .request(
+            "campaign.apply_opening",
+            json!({ "campaign_id": campaign, "content": "  " }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(blank["code"], "validation", "{blank}");
+
+    // 写过一轮之后开场白不能再改。
+    run_turn(&mut plugin, &campaign, "我推开木屋的门。", 0)
+        .await
+        .expect("第一轮");
+    assert_accepted(&plugin.wait_settled(1).await);
+    let items = display(
+        &mut plugin,
+        json!({ "campaign_id": campaign, "refs": [opening_ref] }),
+    )
+    .await;
+    assert_eq!(items["opening"]["node_count"], 3);
+    let late = plugin
+        .request(
+            "campaign.apply_opening",
+            json!({ "campaign_id": campaign, "content": RAIN_GREETING }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(late["code"], "validation", "{late}");
+    let missing = plugin
+        .request(
+            "world_info.list",
+            json!({ "campaign_id": "no-such-campaign" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        missing["code"] == "storage" || missing["code"] == "not_found",
+        "{missing}"
     );
 }

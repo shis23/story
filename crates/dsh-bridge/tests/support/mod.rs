@@ -148,6 +148,75 @@ pub fn write_shell_card(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+pub const SHELL_HOME_URL: &str =
+    "https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/home/index.html";
+pub const SHELL_CUSTOM_URL: &str =
+    "https://testingcf.jsdelivr.net/gh/storyforge-test/shell@1.0.0/dist/custom_start/index.html";
+/// 开场卡的第一条问候：只是首页界面的占位，展示正则把它换成首页 `.load`。
+pub const HOME_GREETING: &str = "【首页】";
+pub const CUSTOM_GREETING: &str = "<customized>自定义开局</customized>";
+pub const RAIN_GREETING: &str = "雨夜，{{user}}推开酒馆的门，{{char}}正在擦拭酒杯。";
+
+fn lore(id: u32, comment: &str, key: &str, enabled: bool) -> Value {
+    json!({
+        "id": id,
+        "keys": [key],
+        "secondary_keys": [],
+        "comment": comment,
+        "content": format!("{comment} 的设定正文。"),
+        "constant": false,
+        "selective": true,
+        "insertion_order": 100,
+        "enabled": enabled,
+        "position": "before_char",
+        "extensions": {}
+    })
+}
+
+/// 开场界面卡（仿命定之诗）：首页占位 + 自定义开局 + 普通问候；世界书里两条「命定系统」
+/// 开关由首页切换。
+pub fn write_opening_card(dir: &Path) -> std::path::PathBuf {
+    let glue = |url: &str| format!("<body><script>$('body').load('{url}')</script></body>");
+    let card = json!({
+        "spec": "chara_card_v2",
+        "spec_version": "2.0",
+        "data": {
+            "name": "Seraphina",
+            "description": "守护森林的女法师，温柔而警惕。",
+            "personality": "温柔、警惕",
+            "scenario": "旅人在森林里迷路，被 Seraphina 救回木屋。",
+            "first_mes": HOME_GREETING,
+            "mes_example": "",
+            "alternate_greetings": [CUSTOM_GREETING, RAIN_GREETING],
+            "tags": [],
+            "creator": "dsh-bridge-test",
+            "character_version": "1",
+            "character_book": {
+                "name": "命定之书",
+                "entries": [
+                    lore(0, "命定系统-魔法", "魔法", true),
+                    lore(1, "命定系统-科技", "科技", false),
+                    lore(2, "森林", "森林", true),
+                ]
+            },
+            "extensions": {
+                "regex_scripts": [
+                    shell_regex("home-shell", "首页", "【首页】", &glue(SHELL_HOME_URL)),
+                    shell_regex(
+                        "custom-shell",
+                        "自定义开局",
+                        r"<customized>[\s\S]*?</customized>",
+                        &glue(SHELL_CUSTOM_URL),
+                    ),
+                ]
+            }
+        }
+    });
+    let path = dir.join("opening-card.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+    path
+}
+
 /// MVU 卡：扩展里带 `stat_data`（字段级 schema），分析器因此会调用模型而不是直接降级。
 pub fn write_mvu_card(dir: &Path) -> std::path::PathBuf {
     let card = json!({

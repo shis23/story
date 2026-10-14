@@ -138,6 +138,9 @@ pub struct NodeDisplay {
     pub content: String,
     /// 回放数据记的是别的对话（分叉继承的轮次），按位置从会话当前存档的对话里取的。
     pub by_position: bool,
+    /// 这条回复所在对话现有的节点数。只有开场白一个节点 = 还在开场态，开场界面可以
+    /// 改写开场白（`campaign.apply_opening`）。
+    pub node_count: usize,
 }
 
 /// 一次 `conversation.display` 最多查的节点数。
@@ -767,6 +770,7 @@ fn locate_display(
         display_content: node_display_content(conversation, index, scripts)?,
         content: active.content.clone(),
         by_position,
+        node_count: conversation.nodes.len(),
     })
 }
 

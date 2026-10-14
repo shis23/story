@@ -25,13 +25,19 @@
 //! - `card_shell.manifest {campaign_id}` → `CardShellInfo`（卡的壳清单与可代取主机；只读）
 //! - `card_shell.variables_set {campaign_id, variables}` → `{ok}`（整体替换存档的卡壳
 //!   选择器桶 `__storyforge_card_shell_variables`；形状与大小不对整份拒绝）
+//! - `campaign.apply_opening {campaign_id, content}` → `OpeningApplied`（开场界面选定的开场
+//!   改写开场白；对话已有后续节点时拒绝）
+//! - `world_info.list {campaign_id}` → `CampaignWorldInfoDto`（本局世界书；只读）
+//! - `world_info.set_enabled {campaign_id, updates: [{entry_index, enabled}]}` → `{updated}`
+//!   （只改启用状态；一次最多 `MAX_WORLD_INFO_TOGGLES` 条）
 //! - `mvu.status {campaign_id}` → `MvuStatus`（卡的 MVU 翻译、角色定义、实例与 Campaign
 //!   变量、待应用的变量定义；只读，不占写作锁）
 //! - `mvu.analyze {campaign_id}` → `MvuAnalyzed`（手动分析，调用一次底层模型）
 //! - `mvu.apply {campaign_id}` → `MvuStatus`（把翻译出的变量定义应用到卡内角色）
 //! - `variables.set {campaign_id, writes: [{scope: "campaign" | "instance", instance_id?,
 //!   key, value}]}` → `{results, status}`（逐条写，单条失败不影响其它条；一次最多
-//!   `MAX_VARIABLE_WRITES` 条）。后三个与 `card_shell.variables_set` 都先等上一轮收尾结束
+//!   `MAX_VARIABLE_WRITES` 条）。后三个与 `card_shell.variables_set` /
+//!   `campaign.apply_opening` / `world_info.set_enabled` 都先等上一轮收尾结束
 //! - `bridge.shutdown {}` → `{}` 后退出
 //!
 //! sidecar → 插件：
@@ -60,6 +66,7 @@ use storyforge_infra_sqlite::backend::{BackendSource, PinnedBackend, StorageBack
 
 use crate::llm::{DshLlmClient, LlmBridgeState};
 use crate::rpc::{Incoming, Peer, RpcError};
+use crate::service::card_shell::WorldInfoToggle;
 use crate::service::mvu::VariableWrite;
 use crate::service::{BridgeError, BridgeService, DisplayRef, SettleReport, TurnObserver};
 
@@ -246,6 +253,36 @@ pub async fn handle_request(
                 .await
                 .map_err(to_rpc)?;
             Ok(json!({ "ok": true }))
+        }
+        "campaign.apply_opening" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let content = string_param(params, "content")?;
+            encode(serde_json::to_value(
+                service
+                    .apply_opening(&campaign_id, content)
+                    .await
+                    .map_err(to_rpc)?,
+            ))
+        }
+        "world_info.list" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            encode(serde_json::to_value(
+                service.world_info(&campaign_id).map_err(to_rpc)?,
+            ))
+        }
+        "world_info.set_enabled" => {
+            let campaign_id = string_param(params, "campaign_id")?;
+            let toggles: Vec<WorldInfoToggle> = match params.get("updates") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    RpcError::new("invalid_params", format!("updates 无效: {error}"))
+                })?,
+            };
+            let updated = service
+                .set_world_info_enabled(&campaign_id, &toggles)
+                .await
+                .map_err(to_rpc)?;
+            Ok(json!({ "updated": updated }))
         }
         "mvu.status" => {
             let campaign_id = string_param(params, "campaign_id")?;
