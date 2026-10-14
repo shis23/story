@@ -1286,7 +1286,7 @@ window.__ModuleLoader__.load({
 						optionSelect("sf-mode", models.generationModes, models.generationMode, (value) =>
 							save("generationMode", { generationMode: value }),
 						),
-						"自动路由想升到高成本群像时会报错，需要在这里显式选群像",
+						"自动路由想升到高成本群像时，会在输入框处问你这一轮怎么写；固定一种模式就不再问",
 						"generationMode",
 					),
 					field(

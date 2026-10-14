@@ -805,3 +805,75 @@ async fn opening_shells_switch_the_opening_and_toggle_world_info_before_the_firs
         "{missing}"
     );
 }
+
+/// 自动路由要升到高成本群像档：本轮不开始（不调模型、不追加用户消息），回
+/// `confirm_generation_mode` 与建议模式；带用户选定的显式模式重发照常写。
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_route_escalation_waits_for_an_explicit_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let card = write_card(temp.path());
+    let mut plugin = FakePlugin::spawn(&temp.path().join("bridge-data"));
+    let character = |name: &str| {
+        json!({
+            "name": name,
+            "persona_prompt": format!("你是{name}。"),
+            "behavior_rules": "",
+            "base_backstory": [],
+            "role_type": "supporting",
+            "group": "旅伴",
+        })
+    };
+    plugin.extracted_characters = Some(
+        json!([
+            character("林医生"),
+            character("陈警官"),
+            character("苏沁"),
+            character("王曼离"),
+        ])
+        .to_string(),
+    );
+    let created = create_campaign(&mut plugin, &card).await;
+    let campaign_id = created["campaign_id"].as_str().unwrap().to_string();
+
+    let intent = "林医生、陈警官、苏沁和王曼离围坐在炉火边，商量明天怎么走出森林。";
+    let calls_before = plugin.llm_calls;
+    let events_before = plugin.events.len();
+    let asked = run_turn(&mut plugin, &campaign_id, intent, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(asked["code"], "confirm_generation_mode", "{asked}");
+    assert_eq!(asked["data"]["mode"], "sequential_crew", "{asked}");
+    assert_eq!(asked["data"]["reason"], "actor_count", "{asked}");
+    assert!(asked["data"]["estimate"].is_string(), "{asked}");
+    assert!(
+        asked["data"]["continuation_estimate"].is_string(),
+        "{asked}"
+    );
+    assert_eq!(plugin.llm_calls, calls_before, "确认前不应调用模型");
+    assert_eq!(plugin.events.len(), events_before, "确认前不应开始写作");
+    let items = display(
+        &mut plugin,
+        json!({ "campaign_id": campaign_id, "refs": [{ "key": "opening", "node_index": 0 }] }),
+    )
+    .await;
+    assert_eq!(
+        items["opening"]["node_count"], 1,
+        "不应追加用户消息: {items}"
+    );
+
+    // 用户选了「这轮按续写」：显式模式不再问。
+    let output = plugin
+        .request(
+            "turn.run",
+            json!({
+                "campaign_id": campaign_id,
+                "intent": intent,
+                "generation_mode": "continuation",
+                "history_turns": 0,
+            }),
+        )
+        .await
+        .expect("explicit continuation");
+    assert_eq!(output["generation_mode"], "continuation");
+    assert_accepted(&plugin.wait_settled(1).await);
+}

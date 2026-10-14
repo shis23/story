@@ -979,6 +979,139 @@ test('role models: each call goes to the model chosen for its group', { skip: !e
   }
 })
 
+/** 角色识别走终止工具 `emit_characters` 认出四个角色；其它调用照常回固定正文。 */
+const CREW = ['林医生', '陈警官', '苏沁', '王曼离']
+function crewModel(calls) {
+  const prose = fakeModel(calls)
+  return async function* stream(options) {
+    if (!options.system?.includes('卡内角色识别')) {
+      yield* prose(options)
+      return
+    }
+    calls.push(options)
+    const characters = CREW.map((name) => ({
+      name,
+      persona_prompt: `你是${name}。`,
+      behavior_rules: '',
+      base_backstory: [],
+      role_type: 'supporting',
+      group: '旅伴',
+    }))
+    const block = { type: 'tool-call', id: 'call-crew', name: 'emit_characters', arguments: JSON.stringify({ characters }) }
+    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    yield { type: 'block-end', index: 0, block }
+    yield { type: 'usage', usage: { inputTokens: 30, outputTokens: 40 } }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+  }
+}
+
+test('auto route escalation: asks in the composer, then writes with the chosen mode', { skip: !existsSync(bin) && `sidecar not built: ${bin}`, timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sf-dsh-escalate-'))
+  const cardsDir = join(root, 'cards')
+  mkdirSync(cardsDir)
+  writeFileSync(
+    join(cardsDir, 'seraphina.json'),
+    JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Seraphina',
+        description: '守护森林的女法师。',
+        personality: '温柔',
+        scenario: '旅人在森林里迷路。',
+        first_mes: OPENING,
+        mes_example: '',
+        alternate_greetings: [],
+        tags: [],
+        creator: 'host-smoke',
+        character_version: '1',
+        extensions: {},
+      },
+    }),
+  )
+  const llmCalls = []
+  const { ctx, adapters, routes, dispose } = fakeCtx(llmCalls)
+  ctx.llm.stream = crewModel(llmCalls)
+  // DSH 的 userQuestions：记下每次提问，按排好的回答作答。
+  const asks = []
+  const replies = []
+  let questions = undefined
+  const agent = { id: 'live-agent' }
+  let sessionId
+  ctx.get = (service) => (service === 'userQuestions' ? questions : undefined)
+  ctx.agents.get = (id) => (id === sessionId ? agent : undefined)
+  const post = (path, body) => call(routes, path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) })
+  try {
+    apply(ctx, { dataDir: join(root, 'data'), cardsDir })
+    assert.equal((await post('/settings', { provider: 'fake', model: 'writer', toolMode: 'native', generationMode: 'auto' })).ok, true)
+    const created = await post('/sessions', { card: 'seraphina.json' })
+    assert.equal(created.ok, true, created.error)
+    sessionId = created.sessionId
+    const adapter = adapters.get('storyforge')
+    const opening = userMessage('（开始新故事）', 'storyforge')
+    await collect(adapter.stream({ sessionId, messages: [opening] }))
+    const turn = () =>
+      collect(
+        adapter.stream({
+          sessionId,
+          messages: [
+            opening,
+            { id: crypto.randomUUID(), role: 'assistant', content: [{ type: 'text', text: OPENING }], source: { kind: 'model', provider: 'storyforge', model: 'pipeline' } },
+            userMessage(`${CREW.join('、')}围坐在炉火边，商量明天怎么走出森林。`, 'user'),
+          ],
+          signal: new AbortController().signal,
+        }),
+      )
+    const writerCalls = () => llmCalls.filter((options) => !options.system?.includes('卡内角色识别')).length
+
+    // 没有可问的界面：照旧报错，指到首页设置；没有调用写作模型。
+    await assert.rejects(turn(), /管线设置/)
+    assert.equal(writerCalls(), 0)
+
+    questions = {
+      ask: async (request) => {
+        asks.push(request)
+        const [question] = request.questions
+        const choice = replies.shift()
+        return { answers: [{ id: question.id, selected: [question.options[choice].label] }] }
+      },
+    }
+    // 取消：本轮不写。问题挂在本会话的 agent 上，三个选项。
+    replies.push(2)
+    await assert.rejects(turn(), /已取消这一轮/)
+    assert.equal(asks.length, 1)
+    assert.equal(asks[0].agent, agent)
+    assert.ok(asks[0].signal)
+    assert.equal(asks[0].questions[0].options.length, 3)
+    assert.match(asks[0].questions[0].question, /群像（顺序子 Agent）/)
+    assert.equal(writerCalls(), 0)
+
+    // 选「这轮按续写」：带显式模式重发，写完一轮。
+    replies.push(1)
+    const chunks = await turn()
+    assert.equal(asks.length, 2)
+    assert.equal(chunks.at(-1).type, 'finish')
+    const reasoning = chunks.filter((chunk) => chunk.type === 'reasoning-delta').map((chunk) => chunk.text).join('')
+    assert.match(reasoning, /【确认】自动路由建议这一轮用群像（顺序子 Agent）/)
+    assert.match(reasoning, /【确认】这一轮用续写（单次执笔）/)
+    assert.match(reasoning, /【本轮】续写（单次执笔）/)
+    const text = chunks.filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text).join('')
+    assert.equal(text, PROSE)
+    assert.ok(writerCalls() >= 1)
+
+    let status
+    for (let i = 0; i < 100; i++) {
+      status = await call(routes, '/status')
+      if (status.settles.length > 0) break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    assert.equal(status.settles.length, 1, JSON.stringify(status))
+  } finally {
+    await dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 /** 等 sidecar 进程退出（插件卸载不等它，重启同一数据目录前要等）。 */
 async function waitForExit(pid, timeoutMs = 15_000) {
   if (!pid) return

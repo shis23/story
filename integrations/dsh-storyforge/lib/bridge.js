@@ -21,6 +21,8 @@ export class BridgeRpcError extends Error {
     this.code = code
     this.status = extra.status
     this.retryAfterMs = extra.retryAfterMs
+    /** sidecar 错误的结构化附带信息（如 `confirm_generation_mode` 的建议模式）。 */
+    this.data = extra.data
   }
 }
 
@@ -105,8 +107,13 @@ export function createBridge({ binPath, dataDir, logFile, serveLlm, log }) {
     const entry = pending.get(id)
     if (!entry) return
     pending.delete(id)
-    if (message.error) entry.reject(new BridgeRpcError(message.error.code ?? 'error', message.error.message ?? 'sidecar error'))
-    else entry.resolve(message.result)
+    if (message.error) {
+      entry.reject(
+        new BridgeRpcError(message.error.code ?? 'error', message.error.message ?? 'sidecar error', { data: message.error.data }),
+      )
+    } else {
+      entry.resolve(message.result)
+    }
   }
 
   function start() {

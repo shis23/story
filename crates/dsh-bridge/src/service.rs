@@ -32,12 +32,12 @@ use storyforge_app_service::services::conversations::{
 use storyforge_app_service::{
     AppState, StartWritingRequest, accept_variant_async, create_campaign_for_backend,
     extract_characters_for_host, fork_campaign_for_host, import_character_for_host,
-    set_active_campaign_for_host, start_writing_for_host,
+    route_generation_for_host, set_active_campaign_for_host, start_writing_for_host,
 };
 use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
-use storyforge_domain::generation::GenerationMode;
+use storyforge_domain::generation::{GenerationMode, GenerationRouteDecision};
 use storyforge_domain::preset::RegexScript;
 
 use crate::llm::{LlmBridgeState, UsageTotals};
@@ -167,6 +167,9 @@ pub struct BridgeStatus {
 pub struct BridgeError {
     pub code: String,
     pub message: String,
+    /// 给插件程序化处理的附带信息（JSON-RPC 错误的 `data`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl BridgeError {
@@ -174,7 +177,13 @@ impl BridgeError {
         Self {
             code: code.into(),
             message: message.into(),
+            data: None,
         }
+    }
+
+    fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
 }
 
@@ -557,6 +566,14 @@ impl BridgeService {
         if self.active_campaign().as_ref().map(Id::as_str) != Some(campaign_id) {
             set_active_campaign_for_host(&self.app, campaign_id.to_string())?;
         }
+        if generation_mode.is_none() {
+            // 自动路由要升到高成本档时先回给插件问用户（start_writing 自己也会拒绝，
+            // 但那是一句话的 validation 错误，插件没法据此弹选项）。
+            let decision = route_generation_for_host(&self.app, &intent, None, None).await?;
+            if decision.requires_cost_confirmation {
+                return Err(confirm_generation_mode(&decision));
+            }
+        }
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let forward_observer = observer.clone();
@@ -840,6 +857,26 @@ pub fn committed_turns(conversation: &Conversation) -> usize {
                 && pair[1].status == VariantStatus::Final
         })
         .count()
+}
+
+/// 自动路由建议升到高成本档：本轮没开始（没调模型、没写存档），`data` 带建议模式与
+/// 预计调用量，插件问过用户后带显式 `generation_mode` 重发。
+fn confirm_generation_mode(decision: &GenerationRouteDecision) -> BridgeError {
+    let mode = serde_json::to_value(decision.mode).unwrap_or(Value::Null);
+    BridgeError::new(
+        "confirm_generation_mode",
+        format!(
+            "自动路由建议本轮用 {}（预计 {}），本轮还没开始；请确认后带 generation_mode 重发。",
+            mode.as_str().unwrap_or("?"),
+            decision.mode.estimated_call_label()
+        ),
+    )
+    .with_data(serde_json::json!({
+        "mode": mode,
+        "reason": decision.reason,
+        "estimate": decision.mode.estimated_call_label(),
+        "continuation_estimate": GenerationMode::Continuation.estimated_call_label(),
+    }))
 }
 
 fn out_of_sync(history_turns: usize, committed: usize) -> BridgeError {

@@ -2,7 +2,7 @@
 //!
 //! 线上格式：每行一个 JSON 对象。
 //! - 请求：`{"id", "method", "params"}`（双方都可以发起）
-//! - 响应：`{"id", "result"}` 或 `{"id", "error": {code, message, status?, retry_after_ms?}}`
+//! - 响应：`{"id", "result"}` 或 `{"id", "error": {code, message, status?, retry_after_ms?, data?}}`
 //! - 通知：`{"method", "params"}`（无 id）
 //!
 //! sidecar 发起的请求（目前只有 `llm.stream`）可以在响应之前收到若干
@@ -26,6 +26,9 @@ pub struct RpcError {
     pub status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// 结构化附带信息（如 `confirm_generation_mode` 的建议模式），供对端程序化处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -35,6 +38,7 @@ impl RpcError {
             message: message.into(),
             status: None,
             retry_after_ms: None,
+            data: None,
         }
     }
 
