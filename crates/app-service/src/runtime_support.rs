@@ -32,22 +32,21 @@ pub async fn run_shared_postprocess_background(
         return Ok(false);
     }
 
-    // ── R11：终态事件仲裁（修本轮引入的"双发"回归）─────────────────────────
-    // 此前 app-pipeline 的终态事件（Done/Failed/Skipped）会**直接**流向前端，
-    // 本函数随后又按持久化结果再发一个终态事件 ⇒ 生产路径上取消时发 2 个
-    // `PostProcessSkipped`、正常落盘时发 2 个 `PostProcessDone`，违反
-    // `postprocess_pipeline_event` 文档写下的"恰好一个"契约。
+    // ── R11：终态事件仲裁 ─────────────────────────────────────────────────
+    // 生产路径向前端发的后处理终态事件（Done / Failed / Skipped）每次**恰好一个**，
+    // 而且排在 runner 的进度事件（PostProcessStarted / SummaryDone 等）之后——
+    // 前端 `usePipeline.js` 按到达顺序处理，最后到达的事件决定显示状态。
     //
-    // 单一权威裁定：**本函数（Tauri 持久化层）**是生产路径终态事件的唯一权威——
-    // 只有这一层知道 outcome 是否真的落盘（Done / 写回失败→Failed / 取消→Skipped）。
-    // pipeline 自报的终态事件被**截留**为兜底：仅当本层分支不派生终态事件时
-    // （非 Campaign 路径、配置关闭、`apply_outcome` 返回"无需写回"等）才使用，
-    // 保证前端在这种路径上仍然拿到恰好一个终态事件、能置 idle。
-    // 非终态事件（PostProcessStarted / SummaryDone / MVU 等）仍立即转发，
-    // 不延迟前端进度显示。
+    // 单一权威：**本函数（持久化层）**的结论优先——只有这一层知道 outcome 是否
+    // 真的落盘（Done / 写回失败→Failed / 取消→Skipped）。runner 自报的终态事件
+    // 被转发任务**截留**为兜底：写入层没有结论时（非 Campaign 路径、配置全关只做了
+    // 空记账、`apply_outcome` 返回"无需写回"等）才用它；两边都没有就补一个 Skipped。
+    // 非终态事件由转发任务立即转发，不延迟前端进度显示。
+    //
+    // 顺序：主体只**记下**写入层结论，等 `drop(pipeline_tx)` → `forwarder.await`
+    // 排空之后才发终态——此时 runner 的进度事件都已进了前端 channel。
     let (pipeline_tx, forwarder, captured) = spawn_pipeline_event_arbiter(&event_tx);
-    let mut terminal = TerminalEventSender::new(event_tx.clone());
-    let result = run_shared_postprocess_body(
+    let body = run_shared_postprocess_body(
         storage,
         pipeline,
         writing_ctx,
@@ -57,26 +56,42 @@ pub async fn run_shared_postprocess_background(
         fallback_fragments,
         mvu_update_rules,
         &pipeline_tx,
-        &mut terminal,
         cancel,
         identity,
         runtime,
     )
     .await;
-    // 关闭代理并等转发任务排空：此时 pipeline 自报的终态事件已落入 `captured`。
     drop(pipeline_tx);
     let _ = forwarder.await;
-    if !terminal.sent {
-        let fallback = captured.lock().unwrap_or_else(|p| p.into_inner()).take();
-        terminal.send(fallback);
-    }
+    let runner_terminal = captured.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let (result, decided) = match body {
+        Ok((applied, decided)) => (Ok(applied), decided),
+        // 返回 Err 就是写回失败：Failed 的原因与返回给调用方的错误一致。
+        Err(e) => {
+            let failed = postprocess_pipeline_event(Some(&Err(e.clone())), &e.to_string(), false);
+            (Err(e), failed)
+        }
+    };
+    let terminal =
+        decided
+            .or(runner_terminal)
+            .unwrap_or_else(|| PipelineEvent::PostProcessSkipped {
+                reason: POSTPROCESS_NOT_RUN_REASON.into(),
+            });
+    let _ = event_tx.send(terminal);
     result
 }
 
+/// runner 与写入层都没有终态时补发的 Skipped 原因（典型：非 Campaign 局，
+/// runner 不跑也不发事件）。
+const POSTPROCESS_NOT_RUN_REASON: &str = "postprocess not run";
+
 /// R11：生产路径的后处理主体（runner 前取消判断之后的部分）。
 ///
-/// 终态事件一律经 `terminal` 发送（由调用方裁决唯一性）；非终态事件经
-/// `pipeline_tx` 由仲裁任务立即转发，保持前端 Started/Summary 的实时性。
+/// 返回 `(applied, 写入层结论)`。结论只记下、不发送，由调用方在转发任务排空后
+/// 发出；`None` 表示写入层没有结论，回落到 runner 自报的终态。返回 `Err` 时由
+/// 调用方派生 Failed。非终态事件经 `pipeline_tx` 由转发任务立即转发，保持
+/// 前端 Started/Summary 的实时性。
 #[allow(clippy::too_many_arguments)]
 async fn run_shared_postprocess_body(
     storage: Arc<storage_backend::StorageFacade>,
@@ -88,11 +103,10 @@ async fn run_shared_postprocess_body(
     fallback_fragments: Vec<storyforge_domain::mvu_translation::FallbackFragment>,
     mvu_update_rules: Vec<String>,
     pipeline_tx: &tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
-    terminal: &mut TerminalEventSender,
     cancel: watch::Receiver<bool>,
     identity: Option<production_postprocess::PostprocessIdentity>,
     runtime: Option<std::sync::Arc<CampaignRuntimeContext>>,
-) -> Result<bool, production_postprocess::ProductionPostprocessError> {
+) -> Result<(bool, Option<PipelineEvent>), production_postprocess::ProductionPostprocessError> {
     use production_postprocess::ProductionPostprocessError;
 
     let outcome = pipeline
@@ -112,15 +126,14 @@ async fn run_shared_postprocess_body(
     if *cancel.borrow() {
         tracing::warn!("Phase A: postprocess 写回跳过——cancelled after runner");
         // 三.3：runner 后取消同样发出 Skipped（与 runner 前取消同一个事件）。
-        // R11：经仲裁发送——它是本路径**唯一**的取消终态事件（pipeline 自己那条
-        // 已在 runner 内发出、被仲裁截留为兜底），不再双发。
-        terminal.send(postprocess_pipeline_event(None, "", true));
-        return Ok(false);
+        // R11：这是写入层结论，盖过 runner 自报、被截留的那条取消事件。
+        return Ok((false, postprocess_pipeline_event(None, "", true)));
     }
 
     let sink = crate::backend_workflows::BackendTurnAttemptSink::production(storage.clone());
     let Some(identity) = identity else {
-        // 非 Campaign 路径：保持旧行为（直接写 store）
+        // 非 Campaign 路径：保持旧行为（直接写 store）。写成功不下结论，终态取
+        // runner 自报的；写失败经 `?` 返回 Err，由调用方发 Failed。
         if let Some(outcome) = outcome {
             crate::backend_workflows::persist_postprocess_outcome_async(
                 storage.clone(),
@@ -131,7 +144,7 @@ async fn run_shared_postprocess_body(
             .await
             .map_err(ProductionPostprocessError::BatchConstruction)?;
         }
-        return Ok(false);
+        return Ok((false, None));
     };
 
     // Batch source / adapter selection happens in the named backend adapter
@@ -145,54 +158,22 @@ async fn run_shared_postprocess_body(
     let result = service.apply_outcome(&identity, outcome, &present_chars, &cancel);
 
     match result {
-        Ok(result) if result.applied => {
-            let event = postprocess_pipeline_event(Some(&Ok(result)), "", false)
-                .expect("applied result must derive a Done event");
-            terminal.send(Some(event));
-            Ok(true)
-        }
         Ok(result) => {
             if let Some(reason) = result.skipped_reason.as_deref() {
                 tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
             }
-            // 取消不是失败：发 PostProcessSkipped（前端置 idle），
-            // 不再误发 PostProcessFailed（前端会显示「后处理失败」错误态）。
-            // 其它 skipped 原因（late_or_superseded_attempt 等）不产生事件。
-            terminal.send(postprocess_pipeline_event(Some(&Ok(result)), "", false));
-            Ok(false)
+            // 落盘 → Done；取消不是失败 → Skipped（前端置 idle），不误发 Failed。
+            // 配置全关只做了空记账、其它 skipped 原因（late_or_superseded_attempt 等）
+            // 不下结论，回落到 runner 的终态。
+            let applied = result.applied;
+            Ok((
+                applied,
+                postprocess_pipeline_event(Some(&Ok(result)), "", false),
+            ))
         }
         Err(e) => {
             tracing::error!("Phase A: postprocess 失败: {e}");
-            let combined = service_fail_turn(&sink, &identity, e);
-            terminal.send(postprocess_pipeline_event(
-                Some(&Err(combined.clone())),
-                &combined.to_string(),
-                false,
-            ));
-            Err(combined)
-        }
-    }
-}
-
-/// R11：终态事件的发送句柄（由调用方裁决唯一性）。
-///
-/// 生产路径上终态事件必须**恰好一个**，因此本句柄只负责记录"是否已经发过"，
-/// 由 `run_shared_postprocess_background` 在主体返回后用 `sent` 决定是否回退到
-/// pipeline 自报的终态事件。
-struct TerminalEventSender {
-    tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
-    sent: bool,
-}
-
-impl TerminalEventSender {
-    fn new(tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>) -> Self {
-        Self { tx, sent: false }
-    }
-
-    fn send(&mut self, event: Option<PipelineEvent>) {
-        if let Some(event) = event {
-            let _ = self.tx.send(event);
-            self.sent = true;
+            Err(service_fail_turn(&sink, &identity, e))
         }
     }
 }
@@ -214,7 +195,8 @@ fn is_pipeline_terminal_event(event: &PipelineEvent) -> bool {
 /// - 终态事件写入 `captured`（后写覆盖先写），不直接转发。
 ///
 /// 调用方在主体返回后 `drop(发送端)` 并 `await` 任务句柄，即可确定性地得到
-/// "已排空"状态，再决定发送哪一个终态事件——不存在竞态窗口。
+/// "已排空"状态（runner 的进度事件都已进入真实 channel），再发送唯一的终态
+/// 事件——终态必然排在进度事件之后，不存在竞态窗口。
 fn spawn_pipeline_event_arbiter(
     event_tx: &tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
 ) -> (
@@ -243,17 +225,18 @@ fn spawn_pipeline_event_arbiter(
 /// **唯一**事件派生点（禁止手拼事件字符串）。
 ///
 /// 四条路径恰好各产生一个正确事件：
-/// - 正常落盘（`Ok(applied=true)`）→ `PostProcessDone{k,v,t}`；
+/// - 正常落盘（`Ok(applied=true)` 且带 outcome）→ `PostProcessDone{k,v,t}`；
 /// - runner 前/后取消（`cancelled=true`，或结果带 `skipped_reason="cancelled"`）
 ///   → 恰好一个 `PostProcessSkipped`；
 /// - 持久化失败（`Err`）→ 恰好一个 `PostProcessFailed{fail_reason}`；
-/// - 其它 skipped 原因不产生事件。
+/// - 其它 skipped 原因不产生事件；`applied=true` 但没有 outcome（配置全关，
+///   只做了空记账）也不产生事件。
 ///
-/// `run_shared_postprocess_background` 的四个分支全部经此函数发送。
+/// `run_shared_postprocess_background` 的写入层结论全部经此函数派生。
 ///
 /// **R11 单一权威**：这里的"恰好一个"指**整条生产路径**只应向前端发一个终态
 /// 事件。app-pipeline 自己也会发终态事件，因此生产路径上它的事件被
-/// `spawn_pipeline_event_arbiter` 截留（只在 Tauri 侧不派生终态事件时兜底），
+/// `spawn_pipeline_event_arbiter` 截留（只在本函数不派生事件时兜底），
 /// 由本函数派生的事件作为唯一终态。改动任一侧都必须保持该不变量。
 pub fn postprocess_pipeline_event(
     result: Option<
@@ -272,10 +255,12 @@ pub fn postprocess_pipeline_event(
     }
     match result {
         Some(Ok(result)) if result.applied => {
-            let (knowledge_count, variable_count, task_count) = result
-                .outcome
+            // 配置全关时 runner 不产出 outcome，apply_outcome 只做了空记账：没有
+            // 写回内容可报告，生产路径回落到 runner 的配置 Skipped（前端保持空闲）。
+            let outcome = result.outcome.as_ref()?;
+            let (knowledge_count, variable_count, task_count) = outcome
+                .post_process
                 .as_ref()
-                .and_then(|o| o.post_process.as_ref())
                 .map(|pp| {
                     (
                         pp.knowledge_updates.len(),
@@ -2208,6 +2193,15 @@ mod tests {
         assert!(event.is_none(), "非取消跳过不产生事件: {event:?}");
     }
 
+    #[test]
+    fn applied_without_outcome_derives_no_event() {
+        // 配置全关：runner 返回 None，apply_outcome 只做空记账（applied=true、无 outcome）。
+        let mut result = applied_result();
+        result.outcome = None;
+        let event = postprocess_pipeline_event(Some(&Ok(result)), "", false);
+        assert!(event.is_none(), "空记账不是写入层结论: {event:?}");
+    }
+
     // ─── 三.4：backend-neutral 角色解析器（stored/source/card/name 经 facade）─
 
     fn resolver_fixture(
@@ -2666,6 +2660,389 @@ mod tests {
             }
             other => panic!("expected PostProcessSkipped, got {other:?}"),
         }
+    }
+
+    // ─── R11 复核：终态排在进度事件之后，且每次恰好一个 ─────────────────────
+    //
+    // 前端 `usePipeline.js` 按到达顺序处理事件，最后到达的决定显示状态；终态
+    // 若先于 runner 的 Started / SummaryDone 到达，界面会停在"进行中"。
+
+    fn pp_storage(tag: &str) -> (std::path::PathBuf, Arc<storage_backend::StorageFacade>) {
+        let dir = std::env::temp_dir().join(format!("sf-pp-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(storage_backend::StorageFacade::new(
+            dir.clone(),
+            storyforge_infra_sqlite::backend::PinnedBackend::new(
+                storyforge_infra_sqlite::backend::StorageBackend::Json,
+                storyforge_infra_sqlite::backend::BackendSource::Default,
+            ),
+        ));
+        (dir, storage)
+    }
+
+    fn pp_pipeline(
+        dir: &std::path::Path,
+        llm: Arc<dyn storyforge_infra_llm::LlmClient>,
+    ) -> storyforge_app_pipeline::PipelineOrchestrator {
+        let conv_store = Arc::new(storyforge_app_conversation::ConversationStore::new(
+            dir.join("conversations"),
+        ));
+        let tool_ctx = Arc::new(storyforge_app_agent::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        storyforge_app_pipeline::PipelineOrchestrator::new(llm, conv_store, tool_ctx, None)
+    }
+
+    fn pp_writing_ctx(campaign_id: Option<&Id>) -> WritingContext {
+        let mut ctx = WritingContext::legacy(vec![], None, Id::from_str("conv-pp-order"));
+        ctx.campaign_id = campaign_id.cloned();
+        ctx.turn = 1;
+        ctx.story_clock = "第1天".into();
+        ctx
+    }
+
+    fn drain_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PipelineEvent>,
+    ) -> Vec<PipelineEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 恰好一个终态事件，且它是最后到达的事件。
+    fn single_terminal_last(events: &[PipelineEvent]) -> &PipelineEvent {
+        let positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| is_pipeline_terminal_event(e))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "终态事件必须恰好 1 个，got {events:?}");
+        assert_eq!(
+            positions[0],
+            events.len() - 1,
+            "终态事件必须排在所有进度事件之后，got {events:?}"
+        );
+        &events[positions[0]]
+    }
+
+    /// 不该被调用的 LLM（runner 在调用模型前就返回的路径）。
+    struct UnreachableLlm;
+
+    #[async_trait::async_trait]
+    impl storyforge_infra_llm::LlmClient for UnreachableLlm {
+        async fn chat(
+            &self,
+            _req: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            panic!("this path must not call the LLM")
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &storyforge_domain::llm::ChatRequest,
+            _tx: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            panic!("this path must not call the LLM")
+        }
+    }
+
+    /// 正常应答的 LLM；带 `gate` 时每次调用先等放行。放行后把通知传给下一次
+    /// 调用，所以测试只需 `notify_one` 一次，摘要与后处理两路调用都会过闸。
+    struct GatedLlm {
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl GatedLlm {
+        async fn pass_gate(&self) {
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+                gate.notify_one();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl storyforge_infra_llm::LlmClient for GatedLlm {
+        async fn chat(
+            &self,
+            _req: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.pass_gate().await;
+            Ok(CancelInsideLlm::response())
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &storyforge_domain::llm::ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.pass_gate().await;
+            let response = CancelInsideLlm::response();
+            let _ = tx.send(storyforge_domain::llm::StreamChunk {
+                delta_content: Some(response.content.clone()),
+                delta_reasoning_content: None,
+                delta_tool_calls: None,
+                finish_reason: Some("stop".into()),
+            });
+            Ok(response)
+        }
+    }
+
+    /// 运行中取消：唯一的终态是写入层的 `Skipped("postprocess cancelled")`，
+    /// 而且必须排在 runner 已发出的 Started（及 SummaryDone）之后。
+    #[tokio::test]
+    async fn cancel_during_runner_emits_cancelled_skipped_after_progress_events() {
+        let (dir, storage) = pp_storage("cancel-order");
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let llm = Arc::new(CancelInsideLlm {
+            cancel_tx,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let campaign_id = Id::from_str("camp-pp-cancel-order");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+
+        let result = run_shared_postprocess_background(
+            storage,
+            pp_pipeline(&dir, llm),
+            pp_writing_ctx(Some(&campaign_id)),
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.expect("取消路径不应是错误"));
+
+        let events = drain_events(&mut event_rx);
+        assert!(
+            matches!(
+                events.first(),
+                Some(PipelineEvent::PostProcessStarted { .. })
+            ),
+            "取消发生在 runner 内，Started 必须先到达: {events:?}"
+        );
+        match single_terminal_last(&events) {
+            PipelineEvent::PostProcessSkipped { reason } => {
+                assert_eq!(reason, "postprocess cancelled")
+            }
+            other => panic!("expected PostProcessSkipped, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写入失败（identity 指向不存在的 Turn）：恰好一个 Failed，原因与返回的 Err 一致。
+    #[tokio::test]
+    async fn writeback_failure_emits_single_failed_matching_returned_error() {
+        let (dir, storage) = pp_storage("write-fail");
+        let campaign_id = Id::from_str("camp-pp-write-fail");
+        let ctx = pp_writing_ctx(Some(&campaign_id));
+        let identity = production_postprocess::PostprocessIdentity {
+            turn_id: Id::from_str("turn-that-does-not-exist"),
+            attempt_id: Id::new(),
+            campaign_id: campaign_id.clone(),
+            conversation_id: ctx.conversation_id.clone(),
+            turn_number: 1,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let result = run_shared_postprocess_background(
+            storage,
+            pp_pipeline(&dir, Arc::new(GatedLlm { gate: None })),
+            ctx,
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            Some(identity),
+            None,
+        )
+        .await;
+        let err = result.expect_err("Turn 不存在时写回必须失败");
+
+        let events = drain_events(&mut event_rx);
+        match single_terminal_last(&events) {
+            PipelineEvent::PostProcessFailed { reason } => assert_eq!(reason, &err.to_string()),
+            other => panic!("expected PostProcessFailed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Campaign 局里后处理与摘要都被配置关闭：写入层只做了空记账，不算结论；
+    /// 前端应收到 runner 的配置 Skipped（保持空闲），而不是 `Done{0,0,0}`。
+    #[tokio::test]
+    async fn campaign_with_postprocess_disabled_emits_config_skipped_not_done() {
+        use storyforge_domain::turn::{TurnRecord, TurnStatus};
+
+        let (dir, storage) = pp_storage("config-off");
+        let campaign_id = Id::from_str("camp-pp-config-off");
+        let mut ctx = pp_writing_ctx(Some(&campaign_id));
+        let mut profile = storyforge_domain::agent_profile_config::default_agent_profile_config();
+        profile.enable_postprocess = false;
+        profile.enable_summarizer = false;
+        ctx.agent_profile_config = Some(profile);
+
+        let attempt =
+            turn_lifecycle::new_draft_attempt(Id::new(), Id::from_str("variant-1"), "正文", vec![]);
+        let attempt_id = attempt.attempt_id.clone();
+        let mut record = TurnRecord::new(
+            campaign_id.clone(),
+            ctx.conversation_id.clone(),
+            Id::from_str("input"),
+            0,
+        );
+        record.status = TurnStatus::DraftReady;
+        record.attempts.push(attempt);
+        let turn_id = record.turn_id.clone();
+        storage.save_turn(&record).expect("seed draft turn");
+        let identity = production_postprocess::PostprocessIdentity {
+            turn_id,
+            attempt_id,
+            campaign_id: campaign_id.clone(),
+            conversation_id: ctx.conversation_id.clone(),
+            turn_number: 1,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let result = run_shared_postprocess_background(
+            storage,
+            pp_pipeline(&dir, Arc::new(UnreachableLlm)),
+            ctx,
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            Some(identity),
+            None,
+        )
+        .await;
+        result.expect("配置关闭不是错误");
+
+        let events = drain_events(&mut event_rx);
+        match single_terminal_last(&events) {
+            PipelineEvent::PostProcessSkipped { reason } => assert!(
+                reason.contains("enable_postprocess=false"),
+                "应是 runner 的配置跳过原因，got {reason:?}"
+            ),
+            other => panic!("expected PostProcessSkipped, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非 Campaign（无 identity、无 campaign_id）：runner 早退不发事件，
+    /// 写入层也没有结论——仍要补出恰好一个终态。
+    #[tokio::test]
+    async fn non_campaign_run_emits_exactly_one_terminal_event() {
+        let (dir, storage) = pp_storage("no-campaign");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let result = run_shared_postprocess_background(
+            storage,
+            pp_pipeline(&dir, Arc::new(UnreachableLlm)),
+            pp_writing_ctx(None),
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.expect("非 Campaign 路径不应是错误"));
+
+        let events = drain_events(&mut event_rx);
+        assert!(
+            matches!(
+                single_terminal_last(&events),
+                PipelineEvent::PostProcessSkipped { .. }
+            ),
+            "非 Campaign 的终态应是 Skipped: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 终态要等 runner 结束，但进度事件不能跟着等：LLM 被卡住时 Started
+    /// 必须已经到达前端。
+    #[tokio::test]
+    async fn started_reaches_frontend_while_llm_is_blocked() {
+        let (dir, storage) = pp_storage("started-live");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let campaign_id = Id::from_str("camp-pp-started-live");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let run = tokio::spawn(run_shared_postprocess_background(
+            storage,
+            pp_pipeline(
+                &dir,
+                Arc::new(GatedLlm {
+                    gate: Some(gate.clone()),
+                }),
+            ),
+            pp_writing_ctx(Some(&campaign_id)),
+            "正文".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            event_tx,
+            cancel_rx,
+            None,
+            None,
+        ));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), event_rx.recv())
+            .await
+            .expect("LLM 放行前 Started 必须已到达前端")
+            .expect("事件 channel 不应提前关闭");
+        assert!(
+            matches!(first, PipelineEvent::PostProcessStarted { .. }),
+            "第一个事件应是 Started，got {first:?}"
+        );
+
+        gate.notify_one();
+        run.await
+            .expect("后处理任务不应 panic")
+            .expect("正常路径不应是错误");
+        let mut events = vec![first];
+        events.extend(drain_events(&mut event_rx));
+        single_terminal_last(&events);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 近期摘要与查询更贴合、排在前面；注入时它们被剔除后，更早的远记忆仍要能凑满注入上限。
