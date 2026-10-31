@@ -993,9 +993,16 @@ impl AppState {
             if let Some(conn) = conn_store.active_connection() {
                 match storyforge_infra_llm::create_client(&conn) {
                     Ok(client) => {
+                        // 与手动连接路径（set_active_connection）保持一致：生产路径
+                        // 统一包 retry（RateLimited/ServerError/Timeout 指数退避）。
+                        // 漏包的话重启恢复后的 LLM 调用静默失去重试，行为分叉。
+                        let retried = storyforge_infra_llm::with_retry(
+                            client,
+                            storyforge_domain::llm::RetryConfig::default(),
+                        );
                         let intercepted: Arc<dyn LlmClient> =
                             Arc::new(storyforge_app_logging::interceptor::LlmInterceptor::new(
-                                Arc::from(client),
+                                retried,
                                 log_store.clone(),
                                 conn.name.clone(),
                             ));
