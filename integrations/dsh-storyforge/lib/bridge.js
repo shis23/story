@@ -40,7 +40,7 @@ function toRpcError(error) {
 const READY_TIMEOUT_MS = 30_000
 const SHUTDOWN_TIMEOUT_MS = 3_000
 
-export function createBridge({ binPath, dataDir, logFile, serveLlm, log }) {
+export function createBridge({ binPath, dataDir, logFile, serveLlm, log, spawnFn = spawn }) {
   let child = null
   let ready = null
   let nextId = 1
@@ -126,7 +126,14 @@ export function createBridge({ binPath, dataDir, logFile, serveLlm, log }) {
     mkdirSync(dataDir, { recursive: true })
     mkdirSync(dirname(logFile), { recursive: true })
     const stderrLog = createWriteStream(logFile, { flags: 'a' })
-    const proc = spawn(binPath, ['--data-dir', dataDir], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let proc
+    try {
+      proc = spawnFn(binPath, ['--data-dir', dataDir], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    } catch (error) {
+      // 某些 spawn 失败是同步 throw（如 Windows 对非可执行文件报 EFTYPE）；
+      // 与 bridge_missing 一样统一包成 BridgeRpcError，调用方拿到一致的错误语义。
+      throw new BridgeRpcError('bridge_spawn_failed', `sidecar 启动失败：${error?.message ?? error}`)
+    }
     child = proc
     readyInfo = null
     proc.stderr.pipe(stderrLog)
@@ -152,11 +159,30 @@ export function createBridge({ binPath, dataDir, logFile, serveLlm, log }) {
         unsubscribe()
         reject(new BridgeRpcError('bridge_exited', `sidecar 启动后退出，详见 ${logFile}`))
       })
+      // spawn 失败（如 ENOENT、杀软拦截、缺执行位）只触发 error（随后 close），
+      // 不触发 exit——不在Promise 里兜底的话 ready 永远 pending，所有请求
+      // 只能等 READY_TIMEOUT 超时且无从区分原因。Promise 已 settle 时再
+      // reject 是 no-op，与上面的 exit 分支互不冲突。
+      proc.once('error', (error) => {
+        clearTimeout(timer)
+        unsubscribe()
+        reject(new BridgeRpcError('bridge_spawn_failed', `sidecar 启动失败：${error?.message ?? error}`))
+      })
     })
     // 未被等待时不要变成 unhandledRejection。
     ready.catch(() => {})
 
-    proc.on('error', (error) => log(`bridge spawn error: ${error?.stack ?? error}`))
+    proc.on('error', (error) => {
+      log(`bridge spawn error: ${error?.stack ?? error}`)
+      // spawn 失败没有 exit 事件：不在这里清 child 的话它永不清空，
+      // 下一次 ensure() 会一直复用这个死进程的 pending ready，插件要
+      // 重启才能恢复。清掉后下一次请求会重新拉起 sidecar（自愈）。
+      if (child === proc) {
+        child = null
+        ready = null
+      }
+      failAll(new BridgeRpcError('bridge_spawn_failed', `sidecar 启动失败：${error?.message ?? error}`))
+    })
     proc.on('exit', (code, signal) => {
       lastExit = { at: new Date().toISOString(), code, signal }
       log(`bridge exited: code=${code} signal=${signal}`)
