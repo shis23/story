@@ -327,7 +327,9 @@ test('host half drives the real sidecar with models served through ctx.llm', { s
       .get('/api/storyforge/vendor/purify.js')
       .fetch(new Request('http://localhost/api/storyforge/vendor/purify.js'))
     assert.match(purify.headers.get('content-type'), /javascript/)
-    assert.match(await purify.text(), /export \{ purify as default \}/)
+    // DOMPurify es.mjs 的 default 导出绑定名随构建版本变化（3.4.12 是
+    // `purify`，3.4.17 起是 `purify_default`），断言只锚定 default 导出存在。
+    assert.match(await purify.text(), /export \{ \w+ as default \}/)
 
     // DSH 重新生成上一轮（历史里少一轮）：存档已采纳的轮次不能重写，明确拒绝。
     await assert.rejects(collect(adapter.stream({ sessionId, messages })), /不能重新生成/)
