@@ -3,7 +3,7 @@ name: release
 # 构建 Windows（exe/msi/nsis 安装器）+ Android（arm64 release APK）并发布到 GitHub Release。
 #
 # 触发：
-#   - push v* tag  → 构建 + 自动发 GitHub Release（带 release notes）
+#   - push 三段 semver tag（v0.1.2 等）→ 构建 + 自动发 GitHub Release（带 release notes）
 #   - workflow_dispatch → 仅构建并上传 artifact，不发 Release（用于调试）
 #
 # 首次使用前需配置 4 个 GitHub Secret（APK 签名用）：
@@ -17,7 +17,9 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      # 仅三段 semver（与 verify-tag-version.ps1 的校验一致）。此前的 'v*' 通配
+      # 会把 v0.3-glm确定版 这类非 semver 历史 tag 也纳入公网发布触发面。
+      - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
 permissions:
