@@ -162,12 +162,7 @@ pub(crate) fn log_append_frontend(
     message: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) {
-    const MAX_LOG_MSG_LEN: usize = 4096;
-    let message = if message.len() > MAX_LOG_MSG_LEN {
-        format!("{}...(截断)", &message[..MAX_LOG_MSG_LEN])
-    } else {
-        message
-    };
+    let message = truncate_log_message(&message);
     let log_level = match level.as_str() {
         "debug" => LogLevel::Debug,
         "info" => LogLevel::Info,
@@ -185,4 +180,53 @@ pub(crate) fn log_append_frontend(
         fields: std::collections::HashMap::new(),
         llm_detail: None,
     });
+}
+
+/// 截断超长前端日志消息。MAX_LOG_MSG_LEN 是字节上限：`&s[..n]` 按字节切片
+/// 在 UTF-8 多字节字符中间（中文/emoji 占 3-4 字节）会 panic，且本命令同步
+/// 跑在主线程，一条落在边界上的长消息即可崩溃应用——回退到最近的字符边界。
+fn truncate_log_message(message: &str) -> String {
+    const MAX_LOG_MSG_LEN: usize = 4096;
+    if message.len() <= MAX_LOG_MSG_LEN {
+        return message.to_string();
+    }
+    let mut end = MAX_LOG_MSG_LEN;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...(截断)", &message[..end])
+}
+
+#[cfg(test)]
+mod log_truncation_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_message_kept_as_is_when_under_limit() {
+        let msg = "a".repeat(100);
+        assert_eq!(truncate_log_message(&msg), msg);
+    }
+
+    #[test]
+    fn ascii_message_truncated_at_exact_limit() {
+        let msg = "a".repeat(5000);
+        let out = truncate_log_message(&msg);
+        assert_eq!(out.len(), 4096 + "...(截断)".len());
+        assert!(out.starts_with(&"a".repeat(4096)));
+    }
+
+    #[test]
+    fn multibyte_boundary_does_not_panic_and_stays_valid_utf8() {
+        // 4096 字节处恰好落在一个多字节字符中间：1301 个中文字符（3 字节/个）
+        // = 3903 字节，再补 193 个 ASCII → 4096 字节，边界落在第 1302 个中文字符内部。
+        let mut msg = "中".repeat(1301);
+        msg.push_str(&"a".repeat(193));
+        assert_eq!(msg.len(), 4096);
+        msg.push_str(&"尾部".repeat(100));
+        let out = truncate_log_message(&msg);
+        // 截断点回退到字符边界（3903 字节处），内容不超上限且仍是合法 UTF-8。
+        assert!(out.starts_with(&"中".repeat(1301)));
+        assert!(out.ends_with("...(截断)"));
+        assert!(out.len() <= 4096 + "...(截断)".len());
+    }
 }
