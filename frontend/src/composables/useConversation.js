@@ -128,11 +128,17 @@ export function useConversation(handlers = {}) {
     }
   }
 
+  // 单调 token 守卫（与 AppV2 cardShellRefreshToken 同款）：连续打开两个会话时，
+  // 慢返回的旧 getConversation / setActiveCampaign 不得覆盖新选择的会话。
+  let openConversationToken = 0
+
   // openConversation(App.vue:476-518):getConversation → applyConversation,广播 CHAT_LOADED。
   async function openConversation(convSummary) {
+    const token = ++openConversationToken
     try {
       const conv = await getConversation(convSummary.id)
       if (!conv) return
+      if (token !== openConversationToken) return
 
       applyConversation(conv)
       campaign.currentConversationId = convSummary.id
@@ -142,8 +148,11 @@ export function useConversation(handlers = {}) {
       if (convSummary.campaign_id) {
         try {
           await setActiveCampaign(convSummary.campaign_id)
+          if (token !== openConversationToken) return
           campaign.activeCampaign = await getActiveCampaign()
+          if (token !== openConversationToken) return
           if (loadInstanceNameMap) await loadInstanceNameMap()
+          if (token !== openConversationToken) return
           // role_label 用 Campaign 名
           writing.messages.forEach((m) => {
             if (m.role === 'assistant') m.role_label = campaign.activeCampaign?.name || 'AI'
@@ -153,16 +162,19 @@ export function useConversation(handlers = {}) {
         // legacy 会话(无 Campaign 绑定):加载关联角色卡
         try {
           const chars = await import('../tauri-api.js').then(m => m.listCharacters())
+          if (token !== openConversationToken) return
           const char = chars.find((c) => c.id === conv.character_id)
           if (char) {
             campaign.activeChar = char
             if (loadCharDetail) await loadCharDetail(char.id)
+            if (token !== openConversationToken) return
             writing.messages.forEach((m) => {
               if (m.role === 'assistant') m.role_label = char.name
             })
           }
         } catch (e) { console.error('加载关联角色卡失败:', e) }
       }
+      if (token !== openConversationToken) return
       broadcastPluginEvent(ST_EVENT_TYPES.CHAT_LOADED, chatEventPayload({
         conversationId: campaign.currentConversationId,
         campaignId: convSummary.campaign_id || null,
@@ -172,6 +184,8 @@ export function useConversation(handlers = {}) {
       // activeCampaign 已同步为新会话的 Campaign，放在前面会读到旧值）
       onConversationOpened(convSummary)
     } catch (e) {
+      // 过期请求的失败不必打扰新选择（新流程已接管）
+      if (token !== openConversationToken) return
       console.error('打开对话失败:', e)
       await alertDialog('打开对话失败: ' + errorText(e))
     }

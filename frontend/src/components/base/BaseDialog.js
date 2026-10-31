@@ -1,5 +1,8 @@
 import { createApp, h, ref } from 'vue'
-import BaseOverlay from './BaseOverlay.vue'
+
+// BaseOverlay.vue 懒加载：只有 promptDialog 需要它。静态导入会把 .vue 拉进
+// 所有经 BaseDialog 的 node --test 引用链（node 不认 .vue 扩展名），
+// useConversation 等纯逻辑 composable 的测试因此无法加载。
 
 /**
  * 统一对话框入口，替换散落的 alert() / window.confirm / window.prompt。
@@ -39,7 +42,8 @@ export async function alertDialog(message, opts = {}) {
 // Tauri 无原生 prompt；用临时 Vue 应用挂一个 BaseOverlay 输入弹层，
 // 返回 Promise<string|null>：null=取消，字符串=用户输入（已 trim）。
 
-export function promptDialog(message, defaultValue = '', opts = {}) {
+export async function promptDialog(message, defaultValue = '', opts = {}) {
+  const { default: BaseOverlay } = await import('./BaseOverlay.vue')
   return new Promise((resolve) => {
     const host = document.createElement('div')
     document.body.appendChild(host)
