@@ -14,7 +14,7 @@
 
 | 门禁 | 当前状态 | 通过条件 |
 | --- | --- | --- |
-| 源码和文档一致性 | 已回写（2026-09-13 复核） | 模式、快照边界、11 步命令、前置依赖及真实限制已同步；2026-09-13 复核发现并回写 HEAD/校验和资产/远端 CI 范围等陈旧声明，逐条依据（原声明 → 改后 → 证据）见 [`review-2026-09-13/fixes/07-goals-docs-fixes.md`](review-2026-09-13/fixes/07-goals-docs-fixes.md) |
+| 源码和文档一致性 | 已回写（2026-09-13 复核） | 模式、快照边界、11 步命令、前置依赖及真实限制已同步；2026-09-13 复核发现并回写 HEAD/校验和资产/远端 CI 范围等陈旧声明，逐条依据（原声明 → 改后 → 证据）见 `review-2026-09-13/fixes/07-goals-docs-fixes.md`（本机归档） |
 | 密钥扫描、fmt、严格 Clippy | 本轮通过；2026-10-13 复跑通过 | 完整门禁通过，包含未跟踪构建输入扫描 |
 | Rust 工作区 | 本轮通过；2026-10-13 复跑通过 | 默认并发：2026-10-13 为 2260 通过、0 失败、33 忽略（2026-09-06 三轮为 1980/0/33）；未声称忽略用例或覆盖率通过 |
 | 前端逻辑、组件、CSP、移动布局、应用壳、构建 | 本轮通过；2026-10-13 复跑通过 | 2026-10-13 为 535 + 161 + 9 + 28 + 2 = 735 项（2026-09-06 三轮均为 504 + 119 + 9 + 28 + 2 = 662 项，计数完全一致，第三轮运行于已提交的 HEAD 树）；生产构建通过 |
@@ -26,10 +26,10 @@
 | Windows 原生写作流程 | 本轮通过（真实模型） | 4948da7 构建 13/13 项真实 Tauri IPC 检查；LLM 为真实 glm-5.3-flash（coding v4 端点，SSE 透传），33 次调用全 200（25 流式+8 非流式），tool_mode=native 一次通过；L1 磁盘 connections.json 仅 SecretRef 引用、无明文 key，杀进程重启可读（详见下节） |
 | Windows/Android 调试候选 | 本轮产出并验证 | Windows 原生运行；Android APK 签名校验及保留数据覆盖安装通过，仍是调试签名 |
 | 正式分发安装包 | 已闭合（v0.1.2） | tag v0.1.2 触发 GitHub Actions release.yml（run 34013739416），windows/android/release 三 job 全部 success；GitHub Release v0.1.2 于 2026-09-06T05:42:43Z 正式发布（非 draft）；EXE/MSI/APK 三产物均下载实测 SHA-256 一致（APK 为 release keystore 签名）；校验和同名覆盖缺陷已补传 `SHA256SUMS-android.txt` 且 workflow 已改按平台命名——v0.1.2 Release 实际资产为 `SHA256SUMS.txt`（196 B，workflow 上传）与 `SHA256SUMS-android.txt`（88 B，发布后手工补传），**没有** `SHA256SUMS-windows.txt`，平台命名自下一版本生效；Windows EXE 仍无代码签名（详见下节） |
-| 当前候选完整真机写作、第三方插件 | 已闭合（本轮通过） | Windows 原生真实 glm-5.3-flash 写作（上列行）；Android 真机 9/9 环节：GUI 表单配置连接（测试连接 4s 连通）、SecretRef 落盘、续写 91s、采纳记账、对手戏 4 段编排 10.5 分钟、杀进程冷重启全持久，正文真实生成（Campaign 56→603 字），全程未用 IPC 建连接；第三方插件两条通道：1B 真实 TavernHelper 卡 5/5 远程脚本（含 MVU bundle）执行成功，1A manifest 插件 4 个真实缺陷修复并复验。边界与证据见下节。**边界限定（2026-09-13，task-31／M-30-③；2026-09-28 更新）**：「通道闭合」指已验证的挂载／执行／权限门控路径在验收样本上闭合，**不等于不存在可绕过路径**——子帧／权限边界的运行时验证 P0-2（`M-01`）已于 2026-09-28 关闭：运行时 PoC 实锤后落地 `SUBFRAME_IPC_GUARD`（子帧内冻结 `__TAURI_INTERNALS__` + 封堵两条 IPC 传输），同法复验全部通过（证据 `artifacts/p02-poc/`，报告 [`review-2026-09-13/round3-p0-2-closure-2026-09-28.md`](review-2026-09-13/round3-p0-2-closure-2026-09-28.md)）；本行结论不构成插件沙箱攻击面评估（另见本文件 `:60` 的免责声明）。原「已闭合」判定不改写 |
+| 当前候选完整真机写作、第三方插件 | 已闭合（本轮通过） | Windows 原生真实 glm-5.3-flash 写作（上列行）；Android 真机 9/9 环节：GUI 表单配置连接（测试连接 4s 连通）、SecretRef 落盘、续写 91s、采纳记账、对手戏 4 段编排 10.5 分钟、杀进程冷重启全持久，正文真实生成（Campaign 56→603 字），全程未用 IPC 建连接；第三方插件两条通道：1B 真实 TavernHelper 卡 5/5 远程脚本（含 MVU bundle）执行成功，1A manifest 插件 4 个真实缺陷修复并复验。边界与证据见下节。**边界限定（2026-09-13，task-31／M-30-③；2026-09-28 更新）**：「通道闭合」指已验证的挂载／执行／权限门控路径在验收样本上闭合，**不等于不存在可绕过路径**——子帧／权限边界的运行时验证 P0-2（`M-01`）已于 2026-09-28 关闭：运行时 PoC 实锤后落地 `SUBFRAME_IPC_GUARD`（子帧内冻结 `__TAURI_INTERNALS__` + 封堵两条 IPC 传输），同法复验全部通过（证据 `artifacts/p02-poc/`，报告 `review-2026-09-13/round3-p0-2-closure-2026-09-28.md`）；本行结论不构成插件沙箱攻击面评估（另见本文件 `:60` 的免责声明）。原「已闭合」判定不改写 |
 | 当前提交的远端 CI | 已闭合 | 最终提交链 ce6117d（含插件修复与版本 0.1.2）与 tag v0.1.2 已推送 Gitea+GitHub 双远端；GitHub Actions tag 构建全绿（run 34013739416，即最终发布提交的远端构建证据）；另 main@4948da7 的 workflow_dispatch 调试构建全绿（run 33980646148）。Gitea Actions 已按用户 2026-09-06 决定停用：act_runner 与正在执行的任务容器已停止、排队 run 34-36 不再执行、仓库 has_actions 已关闭（原因为 runner 性能不足与工作区缓存 non-fast-forward，即 run #33 全败根因）；远端构建自本轮起只在 GitHub 进行。范围说明：release.yml 的三个 job 以构建与产物上传为主（windows/android：`npm ci` + `npm run build` + 一步前端契约测试 `node --test tests/tauri-command-contract.test.mjs`（2026-09-13 新增；2026-10-12 workflow_dispatch run 38267792406 的 windows/android job 已实跑通过，尚未经 tag 发版运行）+ `cargo tauri build --ci`；release：汇总上传），不含 fmt/clippy/`cargo test`/Pester——11 步确定性门禁只在本地 `scripts/verify-release.ps1` 执行；Gitea Actions 停用标记见 `.gitea/DECOMMISSIONED.md`。2026-10-12 补充：CI 钉 `ubuntu-24.04` 并把 actions 升到 Node 24 主版本（`6f6eef9`）后，workflow_dispatch run 38271134820（该提交）与 38267792406（main@`d031381`）windows/android 双绿，release job 按设计跳过；release.yml 只构建 Tauri 应用，不构建、不分发 `dsh-bridge` |
 
-整体状态：**真实模型写作（Windows 原生 + Android 真机）、第三方插件样本、正式分发安装包（v0.1.2 已发布并实测核验三产物哈希）与远端 CI（GitHub tag 构建全绿，Gitea Actions 已停用）均已闭合；三轮完整 11 步门禁全绿且计数完全一致（第三轮运行于已提交的 HEAD 树，见「停止位置」）**。Gate 6 维持“关闭非 PASS”；不宣称任何覆盖率指标。命令、证据、候选哈希及失败过程见 [`release-closure-2026-09-06.md`](release-closure-2026-09-06.md)。不得将此状态改写成“整个项目已正式发布”。
+整体状态：**真实模型写作（Windows 原生 + Android 真机）、第三方插件样本、正式分发安装包（v0.1.2 已发布并实测核验三产物哈希）与远端 CI（GitHub tag 构建全绿，Gitea Actions 已停用）均已闭合；三轮完整 11 步门禁全绿且计数完全一致（第三轮运行于已提交的 HEAD 树，见「停止位置」）**。Gate 6 维持“关闭非 PASS”；不宣称任何覆盖率指标。命令、证据、候选哈希及失败过程见 `release-closure-2026-09-06.md`（本机归档）。不得将此状态改写成“整个项目已正式发布”。
 
 停止位置：本轮收尾完成，无未完结验收。仓库 HEAD 为 `ab894c6`（`fix(release): platform-suffixed checksum files; record v0.1.2 closure`，2026-09-06 14:18:08 +08），已包含 SHA256SUMS 平台命名修复（`.github/workflows/release.yml` 与 `README.md`）；2026-09-13 复核时 `git status --porcelain` 为空，HEAD 已推送到 Gitea 远端（`origin/main` = ab894c6）；指向 GitHub 的本地 remote-tracking 引用 `github/main` 停在 `3b114fe`（2026-09-02），故本文件不声称 ab894c6 已推送到 GitHub。**发布用的 tag `v0.1.2` 指向 `ce6117d`**（插件修复 + 版本 0.1.2），即平台命名校验和修复不在 v0.1.2 发布物内，自下一版本生效。依赖目录完整（`npm ci` 与前端生产构建通过）。
 
@@ -130,7 +130,7 @@
 
 ## 已有证据
 
-- 2026-09-06 真实模型/插件/正式分发 v0.1.2/远端 CI 闭合记录：见上节「2026-09-06 真实模型与插件闭合」；明细另见 [`release-closure-2026-09-06.md`](release-closure-2026-09-06.md) 追加章节。
+- 2026-09-06 真实模型/插件/正式分发 v0.1.2/远端 CI 闭合记录：见上节「2026-09-06 真实模型与插件闭合」；明细另见 `release-closure-2026-09-06.md`（本机归档）追加章节。
 
 - 2026-09-05 桌面架构修复记录：删除未采纳稿件、已采纳前缀保护、末尾分支、v3 快照、模式无关 Editor 修订和隔离 Card Studio Store 已实现。历史记录为 Rust 1974 通过、33 忽略及 13 项真实 Tauri IPC 检查；模型为本机协议夹具。
 - `android-topbar-acceptance-2026-09-05.md`：真机安全区、顶栏、键盘、面板切换及无清数据覆盖安装。它不是凭据或真实模型写作验收。

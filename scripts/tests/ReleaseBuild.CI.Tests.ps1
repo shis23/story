@@ -27,7 +27,7 @@ Describe 'ReleaseBuild provenance generation' {
             -Branch 'codex/release-ci-evidence' `
             -Target 'x86_64-pc-windows-msvc' `
             -Artifacts $artifacts `
-            -RepoRoot 'C:\Users\Predator\project'
+            -RepoRoot 'C:\Users\Developer\project'
 
         $prov.schema_version | Should Be 1
         $prov.commit | Should Be 'abc1234'
@@ -52,7 +52,7 @@ Describe 'ReleaseBuild provenance generation' {
             -Branch 'test' `
             -Target 'x86_64-pc-windows-msvc' `
             -Artifacts @() `
-            -RepoRoot 'C:\Users\Predator\repo' `
+            -RepoRoot 'C:\Users\Developer\repo' `
             -Notes @("token=$fake")
         $json = $prov | ConvertTo-Json -Depth 10
         # The standalone token in a note MUST be redacted.

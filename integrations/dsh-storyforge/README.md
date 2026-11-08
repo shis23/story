@@ -56,24 +56,24 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 ## 在隔离环境里运行
 
 全部在独立的 `DSH_HOME` 下进行，不会碰 `~/.dsh` 和正在运行的 DSH。以下以
-`C:/Users/Predator/dsh-poc` 为例，工作区目录 `C:/Users/Predator/dsh-poc/workspace`
+`/path/to/dsh-poc` 为例，工作区目录 `/path/to/dsh-poc/workspace`
 （DSH 以启动时的当前目录作为默认工作区）。
 
 1. 从 web 模板建 profile（不启动，只初始化并导出配置）：
 
    ```bash
-   cd /c/Users/Predator/dsh-poc/workspace && DSH_HOME="C:/Users/Predator/dsh-poc" dsh --profile sfpoc --from-default-profile web --dump-config > /dev/null
+   cd /path/to/dsh-poc/workspace && DSH_HOME="/path/to/dsh-poc" dsh --profile sfpoc --from-default-profile web --dump-config > /dev/null
    ```
 
 2. 安装插件（二选一）。插件在 `package.json` 里声明了 `dsh.bundle.patch`，安装后 DSH 把它加进
    profile 的 bundle 列表，以后每次启动自动叠加 `storyforge.patch.yml`，**不需要 `--patch`**：
    - 界面：启动后进「插件 → 添加插件」，填本地目录
-     `C:/Users/Predator/ZCodeProject/storyforge/integrations/dsh-storyforge`，点「安装」，再点「立即启用」
+     `/path/to/storyforge/integrations/dsh-storyforge`，点「安装」，再点「立即启用」
      （不用重启，左侧栏随即出现「StoryForge」）；
    - 命令行（以 `link:` 依赖挂上，改源码不用重装）：
 
      ```bash
-     DSH_HOME="C:/Users/Predator/dsh-poc" dsh plugin --profile sfpoc add "link:C:/Users/Predator/ZCodeProject/storyforge/integrations/dsh-storyforge"
+     DSH_HOME="/path/to/dsh-poc" dsh plugin --profile sfpoc add "link:/path/to/storyforge/integrations/dsh-storyforge"
      ```
 
 3. 构建 sidecar：
@@ -85,7 +85,7 @@ sidecar 的 stderr 写到 `<dataDir>/logs/bridge.log`。StoryForge 自己的 LLM
 4. 启动（端口由系统分配，不自动开浏览器）：
 
    ```bash
-   cd /c/Users/Predator/dsh-poc/workspace && DSH_HOME="C:/Users/Predator/dsh-poc" dsh --profile sfpoc --port 0 --no-open
+   cd /path/to/dsh-poc/workspace && DSH_HOME="/path/to/dsh-poc" dsh --profile sfpoc --port 0 --no-open
    ```
 
 5. 打开输出里的 `dsh web: http://127.0.0.1:<端口>/?token=…` 链接。先在 DSH 设置里配好

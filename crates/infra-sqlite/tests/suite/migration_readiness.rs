@@ -397,12 +397,12 @@ fn backup_manifest_and_file_name_redact_sensitive_label_and_source_path() {
     let backup = create_backup_checkpoint(
         &db,
         dir.path().join("backup"),
-        "privateKey=do-not-export C:\\Users\\Predator",
+        "privateKey=do-not-export C:\\Users\\Developer",
     )
     .unwrap();
     let manifest = fs::read_to_string(&backup.manifest_path).unwrap();
     let file_name = backup.backup_db_path.file_name().unwrap().to_string_lossy();
-    for forbidden in ["do-not-export", "Predator", "privateKey", "private-live"] {
+    for forbidden in ["do-not-export", "Developer", "privateKey", "private-live"] {
         assert!(!manifest.contains(forbidden), "manifest leaked {forbidden}");
         assert!(
             !file_name.contains(forbidden),
@@ -634,7 +634,7 @@ fn export_redacts_operational_rows_and_omits_absolute_source_paths() {
         .execute(
             "INSERT INTO import_runs
              (run_id, source_root, source_manifest_hash, status, started_at, finished_at, error)
-             VALUES ('run-secret', 'C:\\Users\\Predator\\secret-source', 'hash', 'failed', 't', 't',
+             VALUES ('run-secret', 'C:\\Users\\Developer\\secret-source', 'hash', 'failed', 't', 't',
                      'privateKey=do-not-export token=do-not-export')",
             [],
         )
@@ -658,7 +658,7 @@ fn export_redacts_operational_rows_and_omits_absolute_source_paths() {
         for forbidden in [
             "do-not-export",
             "privateKey",
-            "C:\\Users\\Predator",
+            "C:\\Users\\Developer",
             &live_path.display().to_string(),
         ] {
             assert!(

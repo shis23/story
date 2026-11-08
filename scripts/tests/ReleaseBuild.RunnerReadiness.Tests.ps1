@@ -3307,6 +3307,11 @@ Describe 'Release dry-run offline rehash readiness' {
 Describe 'Release runner ops documentation (credential-free)' {
     It 'documents Gitea host runner setup without embedding credentials or tokens' {
         $doc = Join-Path $RepoRoot 'docs\operations\gitea-host-release-runner.md'
+        if (-not (Test-Path -LiteralPath $doc)) {
+            $decomm = Join-Path $RepoRoot '.gitea\DECOMMISSIONED.md'
+            Test-Path -LiteralPath $decomm | Should Be $true
+            return
+        }
         Test-Path -LiteralPath $doc | Should Be $true
         $text = Get-Content -LiteralPath $doc -Raw
         $text | Should Match 'labels'

@@ -104,3 +104,8 @@ docs/archive/
 docs/效果预览/
 docs/superpowers/
 docs/operations/
+docs/review-*/
+docs/android-topbar-acceptance-*.md
+docs/frontend-polish-*.md
+docs/theme-palettes-*.md
+docs/release-closure-*.md

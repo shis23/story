@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-EVID="${STORYFORGE_EVAL_EVIDENCE_ROOT:-/c/Users/Predator/storyforge-evidence}"
+EVID="${STORYFORGE_EVAL_EVIDENCE_ROOT:-${ROOT}/artifacts/storyforge-evidence}"
 ENV_FILE="${EVID}/.eval-env.local"
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "missing $ENV_FILE" >&2

@@ -19,9 +19,9 @@ if (-not (Test-Path -LiteralPath $CommonPath)) {
 
 Describe 'ReleaseBuild path redaction' {
     It 'redacts absolute Windows user paths' {
-        $raw = 'Built at C:\Users\Predator\project\target\release\storyforge.exe size=12'
-        $redacted = Protect-ReleasePath -Text $raw -RepoRoot 'C:\Users\Predator\project'
-        $redacted | Should Not Match 'C:\\Users\\Predator'
+        $raw = 'Built at C:\Users\Developer\project\target\release\storyforge.exe size=12'
+        $redacted = Protect-ReleasePath -Text $raw -RepoRoot 'C:\Users\Developer\project'
+        $redacted | Should Not Match 'C:\\Users\\Developer'
         $redacted | Should Match '<REPO>'
     }
 
@@ -45,10 +45,10 @@ Describe 'ReleaseBuild path redaction' {
 
     It 'redacts Authorization and Bearer credentials from error-shaped text' {
         $opaque = ('opaque' * 5)
-        $raw = "Authorization: Bearer $opaque failed at C:\Users\Predator\repo\script.ps1"
-        $redacted = Protect-ReleasePath -Text $raw -RepoRoot 'C:\Users\Predator\repo'
+        $raw = "Authorization: Bearer $opaque failed at C:\Users\Developer\repo\script.ps1"
+        $redacted = Protect-ReleasePath -Text $raw -RepoRoot 'C:\Users\Developer\repo'
         $redacted | Should Not Match ([regex]::Escape($opaque))
-        $redacted | Should Not Match 'C:\\Users\\Predator'
+        $redacted | Should Not Match 'C:\\Users\\Developer'
         $redacted | Should Match '<REDACTED_SECRET>'
     }
 
@@ -56,17 +56,17 @@ Describe 'ReleaseBuild path redaction' {
         $opaque = ('credential' * 4)
         $record = [pscustomobject]@{
             Exception = [pscustomobject]@{
-                Message = "Authorization: Bearer $opaque at C:\Users\Predator\repo\run.ps1"
+                Message = "Authorization: Bearer $opaque at C:\Users\Developer\repo\run.ps1"
             }
-            ScriptStackTrace = "stack C:\Users\Predator\repo\secret.ps1 token=$opaque"
+            ScriptStackTrace = "stack C:\Users\Developer\repo\secret.ps1 token=$opaque"
             InvocationInfo = [pscustomobject]@{
-                PositionMessage = "position C:\Users\Predator\repo\run.ps1 Bearer $opaque"
+                PositionMessage = "position C:\Users\Developer\repo\run.ps1 Bearer $opaque"
             }
         }
-        $safe = Get-ReleaseSafeErrorDetails -ErrorRecord $record -RepoRoot 'C:\Users\Predator\repo'
+        $safe = Get-ReleaseSafeErrorDetails -ErrorRecord $record -RepoRoot 'C:\Users\Developer\repo'
         $json = $safe | ConvertTo-Json -Depth 5
         $json | Should Not Match ([regex]::Escape($opaque))
-        $json | Should Not Match 'C:\\Users\\Predator'
+        $json | Should Not Match 'C:\\Users\\Developer'
         $safe.message | Should Match '<REDACTED_SECRET>'
     }
 }
@@ -142,7 +142,7 @@ Describe 'ReleaseBuild manifest construction' {
             -BuildStatus 'ok' `
             -Warnings @('size budget warning: windows-exe') `
             -Notes @('host-only; not GUI acceptance') `
-            -RepoRoot 'C:\Users\Predator\project'
+            -RepoRoot 'C:\Users\Developer\project'
 
         $json = $manifest | ConvertTo-Json -Depth 8
         $json | Should Not Match 'C:\\Users'
@@ -164,13 +164,13 @@ Describe 'ReleaseBuild manifest construction' {
             -ToolVersions @{ rustc = '1' } `
             -Artifacts @() `
             -BuildStatus 'ok' `
-            -Warnings @("leak=$fake path=C:\Users\Predator\secret") `
-            -Notes @("cache=C:\Users\Predator\.cargo") `
-            -RepoRoot 'C:\Users\Predator\project'
+            -Warnings @("leak=$fake path=C:\Users\Developer\secret") `
+            -Notes @("cache=C:\Users\Developer\.cargo") `
+            -RepoRoot 'C:\Users\Developer\project'
 
         $json = $manifest | ConvertTo-Json -Depth 8
         $json | Should Not Match ([regex]::Escape($fake))
-        $json | Should Not Match 'C:\\Users\\Predator'
+        $json | Should Not Match 'C:\\Users\\Developer'
         $manifest.warnings[0] | Should Match '<REDACTED_SECRET>|<HOME>'
         $manifest.notes[0] | Should Match '<HOME>'
     }
@@ -204,28 +204,28 @@ Describe 'ReleaseBuild manifest construction' {
         # be altered. Use both forms to prove both behaviors.
         $fake = 'sk' + '-' + ('q' * 24)
         $artifact = New-ReleaseArtifactRecord `
-            -RelativePath "C:\Users\Predator\repo\$fake.exe" `
+            -RelativePath "C:\Users\Developer\repo\$fake.exe" `
             -SizeBytes 12 `
             -Sha256 ('a' * 64) `
             -Kind 'windows-exe' `
             -Status 'present'
         $inventory = [pscustomobject]@{
-            relative_path = "C:\Users\Predator\inventory.json"
+            relative_path = "C:\Users\Developer\inventory.json"
             sha256 = ('b' * 64)
             component_count = 42
             generator = "key=$fake"
         }
         $manifest = New-ReleaseBuildManifest `
             -Commit "commit-$fake" `
-            -Branch "C:\Users\Predator\branch" `
+            -Branch "C:\Users\Developer\branch" `
             -Target 'x86_64-pc-windows-msvc' `
-            -ToolVersions @{ rustc = "C:\Users\Predator\rustc" } `
+            -ToolVersions @{ rustc = "C:\Users\Developer\rustc" } `
             -Artifacts @($artifact) `
             -DependencyInventory $inventory `
             -BuildStatus 'ok' `
             -Warnings @() `
             -Notes @() `
-            -RepoRoot 'C:\Users\Predator\repo'
+            -RepoRoot 'C:\Users\Developer\repo'
 
         $json = $manifest | ConvertTo-Json -Depth 12
         # A standalone sk- value (`key=<fake>`) MUST be redacted.
@@ -233,7 +233,7 @@ Describe 'ReleaseBuild manifest construction' {
         # An sk- substring embedded in an identifier (`commit-<fake>`) is NOT a
         # secret under boundary-aware matching and is preserved as-is.
         $json | Should Match ([regex]::Escape($fake))
-        $json | Should Not Match 'C:\\Users\\Predator'
+        $json | Should Not Match 'C:\\Users\\Developer'
         $manifest.dependency_inventory.sha256 | Should Be ('b' * 64)
         $manifest.dependency_inventory.component_count | Should Be 42
     }
